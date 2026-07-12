@@ -116,11 +116,24 @@ Two distinct axes, often conflated. Neither is allowed in the per-token fetch pa
 **Acceptance:** correct output; per-turn tok/s, expert hit-rate, RSS logged; runs within a declared RAM budget without OOM.
 **Reuse:** colibri end-to-end. **Build:** GPU compute path if targeting GPU; real-weight validation harness.
 
-### v1 — Distributed heat-aware expert cache
+### v1 — Distributed weight sharing
+
+> **Revised — [ROADMAP.md](ROADMAP.md) holds the requirements of record; where the two
+> conflict, ROADMAP.md wins.** Key changes from the original sketch kept below:
+> **GGUF** is the interchange weight format; placement is **random ranges with
+> redundancy** (heat-proportional replication becomes an optional layer on top, not
+> the baseline); the p2p stack is **ENR + gossip + request-response**
+> (Ethereum-style; candidate reuse: `blockblaz/enr`, gossipsub, zeam's networking)
+> rather than Hyperswarm/Hyperbee; a new node syncs weight ranges from peers via
+> req-resp at boot; model-version upgrades happen by **majority hardfork** on a new
+> GGUF file. Open questions to resolve before design: advertise held weights via ENR
+> metadata, a global gossip topic, or both; churn-repair policy for replacing a
+> disconnected peer with one holding the required range.
+
 **Goal:** pool cluster RAM into a content-addressed expert cache; nodes fetch routed experts from local RAM → best source (measured) → local disk; store the 370 GB once.
-**Deliverables:** expert directory + heat tracking; heat-proportional replication; EC cold tier with Merkle manifest; **systematic-EC (or chunked multi-source) bulk propagation** for node onboarding, version rollout, and burst heat-replication; measured tier-order fetch with parallel per-layer fetches; batch-union prefetch; ≥2-source fault tolerance with reroute.
-**Acceptance:** on a workload with a large shared expert set, aggregate cold-miss-to-disk rate drops vs. v0 single-node; measured tok/s under continuous batching; correctness identical to v0; a killed node strands no layer; hotspot experts show balanced load across replicas; a fresh node reaches a hot-set-ready state in bounded time via bulk propagation.
-**Reuse:** Hyperbee/HyperDHT, Mooncake/NIXL/RDMA, RS-EC (durability + systematic bulk), SSZ Merkle. **Build:** directory, placement/replication, propagation, fetch policy, prefetcher, fault tolerance.
+**Original deliverables sketch:** expert directory + heat tracking; heat-proportional replication; EC cold tier with Merkle manifest; **systematic-EC (or chunked multi-source) bulk propagation** for node onboarding, version rollout, and burst heat-replication; measured tier-order fetch with parallel per-layer fetches; batch-union prefetch; ≥2-source fault tolerance with reroute.
+**Acceptance:** on a workload with a large shared expert set, aggregate cold-miss-to-disk rate drops vs. v0 single-node; measured tok/s under continuous batching; correctness identical to v0; a killed node strands no layer; a fresh node reaches a hot-set-ready state in bounded time by syncing ranges from peers; a peer disconnect is repaired by finding a replacement holder of the required range.
+**Build:** GGUF reader/mapper, range placement + redundancy, peer weight req-resp protocol, ENR/gossip weight advertising, hardfork coordination, fetch policy, prefetcher, churn repair.
 
 ### v2 — Untrusted-peer verification
 **Goal:** let peers outside the trust boundary serve experts/compute without silently corrupting output.
@@ -130,7 +143,7 @@ Two distinct axes, often conflated. Neither is allowed in the per-token fetch pa
 ## Tech stack summary
 - **Engine:** colibri technique (CPU) and/or SGLang/vLLM (GPU); `transformers>=5.3.0` for `glm_moe_dsa`.
 - **Weights:** FP8/NVFP4 checkpoints → int4 via colibri converter.
-- **p2p / directory:** Hyperswarm + HyperDHT + Hyperbee.
+- **p2p / directory:** ENR + gossip + request-response (Ethereum-style; see ROADMAP.md — supersedes the original Hyperswarm/HyperDHT/Hyperbee choice).
 - **Transport:** Mooncake Transfer Engine / NIXL / RDMA on fast fabrics.
 - **Storage & coding:** RS-EC (cold durability + systematic LAN bulk), heat-based replication (hot), Merkle/SSZ manifest; RLNC + homomorphic hashing (WAN/untrusted propagation, v2). No coding in the token loop.
 - **Daemon/router:** Rust or Zig (aligns with zig-libp2p / zquic); Python only where wrapping an engine.
