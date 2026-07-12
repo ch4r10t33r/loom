@@ -24,6 +24,10 @@ pub const iobench = @import("iobench.zig");
 pub const sampler = @import("sampler.zig");
 pub const tokenizer = @import("tokenizer.zig");
 pub const stats = @import("stats.zig");
+pub const node = @import("node.zig");
+pub const hf = @import("hf.zig");
+pub const rpc = @import("rpc.zig");
+pub const p2p = @import("p2p.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MB: usize = 1024 * 1024;
@@ -54,6 +58,8 @@ pub fn main(init: std.process.Init) !void {
         try cmdIobench(gpa, io, out, args);
     } else if (std.mem.eql(u8, cmd, "run")) {
         try cmdRun(gpa, io, out, args, init.environ_map);
+    } else if (std.mem.eql(u8, cmd, "node")) {
+        try cmdNode(gpa, io, out, args, init.environ_map);
     } else {
         try out.print("unknown command: {s}\n\n", .{cmd});
         try usage(out);
@@ -65,13 +71,17 @@ fn usage(out: *Io.Writer) !void {
         \\loom v0 — single-node expert-streaming MoE inference
         \\
         \\usage:
+        \\  loom node [--model SPEC] [--rpc-addr A] [--rpc-port P]
+        \\            [--p2p-addr A] [--p2p-port P] [--ram-gb X] [--pin-gb Y]
+        \\            [--seed S] [--stats FILE] [--no-verify]
         \\  loom gen <dir> [--glm] [--seed N]
         \\  loom info <dir>
         \\  loom iobench <file> [--threads N] [--block-mb M] [--reads R]
         \\  loom run <dir> [--prompt STR] [--max-tokens N] [--ram-gb X]
         \\                 [--pin-gb Y] [--temp T] [--seed S] [--stats FILE] [--no-verify]
         \\
-        \\env overrides for `run`: MODEL, RAM_BUDGET_GB, PIN_GB, MAX_TOKENS, TEMP, SEED, STATS
+        \\--model SPEC: <local dir> | tiny | [hf:]org/repo[@rev]   (default: tiny)
+        \\env overrides: MODEL, RAM_BUDGET_GB, PIN_GB, MAX_TOKENS, TEMP, SEED, STATS
         \\
     , .{});
 }
@@ -270,6 +280,42 @@ fn cmdRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, e
     }
 }
 
+// ---- node ------------------------------------------------------------------
+
+fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, env: *std.process.Environ.Map) !void {
+    const model_spec = flagStr(args, "--model") orelse env.get("MODEL") orelse "tiny";
+    const rpc_addr = flagStr(args, "--rpc-addr") orelse "127.0.0.1";
+    const rpc_port = try flagU16(args, "--rpc-port", 8770);
+    const p2p_addr = flagStr(args, "--p2p-addr") orelse "0.0.0.0";
+    const p2p_port = try flagU16(args, "--p2p-port", 8771);
+    const ram_gb = try flagF64(args, "--ram-gb", try envF64(env, "RAM_BUDGET_GB", 4.0));
+    const pin_gb = try flagF64(args, "--pin-gb", try envF64(env, "PIN_GB", 0.0));
+    const seed = try flagU64(args, "--seed", try envU64(env, "SEED", 42));
+    const stats_path = flagStr(args, "--stats") orelse env.get("STATS");
+    const verify = !hasFlag(args, "--no-verify");
+
+    // model cache under $HOME/.cache/loom/models (fallback to ./.loom-cache)
+    const cache_root = if (env.get("HOME")) |home|
+        try std.fmt.allocPrint(gpa, "{s}/.cache/loom/models", .{home})
+    else
+        try gpa.dupe(u8, "./.loom-cache");
+    defer gpa.free(cache_root);
+
+    try node.run(gpa, io, out, .{
+        .model = model_spec,
+        .rpc_addr = rpc_addr,
+        .rpc_port = rpc_port,
+        .p2p_addr = p2p_addr,
+        .p2p_port = p2p_port,
+        .ram_bytes = @intFromFloat(ram_gb * GB),
+        .pin_bytes = @intFromFloat(pin_gb * GB),
+        .verify = verify,
+        .seed = seed,
+        .stats_path = stats_path,
+        .cache_root = cache_root,
+    });
+}
+
 // ---- arg helpers -----------------------------------------------------------
 
 fn argsToSlice(gpa: std.mem.Allocator, vector: []const [*:0]const u8) ![][]const u8 {
@@ -297,6 +343,10 @@ fn flagU64(args: [][]const u8, name: []const u8, default: u64) !u64 {
 }
 fn flagUsize(args: [][]const u8, name: []const u8, default: usize) !usize {
     if (flagStr(args, name)) |v| return std.fmt.parseInt(usize, v, 10);
+    return default;
+}
+fn flagU16(args: [][]const u8, name: []const u8, default: u16) !u16 {
+    if (flagStr(args, name)) |v| return std.fmt.parseInt(u16, v, 10);
     return default;
 }
 fn flagF64(args: [][]const u8, name: []const u8, default: f64) !f64 {

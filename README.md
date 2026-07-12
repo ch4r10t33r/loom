@@ -21,7 +21,42 @@ zig build -Doptimize=ReleaseFast
 zig build test                 # unit tests (quant roundtrip, LRU, router, merkle, layout, ...)
 ```
 
-## Quick start
+## Run a node
+
+`loom node` loads a model, serves inference over RPC, and answers expert-directory
+queries over P2P. Every parameter has a default, so it runs with zero args (it
+auto-generates a synthetic `tiny` model into `~/.cache/loom/models`):
+
+```sh
+loom node
+# loom node --model <local dir | tiny | [hf:]org/repo[@rev]>
+#           --rpc-addr 127.0.0.1 --rpc-port 8770
+#           --p2p-addr 0.0.0.0   --p2p-port 8771
+#           --ram-gb 4 --pin-gb 0 --seed 42 [--stats FILE] [--no-verify]
+```
+
+**RPC** — line-delimited JSON over TCP (keep-alive; connections handled
+concurrently, generation serialized):
+
+```sh
+printf '{"prompt":"Loom weaves","max_tokens":24}\n' | nc 127.0.0.1 8770
+# -> {"ok":true,"generated":24,"text":"...","tokens":[...],"tok_per_s":X,"hit_rate":Y}
+```
+
+**P2P** — minimal peer directory (the v1 "who-has expert" seed):
+
+```sh
+printf 'HELLO\nHAS 5\nPING\n' | nc 127.0.0.1 8771
+# LOOM/0 experts=192 unique_bytes=47185920
+# PRESENT 5 off=1228800 len=245760 sha256=c1a8...
+# PONG
+```
+
+`--model org/repo` downloads a **loom-format** checkpoint (`manifest.loom` +
+`dense.blob` + `experts.blob`) from the Hugging Face Hub over HTTPS into the cache.
+Converting raw GLM-5.2 safetensors (FP8→int4) remains a separate offline step.
+
+## Offline tools
 
 ```sh
 # 1. generate a small synthetic checkpoint (runs on a laptop)
@@ -56,6 +91,10 @@ loom iobench /tmp/ckpt/experts.blob --threads 8 --block-mb 1 --reads 64
 | `expert_cache.zig` | **the v0 core**: pinned hot-set → LRU → pread, per-expert usage, per-block digest verify |
 | `forward.zig` | one node-local forward step wiring dense + MoE layers |
 | `engine.zig` | load + own resident set/KV/cache; RAM-budget → cache sizing; generate |
+| `node.zig` | `loom node`: resolve model → engine → RPC + P2P servers |
+| `hf.zig` | model resolver: local dir / synthetic `tiny` / Hugging Face download |
+| `rpc.zig` | JSON-over-TCP inference server (concurrent conns, serialized generate) |
+| `p2p.zig` | minimal peer directory (`HAS <id>` → holder/offset/len/digest) |
 | `stats.zig` | RSS, usage histogram, `STATS`→`PIN` hot-set selection, raw-count persistence |
 | `iobench.zig` | parallel random block reads → GB/s |
 | `gen_checkpoint.zig` | deterministic synthetic checkpoint generator |
