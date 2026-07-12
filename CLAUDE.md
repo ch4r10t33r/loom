@@ -126,8 +126,10 @@ Two distinct axes, often conflated. Neither is allowed in the per-token fetch pa
 > (Ethereum-style; candidate reuse: `blockblaz/enr`, gossipsub, zeam's networking)
 > rather than Hyperswarm/Hyperbee; a new node syncs weight ranges from peers via
 > req-resp at boot; model-version upgrades happen by **majority hardfork** on a new
-> GGUF file. Open questions to resolve before design: advertise held weights via ENR
-> metadata, a global gossip topic, or both; churn-repair policy for replacing a
+> GGUF file. Weight-holdings advertising is **decided: both** — ENR carries a compact
+> holdings summary for discoverability (300-byte ENR limit → bitmap/manifest-hash,
+> not a full list), and a global gossip topic carries live, detailed holdings
+> updates. Remaining open question: churn-repair policy for replacing a
 > disconnected peer with one holding the required range.
 
 **Goal:** pool cluster RAM into a content-addressed expert cache; nodes fetch routed experts from local RAM → best source (measured) → local disk; store the 370 GB once.

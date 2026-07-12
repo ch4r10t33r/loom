@@ -25,14 +25,18 @@ These supersede the original CLAUDE.md v1 sketch where they conflict.
 4. **Hardfork upgrades.** A majority of nodes agreeing on a new version of the
    GGUF file triggers a hardfork — a coordinated model-version upgrade across
    the swarm.
-5. **ENR weight advertising** *(open question)*. Each peer reports the weights it
-   holds as part of its **ENR + metadata**, so nodes can deliberately peer with
-   nodes holding *different* ranges (coverage-seeking peering).
+5. **ENR weight advertising** *(decided)*. Each peer reports the weights it holds
+   as part of its **ENR + metadata** — ENR is the discoverability mechanism, so
+   nodes can deliberately peer with nodes holding *different* ranges
+   (coverage-seeking peering). Constraint: ENR records are limited to **300
+   bytes**, so the ENR entry must be a compact summary (e.g. a range bitmap /
+   holdings-manifest hash + sequence number), not the full holdings list.
 6. **Churn repair** *(open question)*. When a peer disconnects, a node actively
    seeks a replacement peer that holds the required weight range.
-7. **Gossip advertising** *(open question)*. Whether per-node weight holdings
-   should be advertised via a **global gossip topic** instead of — or alongside —
-   ENR metadata.
+7. **Gossip advertising** *(decided: alongside ENR)*. Per-node weight holdings are
+   **also** advertised on a **global gossip topic**. Division of labor: ENR = the
+   compact, discovery-time summary; gossip = live, detailed holdings updates
+   (range acquisitions/drops) without waiting for ENR re-resolution.
 
 ### Design tensions to resolve before implementation
 
