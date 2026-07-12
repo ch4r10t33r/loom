@@ -1,0 +1,322 @@
+//! Loom v0 — single-node expert-streaming MoE inference.
+//!
+//! Subcommands:
+//!   gen <dir> [--glm] [--seed N]         write a synthetic checkpoint
+//!   info <dir>                           print manifest + verify Merkle root
+//!   iobench <file> [opts]                disk profile (parallel block reads)
+//!   run <dir> [opts]                     generate tokens, log tok/s + hit-rate
+
+const std = @import("std");
+const Io = std.Io;
+
+pub const model = @import("model.zig");
+pub const hash = @import("hash.zig");
+pub const quant = @import("quant.zig");
+pub const tensor = @import("tensor.zig");
+pub const checkpoint = @import("checkpoint.zig");
+pub const expert_cache = @import("expert_cache.zig");
+pub const attention = @import("attention.zig");
+pub const moe = @import("moe.zig");
+pub const forward = @import("forward.zig");
+pub const engine = @import("engine.zig");
+pub const gen_checkpoint = @import("gen_checkpoint.zig");
+pub const iobench = @import("iobench.zig");
+pub const sampler = @import("sampler.zig");
+pub const tokenizer = @import("tokenizer.zig");
+pub const stats = @import("stats.zig");
+
+const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+const MB: usize = 1024 * 1024;
+
+pub fn main(init: std.process.Init) !void {
+    const io = init.io;
+    const gpa = init.gpa;
+
+    var obuf: [4096]u8 = undefined;
+    var out_file = Io.File.stdout().writer(io, &obuf);
+    const out = &out_file.interface;
+    defer out.flush() catch {};
+
+    const args = try argsToSlice(gpa, init.minimal.args.vector);
+    defer gpa.free(args);
+
+    if (args.len < 2) {
+        try usage(out);
+        return;
+    }
+
+    const cmd = args[1];
+    if (std.mem.eql(u8, cmd, "gen")) {
+        try cmdGen(gpa, io, out, args);
+    } else if (std.mem.eql(u8, cmd, "info")) {
+        try cmdInfo(gpa, io, out, args);
+    } else if (std.mem.eql(u8, cmd, "iobench")) {
+        try cmdIobench(gpa, io, out, args);
+    } else if (std.mem.eql(u8, cmd, "run")) {
+        try cmdRun(gpa, io, out, args, init.environ_map);
+    } else {
+        try out.print("unknown command: {s}\n\n", .{cmd});
+        try usage(out);
+    }
+}
+
+fn usage(out: *Io.Writer) !void {
+    try out.print(
+        \\loom v0 — single-node expert-streaming MoE inference
+        \\
+        \\usage:
+        \\  loom gen <dir> [--glm] [--seed N]
+        \\  loom info <dir>
+        \\  loom iobench <file> [--threads N] [--block-mb M] [--reads R]
+        \\  loom run <dir> [--prompt STR] [--max-tokens N] [--ram-gb X]
+        \\                 [--pin-gb Y] [--temp T] [--seed S] [--stats FILE] [--no-verify]
+        \\
+        \\env overrides for `run`: MODEL, RAM_BUDGET_GB, PIN_GB, MAX_TOKENS, TEMP, SEED, STATS
+        \\
+    , .{});
+}
+
+// ---- gen -------------------------------------------------------------------
+
+fn cmdGen(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) !void {
+    if (args.len < 3) return out.print("gen: need <dir>\n", .{});
+    const dir = args[2];
+    const cfg = if (hasFlag(args, "--glm")) model.glmShape() else model.tinyShape();
+    const seed = try flagU64(args, "--seed", 42);
+
+    try out.print("generating {s} checkpoint -> {s}\n", .{ if (hasFlag(args, "--glm")) "GLM-5.2" else "tiny", dir });
+    try out.print("  experts: {d} routed ({d} layers x {d}), {d} bytes each, {d} per-token reads\n", .{
+        cfg.totalRoutedExperts(),
+        cfg.n_moe_layers,
+        cfg.n_experts,
+        cfg.expertBytes(),
+        cfg.n_moe_layers * cfg.n_routed,
+    });
+    try out.flush();
+
+    gen_checkpoint.generate(gpa, io, dir, cfg, seed) catch |e| {
+        try out.print("gen failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    try out.print("done. dense {d} f32, per-token working set {d:.3} MB\n", .{
+        checkpoint.denseElemCount(cfg),
+        @as(f64, @floatFromInt(cfg.perTokenExpertBytes())) / @as(f64, MB),
+    });
+}
+
+// ---- info ------------------------------------------------------------------
+
+fn cmdInfo(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) !void {
+    if (args.len < 3) return out.print("info: need <dir>\n", .{});
+    var loaded = try checkpoint.load(gpa, io, args[2]);
+    defer loaded.deinit();
+    const c = loaded.header.config;
+
+    try out.print("checkpoint {s}\n", .{args[2]});
+    try out.print("  hidden={d} layers={d} (dense {d} + moe {d}) heads={d} head_dim={d}\n", .{
+        c.hidden, c.nLayers(), c.n_dense_layers, c.n_moe_layers, c.n_heads, c.headDim(),
+    });
+    try out.print("  experts={d}/layer, top-{d} routed + {d} shared; kv_lora={d} rope={d}\n", .{
+        c.n_experts, c.n_routed, c.n_shared, c.kv_lora_rank, c.rope_dim,
+    });
+    try out.print("  expert_bytes={d} total_routed={d} per_token={d:.3} MB\n", .{
+        c.expertBytes(), c.totalRoutedExperts(), @as(f64, @floatFromInt(c.perTokenExpertBytes())) / @as(f64, MB),
+    });
+    const root_hex = hash.toHex(loaded.header.merkle_root);
+    try out.print("  merkle_root={s}\n", .{root_hex});
+
+    // recompute Merkle root over the index and verify
+    var leaves = try gpa.alloc(hash.Digest, loaded.entries.len);
+    defer gpa.free(leaves);
+    for (loaded.entries, 0..) |e, i| leaves[i] = e.digest;
+    const recomputed = try hash.merkleRoot(gpa, leaves);
+    try out.print("  merkle_check={s}\n", .{if (hash.eql(recomputed, loaded.header.merkle_root)) "OK" else "MISMATCH"});
+
+    // spot-verify one expert block against its digest
+    if (loaded.entries.len > 0) {
+        const e = loaded.entries[0];
+        const buf = try gpa.alloc(u8, e.len);
+        defer gpa.free(buf);
+        _ = try loaded.experts_file.readPositionalAll(io, buf, e.offset);
+        const got = hash.hashBlock(buf);
+        try out.print("  expert0_digest_check={s}\n", .{if (hash.eql(got, e.digest)) "OK" else "MISMATCH"});
+    }
+}
+
+// ---- iobench ---------------------------------------------------------------
+
+fn cmdIobench(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) !void {
+    if (args.len < 3) return out.print("iobench: need <file>\n", .{});
+    const path = args[2];
+    const default_threads = std.Thread.getCpuCount() catch 4;
+    const threads = try flagUsize(args, "--threads", default_threads);
+    const block_mb = try flagUsize(args, "--block-mb", 19);
+    const reads = try flagUsize(args, "--reads", 64);
+
+    try out.print("iobench {s}: {d} threads x {d} reads of {d} MB\n", .{ path, threads, reads, block_mb });
+    try out.flush();
+
+    const res = iobench.run(gpa, io, path, threads, block_mb * MB, reads, 1234) catch |e| {
+        try out.print("iobench failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    try out.print("  {d} reads, {d:.2} GB in {d:.3} s => {d:.2} GB/s\n", .{
+        res.total_reads,
+        @as(f64, @floatFromInt(res.bytes)) / 1e9,
+        @as(f64, @floatFromInt(res.ns)) / 1e9,
+        res.gbps(),
+    });
+    try out.print("  per-token working set at this bandwidth: see `info` per_token / GB/s\n", .{});
+}
+
+// ---- run -------------------------------------------------------------------
+
+fn cmdRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, env: *std.process.Environ.Map) !void {
+    const dir = if (args.len >= 3 and !std.mem.startsWith(u8, args[2], "--"))
+        args[2]
+    else
+        (env.get("MODEL") orelse return out.print("run: need <dir> or MODEL env\n", .{}));
+
+    const prompt_str = flagStr(args, "--prompt") orelse "Loom";
+    const max_tokens = try flagUsize(args, "--max-tokens", try envUsize(env, "MAX_TOKENS", 32));
+    const ram_gb = try flagF64(args, "--ram-gb", try envF64(env, "RAM_BUDGET_GB", 4.0));
+    const pin_gb = try flagF64(args, "--pin-gb", try envF64(env, "PIN_GB", 0.0));
+    const temp = try flagF64(args, "--temp", try envF64(env, "TEMP", 0.0));
+    const seed = try flagU64(args, "--seed", try envU64(env, "SEED", 42));
+    const stats_path = flagStr(args, "--stats") orelse env.get("STATS");
+    const verify = !hasFlag(args, "--no-verify");
+
+    const ram_bytes: u64 = @intFromFloat(ram_gb * GB);
+    const pin_bytes: u64 = @intFromFloat(pin_gb * GB);
+
+    var eng = engine.Engine.init(gpa, io, dir, .{
+        .ram_budget_bytes = ram_bytes,
+        .pin_budget_bytes = pin_bytes,
+        .verify = verify,
+    }) catch |e| {
+        try out.print("load failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    defer eng.deinit();
+
+    // measure-then-pin: if a STATS counts file already exists and PIN>0, pin the
+    // hot set before generating.
+    if (stats_path) |sp| if (pin_bytes > 0) {
+        if (try stats.readCounts(gpa, io, sp, eng.cache.access_count.len)) |counts| {
+            defer gpa.free(counts);
+            try eng.pinWithinBudget(counts, pin_bytes);
+        }
+    };
+
+    const s = eng.sizes;
+    try out.print("loaded {s}\n", .{dir});
+    try out.print("  ram_budget={d:.2} GB dense={d:.3} GB kv={d:.3} GB\n", .{
+        ram_gb, @as(f64, @floatFromInt(s.dense_bytes)) / GB, @as(f64, @floatFromInt(s.kv_bytes)) / GB,
+    });
+    try out.print("  expert_bytes={d} unique_on_disk={d:.3} GB lru_capacity={d} pinned={d}\n", .{
+        s.expert_bytes, @as(f64, @floatFromInt(s.unique_expert_bytes)) / GB, s.lru_capacity, s.pinned_experts,
+    });
+    try out.flush();
+
+    const prompt = try tokenizer.encode(gpa, prompt_str);
+    defer gpa.free(prompt);
+
+    var produced = std.ArrayList(usize).empty;
+    defer produced.deinit(gpa);
+
+    const t0 = stats.nowNs(io);
+    const n = eng.generate(prompt, max_tokens, @floatCast(temp), seed, &produced) catch |e| {
+        try out.print("generate failed: {s}\n", .{@errorName(e)});
+        return;
+    };
+    const t1 = stats.nowNs(io);
+
+    // decode output bytes
+    try out.print("prompt: {s}\n", .{prompt_str});
+    try out.print("output: ", .{});
+    for (produced.items) |tok| {
+        const b = tokenizer.decodeByte(tok);
+        // keep terminal sane: show printable bytes, escape others
+        if (b >= 32 and b < 127) {
+            try out.print("{c}", .{b});
+        } else {
+            try out.print("\\x{x:0>2}", .{b});
+        }
+    }
+    try out.print("\n", .{});
+
+    const secs = @as(f64, @floatFromInt(t1 - t0)) / 1e9;
+    const cs = eng.cache.stats;
+    try out.print("---- stats ----\n", .{});
+    try out.print("  tokens={d} time={d:.3}s tok/s={d:.2}\n", .{ n, secs, @as(f64, @floatFromInt(n)) / secs });
+    try out.print("  expert accesses={d} pin_hits={d} lru_hits={d} disk_misses={d}\n", .{
+        cs.accesses(), cs.pin_hits, cs.lru_hits, cs.disk_misses,
+    });
+    try out.print("  hit_rate={d:.3} bytes_read={d:.3} MB digest_failures={d}\n", .{
+        cs.hitRate(), @as(f64, @floatFromInt(cs.bytes_read)) / @as(f64, MB), cs.digest_failures,
+    });
+    if (cs.warmup_reads > 0) try out.print("  warmup(pin) reads={d} bytes={d:.3} MB\n", .{
+        cs.warmup_reads, @as(f64, @floatFromInt(cs.warmup_bytes)) / @as(f64, MB),
+    });
+    try out.print("  rss={d:.3} GB\n", .{@as(f64, @floatFromInt(stats.rssBytes())) / GB});
+
+    // persist usage for the next run's PIN
+    if (stats_path) |sp| {
+        try stats.writeCounts(io, sp, eng.cache.access_count);
+        var hbuf: [4096]u8 = undefined;
+        const hist = try std.fmt.bufPrint(&hbuf, "{s}.txt", .{sp});
+        try stats.writeUsageHistogram(gpa, io, hist, eng.cache.access_count, s.expert_bytes);
+        try out.print("  wrote usage -> {s} (+ {s})\n", .{ sp, hist });
+    }
+}
+
+// ---- arg helpers -----------------------------------------------------------
+
+fn argsToSlice(gpa: std.mem.Allocator, vector: []const [*:0]const u8) ![][]const u8 {
+    const out = try gpa.alloc([]const u8, vector.len);
+    for (vector, 0..) |a, i| out[i] = std.mem.span(a);
+    return out;
+}
+
+fn hasFlag(args: [][]const u8, name: []const u8) bool {
+    for (args) |a| if (std.mem.eql(u8, a, name)) return true;
+    return false;
+}
+
+fn flagStr(args: [][]const u8, name: []const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i + 1 < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], name)) return args[i + 1];
+    }
+    return null;
+}
+
+fn flagU64(args: [][]const u8, name: []const u8, default: u64) !u64 {
+    if (flagStr(args, name)) |v| return std.fmt.parseInt(u64, v, 10);
+    return default;
+}
+fn flagUsize(args: [][]const u8, name: []const u8, default: usize) !usize {
+    if (flagStr(args, name)) |v| return std.fmt.parseInt(usize, v, 10);
+    return default;
+}
+fn flagF64(args: [][]const u8, name: []const u8, default: f64) !f64 {
+    if (flagStr(args, name)) |v| return std.fmt.parseFloat(f64, v);
+    return default;
+}
+
+fn envUsize(env: *std.process.Environ.Map, name: []const u8, default: usize) !usize {
+    if (env.get(name)) |v| return std.fmt.parseInt(usize, v, 10);
+    return default;
+}
+fn envU64(env: *std.process.Environ.Map, name: []const u8, default: u64) !u64 {
+    if (env.get(name)) |v| return std.fmt.parseInt(u64, v, 10);
+    return default;
+}
+fn envF64(env: *std.process.Environ.Map, name: []const u8, default: f64) !f64 {
+    if (env.get(name)) |v| return std.fmt.parseFloat(f64, v);
+    return default;
+}
+
+test {
+    std.testing.refAllDecls(@This());
+}
