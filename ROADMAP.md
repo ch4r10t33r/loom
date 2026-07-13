@@ -41,8 +41,17 @@ These supersede the original CLAUDE.md v1 sketch where they conflict.
    holdings-manifest hash + sequence number), not the full holdings list.
    *Progress:* the holdings bitmap + hex encoding used by the `HOLDINGS` P2P op
    is exactly this summary (1 bit/range); ENR integration itself still todo.
-6. **Churn repair** *(open question)*. When a peer disconnects, a node actively
-   seeks a replacement peer that holds the required weight range.
+6. **Churn repair** *(decided: maximally eager; ✅ first cut implemented)*. When a
+   peer disconnects — or a node's wanted range set is unsatisfied for any
+   reason — the node seeks replacement holders **as eagerly as possible**: an
+   always-on repair loop (2 s interval, `node.zig`) retries all known peers
+   rather than waiting for a miss. Pairs with over-provisioning (random
+   overlapping holdings) so single disconnects rarely leave a range with no
+   holder. Multi-peer bootstrap (`--bootstrap` + `--peers`) fills shortfalls
+   across peers; `fetchFromPeer` refuses peers on a different manifest version
+   (the hardfork guard, #4). Verified live: a node that booted 5/9 against a
+   dead peer recovered to 9/9 within one repair tick of the peer returning.
+   Still todo: peers discovered via ENR/gossip instead of a static list.
 7. **Gossip advertising** *(decided: alongside ENR)*. Per-node weight holdings are
    **also** advertised on a **global gossip topic**. Division of labor: ENR = the
    compact, discovery-time summary; gossip = live, detailed holdings updates

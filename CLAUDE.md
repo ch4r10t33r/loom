@@ -129,8 +129,9 @@ Two distinct axes, often conflated. Neither is allowed in the per-token fetch pa
 > GGUF file. Weight-holdings advertising is **decided: both** — ENR carries a compact
 > holdings summary for discoverability (300-byte ENR limit → bitmap/manifest-hash,
 > not a full list), and a global gossip topic carries live, detailed holdings
-> updates. Remaining open question: churn-repair policy for replacing a
-> disconnected peer with one holding the required range.
+> updates. Churn repair is **decided: maximally eager** — an always-on repair loop
+> immediately seeks replacement holders from all known peers whenever the wanted
+> range set is unsatisfied, rather than lazy repair on next miss.
 
 **Goal:** pool cluster RAM into a content-addressed expert cache; nodes fetch routed experts from local RAM → best source (measured) → local disk; store the 370 GB once.
 **Original deliverables sketch:** expert directory + heat tracking; heat-proportional replication; EC cold tier with Merkle manifest; **systematic-EC (or chunked multi-source) bulk propagation** for node onboarding, version rollout, and burst heat-replication; measured tier-order fetch with parallel per-layer fetches; batch-union prefetch; ≥2-source fault tolerance with reroute.

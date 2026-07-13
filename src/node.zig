@@ -32,9 +32,42 @@ pub const Options = struct {
     // GGUF distribution plane
     gguf_path: ?[]const u8, // serve this complete GGUF (origin/full holder)
     bootstrap: ?[]const u8, // "host:port" — sync weight ranges from this peer
+    peers: ?[]const u8, // extra weight peers, comma-separated "host:port"
     hold_fraction: f32, // fraction of ranges to hold when bootstrapping
     range_bytes: u64, // range size when building a fresh manifest
 };
+
+/// Churn-repair policy (ROADMAP #6, decided: maximally eager): whenever the
+/// wanted range set is unsatisfied, retry every known peer on a short interval —
+/// no waiting for a miss. A peer that was down when we bootstrapped, or that
+/// comes back holding what we need, gets drained within one interval.
+const REPAIR_INTERVAL_NS: i96 = 2 * std.time.ns_per_s;
+
+const RepairCtx = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    store: *weights.Store,
+    peers: []sync.PeerAddr,
+};
+
+fn repairThread(ctx: *RepairCtx) void {
+    while (true) {
+        Io.sleep(ctx.io, .{ .nanoseconds = REPAIR_INTERVAL_NS }, .awake) catch return;
+        if (ctx.store.missingCount() == 0) continue;
+        var repaired: usize = 0;
+        for (ctx.peers) |addr| {
+            if (ctx.store.missingCount() == 0) break;
+            const s = sync.fetchFromPeer(ctx.gpa, ctx.io, ctx.store, addr) catch continue;
+            repaired += s.fetched;
+        }
+        if (repaired > 0) {
+            ctx.store.saveSidecars() catch {};
+            std.debug.print("repair: recovered {d} ranges, held {d}/{d}\n", .{
+                repaired, ctx.store.holdings.count(), ctx.store.wanted.count(),
+            });
+        }
+    }
+}
 
 fn p2pThread(ctx: *p2p.Ctx) void {
     p2p.serve(ctx) catch |e| std.debug.print("p2p: {s}\n", .{@errorName(e)});
@@ -68,6 +101,29 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     var store: ?weights.Store = null;
     defer if (store) |*st| st.deinit();
 
+    // known weight peers = --bootstrap (first) + --peers (comma-separated)
+    var peer_list = std.ArrayList(sync.PeerAddr).empty;
+    defer peer_list.deinit(gpa);
+    if (opts.bootstrap) |bs| {
+        const a = sync.PeerAddr.parse(bs) catch {
+            try out.print("bad --bootstrap address (want host:port): {s}\n", .{bs});
+            return;
+        };
+        try peer_list.append(gpa, a);
+    }
+    if (opts.peers) |csv| {
+        var it = std.mem.splitScalar(u8, csv, ',');
+        while (it.next()) |tok| {
+            const t = std.mem.trim(u8, tok, " ");
+            if (t.len == 0) continue;
+            const a = sync.PeerAddr.parse(t) catch {
+                try out.print("bad --peers entry (want host:port): {s}\n", .{t});
+                return;
+            };
+            try peer_list.append(gpa, a);
+        }
+    }
+
     if (opts.gguf_path) |gp| {
         const store_dir = try std.fmt.allocPrint(gpa, "{s}/gguf-origin", .{opts.cache_root});
         defer gpa.free(store_dir);
@@ -75,16 +131,12 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             try out.print("gguf store failed ({s}): {s}\n", .{ gp, @errorName(e) });
             return;
         };
-    } else if (opts.bootstrap) |bs| {
-        const peer_addr = sync.PeerAddr.parse(bs) catch {
-            try out.print("bad --bootstrap address (want host:port): {s}\n", .{bs});
-            return;
-        };
+    } else if (peer_list.items.len > 0) {
         const store_dir = try std.fmt.allocPrint(gpa, "{s}/gguf-synced", .{opts.cache_root});
         defer gpa.free(store_dir);
-        try out.print("bootstrapping weight ranges from {s} (hold-fraction {d:.2})...\n", .{ bs, opts.hold_fraction });
+        try out.print("bootstrapping weight ranges from {d} peer(s) (hold-fraction {d:.2})...\n", .{ peer_list.items.len, opts.hold_fraction });
         try out.flush();
-        const res = sync.bootstrap(gpa, io, peer_addr, store_dir, opts.hold_fraction, opts.seed, out) catch |e| {
+        const res = sync.bootstrap(gpa, io, peer_list.items, store_dir, opts.hold_fraction, opts.seed, out) catch |e| {
             try out.print("bootstrap failed: {s}\n", .{@errorName(e)});
             return;
         };
@@ -92,6 +144,9 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         try out.print("  synced {d}/{d} wanted ranges, {d:.1} MB, verified against manifest root\n", .{
             res.fetched, res.wanted, @as(f64, @floatFromInt(res.bytes)) / MBf,
         });
+        if (res.fetched < res.wanted) {
+            try out.print("  {d} ranges still missing — eager repair will keep chasing peers\n", .{res.wanted - res.fetched});
+        }
     }
 
     const c = eng.cfg;
@@ -132,6 +187,19 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     };
     const p2p_handle = try std.Thread.spawn(.{}, p2pThread, .{&p2p_ctx});
     defer p2p_handle.join();
+
+    // eager churn repair: runs whenever we hold a store and know any peers
+    var repair_ctx: RepairCtx = undefined;
+    if (store != null and peer_list.items.len > 0) {
+        repair_ctx = .{
+            .gpa = gpa,
+            .io = io,
+            .store = &store.?,
+            .peers = peer_list.items,
+        };
+        const t = try std.Thread.spawn(.{}, repairThread, .{&repair_ctx});
+        t.detach();
+    }
 
     var rpc_ctx = rpc.Ctx{
         .gpa = gpa,

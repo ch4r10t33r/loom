@@ -93,73 +93,42 @@ fn parseDigestHex(s: []const u8) !hashmod.Digest {
     return d;
 }
 
-/// Bootstrap a local weight store from `peer_addr`, holding a random
-/// `fraction` of ranges (seeded so a restarted node re-picks the same set).
-pub fn bootstrap(
-    gpa: std.mem.Allocator,
-    io: Io,
-    peer_addr: PeerAddr,
-    store_dir: []const u8,
-    fraction: f32,
-    seed: u64,
-    progress: ?*Io.Writer,
-) !Result {
-    const peer = try Peer.connect(gpa, io, peer_addr);
+pub const FetchStats = struct { fetched: usize = 0, bytes: u64 = 0 };
+
+/// Fetch the store's wanted-but-missing ranges from one peer. Guards against
+/// cross-version mixing: a peer advertising a different manifest version (e.g.
+/// across a future hardfork) is rejected wholesale. Every range is verified
+/// against its digest before it touches disk. Used by both bootstrap and the
+/// eager repair loop.
+pub fn fetchFromPeer(gpa: std.mem.Allocator, io: Io, store: *weights.Store, addr: PeerAddr) !FetchStats {
+    const m = &store.manifest;
+    const n_ranges = m.nRanges();
+
+    const peer = try Peer.connect(gpa, io, addr);
     defer peer.close(gpa);
 
-    // manifest
+    // same-version guard
     try peer.send("MANIFEST\n", .{});
     const mline = try peer.recvLine();
     if (!std.mem.startsWith(u8, mline, "MANIFEST ")) return error.PeerHasNoStore;
     const version = try parseDigestHex(field(mline, "version") orelse return error.BadManifestLine);
-    const file_size = try std.fmt.parseInt(u64, field(mline, "size") orelse return error.BadManifestLine, 10);
-    const n_ranges = try std.fmt.parseInt(usize, field(mline, "ranges") orelse return error.BadManifestLine, 10);
-    const range_size = try std.fmt.parseInt(u64, field(mline, "range_size") orelse return error.BadManifestLine, 10);
-    if (n_ranges == 0 or n_ranges != (file_size + range_size - 1) / range_size) return error.BadManifestLine;
+    if (!hashmod.eql(version, m.version)) return error.PeerVersionMismatch;
 
-    // digests (bulk), then verify the Merkle root pins the advertised version
-    try peer.send("DIGESTS\n", .{});
-    const dline = try peer.recvLine();
-    if (!std.mem.startsWith(u8, dline, "DIGESTS ")) return error.BadDigestsLine;
-    const dn = try std.fmt.parseInt(usize, dline[8..], 10);
-    if (dn != n_ranges) return error.BadDigestsLine;
-    const digests = try gpa.alloc(hashmod.Digest, n_ranges);
-    var digests_owned = true; // ownership moves into the store below
-    errdefer if (digests_owned) gpa.free(digests);
-    for (digests) |*d| d.* = try parseDigestHex(try peer.recvLine());
-    const root = try hashmod.merkleRoot(gpa, digests);
-    if (!hashmod.eql(root, version)) return error.PeerManifestRootMismatch;
-
-    // peer's holdings
+    // what can this peer serve?
     try peer.send("HOLDINGS\n", .{});
     const hline = try peer.recvLine();
     if (!std.mem.startsWith(u8, hline, "HOLDINGS ")) return error.BadHoldingsLine;
     var peer_holdings = try weights.Holdings.fromHex(gpa, hline[9..], n_ranges);
     defer peer_holdings.deinit(gpa);
 
-    // our target subset
-    var want = try weights.Holdings.initRandom(gpa, n_ranges, fraction, seed);
-    defer want.deinit(gpa);
-    const wanted = want.count();
-
-    var store = try weights.createFromManifest(gpa, io, store_dir, .{
-        .version = version,
-        .file_size = file_size,
-        .range_size = range_size,
-        .digests = digests,
-    });
-    digests_owned = false;
-    errdefer store.deinit();
-
-    const buf = try gpa.alloc(u8, @intCast(range_size));
+    const buf = try gpa.alloc(u8, @intCast(m.range_size));
     defer gpa.free(buf);
 
-    var fetched: usize = 0;
-    var bytes: u64 = 0;
+    var stats = FetchStats{};
     var i: usize = 0;
     while (i < n_ranges) : (i += 1) {
-        if (!want.has(i)) continue;
-        if (!peer_holdings.has(i)) continue; // peer can't serve it; a later peer might
+        if (!store.wanted.has(i) or store.holdings.has(i)) continue;
+        if (!peer_holdings.has(i)) continue; // this peer can't serve it; another might
 
         try peer.send("GETR {d}\n", .{i});
         const rline = try peer.recvLine();
@@ -169,16 +138,88 @@ pub fn bootstrap(
         try peer.r.interface.readSliceAll(buf[0..len]);
         // writeRange verifies the digest before anything touches disk
         try store.writeRange(i, buf[0..len]);
-        fetched += 1;
-        bytes += len;
+        stats.fetched += 1;
+        stats.bytes += len;
+    }
+    return stats;
+}
+
+/// Fetch manifest + digest set from a peer and verify the Merkle root pins the
+/// advertised version. Returns an owned Manifest.
+fn adoptManifest(gpa: std.mem.Allocator, peer: *Peer) !weights.Manifest {
+    try peer.send("MANIFEST\n", .{});
+    const mline = try peer.recvLine();
+    if (!std.mem.startsWith(u8, mline, "MANIFEST ")) return error.PeerHasNoStore;
+    const version = try parseDigestHex(field(mline, "version") orelse return error.BadManifestLine);
+    const file_size = try std.fmt.parseInt(u64, field(mline, "size") orelse return error.BadManifestLine, 10);
+    const n_ranges = try std.fmt.parseInt(usize, field(mline, "ranges") orelse return error.BadManifestLine, 10);
+    const range_size = try std.fmt.parseInt(u64, field(mline, "range_size") orelse return error.BadManifestLine, 10);
+    if (n_ranges == 0 or n_ranges != (file_size + range_size - 1) / range_size) return error.BadManifestLine;
+
+    try peer.send("DIGESTS\n", .{});
+    const dline = try peer.recvLine();
+    if (!std.mem.startsWith(u8, dline, "DIGESTS ")) return error.BadDigestsLine;
+    const dn = try std.fmt.parseInt(usize, dline[8..], 10);
+    if (dn != n_ranges) return error.BadDigestsLine;
+    const digests = try gpa.alloc(hashmod.Digest, n_ranges);
+    errdefer gpa.free(digests);
+    for (digests) |*d| d.* = try parseDigestHex(try peer.recvLine());
+    const root = try hashmod.merkleRoot(gpa, digests);
+    if (!hashmod.eql(root, version)) return error.PeerManifestRootMismatch;
+
+    return .{ .version = version, .file_size = file_size, .range_size = range_size, .digests = digests };
+}
+
+/// Bootstrap a local weight store from `peers`: adopt the manifest from the
+/// first responsive peer, pick a random `fraction` of ranges to hold (seeded so
+/// a restarted node re-picks the same set), then fetch from every peer in turn
+/// until the wanted set is satisfied or peers are exhausted. Any remaining
+/// shortfall is chased by the eager repair loop after boot.
+pub fn bootstrap(
+    gpa: std.mem.Allocator,
+    io: Io,
+    peers: []const PeerAddr,
+    store_dir: []const u8,
+    fraction: f32,
+    seed: u64,
+    progress: ?*Io.Writer,
+) !Result {
+    // adopt a manifest from the first peer that answers
+    var manifest: ?weights.Manifest = null;
+    for (peers) |addr| {
+        const peer = Peer.connect(gpa, io, addr) catch continue;
+        defer peer.close(gpa);
+        manifest = adoptManifest(gpa, peer) catch continue;
+        break;
+    }
+    var m = manifest orelse return error.NoResponsivePeer;
+    var manifest_owned = true; // ownership moves into the store below
+    errdefer if (manifest_owned) m.deinit(gpa);
+
+    var wanted_bits = try weights.Holdings.initRandom(gpa, m.nRanges(), fraction, seed);
+    var wanted_owned = true; // ownership moves into the store below
+    errdefer if (wanted_owned) wanted_bits.deinit(gpa);
+    const wanted = wanted_bits.count();
+
+    var store = try weights.createFromManifest(gpa, io, store_dir, m, wanted_bits);
+    manifest_owned = false;
+    wanted_owned = false;
+    errdefer store.deinit();
+
+    var stats = FetchStats{};
+    for (peers) |addr| {
+        if (store.missingCount() == 0) break;
+        const s = fetchFromPeer(gpa, io, &store, addr) catch continue;
+        stats.fetched += s.fetched;
+        stats.bytes += s.bytes;
         if (progress) |pw| {
-            if (fetched % 16 == 0) {
-                try pw.print("  synced {d}/{d} ranges ({d:.1} MB)\r", .{ fetched, wanted, @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0) });
-                try pw.flush();
-            }
+            try pw.print("  synced {d}/{d} ranges ({d:.1} MB) after {s}:{d}\n", .{
+                stats.fetched, wanted, @as(f64, @floatFromInt(stats.bytes)) / (1024.0 * 1024.0), addr.host, addr.port,
+            });
+            try pw.flush();
         }
     }
     try store.saveSidecars();
 
-    return .{ .store = store, .wanted = wanted, .fetched = fetched, .bytes = bytes };
+    return .{ .store = store, .wanted = wanted, .fetched = stats.fetched, .bytes = stats.bytes };
 }

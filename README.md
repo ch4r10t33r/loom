@@ -73,6 +73,11 @@ loom node --gguf /tmp/model.gguf --range-mb 1 --p2p-port 8771
 # node B: boots by syncing a random half of the ranges from A,
 # digest-verifying every range against the manifest root
 loom node --bootstrap 127.0.0.1:8771 --hold-fraction 0.5 --p2p-port 8781
+
+# node C: wants everything; bootstraps from B and also knows A. Any shortfall
+# is chased by the eager churn-repair loop (2s interval) until satisfied —
+# a peer that was down when C booted gets drained within one tick of returning.
+loom node --bootstrap 127.0.0.1:8781 --peers 127.0.0.1:8771 --hold-fraction 1.0
 ```
 
 P2P weight ops: `MANIFEST` (version/size/ranges), `DIGESTS` (bulk),

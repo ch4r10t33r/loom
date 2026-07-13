@@ -80,7 +80,7 @@ fn usage(out: *Io.Writer) !void {
         \\            [--p2p-addr A] [--p2p-port P] [--ram-gb X] [--pin-gb Y]
         \\            [--seed S] [--stats FILE] [--no-verify]
         \\            [--gguf FILE | --bootstrap HOST:PORT]
-        \\            [--hold-fraction F] [--range-mb M]
+        \\            [--peers H:P,H:P,...] [--hold-fraction F] [--range-mb M]
         \\  loom gguf gen <file> [--seed N] [--data-mb M]
         \\  loom gguf info <file> [--range-mb M]
         \\  loom gen <dir> [--glm] [--seed N]
@@ -332,6 +332,7 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .cache_root = cache_root,
         .gguf_path = gguf_path,
         .bootstrap = bootstrap,
+        .peers = flagStr(args, "--peers"),
         .hold_fraction = @floatCast(std.math.clamp(hold_fraction, 0.0, 1.0)),
         .range_bytes = @intFromFloat(range_mb * @as(f64, MB)),
     });

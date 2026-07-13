@@ -106,18 +106,21 @@ pub const Holdings = struct {
         gpa.free(self.bits);
     }
 
+    // set/has are atomic: the eager repair thread mutates holdings while P2P
+    // connection threads read them concurrently.
     pub fn set(self: *Holdings, i: usize) void {
-        self.bits[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+        _ = @atomicRmw(u8, &self.bits[i / 8], .Or, @as(u8, 1) << @intCast(i % 8), .monotonic);
     }
 
     pub fn has(self: *const Holdings, i: usize) bool {
         if (i >= self.n) return false;
-        return (self.bits[i / 8] >> @intCast(i % 8)) & 1 == 1;
+        const b = @atomicLoad(u8, &self.bits[i / 8], .monotonic);
+        return (b >> @intCast(i % 8)) & 1 == 1;
     }
 
     pub fn count(self: *const Holdings) usize {
         var c: usize = 0;
-        for (self.bits) |b| c += @popCount(b);
+        for (self.bits) |*b| c += @popCount(@atomicLoad(u8, b, .monotonic));
         return c;
     }
 
@@ -153,13 +156,27 @@ pub const Store = struct {
     dir: []const u8, // owned
     manifest: Manifest,
     holdings: Holdings,
+    /// The ranges this node *wants* to hold (its random subset). Holdings ⊆
+    /// wanted; the eager repair loop works to close the gap.
+    wanted: Holdings,
     file: Io.File, // model.gguf, open read/write
 
     pub fn deinit(self: *Store) void {
         self.file.close(self.io);
         self.manifest.deinit(self.gpa);
         self.holdings.deinit(self.gpa);
+        self.wanted.deinit(self.gpa);
         self.gpa.free(self.dir);
+    }
+
+    /// Ranges still wanted but not held — what the repair loop chases.
+    pub fn missingCount(self: *const Store) usize {
+        var c: usize = 0;
+        var i: usize = 0;
+        while (i < self.manifest.nRanges()) : (i += 1) {
+            if (self.wanted.has(i) and !self.holdings.has(i)) c += 1;
+        }
+        return c;
     }
 
     /// Read range `i` into `buf` (must be >= rangeLen(i)). Errors if not held.
@@ -183,7 +200,8 @@ pub const Store = struct {
 
     pub fn saveSidecars(self: *Store) !void {
         try writeManifestFile(self.gpa, self.io, self.dir, &self.manifest);
-        try writeHoldingsFile(self.io, self.dir, &self.holdings);
+        try writeBitmapFile(self.io, self.dir, "holdings.bitmap", &self.holdings);
+        try writeBitmapFile(self.io, self.dir, "wanted.bitmap", &self.wanted);
     }
 };
 
@@ -206,12 +224,25 @@ fn writeManifestFile(gpa: std.mem.Allocator, io: Io, dir: []const u8, m: *const 
     try f.writeStreamingAll(io, text.items);
 }
 
-fn writeHoldingsFile(io: Io, dir: []const u8, h: *const Holdings) !void {
+fn writeBitmapFile(io: Io, dir: []const u8, name: []const u8, h: *const Holdings) !void {
     var pbuf: [4096]u8 = undefined;
-    const p = try subPath(&pbuf, dir, "holdings.bitmap");
+    const p = try subPath(&pbuf, dir, name);
     const f = try Io.Dir.cwd().createFile(io, p, .{ .truncate = true });
     defer f.close(io);
     try f.writeStreamingAll(io, h.bits);
+}
+
+fn loadBitmapFile(gpa: std.mem.Allocator, io: Io, dir: []const u8, name: []const u8, n: usize) !Holdings {
+    var pbuf: [4096]u8 = undefined;
+    const p = try subPath(&pbuf, dir, name);
+    const f = try Io.Dir.cwd().openFile(io, p, .{});
+    defer f.close(io);
+    const size = (try f.stat(io)).size;
+    if (size != (n + 7) / 8) return error.BadBitmapLength;
+    const bits = try gpa.alloc(u8, @intCast(size));
+    errdefer gpa.free(bits);
+    _ = try f.readPositionalAll(io, bits, 0);
+    return .{ .bits = bits, .n = n };
 }
 
 fn parseDigestHex(s: []const u8) !hashmod.Digest {
@@ -268,6 +299,8 @@ pub fn openFull(gpa: std.mem.Allocator, io: Io, gguf_path: []const u8, store_dir
     errdefer manifest.deinit(gpa);
     var holdings = try Holdings.initFull(gpa, manifest.nRanges());
     errdefer holdings.deinit(gpa);
+    var wanted = try Holdings.initFull(gpa, manifest.nRanges());
+    errdefer wanted.deinit(gpa);
 
     const file = try Io.Dir.cwd().openFile(io, gguf_path, .{});
     var store = Store{
@@ -276,6 +309,7 @@ pub fn openFull(gpa: std.mem.Allocator, io: Io, gguf_path: []const u8, store_dir
         .dir = try gpa.dupe(u8, store_dir),
         .manifest = manifest,
         .holdings = holdings,
+        .wanted = wanted,
         .file = file,
     };
     try store.saveSidecars();
@@ -284,8 +318,8 @@ pub fn openFull(gpa: std.mem.Allocator, io: Io, gguf_path: []const u8, store_dir
 
 /// Create an empty store from a manifest received from a peer (bootstrap path).
 /// `model.gguf` is created in `store_dir`, sized, and filled by writeRange as
-/// ranges arrive.
-pub fn createFromManifest(gpa: std.mem.Allocator, io: Io, store_dir: []const u8, manifest: Manifest) !Store {
+/// ranges arrive. Takes ownership of `manifest` and `wanted`.
+pub fn createFromManifest(gpa: std.mem.Allocator, io: Io, store_dir: []const u8, manifest: Manifest, wanted: Holdings) !Store {
     try makePath(io, store_dir);
     var pbuf: [4096]u8 = undefined;
     const p = try subPath(&pbuf, store_dir, "model.gguf");
@@ -300,29 +334,27 @@ pub fn createFromManifest(gpa: std.mem.Allocator, io: Io, store_dir: []const u8,
         .dir = try gpa.dupe(u8, store_dir),
         .manifest = manifest,
         .holdings = holdings,
+        .wanted = wanted,
         .file = file,
     };
 }
 
-/// Reopen a previously synced store directory (manifest + bitmap + model.gguf).
+/// Reopen a previously synced store directory (manifest + bitmaps + model.gguf).
 pub fn openDir(gpa: std.mem.Allocator, io: Io, store_dir: []const u8) !Store {
     var manifest = try loadManifestFile(gpa, io, store_dir);
     errdefer manifest.deinit(gpa);
+    const n = manifest.nRanges();
+
+    var holdings = try loadBitmapFile(gpa, io, store_dir, "holdings.bitmap", n);
+    errdefer holdings.deinit(gpa);
+    var wanted = loadBitmapFile(gpa, io, store_dir, "wanted.bitmap", n) catch |e| switch (e) {
+        // older store without a wanted sidecar: wanted := current holdings
+        error.FileNotFound => Holdings{ .bits = try gpa.dupe(u8, holdings.bits), .n = n },
+        else => return e,
+    };
+    errdefer wanted.deinit(gpa);
 
     var pbuf: [4096]u8 = undefined;
-    const hp = try subPath(&pbuf, store_dir, "holdings.bitmap");
-    const hf = try Io.Dir.cwd().openFile(io, hp, .{});
-    const hsize = (try hf.stat(io)).size;
-    const n = manifest.nRanges();
-    if (hsize != (n + 7) / 8) {
-        hf.close(io);
-        return error.BadBitmapLength;
-    }
-    const bits = try gpa.alloc(u8, @intCast(hsize));
-    errdefer gpa.free(bits);
-    _ = try hf.readPositionalAll(io, bits, 0);
-    hf.close(io);
-
     const mp = try subPath(&pbuf, store_dir, "model.gguf");
     const file = try Io.Dir.cwd().openFile(io, mp, .{ .mode = .read_write });
 
@@ -331,7 +363,8 @@ pub fn openDir(gpa: std.mem.Allocator, io: Io, store_dir: []const u8) !Store {
         .io = io,
         .dir = try gpa.dupe(u8, store_dir),
         .manifest = manifest,
-        .holdings = .{ .bits = bits, .n = n },
+        .holdings = holdings,
+        .wanted = wanted,
         .file = file,
     };
 }
