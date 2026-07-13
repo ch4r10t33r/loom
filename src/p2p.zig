@@ -6,11 +6,19 @@
 //! policy needs (expert_id -> holder + offset/len/digest) without yet doing
 //! replication or heat tracking.
 //!
-//! Protocol (line-delimited):
+//! Protocol (line-delimited; GETR responses carry a binary payload after the
+//! header line):
 //!   HELLO         -> LOOM/0 experts=<n> unique_bytes=<b>
 //!   COUNT         -> <n>
 //!   HAS <id>      -> PRESENT <id> off=<o> len=<l> sha256=<hex> | ABSENT <id> | ERR range
 //!   PING          -> PONG
+//!   -- weight-range distribution (when a GGUF store is attached) --
+//!   MANIFEST      -> MANIFEST version=<hex> size=<b> ranges=<n> range_size=<b>
+//!   DIGEST <i>    -> DIGEST <i> <hex>
+//!   DIGESTS       -> DIGESTS <n>\n<hex>\n x n     (bulk, for bootstrap)
+//!   HOLDINGS      -> HOLDINGS <hex bitmap>      (bit i = holds range i; the
+//!                    same compact summary destined for ENR metadata + gossip)
+//!   GETR <i>      -> DATA <i> len=<l> sha256=<hex>\n<raw bytes> | ERR not_held
 //!   <other>       -> ERR unknown
 
 const std = @import("std");
@@ -18,6 +26,7 @@ const Io = std.Io;
 const net = std.Io.net;
 const checkpoint = @import("checkpoint.zig");
 const hashmod = @import("hash.zig");
+const weights = @import("weights.zig");
 
 pub const Ctx = struct {
     gpa: std.mem.Allocator,
@@ -26,6 +35,9 @@ pub const Ctx = struct {
     unique_bytes: u64,
     addr: []const u8,
     port: u16,
+    /// Attached GGUF weight store, if this node participates in distribution.
+    /// Reads are lock-free (immutable manifest, pread on a shared handle).
+    store: ?*weights.Store = null,
 };
 
 const Conn = struct { ctx: *Ctx, stream: net.Stream };
@@ -94,6 +106,40 @@ fn handleLine(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
         const e = ctx.entries[id];
         const hex = hashmod.toHex(e.digest);
         try wi.print("PRESENT {d} off={d} len={d} sha256={s}\n", .{ id, e.offset, e.len, hex });
+    } else if (std.mem.eql(u8, line, "MANIFEST")) {
+        const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
+        const m = &store.manifest;
+        try wi.print("MANIFEST version={s} size={d} ranges={d} range_size={d}\n", .{
+            hashmod.toHex(m.version), m.file_size, m.nRanges(), m.range_size,
+        });
+    } else if (std.mem.startsWith(u8, line, "DIGEST ")) {
+        const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
+        const i = std.fmt.parseInt(usize, std.mem.trim(u8, line[7..], " "), 10) catch {
+            return wi.print("ERR bad_id\n", .{});
+        };
+        if (i >= store.manifest.nRanges()) return wi.print("ERR range\n", .{});
+        try wi.print("DIGEST {d} {s}\n", .{ i, hashmod.toHex(store.manifest.digests[i]) });
+    } else if (std.mem.eql(u8, line, "DIGESTS")) {
+        const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
+        try wi.print("DIGESTS {d}\n", .{store.manifest.nRanges()});
+        for (store.manifest.digests) |d| try wi.print("{s}\n", .{hashmod.toHex(d)});
+    } else if (std.mem.eql(u8, line, "HOLDINGS")) {
+        const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
+        const hex = try store.holdings.toHex(ctx.gpa);
+        defer ctx.gpa.free(hex);
+        try wi.print("HOLDINGS {s}\n", .{hex});
+    } else if (std.mem.startsWith(u8, line, "GETR ")) {
+        const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
+        const i = std.fmt.parseInt(usize, std.mem.trim(u8, line[5..], " "), 10) catch {
+            return wi.print("ERR bad_id\n", .{});
+        };
+        if (i >= store.manifest.nRanges()) return wi.print("ERR range\n", .{});
+        if (!store.holdings.has(i)) return wi.print("ERR not_held\n", .{});
+        const buf = try ctx.gpa.alloc(u8, @intCast(store.manifest.rangeLen(i)));
+        defer ctx.gpa.free(buf);
+        const data = store.readRange(i, buf) catch return wi.print("ERR read\n", .{});
+        try wi.print("DATA {d} len={d} sha256={s}\n", .{ i, data.len, hashmod.toHex(store.manifest.digests[i]) });
+        try wi.writeAll(data);
     } else {
         try wi.print("ERR unknown\n", .{});
     }

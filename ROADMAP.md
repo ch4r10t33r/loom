@@ -17,11 +17,19 @@ These supersede the original CLAUDE.md v1 sketch where they conflict.
 1. **Local-first model resolution.** If a model is already present in local data
    storage, load it from there; only download from remote otherwise.
    (Implemented in `hf.zig::resolve`; a standing contract as features grow.)
-2. **GGUF weight distribution.** A loaded **GGUF** file's weights are distributed
-   across multiple nodes. Ranges are chosen **randomly**, and the same range may
-   be held by several nodes for **redundancy**.
-3. **Boot-time peer sync.** A new node requests weight ranges from its peers via
-   a **request-response protocol** rather than re-downloading from origin.
+2. **GGUF weight distribution.** ✅ *first cut implemented.* A loaded **GGUF**
+   file's weights are distributed across multiple nodes. Ranges are chosen
+   **randomly** (`--hold-fraction F`, seeded), and the same range may be held by
+   several nodes for **redundancy** (independent random subsets overlap).
+   Implemented: `gguf.zig` (v2/v3 parser + fixture writer), `weights.zig` (range
+   manifest, SHA-256/range, Merkle-root version id, holdings bitmap), P2P ops
+   `MANIFEST`/`DIGEST`/`DIGESTS`/`HOLDINGS`/`GETR`.
+3. **Boot-time peer sync.** ✅ *first cut implemented* (`sync.zig`,
+   `loom node --bootstrap host:port`). A new node requests weight ranges from a
+   peer via the request-response protocol; every range is digest-verified before
+   touching disk and the digest set is verified against the advertised Merkle
+   root. Syncing from a *partial* holder takes what's available and reports the
+   shortfall — the seam where multi-peer sync + churn repair (#6) plug in.
 4. **Hardfork upgrades.** A majority of nodes agreeing on a new version of the
    GGUF file triggers a hardfork — a coordinated model-version upgrade across
    the swarm.
@@ -31,6 +39,8 @@ These supersede the original CLAUDE.md v1 sketch where they conflict.
    (coverage-seeking peering). Constraint: ENR records are limited to **300
    bytes**, so the ENR entry must be a compact summary (e.g. a range bitmap /
    holdings-manifest hash + sequence number), not the full holdings list.
+   *Progress:* the holdings bitmap + hex encoding used by the `HOLDINGS` P2P op
+   is exactly this summary (1 bit/range); ENR integration itself still todo.
 6. **Churn repair** *(open question)*. When a peer disconnects, a node actively
    seeks a replacement peer that holds the required weight range.
 7. **Gossip advertising** *(decided: alongside ENR)*. Per-node weight holdings are

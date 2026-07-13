@@ -10,8 +10,12 @@ const hf = @import("hf.zig");
 const rpc = @import("rpc.zig");
 const p2p = @import("p2p.zig");
 const stats = @import("stats.zig");
+const weights = @import("weights.zig");
+const sync = @import("sync.zig");
+const hashmod = @import("hash.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+const MBf: f64 = 1024.0 * 1024.0;
 
 pub const Options = struct {
     model: []const u8,
@@ -25,6 +29,11 @@ pub const Options = struct {
     seed: u64,
     stats_path: ?[]const u8,
     cache_root: []const u8,
+    // GGUF distribution plane
+    gguf_path: ?[]const u8, // serve this complete GGUF (origin/full holder)
+    bootstrap: ?[]const u8, // "host:port" — sync weight ranges from this peer
+    hold_fraction: f32, // fraction of ranges to hold when bootstrapping
+    range_bytes: u64, // range size when building a fresh manifest
 };
 
 fn p2pThread(ctx: *p2p.Ctx) void {
@@ -55,6 +64,36 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         }
     };
 
+    // ---- GGUF weight-distribution store (optional) ----
+    var store: ?weights.Store = null;
+    defer if (store) |*st| st.deinit();
+
+    if (opts.gguf_path) |gp| {
+        const store_dir = try std.fmt.allocPrint(gpa, "{s}/gguf-origin", .{opts.cache_root});
+        defer gpa.free(store_dir);
+        store = weights.openFull(gpa, io, gp, store_dir, opts.range_bytes) catch |e| {
+            try out.print("gguf store failed ({s}): {s}\n", .{ gp, @errorName(e) });
+            return;
+        };
+    } else if (opts.bootstrap) |bs| {
+        const peer_addr = sync.PeerAddr.parse(bs) catch {
+            try out.print("bad --bootstrap address (want host:port): {s}\n", .{bs});
+            return;
+        };
+        const store_dir = try std.fmt.allocPrint(gpa, "{s}/gguf-synced", .{opts.cache_root});
+        defer gpa.free(store_dir);
+        try out.print("bootstrapping weight ranges from {s} (hold-fraction {d:.2})...\n", .{ bs, opts.hold_fraction });
+        try out.flush();
+        const res = sync.bootstrap(gpa, io, peer_addr, store_dir, opts.hold_fraction, opts.seed, out) catch |e| {
+            try out.print("bootstrap failed: {s}\n", .{@errorName(e)});
+            return;
+        };
+        store = res.store;
+        try out.print("  synced {d}/{d} wanted ranges, {d:.1} MB, verified against manifest root\n", .{
+            res.fetched, res.wanted, @as(f64, @floatFromInt(res.bytes)) / MBf,
+        });
+    }
+
     const c = eng.cfg;
     const s = eng.sizes;
     try out.print("loom node up\n", .{});
@@ -69,7 +108,16 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         s.expert_bytes, s.lru_capacity, s.pinned_experts, @as(f64, @floatFromInt(opts.ram_bytes)) / GB,
     });
     try out.print("  rpc        tcp://{s}:{d}   (json: {{\"prompt\":\"..\",\"max_tokens\":32}})\n", .{ opts.rpc_addr, opts.rpc_port });
-    try out.print("  p2p        tcp://{s}:{d}   (HELLO | COUNT | HAS <id> | PING)\n", .{ opts.p2p_addr, opts.p2p_port });
+    try out.print("  p2p        tcp://{s}:{d}   (HELLO | HAS | MANIFEST | DIGESTS | HOLDINGS | GETR | PING)\n", .{ opts.p2p_addr, opts.p2p_port });
+    if (store) |*st| {
+        try out.print("  weights    version={s} ranges={d} held={d} ({d:.1}%) range_size={d:.1} MB\n", .{
+            hashmod.toHex(st.manifest.version),
+            st.manifest.nRanges(),
+            st.holdings.count(),
+            100.0 * @as(f64, @floatFromInt(st.holdings.count())) / @as(f64, @floatFromInt(st.manifest.nRanges())),
+            @as(f64, @floatFromInt(st.manifest.range_size)) / MBf,
+        });
+    }
     try out.print("  serving... (Ctrl-C to stop)\n", .{});
     try out.flush();
 
@@ -80,6 +128,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .unique_bytes = s.unique_expert_bytes,
         .addr = opts.p2p_addr,
         .port = opts.p2p_port,
+        .store = if (store) |*st| st else null,
     };
     const p2p_handle = try std.Thread.spawn(.{}, p2pThread, .{&p2p_ctx});
     defer p2p_handle.join();

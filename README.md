@@ -56,6 +56,33 @@ printf 'HELLO\nHAS 5\nPING\n' | nc 127.0.0.1 8771
 `dense.blob` + `experts.blob`) from the Hugging Face Hub over HTTPS into the cache.
 Converting raw GLM-5.2 safetensors (FP8→int4) remains a separate offline step.
 
+## GGUF weight distribution (v1, first cut)
+
+A GGUF file is split into fixed-size byte ranges (SHA-256 per range; the Merkle
+root over range digests is the **model version id**). Nodes hold random subsets
+of ranges — overlap across nodes gives redundancy — and new nodes sync from
+peers instead of re-downloading from origin:
+
+```sh
+loom gguf gen /tmp/model.gguf --data-mb 8      # synthetic GGUF fixture
+loom gguf info /tmp/model.gguf --range-mb 1    # metadata + range manifest
+
+# node A: origin, serves the full GGUF
+loom node --gguf /tmp/model.gguf --range-mb 1 --p2p-port 8771
+
+# node B: boots by syncing a random half of the ranges from A,
+# digest-verifying every range against the manifest root
+loom node --bootstrap 127.0.0.1:8771 --hold-fraction 0.5 --p2p-port 8781
+```
+
+P2P weight ops: `MANIFEST` (version/size/ranges), `DIGESTS` (bulk),
+`HOLDINGS` (hex bitmap, bit i = holds range i — the compact summary destined
+for ENR metadata + gossip), `GETR <i>` (range bytes; `ERR not_held` otherwise).
+Syncing from a partial holder takes what's available and reports the shortfall.
+
+See [ROADMAP.md](ROADMAP.md) for where this is headed (ENR/gossip advertising,
+churn repair, majority hardforks).
+
 ## Offline tools
 
 ```sh
@@ -94,7 +121,10 @@ loom iobench /tmp/ckpt/experts.blob --threads 8 --block-mb 1 --reads 64
 | `node.zig` | `loom node`: resolve model → engine → RPC + P2P servers |
 | `hf.zig` | model resolver: local dir / synthetic `tiny` / Hugging Face download |
 | `rpc.zig` | JSON-over-TCP inference server (concurrent conns, serialized generate) |
-| `p2p.zig` | minimal peer directory (`HAS <id>` → holder/offset/len/digest) |
+| `p2p.zig` | peer directory + weight-range serving (`HAS`, `MANIFEST`, `DIGESTS`, `HOLDINGS`, `GETR`) |
+| `gguf.zig` | GGUF v2/v3 parser (header, metadata, tensor table) + synthetic fixture writer |
+| `weights.zig` | range-sharded weight store: manifest, Merkle version id, holdings bitmap, verified range IO |
+| `sync.zig` | boot-time peer sync client (`--bootstrap`): manifest → digests → verified range fetch |
 | `stats.zig` | RSS, usage histogram, `STATS`→`PIN` hot-set selection, raw-count persistence |
 | `iobench.zig` | parallel random block reads → GB/s |
 | `gen_checkpoint.zig` | deterministic synthetic checkpoint generator |

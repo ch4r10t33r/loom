@@ -28,6 +28,9 @@ pub const node = @import("node.zig");
 pub const hf = @import("hf.zig");
 pub const rpc = @import("rpc.zig");
 pub const p2p = @import("p2p.zig");
+pub const gguf = @import("gguf.zig");
+pub const weights = @import("weights.zig");
+pub const sync = @import("sync.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MB: usize = 1024 * 1024;
@@ -60,6 +63,8 @@ pub fn main(init: std.process.Init) !void {
         try cmdRun(gpa, io, out, args, init.environ_map);
     } else if (std.mem.eql(u8, cmd, "node")) {
         try cmdNode(gpa, io, out, args, init.environ_map);
+    } else if (std.mem.eql(u8, cmd, "gguf")) {
+        try cmdGguf(gpa, io, out, args);
     } else {
         try out.print("unknown command: {s}\n\n", .{cmd});
         try usage(out);
@@ -74,6 +79,10 @@ fn usage(out: *Io.Writer) !void {
         \\  loom node [--model SPEC] [--rpc-addr A] [--rpc-port P]
         \\            [--p2p-addr A] [--p2p-port P] [--ram-gb X] [--pin-gb Y]
         \\            [--seed S] [--stats FILE] [--no-verify]
+        \\            [--gguf FILE | --bootstrap HOST:PORT]
+        \\            [--hold-fraction F] [--range-mb M]
+        \\  loom gguf gen <file> [--seed N] [--data-mb M]
+        \\  loom gguf info <file> [--range-mb M]
         \\  loom gen <dir> [--glm] [--seed N]
         \\  loom info <dir>
         \\  loom iobench <file> [--threads N] [--block-mb M] [--reads R]
@@ -301,6 +310,14 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         try gpa.dupe(u8, "./.loom-cache");
     defer gpa.free(cache_root);
 
+    const gguf_path = flagStr(args, "--gguf");
+    const bootstrap = flagStr(args, "--bootstrap");
+    if (gguf_path != null and bootstrap != null) {
+        return out.print("node: --gguf and --bootstrap are mutually exclusive\n", .{});
+    }
+    const hold_fraction = try flagF64(args, "--hold-fraction", 1.0);
+    const range_mb = try flagF64(args, "--range-mb", 4.0);
+
     try node.run(gpa, io, out, .{
         .model = model_spec,
         .rpc_addr = rpc_addr,
@@ -313,7 +330,67 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .seed = seed,
         .stats_path = stats_path,
         .cache_root = cache_root,
+        .gguf_path = gguf_path,
+        .bootstrap = bootstrap,
+        .hold_fraction = @floatCast(std.math.clamp(hold_fraction, 0.0, 1.0)),
+        .range_bytes = @intFromFloat(range_mb * @as(f64, MB)),
     });
+}
+
+// ---- gguf ------------------------------------------------------------------
+
+fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) !void {
+    if (args.len < 4) return out.print("gguf: need gen|info <file>\n", .{});
+    const sub = args[2];
+    const path = args[3];
+
+    if (std.mem.eql(u8, sub, "gen")) {
+        const seed = try flagU64(args, "--seed", 42);
+        const data_mb = try flagUsize(args, "--data-mb", 8);
+        try out.print("writing synthetic GGUF ({d} MB tensor data) -> {s}\n", .{ data_mb, path });
+        try out.flush();
+        try gguf.writeFixture(gpa, io, path, seed, data_mb);
+        try out.print("done\n", .{});
+        return;
+    }
+
+    if (std.mem.eql(u8, sub, "info")) {
+        var parsed = gguf.parse(gpa, io, path) catch |e| {
+            return out.print("parse failed: {s}\n", .{@errorName(e)});
+        };
+        defer parsed.deinit();
+        try out.print("gguf {s}\n", .{path});
+        try out.print("  version={d} alignment={d} data_offset={d} file_size={d}\n", .{
+            parsed.version, parsed.alignment, parsed.data_offset, parsed.file_size,
+        });
+        try out.print("  metadata ({d}):\n", .{parsed.metadata.len});
+        for (parsed.metadata) |kv| {
+            switch (kv.value) {
+                .string => |s| try out.print("    {s} = \"{s}\"\n", .{ kv.key, s }),
+                .int => |v| try out.print("    {s} = {d}\n", .{ kv.key, v }),
+                .uint => |v| try out.print("    {s} = {d}\n", .{ kv.key, v }),
+                .float => |v| try out.print("    {s} = {d}\n", .{ kv.key, v }),
+                .boolean => |v| try out.print("    {s} = {}\n", .{ kv.key, v }),
+                .array => |a| try out.print("    {s} = array(type={d}, n={d})\n", .{ kv.key, a.elem_type, a.count }),
+            }
+        }
+        try out.print("  tensors ({d}):\n", .{parsed.tensors.len});
+        for (parsed.tensors) |t| {
+            try out.print("    {s} type={d} dims={any} offset={d}\n", .{ t.name, t.ggml_type, t.dims, t.offset });
+        }
+
+        // range manifest preview
+        const range_mb = try flagF64(args, "--range-mb", 4.0);
+        const range_bytes: u64 = @intFromFloat(range_mb * @as(f64, MB));
+        var manifest = try weights.buildManifest(gpa, io, path, range_bytes);
+        defer manifest.deinit(gpa);
+        try out.print("  distribution: version={s} ranges={d} range_size={d:.1} MB\n", .{
+            hash.toHex(manifest.version), manifest.nRanges(), range_mb,
+        });
+        return;
+    }
+
+    try out.print("gguf: unknown subcommand {s} (want gen|info)\n", .{sub});
 }
 
 // ---- arg helpers -----------------------------------------------------------
