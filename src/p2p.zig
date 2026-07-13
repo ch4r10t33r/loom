@@ -19,6 +19,12 @@
 //!   HOLDINGS      -> HOLDINGS <hex bitmap>      (bit i = holds range i; the
 //!                    same compact summary destined for ENR metadata + gossip)
 //!   GETR <i>      -> DATA <i> len=<l> sha256=<hex>\n<raw bytes> | ERR not_held
+//!   -- gossip / peer exchange --
+//!   GOSSIP addr=<h:p> version=<hex> holdings=<hex>
+//!                 -> PEERS <n>\n then n lines "addr=.. version=.. holdings=.."
+//!                    (the responder's own entry first, then its peer table;
+//!                    the announcer is merged into the responder's table)
+//!   TABLE         -> same as GOSSIP response but without announcing (debug)
 //!   <other>       -> ERR unknown
 
 const std = @import("std");
@@ -27,6 +33,8 @@ const net = std.Io.net;
 const checkpoint = @import("checkpoint.zig");
 const hashmod = @import("hash.zig");
 const weights = @import("weights.zig");
+const peers = @import("peers.zig");
+const stats = @import("stats.zig");
 
 pub const Ctx = struct {
     gpa: std.mem.Allocator,
@@ -36,9 +44,37 @@ pub const Ctx = struct {
     addr: []const u8,
     port: u16,
     /// Attached GGUF weight store, if this node participates in distribution.
-    /// Reads are lock-free (immutable manifest, pread on a shared handle).
+    /// Reads are lock-free (immutable manifest, pread on a shared handle);
+    /// holdings bits are atomic.
     store: ?*weights.Store = null,
+    /// Dynamic peer table for gossip; when set, GOSSIP/TABLE are served.
+    table: ?*peers.Table = null,
+    /// Our own advertised "host:port" (what we tell peers to dial us on).
+    advertise: []const u8 = "",
 };
+
+fn selfLine(ctx: *Ctx, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) !void {
+    const zero_version = "0" ** 64;
+    if (ctx.store) |st| {
+        const vhex = hashmod.toHex(st.manifest.version);
+        const hhex = try st.holdings.toHex(gpa);
+        defer gpa.free(hhex);
+        try list.print(gpa, "addr={s} version={s} holdings={s}\n", .{ ctx.advertise, vhex, hhex });
+    } else {
+        try list.print(gpa, "addr={s} version={s} holdings=\n", .{ ctx.advertise, zero_version });
+    }
+}
+
+fn sendPeerList(ctx: *Ctx, wi: *Io.Writer) !void {
+    const gpa = ctx.gpa;
+    const table = ctx.table orelse return wi.print("ERR no_gossip\n", .{});
+    var body = std.ArrayList(u8).empty;
+    defer body.deinit(gpa);
+    try selfLine(ctx, gpa, &body);
+    const n = try table.dump(gpa, &body);
+    try wi.print("PEERS {d}\n", .{n + 1});
+    try wi.writeAll(body.items);
+}
 
 const Conn = struct { ctx: *Ctx, stream: net.Stream };
 
@@ -140,7 +176,28 @@ fn handleLine(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
         const data = store.readRange(i, buf) catch return wi.print("ERR read\n", .{});
         try wi.print("DATA {d} len={d} sha256={s}\n", .{ i, data.len, hashmod.toHex(store.manifest.digests[i]) });
         try wi.writeAll(data);
+    } else if (std.mem.startsWith(u8, line, "GOSSIP ")) {
+        const table = ctx.table orelse return wi.print("ERR no_gossip\n", .{});
+        const addr = fieldOf(line, "addr") orelse return wi.print("ERR bad_gossip\n", .{});
+        const version = fieldOf(line, "version") orelse return wi.print("ERR bad_gossip\n", .{});
+        const holdings = fieldOf(line, "holdings") orelse "";
+        _ = table.merge(addr, version, holdings, stats.nowNs(ctx.io)) catch {
+            return wi.print("ERR bad_gossip\n", .{});
+        };
+        try sendPeerList(ctx, wi);
+    } else if (std.mem.eql(u8, line, "TABLE")) {
+        try sendPeerList(ctx, wi);
     } else {
         try wi.print("ERR unknown\n", .{});
     }
+}
+
+fn fieldOf(line: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, line, ' ');
+    while (it.next()) |tok| {
+        if (std.mem.startsWith(u8, tok, key) and tok.len > key.len and tok[key.len] == '=') {
+            return tok[key.len + 1 ..];
+        }
+    }
+    return null;
 }

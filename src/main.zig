@@ -31,6 +31,8 @@ pub const p2p = @import("p2p.zig");
 pub const gguf = @import("gguf.zig");
 pub const weights = @import("weights.zig");
 pub const sync = @import("sync.zig");
+pub const peers = @import("peers.zig");
+pub const gossip = @import("gossip.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MB: usize = 1024 * 1024;
@@ -81,6 +83,7 @@ fn usage(out: *Io.Writer) !void {
         \\            [--seed S] [--stats FILE] [--no-verify]
         \\            [--gguf FILE | --bootstrap HOST:PORT]
         \\            [--peers H:P,H:P,...] [--hold-fraction F] [--range-mb M]
+        \\            [--advertise HOST:PORT]
         \\  loom gguf gen <file> [--seed N] [--data-mb M]
         \\  loom gguf info <file> [--range-mb M]
         \\  loom gen <dir> [--glm] [--seed N]
@@ -333,6 +336,7 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .gguf_path = gguf_path,
         .bootstrap = bootstrap,
         .peers = flagStr(args, "--peers"),
+        .advertise = flagStr(args, "--advertise"),
         .hold_fraction = @floatCast(std.math.clamp(hold_fraction, 0.0, 1.0)),
         .range_bytes = @intFromFloat(range_mb * @as(f64, MB)),
     });

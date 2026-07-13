@@ -74,11 +74,16 @@ loom node --gguf /tmp/model.gguf --range-mb 1 --p2p-port 8771
 # digest-verifying every range against the manifest root
 loom node --bootstrap 127.0.0.1:8771 --hold-fraction 0.5 --p2p-port 8781
 
-# node C: wants everything; bootstraps from B and also knows A. Any shortfall
-# is chased by the eager churn-repair loop (2s interval) until satisfied —
-# a peer that was down when C booted gets drained within one tick of returning.
-loom node --bootstrap 127.0.0.1:8781 --peers 127.0.0.1:8771 --hold-fraction 1.0
+# node C: wants everything but is told ONLY about B. Gossip (3s interval)
+# teaches C about A transitively via B's peer table; the eager churn-repair
+# loop (2s interval) then fetches the missing ranges from A — a peer C was
+# never configured with. Down peers are retried every round, not forgotten.
+loom node --bootstrap 127.0.0.1:8781 --hold-fraction 1.0
 ```
+
+Every node announces `addr/version/holdings` to every known peer and merges the
+peer's table back (`GOSSIP` op; `TABLE` to inspect). `--advertise host:port`
+sets the dialable address (default `127.0.0.1:<p2p-port>`).
 
 P2P weight ops: `MANIFEST` (version/size/ranges), `DIGESTS` (bulk),
 `HOLDINGS` (hex bitmap, bit i = holds range i — the compact summary destined
@@ -130,6 +135,8 @@ loom iobench /tmp/ckpt/experts.blob --threads 8 --block-mb 1 --reads 64
 | `gguf.zig` | GGUF v2/v3 parser (header, metadata, tensor table) + synthetic fixture writer |
 | `weights.zig` | range-sharded weight store: manifest, Merkle version id, holdings bitmap, verified range IO |
 | `sync.zig` | boot-time peer sync client (`--bootstrap`): manifest → digests → verified range fetch |
+| `peers.zig` | dynamic peer table (addr/version/holdings), shared by gossip + repair + P2P threads |
+| `gossip.zig` | 3s gossip loop: announce self, merge peers-of-peers (transitive discovery) |
 | `stats.zig` | RSS, usage histogram, `STATS`→`PIN` hot-set selection, raw-count persistence |
 | `iobench.zig` | parallel random block reads → GB/s |
 | `gen_checkpoint.zig` | deterministic synthetic checkpoint generator |

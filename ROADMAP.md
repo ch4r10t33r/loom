@@ -52,10 +52,19 @@ These supersede the original CLAUDE.md v1 sketch where they conflict.
    (the hardfork guard, #4). Verified live: a node that booted 5/9 against a
    dead peer recovered to 9/9 within one repair tick of the peer returning.
    Still todo: peers discovered via ENR/gossip instead of a static list.
-7. **Gossip advertising** *(decided: alongside ENR)*. Per-node weight holdings are
-   **also** advertised on a **global gossip topic**. Division of labor: ENR = the
-   compact, discovery-time summary; gossip = live, detailed holdings updates
-   (range acquisitions/drops) without waiting for ENR re-resolution.
+7. **Gossip advertising** *(decided: alongside ENR; ✅ first cut implemented)*.
+   Per-node weight holdings are **also** advertised on a **global gossip topic**.
+   Division of labor: ENR = the compact, discovery-time summary; gossip = live,
+   detailed holdings updates (range acquisitions/drops) without waiting for ENR
+   re-resolution. Implemented (LAN-scale epidemic form): a mutex-guarded peer
+   table (`peers.zig`) shared by all loops; a `GOSSIP` P2P op
+   (announce-and-exchange in one round trip: caller's addr/version/holdings
+   merged in, responder's self entry + full table returned); a 3 s gossip loop
+   (`gossip.zig`); churn repair now draws candidates from the live table.
+   Verified live: C, told only about B, learned origin A transitively within one
+   gossip round and repaired 4 missing ranges from it — and A symmetrically
+   learned B and C. Swapping this for real gossipsub/discv5 replaces the
+   transport, not the table.
 
 ### Design tensions to resolve before implementation
 

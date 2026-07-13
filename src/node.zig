@@ -13,6 +13,8 @@ const stats = @import("stats.zig");
 const weights = @import("weights.zig");
 const sync = @import("sync.zig");
 const hashmod = @import("hash.zig");
+const peers = @import("peers.zig");
+const gossip = @import("gossip.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MBf: f64 = 1024.0 * 1024.0;
@@ -35,6 +37,7 @@ pub const Options = struct {
     peers: ?[]const u8, // extra weight peers, comma-separated "host:port"
     hold_fraction: f32, // fraction of ranges to hold when bootstrapping
     range_bytes: u64, // range size when building a fresh manifest
+    advertise: ?[]const u8, // our dialable "host:port" (default 127.0.0.1:<p2p_port>)
 };
 
 /// Churn-repair policy (ROADMAP #6, decided: maximally eager): whenever the
@@ -47,16 +50,24 @@ const RepairCtx = struct {
     gpa: std.mem.Allocator,
     io: Io,
     store: *weights.Store,
-    peers: []sync.PeerAddr,
+    /// Candidate holders come from the live gossip table, so repair reaches
+    /// peers this node was never explicitly told about.
+    table: *peers.Table,
 };
 
 fn repairThread(ctx: *RepairCtx) void {
     while (true) {
         Io.sleep(ctx.io, .{ .nanoseconds = REPAIR_INTERVAL_NS }, .awake) catch return;
         if (ctx.store.missingCount() == 0) continue;
+        const addrs = ctx.table.snapshotAddrs(ctx.gpa) catch continue;
+        defer {
+            for (addrs) |a| ctx.gpa.free(a);
+            ctx.gpa.free(addrs);
+        }
         var repaired: usize = 0;
-        for (ctx.peers) |addr| {
+        for (addrs) |addr_str| {
             if (ctx.store.missingCount() == 0) break;
+            const addr = sync.PeerAddr.parse(addr_str) catch continue;
             const s = sync.fetchFromPeer(ctx.gpa, ctx.io, ctx.store, addr) catch continue;
             repaired += s.fetched;
         }
@@ -104,12 +115,15 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     // known weight peers = --bootstrap (first) + --peers (comma-separated)
     var peer_list = std.ArrayList(sync.PeerAddr).empty;
     defer peer_list.deinit(gpa);
+    var peer_strs = std.ArrayList([]const u8).empty; // same peers, as strings for the gossip table
+    defer peer_strs.deinit(gpa);
     if (opts.bootstrap) |bs| {
         const a = sync.PeerAddr.parse(bs) catch {
             try out.print("bad --bootstrap address (want host:port): {s}\n", .{bs});
             return;
         };
         try peer_list.append(gpa, a);
+        try peer_strs.append(gpa, bs);
     }
     if (opts.peers) |csv| {
         var it = std.mem.splitScalar(u8, csv, ',');
@@ -121,7 +135,19 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                 return;
             };
             try peer_list.append(gpa, a);
+            try peer_strs.append(gpa, t);
         }
+    }
+
+    // gossip peer table, seeded with the statically configured peers
+    var advertise_buf: [128]u8 = undefined;
+    const advertise = opts.advertise orelse
+        try std.fmt.bufPrint(&advertise_buf, "127.0.0.1:{d}", .{opts.p2p_port});
+    var table = peers.Table.init(gpa, io, advertise);
+    defer table.deinit();
+    const zero_version = "0" ** 64;
+    for (peer_strs.items) |ps| {
+        _ = table.merge(ps, zero_version, "", stats.nowNs(io)) catch {};
     }
 
     if (opts.gguf_path) |gp| {
@@ -163,7 +189,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         s.expert_bytes, s.lru_capacity, s.pinned_experts, @as(f64, @floatFromInt(opts.ram_bytes)) / GB,
     });
     try out.print("  rpc        tcp://{s}:{d}   (json: {{\"prompt\":\"..\",\"max_tokens\":32}})\n", .{ opts.rpc_addr, opts.rpc_port });
-    try out.print("  p2p        tcp://{s}:{d}   (HELLO | HAS | MANIFEST | DIGESTS | HOLDINGS | GETR | PING)\n", .{ opts.p2p_addr, opts.p2p_port });
+    try out.print("  p2p        tcp://{s}:{d}   (HELLO | HAS | MANIFEST | DIGESTS | HOLDINGS | GETR | GOSSIP | TABLE | PING)\n", .{ opts.p2p_addr, opts.p2p_port });
+    try out.print("  gossip     advertising as {s}, {d} seed peer(s), every {d}s\n", .{
+        advertise, peer_strs.items.len, @divTrunc(gossip.INTERVAL_NS, std.time.ns_per_s),
+    });
     if (store) |*st| {
         try out.print("  weights    version={s} ranges={d} held={d} ({d:.1}%) range_size={d:.1} MB\n", .{
             hashmod.toHex(st.manifest.version),
@@ -184,18 +213,33 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .addr = opts.p2p_addr,
         .port = opts.p2p_port,
         .store = if (store) |*st| st else null,
+        .table = &table,
+        .advertise = advertise,
     };
     const p2p_handle = try std.Thread.spawn(.{}, p2pThread, .{&p2p_ctx});
     defer p2p_handle.join();
 
-    // eager churn repair: runs whenever we hold a store and know any peers
+    // gossip loop: announce ourselves + learn peers-of-peers
+    var gossip_ctx = gossip.Ctx{
+        .gpa = gpa,
+        .io = io,
+        .table = &table,
+        .store = if (store) |*st| st else null,
+        .advertise = advertise,
+    };
+    {
+        const t = try std.Thread.spawn(.{}, gossip.loop, .{&gossip_ctx});
+        t.detach();
+    }
+
+    // eager churn repair, drawing candidates from the live gossip table
     var repair_ctx: RepairCtx = undefined;
-    if (store != null and peer_list.items.len > 0) {
+    if (store != null) {
         repair_ctx = .{
             .gpa = gpa,
             .io = io,
             .store = &store.?,
-            .peers = peer_list.items,
+            .table = &table,
         };
         const t = try std.Thread.spawn(.{}, repairThread, .{&repair_ctx});
         t.detach();
