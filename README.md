@@ -90,6 +90,23 @@ P2P weight ops: `MANIFEST` (version/size/ranges), `DIGESTS` (bulk),
 for ENR metadata + gossip), `GETR <i>` (range bytes; `ERR not_held` otherwise).
 Syncing from a partial holder takes what's available and reports the shortfall.
 
+## GGUF inference (llama architecture)
+
+The engine can also **run** GGUF models directly — llama architecture with GGML
+F32 / F16 / Q4_0 / Q8_0 tensors (fused matvec over the raw mmap'd bytes, no
+wholesale dequantization), GQA attention, NORM RoPE, and the SentencePiece
+tokenizer embedded in GGUF metadata:
+
+```sh
+loom gguf run stories15M-q4_0.gguf --prompt "Once upon a time" --max-tokens 100
+# -> coherent story text; ~235 tok/s (ReleaseFast, 15M-param Q4_0, one CPU core)
+```
+
+Validated against real models (`ggml-org/models` tinyllamas: stories260K F32,
+stories15M Q4_0/Q8_0) — all produce coherent English, confirming kernels,
+attention, RoPE convention, and tokenizer against reference weights. Serving
+GGUF models through `loom node`'s RPC is the next integration step.
+
 See [ROADMAP.md](ROADMAP.md) for where this is headed (ENR/gossip advertising,
 churn repair, majority hardforks).
 
@@ -132,7 +149,9 @@ loom iobench /tmp/ckpt/experts.blob --threads 8 --block-mb 1 --reads 64
 | `hf.zig` | model resolver: local dir / synthetic `tiny` / Hugging Face download |
 | `rpc.zig` | JSON-over-TCP inference server (concurrent conns, serialized generate) |
 | `p2p.zig` | peer directory + weight-range serving (`HAS`, `MANIFEST`, `DIGESTS`, `HOLDINGS`, `GETR`) |
-| `gguf.zig` | GGUF v2/v3 parser (header, metadata, tensor table) + synthetic fixture writer |
+| `gguf.zig` | GGUF v2/v3 parser (header, metadata incl. tokenizer arrays, tensor table) + fixture writer |
+| `ggml.zig` | GGML tensor kernels: F32/F16/Q4_0/Q8_0 fused matvec + row dequant |
+| `llama.zig` | llama-arch engine over mmap'd GGUF: GQA + NORM RoPE + SwiGLU + SPM tokenizer |
 | `weights.zig` | range-sharded weight store: manifest, Merkle version id, holdings bitmap, verified range IO |
 | `sync.zig` | boot-time peer sync client (`--bootstrap`): manifest → digests → verified range fetch |
 | `peers.zig` | dynamic peer table (addr/version/holdings), shared by gossip + repair + P2P threads |

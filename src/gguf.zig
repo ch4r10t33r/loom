@@ -52,7 +52,11 @@ pub const MetaValue = union(enum) {
     float: f64,
     boolean: bool,
     string: []const u8, // owned by Parsed.arena
-    array: struct { elem_type: u32, count: u64 }, // contents skipped
+    // typed arrays retained for tokenizer metadata; all owned by Parsed.arena
+    array_str: []const []const u8,
+    array_f32: []const f32,
+    array_i32: []const i32,
+    array: struct { elem_type: u32, count: u64 }, // other element types: skipped
 };
 
 pub const MetaKV = struct {
@@ -76,6 +80,37 @@ pub const Parsed = struct {
     pub fn findMeta(self: *const Parsed, key: []const u8) ?MetaValue {
         for (self.metadata) |kv| {
             if (std.mem.eql(u8, kv.key, key)) return kv.value;
+        }
+        return null;
+    }
+
+    pub fn getUint(self: *const Parsed, key: []const u8) ?u64 {
+        return switch (self.findMeta(key) orelse return null) {
+            .uint => |v| v,
+            .int => |v| if (v >= 0) @intCast(v) else null,
+            else => null,
+        };
+    }
+
+    pub fn getFloat(self: *const Parsed, key: []const u8) ?f64 {
+        return switch (self.findMeta(key) orelse return null) {
+            .float => |v| v,
+            .uint => |v| @floatFromInt(v),
+            .int => |v| @floatFromInt(v),
+            else => null,
+        };
+    }
+
+    pub fn getString(self: *const Parsed, key: []const u8) ?[]const u8 {
+        return switch (self.findMeta(key) orelse return null) {
+            .string => |s| s,
+            else => null,
+        };
+    }
+
+    pub fn findTensor(self: *const Parsed, name: []const u8) ?TensorInfo {
+        for (self.tensors) |t| {
+            if (std.mem.eql(u8, t.name, name)) return t;
         }
         return null;
     }
@@ -121,10 +156,30 @@ fn readValue(c: *Cursor, arena: std.mem.Allocator, vtype: u32) !MetaValue {
         .array => blk: {
             const elem_type = try c.u32le();
             const count = try c.u64le();
-            // skip contents (recursively handles arrays of any element type)
-            var i: u64 = 0;
-            while (i < count) : (i += 1) _ = try readValue(c, arena, elem_type);
-            break :blk .{ .array = .{ .elem_type = elem_type, .count = count } };
+            if (count > 1 << 24) return error.TruncatedGguf;
+            switch (@as(ValueType, @enumFromInt(elem_type))) {
+                .string => {
+                    const items = try arena.alloc([]const u8, @intCast(count));
+                    for (items) |*s| s.* = try arena.dupe(u8, try c.str());
+                    break :blk .{ .array_str = items };
+                },
+                .f32 => {
+                    const items = try arena.alloc(f32, @intCast(count));
+                    for (items) |*v| v.* = @bitCast(try c.u32le());
+                    break :blk .{ .array_f32 = items };
+                },
+                .i32 => {
+                    const items = try arena.alloc(i32, @intCast(count));
+                    for (items) |*v| v.* = @bitCast(try c.u32le());
+                    break :blk .{ .array_i32 = items };
+                },
+                else => {
+                    // skip contents (recursively handles arrays of any type)
+                    var i: u64 = 0;
+                    while (i < count) : (i += 1) _ = try readValue(c, arena, elem_type);
+                    break :blk .{ .array = .{ .elem_type = elem_type, .count = count } };
+                },
+            }
         },
         _ => error.UnknownValueType,
     };

@@ -66,6 +66,17 @@ These supersede the original CLAUDE.md v1 sketch where they conflict.
    learned B and C. Swapping this for real gossipsub/discv5 replaces the
    transport, not the table.
 
+### GGUF → inference (✅ first cut implemented)
+
+The engine runs llama-architecture GGUF models directly (`loom gguf run`):
+GGML F32/F16/Q4_0/Q8_0 fused kernels over the mmap'd file (`ggml.zig`), GQA
+attention + NORM RoPE + SwiGLU (`llama.zig`), SentencePiece tokenizer from GGUF
+metadata. Validated on real models (tinyllamas stories260K F32 and stories15M
+Q4_0/Q8_0 — coherent English output, matching llama.cpp behavior). This closes
+the "distribute a file the node can't run" gap for llama-family GGUFs. Still
+todo: serve GGUF models through `loom node`'s RPC; batch >1; F16 KV; the GLM
+MoE arch itself ships as loom-format checkpoints, unchanged.
+
 ### Design tensions to resolve before implementation
 
 - **Random vs. heat-aware placement.** CLAUDE.md prescribes heat-proportional

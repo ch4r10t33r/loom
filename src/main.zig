@@ -33,6 +33,8 @@ pub const weights = @import("weights.zig");
 pub const sync = @import("sync.zig");
 pub const peers = @import("peers.zig");
 pub const gossip = @import("gossip.zig");
+pub const ggml = @import("ggml.zig");
+pub const llama = @import("llama.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MB: usize = 1024 * 1024;
@@ -86,6 +88,7 @@ fn usage(out: *Io.Writer) !void {
         \\            [--advertise HOST:PORT]
         \\  loom gguf gen <file> [--seed N] [--data-mb M]
         \\  loom gguf info <file> [--range-mb M]
+        \\  loom gguf run <file.gguf> [--prompt STR] [--max-tokens N] [--temp T] [--seed S]
         \\  loom gen <dir> [--glm] [--seed N]
         \\  loom info <dir>
         \\  loom iobench <file> [--threads N] [--block-mb M] [--reads R]
@@ -376,6 +379,9 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
                 .uint => |v| try out.print("    {s} = {d}\n", .{ kv.key, v }),
                 .float => |v| try out.print("    {s} = {d}\n", .{ kv.key, v }),
                 .boolean => |v| try out.print("    {s} = {}\n", .{ kv.key, v }),
+                .array_str => |a| try out.print("    {s} = array(string, n={d})\n", .{ kv.key, a.len }),
+                .array_f32 => |a| try out.print("    {s} = array(f32, n={d})\n", .{ kv.key, a.len }),
+                .array_i32 => |a| try out.print("    {s} = array(i32, n={d})\n", .{ kv.key, a.len }),
                 .array => |a| try out.print("    {s} = array(type={d}, n={d})\n", .{ kv.key, a.elem_type, a.count }),
             }
         }
@@ -395,7 +401,68 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
         return;
     }
 
-    try out.print("gguf: unknown subcommand {s} (want gen|info)\n", .{sub});
+    if (std.mem.eql(u8, sub, "run")) {
+        return cmdGgufRun(gpa, io, out, path, args);
+    }
+
+    try out.print("gguf: unknown subcommand {s} (want gen|info|run)\n", .{sub});
+}
+
+fn cmdGgufRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8, args: [][]const u8) !void {
+    const prompt = flagStr(args, "--prompt") orelse "Once upon a time";
+    const max_tokens = try flagUsize(args, "--max-tokens", 128);
+    const temp: f32 = @floatCast(try flagF64(args, "--temp", 0.0));
+    const seed = try flagU64(args, "--seed", 42);
+
+    var m = llama.load(gpa, io, path) catch |e| {
+        return out.print("load failed: {s}\n", .{@errorName(e)});
+    };
+    defer m.deinit();
+    const c = m.cfg;
+    try out.print("llama gguf: dim={d} layers={d} heads={d}/{d}kv ffn={d} vocab={d} ctx={d} rope_dim={d}\n", .{
+        c.dim, c.n_layers, c.n_heads, c.n_kv_heads, c.ffn, c.vocab, c.ctx_len, c.rope_dim,
+    });
+    try out.flush();
+
+    var st = try llama.State.init(gpa, c);
+    defer st.deinit(gpa);
+
+    const prompt_toks = try m.tok.encode(gpa, prompt, true);
+    defer gpa.free(prompt_toks);
+    if (prompt_toks.len == 0) return out.print("empty prompt after tokenization\n", .{});
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+    const sample_scratch = try gpa.alloc(f32, c.vocab);
+    defer gpa.free(sample_scratch);
+
+    const t0 = stats.nowNs(io);
+    var pos: usize = 0;
+    // prefill (echo the prompt as we go)
+    try out.print("output: ", .{});
+    for (prompt_toks) |tok| {
+        if (pos >= c.ctx_len) return out.print("\nprompt exceeds context\n", .{});
+        llama.step(&m, &st, tok, pos);
+        try m.tok.decode(out, tok);
+        pos += 1;
+    }
+    try out.flush();
+
+    var produced: usize = 0;
+    var last: u32 = @intCast(sampler.sample(sample_scratch, st.logits, temp, rnd));
+    while (produced < max_tokens and pos < c.ctx_len) : (produced += 1) {
+        if (last == m.tok.eos) break;
+        try m.tok.decode(out, last);
+        try out.flush();
+        llama.step(&m, &st, last, pos);
+        pos += 1;
+        last = @intCast(sampler.sample(sample_scratch, st.logits, temp, rnd));
+    }
+    const t1 = stats.nowNs(io);
+    const secs = @as(f64, @floatFromInt(t1 - t0)) / 1e9;
+    try out.print("\n---- {d} prompt + {d} generated tokens in {d:.2}s ({d:.1} tok/s) ----\n", .{
+        prompt_toks.len, produced, secs, @as(f64, @floatFromInt(prompt_toks.len + produced)) / secs,
+    });
 }
 
 // ---- arg helpers -----------------------------------------------------------
