@@ -81,6 +81,42 @@ rotate_half nets out to that; NEOX produces degenerate output. Still todo:
 serve GGUF models through `loom node`'s RPC; batch >1; SIMD kernels;
 IQ-quants.
 
+### Bootnode onboarding + GLM 5.2 sharding plan (decided)
+
+Base model: **GLM 5.2** (744B MoE; 75 MoE layers × 256 experts, 8+1 active).
+
+**Shard unit = one expert block ≈ 19 MB int4** (gate/up/down of one expert,
+extent-list over the GGUF's 3D expert tensors) → **19,200 routed shards**
+(~370 GB corpus) plus one **resident bundle** (~10 GB: attention, shared
+experts, embeddings, routers) that *every* node holds in full. Rationale: the
+shard must equal the unit the matmul consumes (principle 7 — token-time fetch
+is one direct addressed read, no assembly); per-layer shards (4.9 GB) are too
+lumpy for redundancy; metadata stays trivial (holdings bitmap 2.4 KB — gossip
+carries it whole, ENR carries its hash + seq; manifest ~1 MB).
+
+**16 GB feasibility.** Held shards are a *disk* budget (pread-served), not RAM.
+RAM: ~10 GB dense resident (mmap) + ~0.7 GB MLA KV (8k ctx) + 2–3 GB
+pinned/LRU expert cache + OS ≈ fits in 16 GB (floor; comfortable at 24–32 GB).
+Disk: contribution `--hold-gb`, default ~50 GB ≈ 2,600 shards.
+
+**Redundancy targets.** Replication factor **R = 3 target, R = 2 hard floor**
+(principle 3). Swarm sizing: N × hold ≥ R × 370 GB → 16 nodes × 50 GB or
+8 × 100 GB reaches R=2; ~22 × 50 GB reaches R=3.
+
+**Bootnode.** An onboarding + coverage accountant, deliberately *not* in the
+inference path and *not* a permanent dependency (Ethereum-bootnode discipline):
+1. serves the expert-aligned manifest + resident bundle to joining nodes;
+2. assigns each joiner the **most under-replicated shards first**
+   (capacity-aware, computed from live gossip holdings) — upgrading random
+   holdings to guaranteed-coverage assignment;
+3. watches per-shard replica counts from the gossip table and nudges
+   re-replication when a shard falls below R (eager repair does the pulling);
+4. after boot, nodes depend only on gossip + repair — a dead bootnode strands
+   nothing already joined.
+Decentralization path (later): deterministic assignment via rendezvous hashing
++ coverage computed by every node from gossiped bitmaps; heat-proportional
+extra replicas on top (see tension below).
+
 ### Design tensions to resolve before implementation
 
 - **Random vs. heat-aware placement.** CLAUDE.md prescribes heat-proportional
