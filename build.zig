@@ -4,12 +4,17 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const snappy = b.dependency("zig_snappy", .{ .target = target, .optimize = optimize });
+
     const exe = b.addExecutable(.{
         .name = "loom",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "snappyz", .module = snappy.module("snappyz") },
+            },
         }),
     });
     b.installArtifact(exe);
@@ -27,6 +32,9 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "snappyz", .module = snappy.module("snappyz") },
+            },
         }),
     });
     const run_tests = b.addRunArtifact(unit_tests);

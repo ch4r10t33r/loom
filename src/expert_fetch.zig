@@ -25,6 +25,7 @@ const weights = @import("weights.zig");
 const sync = @import("sync.zig");
 const hashmod = @import("hash.zig");
 const stats_mod = @import("stats.zig");
+const wire = @import("wire.zig");
 
 pub const Stats = struct {
     local: u64 = 0, // served from held shards (disk/page cache)
@@ -154,8 +155,12 @@ pub const Source = struct {
         self.stats_mutex.unlock(self.io);
     }
 
+    /// One ExpertRequest/ExpertResponse exchange (SPEC.md wire messages v1).
+    /// The request pins our manifest version; the server refuses others. The
+    /// caller verifies the payload against the local manifest digest.
     fn fetchFromPeer(self: *Source, addr: sync.PeerAddr, id: usize, buf: []u8) !usize {
         const io = self.io;
+        const gpa = self.gpa;
         const ip = try net.IpAddress.parse(addr.host, addr.port);
         const stream = try ip.connect(io, .{ .mode = .stream });
         defer stream.close(io);
@@ -164,19 +169,33 @@ pub const Source = struct {
         var r = stream.reader(io, &rbuf);
         var w = stream.writer(io, &wbuf);
 
-        try w.interface.print("GETR {d}\n", .{id});
-        try w.interface.flush();
-        const hline = std.mem.trimEnd(u8, try r.interface.takeDelimiterInclusive('\n'), "\r\n");
-        if (!std.mem.startsWith(u8, hline, "DATA ")) return error.PeerCannotServe;
-        var len: usize = 0;
-        var it = std.mem.splitScalar(u8, hline, ' ');
-        while (it.next()) |tok| {
-            if (std.mem.startsWith(u8, tok, "len=")) {
-                len = try std.fmt.parseInt(usize, tok[4..], 10);
-            }
+        const req = wire.ExpertRequest{
+            .request_id = @intCast(id), // 1 request per connection: shard id doubles as request id
+            .manifest_version = self.store.manifest.version,
+            .shard_id = @intCast(id),
+        };
+        const body = try req.encodeBody(gpa);
+        defer gpa.free(body);
+        const frame = try wire.encodeFrame(gpa, .expert_request, body);
+        defer gpa.free(frame);
+        try wire.writeFrame(&w.interface, frame);
+
+        const resp_raw = try wire.readFrameAlloc(gpa, &r.interface);
+        defer gpa.free(resp_raw);
+        const dec = try wire.decodeFrame(gpa, resp_raw);
+        defer gpa.free(dec.body);
+        if (dec.ty != .expert_response) return error.PeerCannotServe;
+        const resp = try wire.ExpertResponse.parseBody(dec.body);
+        if (resp.request_id != req.request_id or resp.shard_id != req.shard_id) return error.BadResponse;
+        switch (resp.status) {
+            .ok => {},
+            .not_held => return error.PeerNotHeld,
+            .version_mismatch => return error.PeerVersionMismatch,
+            .busy => return error.PeerBusy,
+            else => return error.PeerCannotServe,
         }
-        if (len != buf.len) return error.BadShardLength;
-        try r.interface.readSliceAll(buf);
-        return len;
+        if (resp.payload.len != buf.len) return error.BadShardLength;
+        @memcpy(buf, resp.payload);
+        return resp.payload.len;
     }
 };

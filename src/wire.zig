@@ -1,0 +1,380 @@
+//! Wire messages v1 (SPEC.md): binary frames for heartbeat, gossip announce,
+//! and the expert request/response, with adaptive snappy compression — the
+//! encoder keeps the compressed body only when it is actually smaller
+//! (holdings bitmaps compress well; quantized expert payloads usually don't).
+
+const std = @import("std");
+const snappy = @import("snappyz");
+
+pub const MAGIC = [2]u8{ 'L', 'M' };
+pub const PROTO: u8 = 1;
+pub const HEADER_LEN: usize = 8;
+pub const FLAG_SNAPPY: u8 = 0x01;
+
+pub const MsgType = enum(u8) {
+    heartbeat = 0x01,
+    heartbeat_resp = 0x02,
+    announce = 0x03,
+    expert_request = 0x10,
+    expert_response = 0x11,
+    _,
+};
+
+pub const Status = enum(u8) {
+    ok = 0,
+    not_held = 1,
+    version_mismatch = 2,
+    busy = 3,
+    bad_request = 4,
+    _,
+};
+
+pub const NO_COMMITTEE: u32 = 0xFFFF_FFFF;
+
+// ---- envelope ----------------------------------------------------------------
+
+/// Wrap `body` in a frame, compressing when it pays. Caller owns the result.
+pub fn encodeFrame(gpa: std.mem.Allocator, ty: MsgType, body: []const u8) ![]u8 {
+    var flags: u8 = 0;
+    var payload: []const u8 = body;
+    const compressed = snappy.encode(gpa, body) catch null;
+    // the frame copies whichever buffer wins, so c is always freed on exit
+    defer if (compressed) |c| gpa.free(c);
+    if (compressed) |c| {
+        if (c.len < body.len) {
+            payload = c;
+            flags |= FLAG_SNAPPY;
+        }
+    }
+    const out = try gpa.alloc(u8, HEADER_LEN + payload.len);
+    out[0] = MAGIC[0];
+    out[1] = MAGIC[1];
+    out[2] = @intFromEnum(ty);
+    out[3] = flags;
+    std.mem.writeInt(u32, out[4..8], @intCast(payload.len), .little);
+    @memcpy(out[HEADER_LEN..], payload);
+    return out;
+}
+
+pub const Decoded = struct {
+    ty: MsgType,
+    body: []u8, // owned by caller (decompressed or duplicated)
+};
+
+/// Parse a full frame (header + body). Returns an owned, decompressed body.
+pub fn decodeFrame(gpa: std.mem.Allocator, frame: []const u8) !Decoded {
+    if (frame.len < HEADER_LEN) return error.ShortFrame;
+    if (frame[0] != MAGIC[0] or frame[1] != MAGIC[1]) return error.BadMagic;
+    const ty: MsgType = @enumFromInt(frame[2]);
+    const flags = frame[3];
+    const body_len = std.mem.readInt(u32, frame[4..8], .little);
+    if (frame.len != HEADER_LEN + body_len) return error.LengthMismatch;
+    const raw = frame[HEADER_LEN..];
+    const body = if (flags & FLAG_SNAPPY != 0)
+        try snappy.decode(gpa, raw)
+    else
+        try gpa.dupe(u8, raw);
+    return .{ .ty = ty, .body = body };
+}
+
+// ---- body helpers ------------------------------------------------------------
+
+const Cursor = struct {
+    buf: []const u8,
+    pos: usize = 0,
+
+    fn need(self: *Cursor, n: usize) ![]const u8 {
+        if (self.pos + n > self.buf.len) return error.Truncated;
+        const s = self.buf[self.pos..][0..n];
+        self.pos += n;
+        return s;
+    }
+    fn u8v(self: *Cursor) !u8 {
+        return (try self.need(1))[0];
+    }
+    fn u16v(self: *Cursor) !u16 {
+        return std.mem.readInt(u16, (try self.need(2))[0..2], .little);
+    }
+    fn u32v(self: *Cursor) !u32 {
+        return std.mem.readInt(u32, (try self.need(4))[0..4], .little);
+    }
+    fn u64v(self: *Cursor) !u64 {
+        return std.mem.readInt(u64, (try self.need(8))[0..8], .little);
+    }
+    fn i64v(self: *Cursor) !i64 {
+        return @bitCast(try self.u64v());
+    }
+};
+
+fn appendU16(gpa: std.mem.Allocator, b: *std.ArrayList(u8), v: u16) !void {
+    var t: [2]u8 = undefined;
+    std.mem.writeInt(u16, &t, v, .little);
+    try b.appendSlice(gpa, &t);
+}
+fn appendU32(gpa: std.mem.Allocator, b: *std.ArrayList(u8), v: u32) !void {
+    var t: [4]u8 = undefined;
+    std.mem.writeInt(u32, &t, v, .little);
+    try b.appendSlice(gpa, &t);
+}
+fn appendU64(gpa: std.mem.Allocator, b: *std.ArrayList(u8), v: u64) !void {
+    var t: [8]u8 = undefined;
+    std.mem.writeInt(u64, &t, v, .little);
+    try b.appendSlice(gpa, &t);
+}
+
+// ---- Heartbeat (0x01 / 0x02) ---------------------------------------------------
+
+pub const Heartbeat = struct {
+    proto: u8 = PROTO,
+    committee_id: u32 = NO_COMMITTEE,
+    manifest_version: [32]u8 = [_]u8{0} ** 32,
+    holdings_seq: u64 = 0,
+    holdings_digest: [32]u8 = [_]u8{0} ** 32,
+    load: u16 = 0,
+    sent_at_ns: i64 = 0,
+    addr: []const u8 = "", // sender's advertised host:port (<=255 bytes)
+
+    pub fn encodeBody(self: *const Heartbeat, gpa: std.mem.Allocator) ![]u8 {
+        var b = std.ArrayList(u8).empty;
+        errdefer b.deinit(gpa);
+        try b.append(gpa, self.proto);
+        try appendU32(gpa, &b, self.committee_id);
+        try b.appendSlice(gpa, &self.manifest_version);
+        try appendU64(gpa, &b, self.holdings_seq);
+        try b.appendSlice(gpa, &self.holdings_digest);
+        try appendU16(gpa, &b, self.load);
+        try appendU64(gpa, &b, @bitCast(self.sent_at_ns));
+        try b.append(gpa, @intCast(@min(self.addr.len, 255)));
+        try b.appendSlice(gpa, self.addr[0..@min(self.addr.len, 255)]);
+        return b.toOwnedSlice(gpa);
+    }
+
+    /// `body` must outlive the result (addr aliases it).
+    pub fn parseBody(body: []const u8) !Heartbeat {
+        var c = Cursor{ .buf = body };
+        var hb = Heartbeat{};
+        hb.proto = try c.u8v();
+        hb.committee_id = try c.u32v();
+        @memcpy(&hb.manifest_version, try c.need(32));
+        hb.holdings_seq = try c.u64v();
+        @memcpy(&hb.holdings_digest, try c.need(32));
+        hb.load = try c.u16v();
+        hb.sent_at_ns = try c.i64v();
+        const alen = try c.u8v();
+        hb.addr = try c.need(alen);
+        return hb;
+    }
+};
+
+// ---- Announce (0x03) -----------------------------------------------------------
+
+pub const Announce = struct {
+    proto: u8 = PROTO,
+    committee_id: u32 = NO_COMMITTEE,
+    manifest_version: [32]u8 = [_]u8{0} ** 32,
+    holdings_seq: u64 = 0,
+    addr: []const u8 = "",
+    holdings_bitmap: []const u8 = &.{},
+
+    pub fn encodeBody(self: *const Announce, gpa: std.mem.Allocator) ![]u8 {
+        var b = std.ArrayList(u8).empty;
+        errdefer b.deinit(gpa);
+        try b.append(gpa, self.proto);
+        try appendU32(gpa, &b, self.committee_id);
+        try b.appendSlice(gpa, &self.manifest_version);
+        try appendU64(gpa, &b, self.holdings_seq);
+        try b.append(gpa, @intCast(@min(self.addr.len, 255)));
+        try b.appendSlice(gpa, self.addr[0..@min(self.addr.len, 255)]);
+        try appendU32(gpa, &b, @intCast(self.holdings_bitmap.len));
+        try b.appendSlice(gpa, self.holdings_bitmap);
+        return b.toOwnedSlice(gpa);
+    }
+
+    /// `body` must outlive the result (addr/bitmap alias it).
+    pub fn parseBody(body: []const u8) !Announce {
+        var c = Cursor{ .buf = body };
+        var a = Announce{};
+        a.proto = try c.u8v();
+        a.committee_id = try c.u32v();
+        @memcpy(&a.manifest_version, try c.need(32));
+        a.holdings_seq = try c.u64v();
+        const alen = try c.u8v();
+        a.addr = try c.need(alen);
+        const blen = try c.u32v();
+        a.holdings_bitmap = try c.need(blen);
+        return a;
+    }
+};
+
+// ---- ExpertRequest (0x10) / ExpertResponse (0x11) ------------------------------
+
+pub const ExpertRequest = struct {
+    proto: u8 = PROTO,
+    request_id: u64,
+    manifest_version: [32]u8,
+    shard_id: u32,
+
+    pub fn encodeBody(self: *const ExpertRequest, gpa: std.mem.Allocator) ![]u8 {
+        var b = std.ArrayList(u8).empty;
+        errdefer b.deinit(gpa);
+        try b.append(gpa, self.proto);
+        try appendU64(gpa, &b, self.request_id);
+        try b.appendSlice(gpa, &self.manifest_version);
+        try appendU32(gpa, &b, self.shard_id);
+        return b.toOwnedSlice(gpa);
+    }
+
+    pub fn parseBody(body: []const u8) !ExpertRequest {
+        var c = Cursor{ .buf = body };
+        var r = ExpertRequest{ .request_id = 0, .manifest_version = undefined, .shard_id = 0 };
+        r.proto = try c.u8v();
+        r.request_id = try c.u64v();
+        @memcpy(&r.manifest_version, try c.need(32));
+        r.shard_id = try c.u32v();
+        return r;
+    }
+};
+
+pub const ExpertResponse = struct {
+    request_id: u64,
+    status: Status,
+    shard_id: u32,
+    payload: []const u8 = &.{},
+
+    pub fn encodeBody(self: *const ExpertResponse, gpa: std.mem.Allocator) ![]u8 {
+        var b = std.ArrayList(u8).empty;
+        errdefer b.deinit(gpa);
+        try appendU64(gpa, &b, self.request_id);
+        try b.append(gpa, @intFromEnum(self.status));
+        try appendU32(gpa, &b, self.shard_id);
+        try appendU32(gpa, &b, @intCast(self.payload.len));
+        try b.appendSlice(gpa, self.payload);
+        return b.toOwnedSlice(gpa);
+    }
+
+    /// `body` must outlive the result (payload aliases it).
+    pub fn parseBody(body: []const u8) !ExpertResponse {
+        var c = Cursor{ .buf = body };
+        var r = ExpertResponse{ .request_id = 0, .status = .bad_request, .shard_id = 0 };
+        r.request_id = try c.u64v();
+        r.status = @enumFromInt(try c.u8v());
+        r.shard_id = try c.u32v();
+        const plen = try c.u32v();
+        r.payload = try c.need(plen);
+        return r;
+    }
+};
+
+// ---- stream transport ("FRAME <len>\n" + bytes over the line protocol) --------
+
+pub const Io = std.Io;
+
+pub fn writeFrame(wi: *Io.Writer, frame: []const u8) !void {
+    try wi.print("FRAME {d}\n", .{frame.len});
+    try wi.writeAll(frame);
+    try wi.flush();
+}
+
+/// Reads a `FRAME <len>` header line + body. Caller owns the result.
+pub fn readFrameAlloc(gpa: std.mem.Allocator, ri: *Io.Reader) ![]u8 {
+    const line = std.mem.trimEnd(u8, try ri.takeDelimiterInclusive('\n'), "\r\n");
+    if (!std.mem.startsWith(u8, line, "FRAME ")) return error.NotAFrame;
+    const len = try std.fmt.parseInt(usize, line[6..], 10);
+    if (len < HEADER_LEN or len > 512 * 1024 * 1024) return error.BadFrameLength;
+    const buf = try gpa.alloc(u8, len);
+    errdefer gpa.free(buf);
+    try ri.readSliceAll(buf);
+    return buf;
+}
+
+// ---- tests --------------------------------------------------------------------
+
+test "heartbeat frame roundtrip" {
+    const gpa = std.testing.allocator;
+    const hb = Heartbeat{
+        .committee_id = 3,
+        .manifest_version = [_]u8{0xAB} ** 32,
+        .holdings_seq = 42,
+        .holdings_digest = [_]u8{0xCD} ** 32,
+        .load = 7,
+        .sent_at_ns = 123456789,
+        .addr = "127.0.0.1:8771",
+    };
+    const body = try hb.encodeBody(gpa);
+    defer gpa.free(body);
+    const frame = try encodeFrame(gpa, .heartbeat, body);
+    defer gpa.free(frame);
+
+    const dec = try decodeFrame(gpa, frame);
+    defer gpa.free(dec.body);
+    try std.testing.expect(dec.ty == .heartbeat);
+    const back = try Heartbeat.parseBody(dec.body);
+    try std.testing.expect(back.committee_id == 3);
+    try std.testing.expect(back.holdings_seq == 42);
+    try std.testing.expect(back.load == 7);
+    try std.testing.expectEqualStrings("127.0.0.1:8771", back.addr);
+}
+
+test "announce with compressible bitmap gets snappy flag" {
+    const gpa = std.testing.allocator;
+    var bitmap = [_]u8{0} ** 2400; // GLM-scale sparse bitmap: compresses hard
+    bitmap[3] = 0xFF;
+    const ann = Announce{
+        .committee_id = 0,
+        .holdings_seq = 9,
+        .addr = "10.0.0.2:8771",
+        .holdings_bitmap = &bitmap,
+    };
+    const body = try ann.encodeBody(gpa);
+    defer gpa.free(body);
+    const frame = try encodeFrame(gpa, .announce, body);
+    defer gpa.free(frame);
+    try std.testing.expect(frame[3] & FLAG_SNAPPY != 0); // compressed
+    try std.testing.expect(frame.len < body.len / 4); // and much smaller
+
+    const dec = try decodeFrame(gpa, frame);
+    defer gpa.free(dec.body);
+    const back = try Announce.parseBody(dec.body);
+    try std.testing.expect(back.holdings_bitmap.len == 2400);
+    try std.testing.expect(back.holdings_bitmap[3] == 0xFF);
+    try std.testing.expect(back.holdings_seq == 9);
+}
+
+test "expert request/response roundtrip; incompressible payload stays raw" {
+    const gpa = std.testing.allocator;
+    const req = ExpertRequest{ .request_id = 77, .manifest_version = [_]u8{1} ** 32, .shard_id = 1729 };
+    const rbody = try req.encodeBody(gpa);
+    defer gpa.free(rbody);
+    const rframe = try encodeFrame(gpa, .expert_request, rbody);
+    defer gpa.free(rframe);
+    const rdec = try decodeFrame(gpa, rframe);
+    defer gpa.free(rdec.body);
+    const rback = try ExpertRequest.parseBody(rdec.body);
+    try std.testing.expect(rback.request_id == 77 and rback.shard_id == 1729);
+
+    // pseudo-random (quantized-weight-like) payload: snappy should NOT win
+    var prng = std.Random.DefaultPrng.init(5);
+    var payload: [4096]u8 = undefined;
+    prng.random().bytes(&payload);
+    const resp = ExpertResponse{ .request_id = 77, .status = .ok, .shard_id = 1729, .payload = &payload };
+    const body = try resp.encodeBody(gpa);
+    defer gpa.free(body);
+    const frame = try encodeFrame(gpa, .expert_response, body);
+    defer gpa.free(frame);
+    try std.testing.expect(frame[3] & FLAG_SNAPPY == 0); // raw: compression didn't pay
+
+    const dec = try decodeFrame(gpa, frame);
+    defer gpa.free(dec.body);
+    const back = try ExpertResponse.parseBody(dec.body);
+    try std.testing.expect(back.status == .ok);
+    try std.testing.expectEqualSlices(u8, &payload, back.payload);
+}
+
+test "corrupt frames are rejected" {
+    const gpa = std.testing.allocator;
+    try std.testing.expectError(error.ShortFrame, decodeFrame(gpa, "LM"));
+    var bad = [_]u8{ 'X', 'Y', 1, 0, 0, 0, 0, 0 };
+    try std.testing.expectError(error.BadMagic, decodeFrame(gpa, &bad));
+    var mism = [_]u8{ 'L', 'M', 1, 0, 9, 0, 0, 0 }; // claims 9 body bytes, has 0
+    try std.testing.expectError(error.LengthMismatch, decodeFrame(gpa, &mism));
+}

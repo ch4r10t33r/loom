@@ -3,7 +3,12 @@
     .version = "0.0.0",
     .fingerprint = 0xc2597137d5644db8,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .zig_snappy = .{
+            .url = "git+https://github.com/blockblaz/zig-snappy?ref=v0.0.5#050f529bc5fa11242140312ecf550c186f05af1e",
+            .hash = "zig_snappy-0.0.5-bDFzXlh4AADPRkDi2swDMAf8shH39Fc1g5oYRAhFQfTt",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

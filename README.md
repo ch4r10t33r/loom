@@ -136,6 +136,7 @@ for the connection so far. Errors come back as `{"ok":false,"error":"..."}`.
 | `GETR <i>` | `DATA <i> len=<l> sha256=<hex>` + raw bytes \| `ERR not_held` | fetch one range |
 | `JOIN addr=.. fraction=..` | `COMMITTEE id=.. members=.. assign=<hex>` | bootnode: committee + assigned want-set |
 | `COMMITTEES` | per-committee coverage summary | bootnode debug |
+| `FRAME <len>` + frame | `FRAME <len>` + frame | binary wire messages v1 (SPEC.md): heartbeat (committee state: version, holdings seq/digest, load), expert request/response (status: ok/not_held/version_mismatch/busy), adaptive snappy |
 | `GOSSIP addr=.. version=.. holdings=..` | `PEERS <n>` + n × `addr=.. version=.. holdings=..` | announce yourself, receive the responder's entry + peer table |
 | `TABLE` | same as `GOSSIP` response | inspect the peer table without announcing |
 

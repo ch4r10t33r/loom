@@ -39,6 +39,7 @@ pub const deepseek = @import("deepseek.zig");
 pub const expert_fetch = @import("expert_fetch.zig");
 pub const bpe = @import("bpe.zig");
 pub const bootnode = @import("bootnode.zig");
+pub const wire = @import("wire.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MB: usize = 1024 * 1024;

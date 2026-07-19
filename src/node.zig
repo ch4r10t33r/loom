@@ -16,6 +16,7 @@ const hashmod = @import("hash.zig");
 const peers = @import("peers.zig");
 const gossip = @import("gossip.zig");
 const bootnode = @import("bootnode.zig");
+const wire = @import("wire.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MBf: f64 = 1024.0 * 1024.0;
@@ -52,20 +53,37 @@ const HeartbeatCtx = struct {
     io: Io,
     members: [][]u8, // owned addr strings
     alive: []bool,
+    last_seq: []u64,
+    p2p_ctx: *p2p.Ctx, // our own state rides the heartbeat (SPEC.md container)
 
-    fn pingOnce(io: Io, addr_str: []const u8) bool {
-        const addr = sync.PeerAddr.parse(addr_str) catch return false;
-        const ip = std.Io.net.IpAddress.parse(addr.host, addr.port) catch return false;
-        const stream = ip.connect(io, .{ .mode = .stream }) catch return false;
+    /// One wire-frame heartbeat exchange. Returns the peer's heartbeat.
+    fn exchange(self: *HeartbeatCtx, addr_str: []const u8) ?wire.Heartbeat {
+        const gpa = self.gpa;
+        const io = self.io;
+        const addr = sync.PeerAddr.parse(addr_str) catch return null;
+        const ip = std.Io.net.IpAddress.parse(addr.host, addr.port) catch return null;
+        const stream = ip.connect(io, .{ .mode = .stream }) catch return null;
         defer stream.close(io);
-        var rbuf: [256]u8 = undefined;
-        var wbuf: [64]u8 = undefined;
+        var rbuf: [4096]u8 = undefined;
+        var wbuf: [1024]u8 = undefined;
         var r = stream.reader(io, &rbuf);
         var w = stream.writer(io, &wbuf);
-        w.interface.print("PING\n", .{}) catch return false;
-        w.interface.flush() catch return false;
-        const line = r.interface.takeDelimiterInclusive('\n') catch return false;
-        return std.mem.startsWith(u8, line, "PONG");
+
+        const hb = p2p.selfHeartbeat(self.p2p_ctx);
+        const body = hb.encodeBody(gpa) catch return null;
+        defer gpa.free(body);
+        const frame = wire.encodeFrame(gpa, .heartbeat, body) catch return null;
+        defer gpa.free(frame);
+        wire.writeFrame(&w.interface, frame) catch return null;
+
+        const resp_raw = wire.readFrameAlloc(gpa, &r.interface) catch return null;
+        defer gpa.free(resp_raw);
+        const dec = wire.decodeFrame(gpa, resp_raw) catch return null;
+        defer gpa.free(dec.body);
+        if (dec.ty != .heartbeat_resp) return null;
+        var out = wire.Heartbeat.parseBody(dec.body) catch return null;
+        out.addr = ""; // aliases freed body; not needed by callers
+        return out;
     }
 };
 
@@ -73,10 +91,19 @@ fn heartbeatThread(ctx: *HeartbeatCtx) void {
     while (true) {
         Io.sleep(ctx.io, .{ .nanoseconds = HEARTBEAT_INTERVAL_NS }, .awake) catch return;
         for (ctx.members, 0..) |m, i| {
-            const ok = HeartbeatCtx.pingOnce(ctx.io, m);
+            const resp = ctx.exchange(m);
+            const ok = resp != null;
             if (ok != ctx.alive[i]) {
                 std.debug.print("heartbeat: committee member {s} {s}\n", .{ m, if (ok) "alive" else "DEAD" });
                 ctx.alive[i] = ok;
+            }
+            if (resp) |hb| {
+                if (hb.holdings_seq != ctx.last_seq[i]) {
+                    std.debug.print("heartbeat: {s} holdings_seq {d} -> {d} (load {d})\n", .{
+                        m, ctx.last_seq[i], hb.holdings_seq, hb.load,
+                    });
+                    ctx.last_seq[i] = hb.holdings_seq;
+                }
             }
         }
     }
@@ -160,6 +187,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     }
     var registry: ?bootnode.Registry = null;
     defer if (registry) |*r| r.deinit();
+    var joined_committee_id: u32 = wire.NO_COMMITTEE;
 
     // known weight peers = --bootstrap (first) + --peers (comma-separated)
     var peer_list = std.ArrayList(sync.PeerAddr).empty;
@@ -231,6 +259,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         }
 
         if (joined) |*ji| {
+            joined_committee_id = @intCast(ji.committee_id);
             try out.print("joined committee {d} ({d} member(s) already in it)\n", .{ ji.committee_id, ji.members.len });
             // sync preference: committee members first, then the bootnode
             var srcs = std.ArrayList(sync.PeerAddr).empty;
@@ -319,6 +348,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .store = if (store) |*st| st else null,
         .table = &table,
         .boot = if (registry) |*r| r else null,
+        .committee_id = joined_committee_id,
         .advertise = advertise,
     };
     const p2p_handle = try std.Thread.spawn(.{}, p2pThread, .{&p2p_ctx});
@@ -342,7 +372,16 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     if (committee_members.len > 0) {
         const alive = try gpa.alloc(bool, committee_members.len);
         @memset(alive, true);
-        hb_ctx = .{ .gpa = gpa, .io = io, .members = committee_members, .alive = alive };
+        const last_seq = try gpa.alloc(u64, committee_members.len);
+        @memset(last_seq, 0);
+        hb_ctx = .{
+            .gpa = gpa,
+            .io = io,
+            .members = committee_members,
+            .alive = alive,
+            .last_seq = last_seq,
+            .p2p_ctx = &p2p_ctx,
+        };
         const t = try std.Thread.spawn(.{}, heartbeatThread, .{&hb_ctx});
         t.detach();
     }

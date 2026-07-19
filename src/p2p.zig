@@ -41,6 +41,7 @@ const weights = @import("weights.zig");
 const peers = @import("peers.zig");
 const stats = @import("stats.zig");
 const bootnode = @import("bootnode.zig");
+const wire = @import("wire.zig");
 
 pub const Ctx = struct {
     gpa: std.mem.Allocator,
@@ -57,6 +58,10 @@ pub const Ctx = struct {
     table: ?*peers.Table = null,
     /// Committee registry; when set, this node acts as a bootnode (JOIN).
     boot: ?*bootnode.Registry = null,
+    /// This node's committee id (wire.NO_COMMITTEE when not in one).
+    committee_id: u32 = 0xFFFF_FFFF,
+    /// In-flight expert requests being served (the heartbeat load hint).
+    load: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// Our own advertised "host:port" (what we tell peers to dial us on).
     advertise: []const u8 = "",
 };
@@ -126,12 +131,12 @@ fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
     while (true) {
         const raw = ri.takeDelimiterInclusive('\n') catch return;
         const line = std.mem.trimEnd(u8, raw, "\r\n");
-        try handleLine(ctx, line, wi);
+        try handleLine(ctx, line, ri, wi);
         try wi.flush();
     }
 }
 
-fn handleLine(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
+fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer) !void {
     if (line.len == 0) return;
     if (std.mem.eql(u8, line, "PING")) {
         try wi.print("PONG\n", .{});
@@ -193,6 +198,13 @@ fn handleLine(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
         const data = store.readRange(i, buf) catch return wi.print("ERR read\n", .{});
         try wi.print("DATA {d} len={d} sha256={s}\n", .{ i, data.len, hashmod.toHex(store.manifest.digests[i]) });
         try wi.writeAll(data);
+    } else if (std.mem.startsWith(u8, line, "FRAME ")) {
+        const len = std.fmt.parseInt(usize, line[6..], 10) catch return wi.print("ERR bad_frame\n", .{});
+        if (len < wire.HEADER_LEN or len > 512 * 1024 * 1024) return wi.print("ERR bad_frame\n", .{});
+        const raw = try ctx.gpa.alloc(u8, len);
+        defer ctx.gpa.free(raw);
+        try ri.readSliceAll(raw);
+        try handleFrame(ctx, raw, wi);
     } else if (std.mem.startsWith(u8, line, "JOIN ")) {
         const reg = ctx.boot orelse return wi.print("ERR no_bootnode\n", .{});
         const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
@@ -232,6 +244,70 @@ fn handleLine(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
     } else {
         try wi.print("ERR unknown\n", .{});
     }
+}
+
+/// Dispatch a decoded wire frame (SPEC.md wire messages v1).
+fn handleFrame(ctx: *Ctx, raw: []const u8, wi: *Io.Writer) !void {
+    const dec = wire.decodeFrame(ctx.gpa, raw) catch return wi.print("ERR bad_frame\n", .{});
+    defer ctx.gpa.free(dec.body);
+    switch (dec.ty) {
+        .heartbeat => {
+            // respond with our own state: one exchange refreshes both sides
+            const resp = selfHeartbeat(ctx);
+            const body = try resp.encodeBody(ctx.gpa);
+            defer ctx.gpa.free(body);
+            const frame = try wire.encodeFrame(ctx.gpa, .heartbeat_resp, body);
+            defer ctx.gpa.free(frame);
+            try wire.writeFrame(wi, frame);
+        },
+        .expert_request => {
+            const req = wire.ExpertRequest.parseBody(dec.body) catch {
+                return sendExpertResponse(ctx, wi, .{ .request_id = 0, .status = .bad_request, .shard_id = 0 });
+            };
+            const store = ctx.store orelse {
+                return sendExpertResponse(ctx, wi, .{ .request_id = req.request_id, .status = .not_held, .shard_id = req.shard_id });
+            };
+            if (!std.mem.eql(u8, &req.manifest_version, &store.manifest.version)) {
+                return sendExpertResponse(ctx, wi, .{ .request_id = req.request_id, .status = .version_mismatch, .shard_id = req.shard_id });
+            }
+            if (req.shard_id >= store.manifest.nRanges() or !store.holdings.has(req.shard_id)) {
+                return sendExpertResponse(ctx, wi, .{ .request_id = req.request_id, .status = .not_held, .shard_id = req.shard_id });
+            }
+            _ = ctx.load.fetchAdd(1, .monotonic);
+            defer _ = ctx.load.fetchSub(1, .monotonic);
+            const buf = try ctx.gpa.alloc(u8, @intCast(store.manifest.rangeLen(req.shard_id)));
+            defer ctx.gpa.free(buf);
+            const data = store.readRange(req.shard_id, buf) catch {
+                return sendExpertResponse(ctx, wi, .{ .request_id = req.request_id, .status = .not_held, .shard_id = req.shard_id });
+            };
+            try sendExpertResponse(ctx, wi, .{ .request_id = req.request_id, .status = .ok, .shard_id = req.shard_id, .payload = data });
+        },
+        else => try wi.print("ERR unexpected_frame\n", .{}),
+    }
+}
+
+/// Our own heartbeat/announce state snapshot.
+pub fn selfHeartbeat(ctx: *Ctx) wire.Heartbeat {
+    var hb = wire.Heartbeat{
+        .committee_id = ctx.committee_id,
+        .load = @intCast(@min(ctx.load.load(.monotonic), std.math.maxInt(u16))),
+        .sent_at_ns = @intCast(@mod(stats.nowNs(ctx.io), std.math.maxInt(i64))),
+        .addr = ctx.advertise,
+    };
+    if (ctx.store) |st| {
+        hb.manifest_version = st.manifest.version;
+        hb.holdings_seq = @intCast(st.holdings.count()); // holdings only grow: count is monotonic
+        hb.holdings_digest = hashmod.hashBlock(st.holdings.bits);
+    }
+    return hb;
+}
+
+fn sendExpertResponse(ctx: *Ctx, wi: *Io.Writer, resp: wire.ExpertResponse) !void {
+    const body = try resp.encodeBody(ctx.gpa);
+    defer ctx.gpa.free(body);
+    const frame = try wire.encodeFrame(ctx.gpa, .expert_response, body);
+    defer ctx.gpa.free(frame);
+    try wire.writeFrame(wi, frame);
 }
 
 fn fieldOf(line: []const u8, key: []const u8) ?[]const u8 {
