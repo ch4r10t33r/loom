@@ -13,6 +13,13 @@
 ## v1 — distributed weight sharing (requirements of record)
 
 These supersede the original CLAUDE.md v1 sketch where they conflict.
+The p2p layer's committee spec lives in [SPEC.md](SPEC.md) — **✅ first cut
+implemented** (`bootnode.zig` registry, JOIN protocol, assigned want-sets,
+committee-first sync, 5 s heartbeats with death detection, committee-then-mesh
+fetch order). Verified live: B+C formed a complete committee with
+complementary assignments; D saturated it to R=2; E opened committee 1;
+C detected B's death via heartbeat; a fetch with a dead committee peer fell
+through to the mesh and completed inference.
 
 1. **Local-first model resolution.** If a model is already present in local data
    storage, load it from there; only download from remote otherwise.

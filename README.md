@@ -87,6 +87,17 @@ Env overrides (flags win): `MODEL`, `RAM_BUDGET_GB`, `PIN_GB`, `SEED`, `STATS`.
 | `--peers H:P,H:P,...` | none | Additional known peers (seed the gossip table; used by bootstrap and repair). |
 | `--hold-fraction F` | `1.0` | Fraction of ranges this node wants to hold, chosen randomly (seeded by `--seed`, so a restart re-picks the same set). Independent random subsets across nodes overlap → emergent redundancy. |
 | `--range-mb M` | `4.0` | Range size when *building* a fresh manifest (origin only; bootstrappers adopt the peer's value). |
+| `--r-target N` | `2` | Committee redundancy target when acting as bootnode (expert-sharded origin). |
+
+**Committees (SPEC.md).** An expert-sharded origin automatically acts as the
+**bootnode**: `JOIN` assigns each connecting node to a **shard committee** and
+a least-covered-first want-set, so every committee converges to holding the
+complete shard set with redundancy `--r-target` (default 2) by construction.
+Joiners sync from committee members first, then the bootnode; committee
+members heartbeat each other every 5 s and log liveness transitions. When all
+committees are saturated, the next joiner opens a new one. See
+[SPEC.md](SPEC.md) for the full p2p-layer spec (roles, invariants, query
+path, wire protocol).
 
 Two loops run alongside the servers:
 
@@ -123,6 +134,8 @@ for the connection so far. Errors come back as `{"ok":false,"error":"..."}`.
 | `DIGEST <i>` / `DIGESTS` | one / all range digests | verification data |
 | `HOLDINGS` | `HOLDINGS <hex bitmap>` | which ranges this node holds (bit i = range i) — the compact summary destined for ENR metadata |
 | `GETR <i>` | `DATA <i> len=<l> sha256=<hex>` + raw bytes \| `ERR not_held` | fetch one range |
+| `JOIN addr=.. fraction=..` | `COMMITTEE id=.. members=.. assign=<hex>` | bootnode: committee + assigned want-set |
+| `COMMITTEES` | per-committee coverage summary | bootnode debug |
 | `GOSSIP addr=.. version=.. holdings=..` | `PEERS <n>` + n × `addr=.. version=.. holdings=..` | announce yourself, receive the responder's entry + peer table |
 | `TABLE` | same as `GOSSIP` response | inspect the peer table without announcing |
 

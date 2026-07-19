@@ -159,6 +159,92 @@ fn adoptManifest(gpa: std.mem.Allocator, peer: *Peer) !weights.Manifest {
     return weights.parseManifestBytes(gpa, bytes);
 }
 
+pub const JoinInfo = struct {
+    committee_id: usize,
+    members: [][]u8, // owned addr strings
+    manifest: weights.Manifest, // owned
+    wanted: weights.Holdings, // owned
+
+    pub fn deinit(self: *JoinInfo, gpa: std.mem.Allocator) void {
+        for (self.members) |m| gpa.free(m);
+        gpa.free(self.members);
+        self.manifest.deinit(gpa);
+        self.wanted.deinit(gpa);
+    }
+};
+
+/// SPEC.md join flow: adopt the manifest from the bootnode, then JOIN — the
+/// bootnode assigns a committee, member list, and a least-covered-first
+/// want-set. Errors with PeerNotBootnode if the peer doesn't run a registry.
+pub fn joinSwarm(gpa: std.mem.Allocator, io: Io, addr: PeerAddr, self_addr: []const u8, fraction: f32) !JoinInfo {
+    const peer = try Peer.connect(gpa, io, addr);
+    defer peer.close(gpa);
+
+    var manifest = try adoptManifest(gpa, peer);
+    errdefer manifest.deinit(gpa);
+
+    try peer.send("JOIN addr={s} fraction={d}\n", .{ self_addr, fraction });
+    const line = try peer.recvLine();
+    if (std.mem.startsWith(u8, line, "ERR no_bootnode")) return error.PeerNotBootnode;
+    if (!std.mem.startsWith(u8, line, "COMMITTEE ")) return error.BadJoinResponse;
+    const id = try std.fmt.parseInt(usize, field(line, "id") orelse return error.BadJoinResponse, 10);
+    const members_csv = field(line, "members") orelse "";
+    const assign_hex = field(line, "assign") orelse return error.BadJoinResponse;
+
+    var wanted = try weights.Holdings.fromHex(gpa, assign_hex, manifest.nRanges());
+    errdefer wanted.deinit(gpa);
+
+    var members = std.ArrayList([]u8).empty;
+    errdefer {
+        for (members.items) |m| gpa.free(m);
+        members.deinit(gpa);
+    }
+    var it = std.mem.splitScalar(u8, members_csv, ',');
+    while (it.next()) |tok| {
+        if (tok.len == 0) continue;
+        try members.append(gpa, try gpa.dupe(u8, tok));
+    }
+
+    return .{
+        .committee_id = id,
+        .members = try members.toOwnedSlice(gpa),
+        .manifest = manifest,
+        .wanted = wanted,
+    };
+}
+
+/// Create a store from an adopted manifest + want-set and fill it from
+/// `peers` in order. Takes ownership of `manifest` and `wanted`.
+pub fn bootstrapWithWanted(
+    gpa: std.mem.Allocator,
+    io: Io,
+    peers: []const PeerAddr,
+    store_dir: []const u8,
+    manifest: weights.Manifest,
+    wanted_bits: weights.Holdings,
+    progress: ?*Io.Writer,
+) !Result {
+    const wanted = wanted_bits.count();
+    var store = try weights.createFromManifest(gpa, io, store_dir, manifest, wanted_bits);
+    errdefer store.deinit();
+
+    var stats = FetchStats{};
+    for (peers) |addr| {
+        if (store.missingCount() == 0) break;
+        const s = fetchFromPeer(gpa, io, &store, addr) catch continue;
+        stats.fetched += s.fetched;
+        stats.bytes += s.bytes;
+        if (progress) |pw| {
+            try pw.print("  synced {d}/{d} ranges ({d:.1} MB) after {s}:{d}\n", .{
+                stats.fetched, wanted, @as(f64, @floatFromInt(stats.bytes)) / (1024.0 * 1024.0), addr.host, addr.port,
+            });
+            try pw.flush();
+        }
+    }
+    try store.saveSidecars();
+    return .{ .store = store, .wanted = wanted, .fetched = stats.fetched, .bytes = stats.bytes };
+}
+
 /// Bootstrap a local weight store from `peers`: adopt the manifest from the
 /// first responsive peer, pick a random `fraction` of ranges to hold (seeded so
 /// a restarted node re-picks the same set), then fetch from every peer in turn
@@ -182,33 +268,14 @@ pub fn bootstrap(
         break;
     }
     var m = manifest orelse return error.NoResponsivePeer;
-    var manifest_owned = true; // ownership moves into the store below
+    var manifest_owned = true; // ownership moves below
     errdefer if (manifest_owned) m.deinit(gpa);
 
     var wanted_bits = try weights.Holdings.initWanted(gpa, m.nRanges(), m.n_resident, fraction, seed);
-    var wanted_owned = true; // ownership moves into the store below
+    var wanted_owned = true;
     errdefer if (wanted_owned) wanted_bits.deinit(gpa);
-    const wanted = wanted_bits.count();
 
-    var store = try weights.createFromManifest(gpa, io, store_dir, m, wanted_bits);
     manifest_owned = false;
     wanted_owned = false;
-    errdefer store.deinit();
-
-    var stats = FetchStats{};
-    for (peers) |addr| {
-        if (store.missingCount() == 0) break;
-        const s = fetchFromPeer(gpa, io, &store, addr) catch continue;
-        stats.fetched += s.fetched;
-        stats.bytes += s.bytes;
-        if (progress) |pw| {
-            try pw.print("  synced {d}/{d} ranges ({d:.1} MB) after {s}:{d}\n", .{
-                stats.fetched, wanted, @as(f64, @floatFromInt(stats.bytes)) / (1024.0 * 1024.0), addr.host, addr.port,
-            });
-            try pw.flush();
-        }
-    }
-    try store.saveSidecars();
-
-    return .{ .store = store, .wanted = wanted, .fetched = stats.fetched, .bytes = stats.bytes };
+    return bootstrapWithWanted(gpa, io, peers, store_dir, m, wanted_bits, progress);
 }

@@ -38,6 +38,7 @@ pub const llama = @import("llama.zig");
 pub const deepseek = @import("deepseek.zig");
 pub const expert_fetch = @import("expert_fetch.zig");
 pub const bpe = @import("bpe.zig");
+pub const bootnode = @import("bootnode.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MB: usize = 1024 * 1024;
@@ -88,12 +89,12 @@ fn usage(out: *Io.Writer) !void {
         \\            [--seed S] [--stats FILE] [--no-verify]
         \\            [--gguf FILE | --bootstrap HOST:PORT]
         \\            [--peers H:P,H:P,...] [--hold-fraction F] [--range-mb M]
-        \\            [--advertise HOST:PORT]
+        \\            [--advertise HOST:PORT] [--r-target N]
         \\  loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2]
         \\  loom gguf info <file> [--range-mb M]
         \\  loom gguf shard <file>
         \\  loom gguf run <file.gguf | store-dir> [--prompt STR] [--max-tokens N] [--temp T]
-        \\                [--seed S] [--ctx N] [--peers H:P,...]   (store-dir: distributed run)
+        \\                [--seed S] [--ctx N] [--committee H:P,...] [--peers H:P,...]
         \\  loom gen <dir> [--glm] [--seed N]
         \\  loom info <dir>
         \\  loom iobench <file> [--threads N] [--block-mb M] [--reads R]
@@ -345,6 +346,7 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .bootstrap = bootstrap,
         .peers = flagStr(args, "--peers"),
         .advertise = flagStr(args, "--advertise"),
+        .r_target = @intCast(try flagU64(args, "--r-target", 2)),
         .hold_fraction = @floatCast(std.math.clamp(hold_fraction, 0.0, 1.0)),
         .range_bytes = @intFromFloat(range_mb * @as(f64, MB)),
     });
@@ -517,8 +519,20 @@ fn runDeepseekStore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, dir: []cons
             try peer_list.append(gpa, a);
         }
     }
+    var committee_list = std.ArrayList(sync.PeerAddr).empty;
+    defer committee_list.deinit(gpa);
+    if (flagStr(args, "--committee")) |csv| {
+        var it = std.mem.splitScalar(u8, csv, ',');
+        while (it.next()) |tok| {
+            const t = std.mem.trim(u8, tok, " ");
+            if (t.len == 0) continue;
+            const a = sync.PeerAddr.parse(t) catch return out.print("bad --committee entry: {s}\n", .{t});
+            try committee_list.append(gpa, a);
+        }
+    }
 
     var src = try expert_fetch.Source.init(gpa, io, &store, peer_list.items);
+    src.committee = committee_list.items;
     defer src.deinit();
 
     const mpath = try std.fmt.allocPrint(gpa, "{s}/model.gguf", .{dir});

@@ -38,6 +38,9 @@ pub const Source = struct {
     gpa: std.mem.Allocator,
     io: Io,
     store: *weights.Store,
+    /// SPEC.md query path: committee members are the allotted first-choice
+    /// holders; `peers` is the mesh fallback (gossip-discovered or static).
+    committee: []const sync.PeerAddr = &.{},
     peers: []const sync.PeerAddr,
     /// reusable buffer for single-threaded get(); prefetch threads allocate
     scratch: []u8,
@@ -118,9 +121,14 @@ pub const Source = struct {
             break :blk s;
         };
 
+        // SPEC.md order: committee first (round-robin spread), then the mesh
+        const total = self.committee.len + self.peers.len;
         var attempt: usize = 0;
-        while (attempt < self.peers.len) : (attempt += 1) {
-            const addr = self.peers[(start + attempt) % self.peers.len];
+        while (attempt < total) : (attempt += 1) {
+            const addr = if (attempt < self.committee.len)
+                self.committee[(start + attempt) % self.committee.len]
+            else
+                self.peers[(attempt - self.committee.len)];
             const n = self.fetchFromPeer(addr, id, buf[0..want_len]) catch {
                 self.bumpFailure();
                 continue;

@@ -20,6 +20,10 @@
 //!   HOLDINGS      -> HOLDINGS <hex bitmap>      (bit i = holds range i; the
 //!                    same compact summary destined for ENR metadata + gossip)
 //!   GETR <i>      -> DATA <i> len=<l> sha256=<hex>\n<raw bytes> | ERR not_held
+//!   -- bootnode (when a committee registry is attached; SPEC.md) --
+//!   JOIN addr=<h:p> fraction=<f>
+//!                 -> COMMITTEE id=<n> members=<a,b,...> assign=<hex bitmap>
+//!   COMMITTEES    -> COMMITTEES <n>\n then n summary lines (debug)
 //!   -- gossip / peer exchange --
 //!   GOSSIP addr=<h:p> version=<hex> holdings=<hex>
 //!                 -> PEERS <n>\n then n lines "addr=.. version=.. holdings=.."
@@ -36,6 +40,7 @@ const hashmod = @import("hash.zig");
 const weights = @import("weights.zig");
 const peers = @import("peers.zig");
 const stats = @import("stats.zig");
+const bootnode = @import("bootnode.zig");
 
 pub const Ctx = struct {
     gpa: std.mem.Allocator,
@@ -50,6 +55,8 @@ pub const Ctx = struct {
     store: ?*weights.Store = null,
     /// Dynamic peer table for gossip; when set, GOSSIP/TABLE are served.
     table: ?*peers.Table = null,
+    /// Committee registry; when set, this node acts as a bootnode (JOIN).
+    boot: ?*bootnode.Registry = null,
     /// Our own advertised "host:port" (what we tell peers to dial us on).
     advertise: []const u8 = "",
 };
@@ -186,6 +193,31 @@ fn handleLine(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
         const data = store.readRange(i, buf) catch return wi.print("ERR read\n", .{});
         try wi.print("DATA {d} len={d} sha256={s}\n", .{ i, data.len, hashmod.toHex(store.manifest.digests[i]) });
         try wi.writeAll(data);
+    } else if (std.mem.startsWith(u8, line, "JOIN ")) {
+        const reg = ctx.boot orelse return wi.print("ERR no_bootnode\n", .{});
+        const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
+        const addr = fieldOf(line, "addr") orelse return wi.print("ERR bad_join\n", .{});
+        const frac_s = fieldOf(line, "fraction") orelse return wi.print("ERR bad_join\n", .{});
+        const frac = std.fmt.parseFloat(f32, frac_s) catch return wi.print("ERR bad_join\n", .{});
+        const n_experts = store.manifest.nRanges() - store.manifest.n_resident;
+        const capacity: usize = @intFromFloat(@max(1.0, @round(std.math.clamp(frac, 0.0, 1.0) * @as(f32, @floatFromInt(n_experts)))));
+        var out = reg.join(addr, capacity) catch return wi.print("ERR join_failed\n", .{});
+        defer out.deinit(ctx.gpa);
+        const hex = try out.assign.toHex(ctx.gpa);
+        defer ctx.gpa.free(hex);
+        try wi.print("COMMITTEE id={d} members=", .{out.committee_id});
+        for (out.members, 0..) |m, k| {
+            if (k != 0) try wi.print(",", .{});
+            try wi.print("{s}", .{m});
+        }
+        try wi.print(" assign={s}\n", .{hex});
+    } else if (std.mem.eql(u8, line, "COMMITTEES")) {
+        const reg = ctx.boot orelse return wi.print("ERR no_bootnode\n", .{});
+        var body = std.ArrayList(u8).empty;
+        defer body.deinit(ctx.gpa);
+        const n = try reg.summary(ctx.gpa, &body);
+        try wi.print("COMMITTEES {d}\n", .{n});
+        try wi.writeAll(body.items);
     } else if (std.mem.startsWith(u8, line, "GOSSIP ")) {
         const table = ctx.table orelse return wi.print("ERR no_gossip\n", .{});
         const addr = fieldOf(line, "addr") orelse return wi.print("ERR bad_gossip\n", .{});

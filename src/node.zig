@@ -15,6 +15,7 @@ const sync = @import("sync.zig");
 const hashmod = @import("hash.zig");
 const peers = @import("peers.zig");
 const gossip = @import("gossip.zig");
+const bootnode = @import("bootnode.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MBf: f64 = 1024.0 * 1024.0;
@@ -38,7 +39,48 @@ pub const Options = struct {
     hold_fraction: f32, // fraction of ranges to hold when bootstrapping
     range_bytes: u64, // range size when building a fresh manifest
     advertise: ?[]const u8, // our dialable "host:port" (default 127.0.0.1:<p2p_port>)
+    r_target: u16, // committee redundancy target when acting as bootnode
 };
+
+/// Committee heartbeat (SPEC.md): PING each committee member on a fixed
+/// interval, track liveness, log transitions. A member that stops answering
+/// is marked dead locally; its shards become repair candidates.
+const HEARTBEAT_INTERVAL_NS: i96 = 5 * std.time.ns_per_s;
+
+const HeartbeatCtx = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    members: [][]u8, // owned addr strings
+    alive: []bool,
+
+    fn pingOnce(io: Io, addr_str: []const u8) bool {
+        const addr = sync.PeerAddr.parse(addr_str) catch return false;
+        const ip = std.Io.net.IpAddress.parse(addr.host, addr.port) catch return false;
+        const stream = ip.connect(io, .{ .mode = .stream }) catch return false;
+        defer stream.close(io);
+        var rbuf: [256]u8 = undefined;
+        var wbuf: [64]u8 = undefined;
+        var r = stream.reader(io, &rbuf);
+        var w = stream.writer(io, &wbuf);
+        w.interface.print("PING\n", .{}) catch return false;
+        w.interface.flush() catch return false;
+        const line = r.interface.takeDelimiterInclusive('\n') catch return false;
+        return std.mem.startsWith(u8, line, "PONG");
+    }
+};
+
+fn heartbeatThread(ctx: *HeartbeatCtx) void {
+    while (true) {
+        Io.sleep(ctx.io, .{ .nanoseconds = HEARTBEAT_INTERVAL_NS }, .awake) catch return;
+        for (ctx.members, 0..) |m, i| {
+            const ok = HeartbeatCtx.pingOnce(ctx.io, m);
+            if (ok != ctx.alive[i]) {
+                std.debug.print("heartbeat: committee member {s} {s}\n", .{ m, if (ok) "alive" else "DEAD" });
+                ctx.alive[i] = ok;
+            }
+        }
+    }
+}
 
 /// Churn-repair policy (ROADMAP #6, decided: maximally eager): whenever the
 /// wanted range set is unsatisfied, retry every known peer on a short interval —
@@ -111,6 +153,13 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     // ---- GGUF weight-distribution store (optional) ----
     var store: ?weights.Store = null;
     defer if (store) |*st| st.deinit();
+    var committee_members: [][]u8 = &.{};
+    defer {
+        for (committee_members) |m| gpa.free(m);
+        if (committee_members.len > 0) gpa.free(committee_members);
+    }
+    var registry: ?bootnode.Registry = null;
+    defer if (registry) |*r| r.deinit();
 
     // known weight peers = --bootstrap (first) + --peers (comma-separated)
     var peer_list = std.ArrayList(sync.PeerAddr).empty;
@@ -157,21 +206,70 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             try out.print("gguf store failed ({s}): {s}\n", .{ gp, @errorName(e) });
             return;
         };
+        // an expert-sharded origin acts as the bootnode (SPEC.md)
+        if (store.?.manifest.mode == .expert) {
+            registry = bootnode.Registry.init(
+                gpa,
+                io,
+                store.?.manifest.nRanges(),
+                store.?.manifest.n_resident,
+                opts.r_target,
+            );
+        }
     } else if (peer_list.items.len > 0) {
         const store_dir = try std.fmt.allocPrint(gpa, "{s}/gguf-synced", .{opts.cache_root});
         defer gpa.free(store_dir);
-        try out.print("bootstrapping weight ranges from {d} peer(s) (hold-fraction {d:.2})...\n", .{ peer_list.items.len, opts.hold_fraction });
-        try out.flush();
-        const res = sync.bootstrap(gpa, io, peer_list.items, store_dir, opts.hold_fraction, opts.seed, out) catch |e| {
-            try out.print("bootstrap failed: {s}\n", .{@errorName(e)});
-            return;
-        };
-        store = res.store;
-        try out.print("  synced {d}/{d} wanted ranges, {d:.1} MB, verified against manifest root\n", .{
-            res.fetched, res.wanted, @as(f64, @floatFromInt(res.bytes)) / MBf,
-        });
-        if (res.fetched < res.wanted) {
-            try out.print("  {d} ranges still missing — eager repair will keep chasing peers\n", .{res.wanted - res.fetched});
+
+        // SPEC.md join flow: ask the bootnode for a committee + assigned
+        // want-set. Falls back to random hold-fraction if the peer is not a
+        // bootnode (legacy swarms, fixed-mode manifests).
+        var joined: ?sync.JoinInfo = null;
+        if (sync.joinSwarm(gpa, io, peer_list.items[0], advertise, opts.hold_fraction)) |ji| {
+            joined = ji;
+        } else |e| {
+            try out.print("join declined ({s}); using random hold-fraction\n", .{@errorName(e)});
+        }
+
+        if (joined) |*ji| {
+            try out.print("joined committee {d} ({d} member(s) already in it)\n", .{ ji.committee_id, ji.members.len });
+            // sync preference: committee members first, then the bootnode
+            var srcs = std.ArrayList(sync.PeerAddr).empty;
+            defer srcs.deinit(gpa);
+            for (ji.members) |m| {
+                if (sync.PeerAddr.parse(m)) |a| {
+                    try srcs.append(gpa, a);
+                    _ = table.merge(m, "0" ** 64, "", stats.nowNs(io)) catch {};
+                } else |_| {}
+            }
+            try srcs.appendSlice(gpa, peer_list.items);
+
+            // hand manifest+wanted to the store; keep members for heartbeats
+            const res = sync.bootstrapWithWanted(gpa, io, srcs.items, store_dir, ji.manifest, ji.wanted, out) catch |e| {
+                try out.print("bootstrap failed: {s}\n", .{@errorName(e)});
+                for (ji.members) |m| gpa.free(m);
+                gpa.free(ji.members);
+                return;
+            };
+            store = res.store;
+            committee_members = ji.members; // ownership moves (freed at exit)
+            ji.members = &.{};
+            try out.print("  synced {d}/{d} assigned shards, {d:.1} MB, verified against manifest root\n", .{
+                res.fetched, res.wanted, @as(f64, @floatFromInt(res.bytes)) / MBf,
+            });
+        } else {
+            try out.print("bootstrapping weight ranges from {d} peer(s) (hold-fraction {d:.2})...\n", .{ peer_list.items.len, opts.hold_fraction });
+            try out.flush();
+            const res = sync.bootstrap(gpa, io, peer_list.items, store_dir, opts.hold_fraction, opts.seed, out) catch |e| {
+                try out.print("bootstrap failed: {s}\n", .{@errorName(e)});
+                return;
+            };
+            store = res.store;
+            try out.print("  synced {d}/{d} wanted ranges, {d:.1} MB, verified against manifest root\n", .{
+                res.fetched, res.wanted, @as(f64, @floatFromInt(res.bytes)) / MBf,
+            });
+            if (res.fetched < res.wanted) {
+                try out.print("  {d} ranges still missing — eager repair will keep chasing peers\n", .{res.wanted - res.fetched});
+            }
         }
     }
 
@@ -192,6 +290,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     try out.print("  p2p        tcp://{s}:{d}   (HELLO | HAS | MANIFEST | DIGESTS | HOLDINGS | GETR | GOSSIP | TABLE | PING)\n", .{ opts.p2p_addr, opts.p2p_port });
     try out.print("  gossip     advertising as {s}, {d} seed peer(s), every {d}s\n", .{
         advertise, peer_strs.items.len, @divTrunc(gossip.INTERVAL_NS, std.time.ns_per_s),
+    });
+    if (registry != null) try out.print("  bootnode   committee registry active (R target {d})\n", .{opts.r_target});
+    if (committee_members.len > 0) try out.print("  committee  {d} member(s), heartbeat every {d}s\n", .{
+        committee_members.len, @divTrunc(HEARTBEAT_INTERVAL_NS, std.time.ns_per_s),
     });
     if (store) |*st| {
         try out.print("  weights    version={s}\n", .{hashmod.toHex(st.manifest.version)});
@@ -216,6 +318,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .port = opts.p2p_port,
         .store = if (store) |*st| st else null,
         .table = &table,
+        .boot = if (registry) |*r| r else null,
         .advertise = advertise,
     };
     const p2p_handle = try std.Thread.spawn(.{}, p2pThread, .{&p2p_ctx});
@@ -231,6 +334,16 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     };
     {
         const t = try std.Thread.spawn(.{}, gossip.loop, .{&gossip_ctx});
+        t.detach();
+    }
+
+    // committee heartbeats (SPEC.md)
+    var hb_ctx: HeartbeatCtx = undefined;
+    if (committee_members.len > 0) {
+        const alive = try gpa.alloc(bool, committee_members.len);
+        @memset(alive, true);
+        hb_ctx = .{ .gpa = gpa, .io = io, .members = committee_members, .alive = alive };
+        const t = try std.Thread.spawn(.{}, heartbeatThread, .{&hb_ctx});
         t.detach();
     }
 
