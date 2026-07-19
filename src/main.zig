@@ -36,6 +36,8 @@ pub const gossip = @import("gossip.zig");
 pub const ggml = @import("ggml.zig");
 pub const llama = @import("llama.zig");
 pub const deepseek = @import("deepseek.zig");
+pub const expert_fetch = @import("expert_fetch.zig");
+pub const bpe = @import("bpe.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MB: usize = 1024 * 1024;
@@ -90,7 +92,8 @@ fn usage(out: *Io.Writer) !void {
         \\  loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2]
         \\  loom gguf info <file> [--range-mb M]
         \\  loom gguf shard <file>
-        \\  loom gguf run <file.gguf> [--prompt STR] [--max-tokens N] [--temp T] [--seed S] [--ctx N]
+        \\  loom gguf run <file.gguf | store-dir> [--prompt STR] [--max-tokens N] [--temp T]
+        \\                [--seed S] [--ctx N] [--peers H:P,...]   (store-dir: distributed run)
         \\  loom gen <dir> [--glm] [--seed N]
         \\  loom info <dir>
         \\  loom iobench <file> [--threads N] [--block-mb M] [--reads R]
@@ -461,6 +464,16 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
 }
 
 fn cmdGgufRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8, args: [][]const u8) !void {
+    // a store directory (partial, expert-sharded) runs distributed
+    {
+        var pbuf: [4096]u8 = undefined;
+        const mp = std.fmt.bufPrint(&pbuf, "{s}/ranges.manifest", .{path}) catch null;
+        if (mp != null) {
+            if (Io.Dir.cwd().access(io, mp.?, .{})) |_| {
+                return runDeepseekStore(gpa, io, out, path, args);
+            } else |_| {}
+        }
+    }
     // peek the architecture, then dispatch to the matching engine
     var peek = gguf.parse(gpa, io, path) catch |e| {
         return out.print("parse failed: {s}\n", .{@errorName(e)});
@@ -479,6 +492,111 @@ fn cmdGgufRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8,
         return runEngine(deepseek, gpa, io, out, path, args);
     }
     try out.print("unsupported architecture: {s} (supported: llama, deepseek2)\n", .{arch});
+}
+
+/// Run a deepseek2 model from a *partial* expert-sharded store: held shards
+/// come from the local sparse file, missing ones are fetched from --peers in
+/// the token loop (digest-verified, persisted — issue #3).
+fn runDeepseekStore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, dir: []const u8, args: [][]const u8) !void {
+    var store = weights.openDir(gpa, io, dir) catch |e| {
+        return out.print("store open failed: {s}\n", .{@errorName(e)});
+    };
+    defer store.deinit();
+    if (store.manifest.mode != .expert) {
+        return out.print("store is not expert-sharded (mode={s}) — cannot run distributed\n", .{@tagName(store.manifest.mode)});
+    }
+
+    var peer_list = std.ArrayList(sync.PeerAddr).empty;
+    defer peer_list.deinit(gpa);
+    if (flagStr(args, "--peers")) |csv| {
+        var it = std.mem.splitScalar(u8, csv, ',');
+        while (it.next()) |tok| {
+            const t = std.mem.trim(u8, tok, " ");
+            if (t.len == 0) continue;
+            const a = sync.PeerAddr.parse(t) catch return out.print("bad --peers entry: {s}\n", .{t});
+            try peer_list.append(gpa, a);
+        }
+    }
+
+    var src = try expert_fetch.Source.init(gpa, io, &store, peer_list.items);
+    defer src.deinit();
+
+    const mpath = try std.fmt.allocPrint(gpa, "{s}/model.gguf", .{dir});
+    defer gpa.free(mpath);
+    var m = deepseek.load(gpa, io, mpath) catch |e| {
+        return out.print("load failed: {s}\n", .{@errorName(e)});
+    };
+    defer m.deinit();
+    deepseek.attachDist(&m, gpa, &src) catch |e| {
+        return out.print("attach failed: {s}\n", .{@errorName(e)});
+    };
+
+    const held_before = store.holdings.count();
+    try out.print("distributed store: shards={d} held={d} ({d} resident + experts) peers={d}\n", .{
+        store.manifest.nRanges(), held_before, store.manifest.n_resident, peer_list.items.len,
+    });
+
+    const ctx_cap = try flagUsize(args, "--ctx", 4096);
+    m.cfg.ctx_len = @min(m.cfg.ctx_len, ctx_cap);
+    const c = m.cfg;
+    try out.print("gguf: dim={d} layers={d} heads={d} vocab={d} ctx={d}\n", .{
+        c.dim, c.n_layers, c.n_heads, c.vocab, c.ctx_len,
+    });
+    try out.flush();
+
+    var st = try deepseek.State.init(gpa, c);
+    defer st.deinit(gpa);
+
+    const prompt = flagStr(args, "--prompt") orelse "Once upon a time";
+    const max_tokens = try flagUsize(args, "--max-tokens", 128);
+    const temp: f32 = @floatCast(try flagF64(args, "--temp", 0.0));
+    const seed = try flagU64(args, "--seed", 42);
+
+    const prompt_toks = try m.encodePrompt(gpa, prompt);
+    defer gpa.free(prompt_toks);
+    if (prompt_toks.len == 0) return out.print("empty prompt after tokenization\n", .{});
+
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+    const sample_scratch = try gpa.alloc(f32, c.vocab);
+    defer gpa.free(sample_scratch);
+
+    const t0 = stats.nowNs(io);
+    var pos: usize = 0;
+    try out.print("output: ", .{});
+    for (prompt_toks) |tok| {
+        if (pos >= c.ctx_len) return out.print("\nprompt exceeds context\n", .{});
+        try deepseek.step(&m, &st, tok, pos);
+        try m.decodeToken(out, tok);
+        pos += 1;
+    }
+    try out.flush();
+
+    var produced: usize = 0;
+    var last: u32 = @intCast(sampler.sample(sample_scratch, st.logits, temp, rnd));
+    while (produced < max_tokens and pos < c.ctx_len) : (produced += 1) {
+        if (last == m.eosToken()) break;
+        try m.decodeToken(out, last);
+        try out.flush();
+        try deepseek.step(&m, &st, last, pos);
+        pos += 1;
+        last = @intCast(sampler.sample(sample_scratch, st.logits, temp, rnd));
+    }
+    const t1 = stats.nowNs(io);
+    const secs = @as(f64, @floatFromInt(t1 - t0)) / 1e9;
+    const fs = src.stats;
+    try out.print("\n---- {d} prompt + {d} generated tokens in {d:.2}s ({d:.1} tok/s) ----\n", .{
+        prompt_toks.len, produced, secs, @as(f64, @floatFromInt(prompt_toks.len + produced)) / secs,
+    });
+    try out.print("expert tiers: local={d} peer_fetched={d} ({d:.1} MB, avg {d:.1} ms/fetch) failures={d}\n", .{
+        fs.local, fs.fetched, @as(f64, @floatFromInt(fs.fetch_bytes)) / @as(f64, MB),
+        if (fs.fetched > 0) @as(f64, @floatFromInt(fs.fetch_ns)) / @as(f64, @floatFromInt(fs.fetched)) / 1e6 else 0,
+        fs.fetch_failures,
+    });
+    try store.saveSidecars(); // fetched shards persist: this node is now a bigger holder
+    try out.print("holdings grew {d} -> {d} shards (fetched experts persisted + advertised)\n", .{
+        held_before, store.holdings.count(),
+    });
 }
 
 /// Generic generation loop over either engine module (same load/State/step shape).
@@ -519,7 +637,7 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
     try out.print("output: ", .{});
     for (prompt_toks) |tok| {
         if (pos >= c.ctx_len) return out.print("\nprompt exceeds context\n", .{});
-        eng.step(&m, &st, tok, pos);
+        try eng.step(&m, &st, tok, pos);
         try m.decodeToken(out, tok);
         pos += 1;
     }
@@ -531,7 +649,7 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
         if (last == m.eosToken()) break;
         try m.decodeToken(out, last);
         try out.flush();
-        eng.step(&m, &st, last, pos);
+        try eng.step(&m, &st, last, pos);
         pos += 1;
         last = @intCast(sampler.sample(sample_scratch, st.logits, temp, rnd));
     }

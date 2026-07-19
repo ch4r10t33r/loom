@@ -66,6 +66,21 @@ These supersede the original CLAUDE.md v1 sketch where they conflict.
    learned B and C. Swapping this for real gossipsub/discv5 replaces the
    transport, not the table.
 
+### Token-loop peer fetch (✅ first cut implemented — issue #3)
+
+`expert_fetch.zig` + `loom gguf run <store-dir> --peers`: a node running a
+deepseek2 model from a *partial* expert-sharded store fetches missing experts
+from peers inside the token loop — parallel per-layer prefetch (miss latency =
+max, not sum), round-robin holder spreading, per-peer fallback, digest-verify
+before disk, fetched shards persisted + advertised (organic heat replication).
+Verified on real DeepSeek-V2-Lite: a 33% store (573/1737 shards) produced the
+correct completion ("Paris."), streaming 641 experts / 3.5 GB from one peer
+with zero failures; token-identical to a full-copy run on the fixture. Still
+todo: holder discovery from the gossip table instead of --peers; measured
+disk-vs-peer ordering once heat replication puts shards in both tiers; RAM
+LRU for beyond-disk-budget caching; serving the distributed engine via node
+RPC.
+
 ### GGUF → inference (✅ first cut implemented)
 
 The engine runs llama-architecture and **deepseek2-architecture** GGUF models

@@ -26,6 +26,7 @@ const ggml = @import("ggml.zig");
 const tensor = @import("tensor.zig");
 const llama = @import("llama.zig");
 const bpe = @import("bpe.zig");
+const expert_fetch = @import("expert_fetch.zig");
 
 /// Real DeepSeek/Kimi GGUFs ship a gpt2-style BPE tokenizer; fixtures (and
 /// some conversions) use SPM. Selected by `tokenizer.ggml.model`.
@@ -150,6 +151,12 @@ pub const Model = struct {
     output: Tensor,
     layers: []LayerT,
     tok: Tok,
+    /// Distributed expert source (issue #3): when set, routed-expert weights
+    /// come through Source.get() — local tier or peer fetch — instead of the
+    /// (possibly sparse) memory map.
+    dist: ?*expert_fetch.Source = null,
+    /// (layer * n_expert + e) -> manifest shard id; built by attachDist.
+    expert_shard: []usize = &.{},
 
     pub fn encodePrompt(self: *const Model, gpa: std.mem.Allocator, text: []const u8) ![]u32 {
         return self.tok.encode(gpa, text, true);
@@ -162,6 +169,7 @@ pub const Model = struct {
     }
 
     pub fn deinit(self: *Model) void {
+        if (self.expert_shard.len > 0) self.gpa.free(self.expert_shard);
         self.tok.deinit(self.gpa);
         self.gpa.free(self.layers);
         self.mm.destroy(self.io);
@@ -346,6 +354,41 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
     return model;
 }
 
+/// Attach a distributed expert source. Maps every (layer, expert) to its
+/// manifest shard by matching the gate slice's file offset against the shard's
+/// first extent — no reliance on shard ordering conventions.
+pub fn attachDist(m: *Model, gpa: std.mem.Allocator, src: *expert_fetch.Source) !void {
+    const mani = &src.store.manifest;
+    if (mani.mode != .expert) return error.NotExpertManifest;
+
+    var by_off = std.AutoHashMap(u64, usize).init(gpa);
+    defer by_off.deinit();
+    var i: usize = mani.n_resident;
+    while (i < mani.nRanges()) : (i += 1) {
+        try by_off.put(mani.shardExtents(i)[0].offset, i);
+    }
+
+    const map = try gpa.alloc(usize, m.cfg.n_layers * m.cfg.n_expert);
+    errdefer gpa.free(map);
+    @memset(map, std.math.maxInt(usize));
+
+    var nb: [128]u8 = undefined;
+    for (m.layers, 0..) |l, li| {
+        if (!l.is_moe) continue;
+        const name = try std.fmt.bufPrint(&nb, "blk.{d}.ffn_gate_exps.weight", .{li});
+        const t = m.parsed.findTensor(name) orelse return error.MissingTensor;
+        const ty: ggml.Type = @enumFromInt(t.ggml_type);
+        const per: u64 = @intCast(t.dims[1] * ggml.rowBytes(ty, @intCast(t.dims[0])));
+        var e: usize = 0;
+        while (e < m.cfg.n_expert) : (e += 1) {
+            const off = m.parsed.data_offset + t.offset + per * e;
+            map[li * m.cfg.n_expert + e] = by_off.get(off) orelse return error.ShardMapMismatch;
+        }
+    }
+    m.expert_shard = map;
+    m.dist = src;
+}
+
 // ---- state & forward ---------------------------------------------------------
 
 pub const State = struct {
@@ -524,8 +567,9 @@ fn route(cfg: Config, router_logits: []const f32, bias: ?[]const f32, sel: []Sel
     for (sel) |*s| s.gate *= cfg.weights_scale;
 }
 
-/// One token step; logits land in st.logits.
-pub fn step(m: *const Model, st: *State, token: u32, pos: usize) void {
+/// One token step; logits land in st.logits. Errors only when a distributed
+/// expert shard has no reachable holder (fail loud, not silently degraded).
+pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     const cfg = m.cfg;
     const kd = cfg.keyDim();
     const nope = cfg.nope_dim;
@@ -610,13 +654,36 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) void {
             var acc_buf: [8192]f32 = undefined;
             const acc = acc_buf[0..cfg.dim];
             @memset(acc, 0);
+            if (m.dist) |src| {
+                // warm the missing shards in parallel: per-layer miss latency
+                // becomes max(fetch), not sum(fetch)
+                var ids_buf: [64]usize = undefined;
+                for (sel, 0..) |s, k| ids_buf[k] = m.expert_shard[li * cfg.n_expert + s.expert];
+                src.prefetch(ids_buf[0..sel.len]);
+            }
             for (sel) |s| {
-                denseFFN(
-                    st,
-                    l.ffn_gate_exps.?.expert(s.expert),
-                    l.ffn_up_exps.?.expert(s.expert),
-                    l.ffn_down_exps.?.expert(s.expert),
-                );
+                if (m.dist) |src| {
+                    const blk = try src.get(m.expert_shard[li * cfg.n_expert + s.expert]);
+                    const gt = l.ffn_gate_exps.?;
+                    const ut = l.ffn_up_exps.?;
+                    const dt = l.ffn_down_exps.?;
+                    const gl = gt.ne1 * ggml.rowBytes(gt.ty, gt.ne0);
+                    const ul = ut.ne1 * ggml.rowBytes(ut.ty, ut.ne0);
+                    const dl = dt.ne1 * ggml.rowBytes(dt.ty, dt.ne0);
+                    denseFFN(
+                        st,
+                        .{ .ty = gt.ty, .data = blk[0..gl], .ne0 = gt.ne0, .ne1 = gt.ne1, .ne2 = 1 },
+                        .{ .ty = ut.ty, .data = blk[gl..][0..ul], .ne0 = ut.ne0, .ne1 = ut.ne1, .ne2 = 1 },
+                        .{ .ty = dt.ty, .data = blk[gl + ul ..][0..dl], .ne0 = dt.ne0, .ne1 = dt.ne1, .ne2 = 1 },
+                    );
+                } else {
+                    denseFFN(
+                        st,
+                        l.ffn_gate_exps.?.expert(s.expert),
+                        l.ffn_up_exps.?.expert(s.expert),
+                        l.ffn_down_exps.?.expert(s.expert),
+                    );
+                }
                 for (acc, st.ffn_out) |*a, v| a.* += s.gate * v;
             }
             if (l.ffn_gate_shexp) |gs| {

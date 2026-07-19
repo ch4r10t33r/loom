@@ -329,9 +329,32 @@ loom gguf run stories15M-q4_0.gguf --prompt "Once upon a time" --max-tokens 100
 ```
 
 Validated against real reference models (`ggml-org/models` tinyllamas:
-stories260K F32/GQA, stories15M Q4_0 and Q8_0) — coherent English confirms
-kernels, attention, RoPE convention, and tokenizer simultaneously. Serving GGUF
-models through `loom node`'s RPC is the next integration step.
+stories260K F32/GQA, stories15M Q4_0 and Q8_0, DeepSeek-V2-Lite Q4_K_M) —
+coherent English confirms kernels, attention, RoPE convention, and tokenizer
+simultaneously. Serving GGUF models through `loom node`'s RPC is the next
+integration step.
+
+### Distributed run: inference from a partial store
+
+Point `gguf run` at a **store directory** (instead of a .gguf) and give it
+peers: held shards come from the local sparse file; missing experts are
+**fetched from peers inside the token loop** — in parallel per MoE layer,
+round-robin across holders, digest-verified before touching disk, then
+persisted (so the node's holdings grow with use and gossip advertises them:
+fetch-on-demand doubles as organic heat replication).
+
+```sh
+# node A serves the full expert-sharded model
+loom node --gguf DeepSeek-V2-Lite.Q4_K_M.gguf --p2p-port 8771
+
+# this machine holds a 33% store (bootstrapped earlier); missing experts
+# stream from A during inference — output is token-identical to a full copy
+loom gguf run ~/.cache/loom/models/gguf-synced --peers 127.0.0.1:8771 \
+     --prompt "The capital of France is" --max-tokens 8
+# output: The capital of France is Paris.
+# expert tiers: local=2184 peer_fetched=641 (3512.6 MB, avg 29.2 ms/fetch) failures=0
+# holdings grew 573 -> 1214 shards (fetched experts persisted + advertised)
+```
 
 ---
 

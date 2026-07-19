@@ -381,7 +381,7 @@ fn ropeNorm(vec: []f32, rope_dim: usize, pos: usize, base: f32) void {
 }
 
 /// One token step; logits land in `st.logits`.
-pub fn step(m: *const Model, st: *State, token: u32, pos: usize) void {
+pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     const cfg = m.cfg;
     const hd = cfg.headDim();
     const kvd = cfg.kvDim();
