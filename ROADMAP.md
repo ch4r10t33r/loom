@@ -85,6 +85,14 @@ IQ-quants.
 
 Base model: **GLM 5.2** (744B MoE; 75 MoE layers × 256 experts, 8+1 active).
 
+**Sharding: ✅ implemented** (`weights.zig` expert mode, inspectable via
+`loom gguf shard`, auto-selected by `loom node --gguf`; shards are extent
+lists; the resident bundle is chunked at 16 MB and always in every node's
+want-set — `--hold-fraction` applies to expert shards only. Verified on the
+deepseek2 fixture and on real DeepSeek-V2-Lite Q4_K_M: 1,664 expert +
+73 resident shards, two-node bootstrap holds all resident + a fraction of
+experts, 3-extent shards digest-verified.)
+
 **Shard unit = one expert block ≈ 19 MB int4** (gate/up/down of one expert,
 extent-list over the GGUF's 3D expert tensors) → **19,200 routed shards**
 (~370 GB corpus) plus one **resident bundle** (~10 GB: attention, shared
