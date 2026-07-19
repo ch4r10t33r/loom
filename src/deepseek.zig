@@ -4,7 +4,11 @@
 //! MLA attention: q through a LoRA bottleneck (q_a -> norm -> q_b), k/v through
 //! a compressed latent (kv_a_mqa -> norm = c_kv, cached) plus one shared
 //! rope-carrying k head; per-head k_nope/v are re-expanded from the cached
-//! latent via kv_b every step. NEOX-style rope on the decoupled rope slice.
+//! latent via kv_b every step. Rope on the decoupled slice is **NORM-style**
+//! (adjacent pairs): DeepSeek's reference code views the rope dims as
+//! (d/2, 2) and transposes before rotate_half, which makes its net effect an
+//! adjacent-pair rotation on the stored layout — validated empirically on
+//! real V2-Lite weights (NEOX produces degenerate output, NORM is coherent).
 //!
 //! MoE FFN: router (ffn_gate_inp) scored by sigmoid or softmax
 //! (expert_gating_func), optional selection-only bias (exp_probs_b, the
@@ -13,8 +17,7 @@
 //! `leading_dense_block_count` layers use a plain dense SwiGLU FFN.
 //!
 //! Weights stay in GGML formats in the read-only memory map (fused kernels,
-//! ggml.zig). Known gaps vs. real checkpoints, tracked in issue #1: BPE (gpt2)
-//! tokenizer, YaRN mscale attention scaling, K-quant tensor types.
+//! ggml.zig). Validated against real DeepSeek-V2-Lite Q4_K_M weights.
 
 const std = @import("std");
 const Io = std.Io;
@@ -22,6 +25,39 @@ const gguf = @import("gguf.zig");
 const ggml = @import("ggml.zig");
 const tensor = @import("tensor.zig");
 const llama = @import("llama.zig");
+const bpe = @import("bpe.zig");
+
+/// Real DeepSeek/Kimi GGUFs ship a gpt2-style BPE tokenizer; fixtures (and
+/// some conversions) use SPM. Selected by `tokenizer.ggml.model`.
+pub const Tok = union(enum) {
+    spm: llama.Tokenizer,
+    bpe: bpe.Bpe,
+
+    pub fn encode(self: *const Tok, gpa: std.mem.Allocator, text: []const u8, add_bos: bool) ![]u32 {
+        return switch (self.*) {
+            .spm => |*t| t.encode(gpa, text, add_bos),
+            .bpe => |*t| t.encode(gpa, text, add_bos),
+        };
+    }
+    pub fn decode(self: *const Tok, w: *Io.Writer, id: u32) !void {
+        return switch (self.*) {
+            .spm => |*t| t.decode(w, id),
+            .bpe => |*t| t.decode(w, id),
+        };
+    }
+    pub fn eosId(self: *const Tok) u32 {
+        return switch (self.*) {
+            .spm => |*t| t.eos,
+            .bpe => |*t| t.eos,
+        };
+    }
+    pub fn deinit(self: *Tok, gpa: std.mem.Allocator) void {
+        switch (self.*) {
+            .spm => |*t| t.deinit(gpa),
+            .bpe => |*t| t.deinit(gpa),
+        }
+    }
+};
 
 pub const GatingFunc = enum(u32) { softmax = 1, sigmoid = 2 };
 
@@ -47,6 +83,12 @@ pub const Config = struct {
     ctx_len: usize,
     rope_base: f32,
     eps: f32,
+    // YaRN context extension (deepseek2.rope.scaling.*). factor == 0 -> off.
+    yarn_factor: f32,
+    yarn_orig_ctx: f32,
+    yarn_log_mul: f32,
+    // attention softmax scale, mscale^2 / sqrt(key_dim) under YaRN
+    attn_scale: f32,
 
     pub fn keyDim(self: Config) usize {
         return self.nope_dim + self.rope_dim;
@@ -107,7 +149,17 @@ pub const Model = struct {
     output_norm: Tensor,
     output: Tensor,
     layers: []LayerT,
-    tok: llama.Tokenizer,
+    tok: Tok,
+
+    pub fn encodePrompt(self: *const Model, gpa: std.mem.Allocator, text: []const u8) ![]u32 {
+        return self.tok.encode(gpa, text, true);
+    }
+    pub fn decodeToken(self: *const Model, w: *Io.Writer, id: u32) !void {
+        return self.tok.decode(w, id);
+    }
+    pub fn eosToken(self: *const Model) u32 {
+        return self.tok.eosId();
+    }
 
     pub fn deinit(self: *Model) void {
         self.tok.deinit(self.gpa);
@@ -181,10 +233,31 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
         .ctx_len = @intCast(parsed.getUint("deepseek2.context_length") orelse 2048),
         .rope_base = @floatCast(parsed.getFloat("deepseek2.rope.freq_base") orelse 10000.0),
         .eps = @floatCast(parsed.getFloat("deepseek2.attention.layer_norm_rms_epsilon") orelse 1e-6),
+        .yarn_factor = 0,
+        .yarn_orig_ctx = 0,
+        .yarn_log_mul = 0,
+        .attn_scale = 0, // both fixed up below
     };
     if (cfg.n_layers > cfg.n_dense_layers and (cfg.n_expert == 0 or cfg.n_used == 0 or cfg.moe_ffn == 0))
         return error.BadConfig;
     if (cfg.n_expert > 512) return error.BadConfig;
+
+    // YaRN: DeepSeek applies the mscale to the attention softmax scale (the
+    // in-rope mscale is cancelled by attn_factor = 1/(1 + 0.1 ln(1/freq_scale)),
+    // as in llama.cpp's deepseek2 graph): kq_scale = mscale^2 / sqrt(key_dim),
+    // mscale = 1 + yarn_log_mul * ln(factor).
+    var cfg2 = cfg;
+    const scaling_type = parsed.getString("deepseek2.rope.scaling.type") orelse "";
+    if (std.mem.eql(u8, scaling_type, "yarn")) {
+        cfg2.yarn_factor = @floatCast(parsed.getFloat("deepseek2.rope.scaling.factor") orelse 1.0);
+        cfg2.yarn_orig_ctx = @floatCast(parsed.getFloat("deepseek2.rope.scaling.original_context_length") orelse 4096.0);
+        cfg2.yarn_log_mul = @floatCast(parsed.getFloat("deepseek2.rope.scaling.yarn_log_multiplier") orelse 0.1);
+    }
+    const mscale: f32 = if (cfg2.yarn_factor > 1.0)
+        1.0 + cfg2.yarn_log_mul * @log(cfg2.yarn_factor)
+    else
+        1.0;
+    cfg2.attn_scale = mscale * mscale / @sqrt(@as(f32, @floatFromInt(cfg2.keyDim())));
 
     var model = Model{
         .gpa = gpa,
@@ -192,7 +265,7 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
         .parsed = parsed,
         .file = file,
         .mm = mm,
-        .cfg = cfg,
+        .cfg = cfg2,
         .token_embd = undefined,
         .output_norm = undefined,
         .output = undefined,
@@ -265,7 +338,11 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
     }
     model.layers = layers;
 
-    model.tok = try llama.Tokenizer.init(gpa, &model.parsed);
+    const tok_model = model.parsed.getString("tokenizer.ggml.model") orelse "llama";
+    model.tok = if (std.mem.eql(u8, tok_model, "gpt2"))
+        .{ .bpe = try bpe.Bpe.init(gpa, &model.parsed) }
+    else
+        .{ .spm = try llama.Tokenizer.init(gpa, &model.parsed) };
     return model;
 }
 
@@ -329,6 +406,61 @@ pub const State = struct {
 
 fn mv(t: Tensor, out: []f32, x: []const f32) void {
     ggml.matvec(t.ty, out, t.data, x, t.ne1, t.ne0);
+}
+
+/// NORM adjacent-pair rope, with YaRN frequency correction when enabled: each
+/// pair's angle blends the interpolated (theta/factor) and extrapolated
+/// frequency by a ramp over the corrected dimension range (beta_fast=32,
+/// beta_slow=1), as in ggml's rope_yarn. The in-rope mscale is omitted —
+/// deepseek2 cancels it and applies mscale to the attention scale instead.
+fn ropeApply(cfg: Config, vec: []f32, pos: usize) void {
+    if (cfg.yarn_factor <= 1.0) {
+        ropeNormPlain(vec, pos, cfg.rope_base);
+        return;
+    }
+    const d: f32 = @floatFromInt(vec.len);
+    const two_pi = 2.0 * std.math.pi;
+    const corr = struct {
+        fn dim(nd: f32, orig: f32, beta: f32, base: f32) f32 {
+            return nd * @log(orig / (beta * two_pi)) / (2.0 * @log(base));
+        }
+    };
+    const low = @max(0.0, @floor(corr.dim(d, cfg.yarn_orig_ctx, 32.0, cfg.rope_base)));
+    const high = @min(d - 1.0, @ceil(corr.dim(d, cfg.yarn_orig_ctx, 1.0, cfg.rope_base)));
+
+    var i: usize = 0;
+    while (2 * i + 1 < vec.len) : (i += 1) {
+        const exponent = @as(f32, @floatFromInt(2 * i)) / d;
+        const freq = std.math.pow(f32, cfg.rope_base, -exponent);
+        const theta_extrap = @as(f32, @floatFromInt(pos)) * freq;
+        const theta_interp = theta_extrap / cfg.yarn_factor;
+        const y = (@as(f32, @floatFromInt(i)) - low) / @max(0.001, high - low);
+        const ramp_mix = 1.0 - std.math.clamp(y, 0.0, 1.0); // 1 = extrapolate
+        const theta = theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix;
+        const c = @cos(theta);
+        const sn = @sin(theta);
+        const a = vec[2 * i];
+        const b = vec[2 * i + 1];
+        vec[2 * i] = a * c - b * sn;
+        vec[2 * i + 1] = a * sn + b * c;
+    }
+}
+
+/// NORM-style rope: adjacent pairs (2i, 2i+1), freq by pair index.
+fn ropeNormPlain(vec: []f32, pos: usize, base: f32) void {
+    const d: f32 = @floatFromInt(vec.len);
+    var i: usize = 0;
+    while (2 * i + 1 < vec.len) : (i += 1) {
+        const exponent = @as(f32, @floatFromInt(2 * i)) / d;
+        const freq = std.math.pow(f32, base, -exponent);
+        const angle = @as(f32, @floatFromInt(pos)) * freq;
+        const c = @cos(angle);
+        const sn = @sin(angle);
+        const a = vec[2 * i];
+        const b = vec[2 * i + 1];
+        vec[2 * i] = a * c - b * sn;
+        vec[2 * i + 1] = a * sn + b * c;
+    }
 }
 
 fn asF32(t: Tensor) []const f32 {
@@ -400,7 +532,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) void {
     const rope = cfg.rope_dim;
     const kvr = cfg.kv_lora_rank;
     const vd = cfg.v_head_dim;
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(kd)));
+    const scale = cfg.attn_scale;
 
     ggml.dequantRow(m.token_embd.ty, st.x, m.token_embd.data, token, cfg.dim);
 
@@ -421,11 +553,11 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) void {
         tensor.rmsnorm(c_kv, st.kv_a[0..kvr], asF32(l.attn_kv_a_norm), cfg.eps);
         const k_rope = st.k_rope_cache[(li * cfg.ctx_len + pos) * rope ..][0..rope];
         @memcpy(k_rope, st.kv_a[kvr .. kvr + rope]);
-        tensor.rope(k_rope, pos, cfg.rope_base); // NEOX half-split
+        ropeApply(cfg, k_rope, pos);
 
         var h: usize = 0;
         while (h < cfg.n_heads) : (h += 1) {
-            tensor.rope(st.q[h * kd + nope ..][0..rope], pos, cfg.rope_base);
+            ropeApply(cfg, st.q[h * kd + nope ..][0..rope], pos);
         }
 
         const seq = pos + 1;
@@ -505,7 +637,8 @@ test "route: sigmoid gating with selection bias picks by biased score, gates fro
         .kv_lora_rank = 4, .rope_dim = 2, .nope_dim = 2, .v_head_dim = 2, .ffn = 8,
         .moe_ffn = 8, .n_expert = 4, .n_used = 2, .n_shared = 0, .gating = .sigmoid,
         .weights_norm = true, .weights_scale = 1.0, .vocab = 8, .ctx_len = 8,
-        .rope_base = 10000, .eps = 1e-6,
+        .rope_base = 10000, .eps = 1e-6, .yarn_factor = 0, .yarn_orig_ctx = 0,
+        .yarn_log_mul = 0, .attn_scale = 1.0,
     };
     // raw logits favor experts 0,1; bias flips selection to 2,3
     const logits = [_]f32{ 2.0, 1.5, 0.0, -0.5 };

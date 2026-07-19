@@ -266,7 +266,7 @@ loom gguf info stories15M-q4_0.gguf --range-mb 1
 ### `loom gguf run` — run a llama-architecture GGUF model
 
 ```
-loom gguf run <file.gguf> [--prompt STR] [--max-tokens N] [--temp T] [--seed S]
+loom gguf run <file.gguf> [--prompt STR] [--max-tokens N] [--temp T] [--seed S] [--ctx N]
 ```
 
 | Flag | Default |
@@ -280,18 +280,20 @@ Real inference over the mmap'd file, dispatched on `general.architecture`:
 
 - **`llama`** — GQA attention, NORM-style RoPE, SwiGLU.
 - **`deepseek2`** (DeepSeek V2/V3, Kimi K2, GLM-class MoE) — MLA attention
-  (q-LoRA, compressed-KV latent cache, decoupled NEOX rope head) + MoE FFN
+  (q-LoRA, compressed-KV latent cache, decoupled NORM-rope head), MoE FFN
   (sigmoid/softmax gating, noaux_tc selection bias, top-k with renormalized
-  scaled gates, shared experts, leading dense layers). First cut: validated
-  end-to-end on the synthetic `--arch deepseek2` fixture; running *real*
-  DeepSeek/Kimi GGUFs still needs the BPE (gpt2) tokenizer, YaRN mscale, and
-  K-quant tensor types —
-  tracked in [#1](https://github.com/ch4r10t33r/loom/issues/1).
+  scaled gates, shared experts, leading dense layers), YaRN context-extension
+  scaling, and the gpt2-style **byte-level BPE tokenizer** from GGUF merges.
+  **Validated on real weights**: DeepSeek-V2-Lite Q4_K_M (15.7B MoE, 27 MLA
+  layers, 64 experts) produces correct factual completions ("The capital of
+  France is Paris.") on one CPU core.
 
-GGML **F32 / F16 / Q4_0 / Q8_0** tensors (fused matvec on the raw bytes — no
-wholesale dequantization) and the **SentencePiece tokenizer embedded in the
-GGUF metadata** (score-based pair merging, byte fallback). Output streams as
-it generates.
+GGML tensor types: **F32 / F16 / Q4_0 / Q5_0 / Q8_0 / Q4_K / Q5_K / Q6_K**
+(fused matvec on the raw mmap'd bytes — no wholesale dequantization).
+Tokenizers: SentencePiece (score-merge, byte fallback) and byte-level BPE
+(merge ranks, gpt2 byte table), selected by `tokenizer.ggml.model`. Output
+streams as it generates. `--ctx N` (default 4096) caps the KV allocation for
+models advertising 100k+ contexts.
 
 ```sh
 curl -LO https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf

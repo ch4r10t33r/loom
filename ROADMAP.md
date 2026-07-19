@@ -68,14 +68,18 @@ These supersede the original CLAUDE.md v1 sketch where they conflict.
 
 ### GGUF → inference (✅ first cut implemented)
 
-The engine runs llama-architecture GGUF models directly (`loom gguf run`):
-GGML F32/F16/Q4_0/Q8_0 fused kernels over the mmap'd file (`ggml.zig`), GQA
-attention + NORM RoPE + SwiGLU (`llama.zig`), SentencePiece tokenizer from GGUF
-metadata. Validated on real models (tinyllamas stories260K F32 and stories15M
-Q4_0/Q8_0 — coherent English output, matching llama.cpp behavior). This closes
-the "distribute a file the node can't run" gap for llama-family GGUFs. Still
-todo: serve GGUF models through `loom node`'s RPC; batch >1; F16 KV; the GLM
-MoE arch itself ships as loom-format checkpoints, unchanged.
+The engine runs llama-architecture and **deepseek2-architecture** GGUF models
+directly (`loom gguf run`), dispatched on `general.architecture`. GGML
+F32/F16/Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K fused kernels over the mmap'd file
+(`ggml.zig`); llama: GQA + NORM RoPE + SwiGLU (`llama.zig`); deepseek2 (the
+Kimi/DeepSeek/GLM MoE family): MLA + MoE routing + YaRN + byte-level BPE
+tokenizer (`deepseek.zig`, `bpe.zig`). Validated on real weights: tinyllamas
+(F32/Q4_0/Q8_0, coherent stories) and **DeepSeek-V2-Lite Q4_K_M** (15.7B MoE —
+correct factual completions on one CPU core). Note: deepseek2 rope is
+NORM-style (adjacent pairs) — DeepSeek's reference interleave-view before
+rotate_half nets out to that; NEOX produces degenerate output. Still todo:
+serve GGUF models through `loom node`'s RPC; batch >1; SIMD kernels;
+IQ-quants.
 
 ### Design tensions to resolve before implementation
 

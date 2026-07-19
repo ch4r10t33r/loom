@@ -12,12 +12,16 @@ pub const Type = enum(u32) {
     f32 = 0,
     f16 = 1,
     q4_0 = 2,
+    q5_0 = 6,
     q8_0 = 8,
+    q4_k = 12,
+    q5_k = 13,
+    q6_k = 14,
     _,
 
     pub fn supported(t: u32) bool {
         return switch (@as(Type, @enumFromInt(t))) {
-            .f32, .f16, .q4_0, .q8_0 => true,
+            .f32, .f16, .q4_0, .q5_0, .q8_0, .q4_k, .q5_k, .q6_k => true,
             _ => false,
         };
     }
@@ -25,7 +29,13 @@ pub const Type = enum(u32) {
 
 pub const QK_0: usize = 32; // block width for q4_0 / q8_0
 const Q4_0_BLOCK: usize = 2 + QK_0 / 2; // f16 scale + 16 nibble bytes = 18
+const Q5_0_BLOCK: usize = 2 + 4 + QK_0 / 2; // f16 scale + 32 high bits + nibbles = 22
 const Q8_0_BLOCK: usize = 2 + QK_0; // f16 scale + 32 int8 = 34
+
+pub const QK_K: usize = 256; // super-block width for K-quants
+const Q4_K_BLOCK: usize = 2 + 2 + 12 + QK_K / 2; // d, dmin, 6-bit scales, nibbles = 144
+const Q5_K_BLOCK: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2; // + high bits = 176
+const Q6_K_BLOCK: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2; // ql, qh, scales, d = 210
 
 /// Bytes of one row of `n` elements in format `t`. `n` must be a multiple of
 /// the block width for quantized types.
@@ -34,7 +44,11 @@ pub fn rowBytes(t: Type, n: usize) usize {
         .f32 => n * 4,
         .f16 => n * 2,
         .q4_0 => (n / QK_0) * Q4_0_BLOCK,
+        .q5_0 => (n / QK_0) * Q5_0_BLOCK,
         .q8_0 => (n / QK_0) * Q8_0_BLOCK,
+        .q4_k => (n / QK_K) * Q4_K_BLOCK,
+        .q5_k => (n / QK_K) * Q5_K_BLOCK,
+        .q6_k => (n / QK_K) * Q6_K_BLOCK,
         _ => unreachable,
     };
 }
@@ -56,9 +70,165 @@ pub fn matvec(t: Type, out: []f32, data: []const u8, x: []const f32, rows: usize
         .f32 => matvecF32(out, data, x, rows, cols),
         .f16 => matvecF16(out, data, x, rows, cols),
         .q4_0 => matvecQ40(out, data, x, rows, cols),
+        .q5_0 => matvecQ50(out, data, x, rows, cols),
         .q8_0 => matvecQ80(out, data, x, rows, cols),
+        .q4_k, .q5_k, .q6_k => matvecK(t, out, data, x, rows, cols),
         _ => unreachable,
     }
+}
+
+/// K-quant matvec: dequantize one 256-wide super-block at a time and dot it.
+fn matvecK(t: Type, out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
+    std.debug.assert(cols % QK_K == 0);
+    const bs: usize = switch (t) {
+        .q4_k => Q4_K_BLOCK,
+        .q5_k => Q5_K_BLOCK,
+        .q6_k => Q6_K_BLOCK,
+        else => unreachable,
+    };
+    const blocks_per_row = cols / QK_K;
+    const rb = blocks_per_row * bs;
+    var vals: [QK_K]f32 = undefined;
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        const row = data[r * rb ..][0..rb];
+        var acc: f32 = 0;
+        var b: usize = 0;
+        while (b < blocks_per_row) : (b += 1) {
+            const block = row[b * bs ..][0..bs];
+            switch (t) {
+                .q4_k => dequantBlockQ4K(block, &vals),
+                .q5_k => dequantBlockQ5K(block, &vals),
+                .q6_k => dequantBlockQ6K(block, &vals),
+                else => unreachable,
+            }
+            const xb = x[b * QK_K ..][0..QK_K];
+            var partial: f32 = 0;
+            for (vals, xb) |v, xv| partial += v * xv;
+            acc += partial;
+        }
+        out[r] = acc;
+    }
+}
+
+/// 6-bit scale/min unpacking shared by q4_k/q5_k (llama.cpp get_scale_min_k4).
+inline fn scaleMinK4(j: usize, scales: *const [12]u8, sc: *u8, m: *u8) void {
+    if (j < 4) {
+        sc.* = scales[j] & 63;
+        m.* = scales[j + 4] & 63;
+    } else {
+        sc.* = (scales[j + 4] & 0xF) | ((scales[j - 4] >> 6) << 4);
+        m.* = (scales[j + 4] >> 4) | ((scales[j] >> 6) << 4);
+    }
+}
+
+fn dequantBlockQ4K(block: []const u8, vals: *[QK_K]f32) void {
+    const d = f16FromBytes(block[0..2]);
+    const dmin = f16FromBytes(block[2..4]);
+    const scales: *const [12]u8 = block[4..16];
+    const qs = block[16..][0 .. QK_K / 2];
+    var is: usize = 0;
+    var y: usize = 0;
+    var q: usize = 0;
+    var j: usize = 0;
+    while (j < QK_K) : (j += 64) {
+        var sc: u8 = undefined;
+        var mn: u8 = undefined;
+        scaleMinK4(is, scales, &sc, &mn);
+        const d1 = d * @as(f32, @floatFromInt(sc));
+        const m1 = dmin * @as(f32, @floatFromInt(mn));
+        scaleMinK4(is + 1, scales, &sc, &mn);
+        const d2 = d * @as(f32, @floatFromInt(sc));
+        const m2 = dmin * @as(f32, @floatFromInt(mn));
+        var l: usize = 0;
+        while (l < 32) : (l += 1) {
+            vals[y + l] = d1 * @as(f32, @floatFromInt(qs[q + l] & 0xF)) - m1;
+        }
+        l = 0;
+        while (l < 32) : (l += 1) {
+            vals[y + 32 + l] = d2 * @as(f32, @floatFromInt(qs[q + l] >> 4)) - m2;
+        }
+        y += 64;
+        q += 32;
+        is += 2;
+    }
+}
+
+fn dequantBlockQ5K(block: []const u8, vals: *[QK_K]f32) void {
+    const d = f16FromBytes(block[0..2]);
+    const dmin = f16FromBytes(block[2..4]);
+    const scales: *const [12]u8 = block[4..16];
+    const qh = block[16..][0 .. QK_K / 8];
+    const qs = block[16 + QK_K / 8 ..][0 .. QK_K / 2];
+    var is: usize = 0;
+    var y: usize = 0;
+    var q: usize = 0;
+    var hb1: u8 = 1;
+    var hb2: u8 = 2;
+    var j: usize = 0;
+    while (j < QK_K) : (j += 64) {
+        var sc: u8 = undefined;
+        var mn: u8 = undefined;
+        scaleMinK4(is, scales, &sc, &mn);
+        const d1 = d * @as(f32, @floatFromInt(sc));
+        const m1 = dmin * @as(f32, @floatFromInt(mn));
+        scaleMinK4(is + 1, scales, &sc, &mn);
+        const d2 = d * @as(f32, @floatFromInt(sc));
+        const m2 = dmin * @as(f32, @floatFromInt(mn));
+        var l: usize = 0;
+        while (l < 32) : (l += 1) {
+            const hi: f32 = if (qh[l] & hb1 != 0) 16 else 0;
+            vals[y + l] = d1 * (@as(f32, @floatFromInt(qs[q + l] & 0xF)) + hi) - m1;
+        }
+        l = 0;
+        while (l < 32) : (l += 1) {
+            const hi: f32 = if (qh[l] & hb2 != 0) 16 else 0;
+            vals[y + 32 + l] = d2 * (@as(f32, @floatFromInt(qs[q + l] >> 4)) + hi) - m2;
+        }
+        y += 64;
+        q += 32;
+        is += 2;
+        hb1 <<= 2;
+        hb2 <<= 2;
+    }
+}
+
+fn dequantBlockQ6K(block: []const u8, vals: *[QK_K]f32) void {
+    const ql_all = block[0 .. QK_K / 2];
+    const qh_all = block[QK_K / 2 ..][0 .. QK_K / 4];
+    const sc_all = block[QK_K / 2 + QK_K / 4 ..][0 .. QK_K / 16];
+    const d = f16FromBytes(block[QK_K / 2 + QK_K / 4 + QK_K / 16 ..][0..2]);
+
+    var y: usize = 0;
+    var qlo: usize = 0;
+    var qho: usize = 0;
+    var sco: usize = 0;
+    var n: usize = 0;
+    while (n < QK_K) : (n += 128) {
+        var l: usize = 0;
+        while (l < 32) : (l += 1) {
+            const is = l / 16;
+            const ql = ql_all[qlo..];
+            const qh = qh_all[qho..];
+            const sc = sc_all[sco..];
+            const q1: i32 = @as(i32, (ql[l] & 0xF) | ((qh[l] >> 0 & 3) << 4)) - 32;
+            const q2: i32 = @as(i32, (ql[l + 32] & 0xF) | ((qh[l] >> 2 & 3) << 4)) - 32;
+            const q3: i32 = @as(i32, (ql[l] >> 4) | ((qh[l] >> 4 & 3) << 4)) - 32;
+            const q4: i32 = @as(i32, (ql[l + 32] >> 4) | ((qh[l] >> 6 & 3) << 4)) - 32;
+            vals[y + l] = d * i8f(sc[is]) * @as(f32, @floatFromInt(q1));
+            vals[y + l + 32] = d * i8f(sc[is + 2]) * @as(f32, @floatFromInt(q2));
+            vals[y + l + 64] = d * i8f(sc[is + 4]) * @as(f32, @floatFromInt(q3));
+            vals[y + l + 96] = d * i8f(sc[is + 6]) * @as(f32, @floatFromInt(q4));
+        }
+        y += 128;
+        qlo += 64;
+        qho += 32;
+        sco += 8;
+    }
+}
+
+inline fn i8f(b: u8) f32 {
+    return @floatFromInt(@as(i8, @bitCast(b)));
 }
 
 fn matvecF32(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
@@ -115,6 +285,39 @@ fn matvecQ40(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: us
     }
 }
 
+fn matvecQ50(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
+    std.debug.assert(cols % QK_0 == 0);
+    const blocks_per_row = cols / QK_0;
+    const rb = blocks_per_row * Q5_0_BLOCK;
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        const row = data[r * rb ..][0..rb];
+        var acc: f32 = 0;
+        var b: usize = 0;
+        while (b < blocks_per_row) : (b += 1) {
+            const block = row[b * Q5_0_BLOCK ..][0..Q5_0_BLOCK];
+            const scale = f16FromBytes(block[0..2]);
+            if (scale == 0) continue;
+            const qh = std.mem.readInt(u32, block[2..6], .little);
+            const qs = block[6..][0 .. QK_0 / 2];
+            const xb = x[b * QK_0 ..][0..QK_0];
+            var partial: f32 = 0;
+            var j: u5 = 0;
+            while (true) {
+                const xh0: u8 = @intCast(((qh >> j) << 4) & 0x10);
+                const xh1: u8 = @intCast((qh >> (j + 12)) & 0x10);
+                const w0 = @as(f32, @floatFromInt(@as(i32, (qs[j] & 0xF) | xh0) - 16));
+                const w1 = @as(f32, @floatFromInt(@as(i32, (qs[j] >> 4) | xh1) - 16));
+                partial += w0 * xb[j] + w1 * xb[@as(usize, j) + QK_0 / 2];
+                if (j == 15) break;
+                j += 1;
+            }
+            acc += partial * scale;
+        }
+        out[r] = acc;
+    }
+}
+
 fn matvecQ80(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
     std.debug.assert(cols % QK_0 == 0);
     const blocks_per_row = cols / QK_0;
@@ -155,6 +358,49 @@ pub fn dequantRow(t: Type, out: []f32, data: []const u8, r: usize, cols: usize) 
             const w: []const u16 = @alignCast(std.mem.bytesAsSlice(u16, data));
             for (out, w[r * cols ..][0..cols]) |*o, bits| {
                 o.* = @floatCast(@as(f16, @bitCast(bits)));
+            }
+        },
+        .q4_k, .q5_k, .q6_k => {
+            const rb = rowBytes(t, cols);
+            const row = data[r * rb ..][0..rb];
+            const bs: usize = switch (t) {
+                .q4_k => Q4_K_BLOCK,
+                .q5_k => Q5_K_BLOCK,
+                else => Q6_K_BLOCK,
+            };
+            var vals: [QK_K]f32 = undefined;
+            var b: usize = 0;
+            while (b * QK_K < cols) : (b += 1) {
+                const block = row[b * bs ..][0..bs];
+                switch (t) {
+                    .q4_k => dequantBlockQ4K(block, &vals),
+                    .q5_k => dequantBlockQ5K(block, &vals),
+                    else => dequantBlockQ6K(block, &vals),
+                }
+                @memcpy(out[b * QK_K ..][0..QK_K], &vals);
+            }
+        },
+        .q5_0 => {
+            // embeddings are never q5_0 in practice; go through a 1-row matvec
+            // against basis vectors would be wasteful, so walk blocks directly
+            const rb = rowBytes(t, cols);
+            const row = data[r * rb ..][0..rb];
+            var b: usize = 0;
+            while (b * QK_0 < cols) : (b += 1) {
+                const block = row[b * Q5_0_BLOCK ..][0..Q5_0_BLOCK];
+                const scale = f16FromBytes(block[0..2]);
+                const qh = std.mem.readInt(u32, block[2..6], .little);
+                const qs = block[6..][0 .. QK_0 / 2];
+                const ob = out[b * QK_0 ..][0..QK_0];
+                var j: u5 = 0;
+                while (true) {
+                    const xh0: u8 = @intCast(((qh >> j) << 4) & 0x10);
+                    const xh1: u8 = @intCast((qh >> (j + 12)) & 0x10);
+                    ob[j] = @as(f32, @floatFromInt(@as(i32, (qs[j] & 0xF) | xh0) - 16)) * scale;
+                    ob[@as(usize, j) + QK_0 / 2] = @as(f32, @floatFromInt(@as(i32, (qs[j] >> 4) | xh1) - 16)) * scale;
+                    if (j == 15) break;
+                    j += 1;
+                }
             }
         },
         .q4_0, .q8_0 => {
@@ -263,6 +509,60 @@ test "q4_0 and q8_0 matvec match f32 reference within quant error" {
         try std.testing.expect(@abs(out4[r] - ref[r]) < 0.6); // int4 is lossy
         try std.testing.expect(@abs(out8[r] - ref[r]) < 0.05); // int8 is close
     }
+}
+
+test "q4_k dequant with handcrafted block" {
+    var block = [_]u8{0} ** Q4_K_BLOCK;
+    // d = 1.0, dmin = 0.0
+    std.mem.writeInt(u16, block[0..2], @bitCast(@as(f16, 1.0)), .little);
+    std.mem.writeInt(u16, block[2..4], @bitCast(@as(f16, 0.0)), .little);
+    // sub-blocks 0..3: sc = 1 (scales[0..4]=1), min = 0 (scales[4..8]=0)
+    block[4] = 1;
+    block[5] = 1;
+    block[6] = 1;
+    block[7] = 1;
+    // qs = 0x31: low nibble 1, high nibble 3
+    for (block[16..]) |*b| b.* = 0x31;
+
+    var vals: [QK_K]f32 = undefined;
+    dequantBlockQ4K(&block, &vals);
+    // first 128 elems: groups of (32 x low=1, 32 x high=3); last 128: sc=0 -> 0
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), vals[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), vals[32], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), vals[64], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), vals[96], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), vals[128], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), vals[255], 1e-4);
+
+    // matvec against ones = sum = 32*(1+3)*2 = 256
+    const x = [_]f32{1.0} ** QK_K;
+    var out: [1]f32 = undefined;
+    matvec(.q4_k, &out, &block, &x, 1, QK_K);
+    try std.testing.expectApproxEqAbs(@as(f32, 256.0), out[0], 1e-2);
+}
+
+test "q6_k dequant with handcrafted block" {
+    var block = [_]u8{0} ** Q6_K_BLOCK;
+    // ql=0, qh=0 -> q = -32 everywhere; scales all 1; d = 0.5
+    for (block[QK_K / 2 + QK_K / 4 ..][0 .. QK_K / 16]) |*b| b.* = 1;
+    std.mem.writeInt(u16, block[QK_K / 2 + QK_K / 4 + QK_K / 16 ..][0..2], @bitCast(@as(f16, 0.5)), .little);
+
+    var vals: [QK_K]f32 = undefined;
+    dequantBlockQ6K(&block, &vals);
+    for (vals) |v| try std.testing.expectApproxEqAbs(@as(f32, -16.0), v, 1e-4);
+}
+
+test "q5_k high bit adds 16" {
+    var block = [_]u8{0} ** Q5_K_BLOCK;
+    std.mem.writeInt(u16, block[0..2], @bitCast(@as(f16, 1.0)), .little);
+    std.mem.writeInt(u16, block[2..4], @bitCast(@as(f16, 0.0)), .little);
+    block[4] = 1; // sc(sub-block 0) = 1
+    // qh bit0 set for l=0 -> element 0 gets +16; qs all zero
+    block[16] = 1;
+    var vals: [QK_K]f32 = undefined;
+    dequantBlockQ5K(&block, &vals);
+    try std.testing.expectApproxEqAbs(@as(f32, 16.0), vals[0], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), vals[1], 1e-4);
 }
 
 test "f16 matvec and dequantRow" {

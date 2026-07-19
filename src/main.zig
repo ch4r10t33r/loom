@@ -89,7 +89,7 @@ fn usage(out: *Io.Writer) !void {
         \\            [--advertise HOST:PORT]
         \\  loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2]
         \\  loom gguf info <file> [--range-mb M]
-        \\  loom gguf run <file.gguf> [--prompt STR] [--max-tokens N] [--temp T] [--seed S]
+        \\  loom gguf run <file.gguf> [--prompt STR] [--max-tokens N] [--temp T] [--seed S] [--ctx N]
         \\  loom gen <dir> [--glm] [--seed N]
         \\  loom info <dir>
         \\  loom iobench <file> [--threads N] [--block-mb M] [--reads R]
@@ -448,6 +448,9 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
         return out.print("load failed: {s}\n", .{@errorName(e)});
     };
     defer m.deinit();
+    // cap the KV allocation: model context lengths can be 100k+
+    const ctx_cap = try flagUsize(args, "--ctx", 4096);
+    m.cfg.ctx_len = @min(m.cfg.ctx_len, ctx_cap);
     const c = m.cfg;
     try out.print("gguf: dim={d} layers={d} heads={d} vocab={d} ctx={d}\n", .{
         c.dim, c.n_layers, c.n_heads, c.vocab, c.ctx_len,
@@ -457,7 +460,7 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
     var st = try eng.State.init(gpa, c);
     defer st.deinit(gpa);
 
-    const prompt_toks = try m.tok.encode(gpa, prompt, true);
+    const prompt_toks = try m.encodePrompt(gpa, prompt);
     defer gpa.free(prompt_toks);
     if (prompt_toks.len == 0) return out.print("empty prompt after tokenization\n", .{});
 
@@ -473,7 +476,7 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
     for (prompt_toks) |tok| {
         if (pos >= c.ctx_len) return out.print("\nprompt exceeds context\n", .{});
         eng.step(&m, &st, tok, pos);
-        try m.tok.decode(out, tok);
+        try m.decodeToken(out, tok);
         pos += 1;
     }
     try out.flush();
@@ -481,8 +484,8 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
     var produced: usize = 0;
     var last: u32 = @intCast(sampler.sample(sample_scratch, st.logits, temp, rnd));
     while (produced < max_tokens and pos < c.ctx_len) : (produced += 1) {
-        if (last == m.tok.eos) break;
-        try m.tok.decode(out, last);
+        if (last == m.eosToken()) break;
+        try m.decodeToken(out, last);
         try out.flush();
         eng.step(&m, &st, last, pos);
         pos += 1;

@@ -66,6 +66,16 @@ pub const Model = struct {
 
     tok: Tokenizer,
 
+    pub fn encodePrompt(self: *const Model, gpa: std.mem.Allocator, text: []const u8) ![]u32 {
+        return self.tok.encode(gpa, text, true);
+    }
+    pub fn decodeToken(self: *const Model, w: *Io.Writer, id: u32) !void {
+        return self.tok.decode(w, id);
+    }
+    pub fn eosToken(self: *const Model) u32 {
+        return self.tok.eos;
+    }
+
     pub fn deinit(self: *Model) void {
         self.tok.deinit(self.gpa);
         self.gpa.free(self.layers);
