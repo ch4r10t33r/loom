@@ -14,7 +14,7 @@ One binary, `loom`, provides:
 | [`loom node`](#loom-node--run-an-inference--weight-sharing-node) | the daemon: load a model, serve inference over RPC, share/sync/repair GGUF weight ranges over P2P with gossip discovery |
 | [`loom run`](#loom-run--one-shot-local-inference) | one-shot local inference against a loom checkpoint (no servers) |
 | [`loom gen`](#loom-gen--generate-a-synthetic-checkpoint) / [`loom info`](#loom-info--inspect--verify-a-checkpoint) | create / inspect+verify loom-format checkpoints |
-| [`loom gguf`](#loom-gguf--gguf-tools-gen--info--run) | GGUF tools: make a fixture, inspect a file, **run a llama-architecture GGUF model** |
+| [`loom gguf`](#loom-gguf--gguf-tools-gen--info--shard--run) | GGUF tools: make a fixture, inspect a file, **shard by expert**, run llama/deepseek2 models |
 | [`loom iobench`](#loom-iobench--disk-profiler) | disk profiler for the random-read pattern the engine issues |
 
 ## Build
@@ -118,7 +118,8 @@ for the connection so far. Errors come back as `{"ok":false,"error":"..."}`.
 | `PING` | `PONG` | liveness |
 | `HELLO` | `LOOM/0 experts=<n> unique_bytes=<b>` | node summary |
 | `HAS <id>` | `PRESENT <id> off=.. len=.. sha256=..` \| `ERR range` | expert-directory query (v1 seed) |
-| `MANIFEST` | `MANIFEST version=<hex> size=<b> ranges=<n> range_size=<b>` | weight manifest (`ERR no_store` if no GGUF attached) |
+| `MANIFEST` | `MANIFEST version=.. size=.. ranges=.. range_size=.. mode=<fixed\|expert> resident=<n>` | manifest summary (`ERR no_store` if no GGUF attached) |
+| `MANIFESTFILE` | `MANIFESTFILE len=<n>` + serialized manifest | full manifest (digests + extent lists) — what bootstrap adopts |
 | `DIGEST <i>` / `DIGESTS` | one / all range digests | verification data |
 | `HOLDINGS` | `HOLDINGS <hex bitmap>` | which ranges this node holds (bit i = range i) — the compact summary destined for ENR metadata |
 | `GETR <i>` | `DATA <i> len=<l> sha256=<hex>` + raw bytes \| `ERR not_held` | fetch one range |
@@ -233,7 +234,7 @@ loom info /tmp/ckpt
 
 ---
 
-## `loom gguf` — GGUF tools (`gen` / `info` / `run`)
+## `loom gguf` — GGUF tools (`gen` / `info` / `shard` / `run`)
 
 ### `loom gguf gen` — synthetic GGUF fixture
 
@@ -262,6 +263,30 @@ manifest this file would get: range count + Merkle-root **version id**.
 ```sh
 loom gguf info stories15M-q4_0.gguf --range-mb 1
 ```
+
+### `loom gguf shard` — expert-aligned shard manifest
+
+```
+loom gguf shard <file>
+```
+
+The sharding tool: parses the GGUF tensor table and builds the expert-aligned
+manifest — one shard per (layer, expert) as a 3-extent list over the
+`ffn_{gate,up,down}_exps` tensors, resident bundle chunked at 16 MB — then
+prints the summary. `loom node --gguf` runs the same split automatically
+(expert mode when the file has expert tensors, fixed ranges otherwise).
+
+```sh
+loom gguf shard DeepSeek-V2-Lite.Q4_K_M.gguf
+#   shards         1737 total = 73 resident + 1664 expert
+#   resident       0.780 GB in 73 chunks (held by every node)
+#   expert shards  4.98..6.02 MB (avg 5.46 MB), 8.87 GB routed corpus
+#   metadata       manifest 204.3 KB, holdings bitmap 218 B
+```
+
+For GLM 5.2 this yields the planned 19,200 expert shards (~19 MB each) + a
+~10 GB resident bundle. `--hold-fraction` applies to *expert* shards only —
+resident shards are always in every node's want-set.
 
 ### `loom gguf run` — run a llama-architecture GGUF model
 

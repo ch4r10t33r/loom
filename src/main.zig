@@ -89,6 +89,7 @@ fn usage(out: *Io.Writer) !void {
         \\            [--advertise HOST:PORT]
         \\  loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2]
         \\  loom gguf info <file> [--range-mb M]
+        \\  loom gguf shard <file>
         \\  loom gguf run <file.gguf> [--prompt STR] [--max-tokens N] [--temp T] [--seed S] [--ctx N]
         \\  loom gen <dir> [--glm] [--seed N]
         \\  loom info <dir>
@@ -413,7 +414,50 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
         return cmdGgufRun(gpa, io, out, path, args);
     }
 
-    try out.print("gguf: unknown subcommand {s} (want gen|info|run)\n", .{sub});
+    if (std.mem.eql(u8, sub, "shard")) {
+        var m = weights.buildExpertManifest(gpa, io, path) catch |e| switch (e) {
+            error.NoExpertTensors => return out.print(
+                "no 3D expert tensors found — not a MoE GGUF (fixed-size ranges apply instead)\n", .{}),
+            else => return out.print("shard failed: {s}\n", .{@errorName(e)}),
+        };
+        defer m.deinit(gpa);
+
+        var resident_bytes: u64 = 0;
+        var i: usize = 0;
+        while (i < m.n_resident) : (i += 1) resident_bytes += m.rangeLen(i);
+        const n_expert = m.nRanges() - m.n_resident;
+        var emin: u64 = std.math.maxInt(u64);
+        var emax: u64 = 0;
+        var esum: u64 = 0;
+        while (i < m.nRanges()) : (i += 1) {
+            const l = m.rangeLen(i);
+            emin = @min(emin, l);
+            emax = @max(emax, l);
+            esum += l;
+        }
+        try out.print("expert-aligned shard manifest for {s}\n", .{path});
+        try out.print("  version        {s}\n", .{hash.toHex(m.version)});
+        try out.print("  file           {d:.2} GB ({d} bytes)\n", .{ @as(f64, @floatFromInt(m.file_size)) / GB, m.file_size });
+        try out.print("  shards         {d} total = {d} resident + {d} expert\n", .{ m.nRanges(), m.n_resident, n_expert });
+        try out.print("  resident       {d:.3} GB in {d} chunks (held by every node)\n", .{ @as(f64, @floatFromInt(resident_bytes)) / GB, m.n_resident });
+        if (n_expert > 0) try out.print("  expert shards  {d:.2}..{d:.2} MB (avg {d:.2} MB), {d:.2} GB routed corpus\n", .{
+            @as(f64, @floatFromInt(emin)) / @as(f64, MB),
+            @as(f64, @floatFromInt(emax)) / @as(f64, MB),
+            @as(f64, @floatFromInt(esum)) / @as(f64, @floatFromInt(n_expert)) / @as(f64, MB),
+            @as(f64, @floatFromInt(esum)) / GB,
+        });
+        try out.print("  metadata       manifest {d:.1} KB, holdings bitmap {d} B\n", .{
+            blk: {
+                const t = try m.serialize(gpa);
+                defer gpa.free(t);
+                break :blk @as(f64, @floatFromInt(t.len)) / 1024.0;
+            },
+            (m.nRanges() + 7) / 8,
+        });
+        return;
+    }
+
+    try out.print("gguf: unknown subcommand {s} (want gen|info|shard|run)\n", .{sub});
 }
 
 fn cmdGgufRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8, args: [][]const u8) !void {

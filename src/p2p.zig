@@ -13,7 +13,8 @@
 //!   HAS <id>      -> PRESENT <id> off=<o> len=<l> sha256=<hex> | ABSENT <id> | ERR range
 //!   PING          -> PONG
 //!   -- weight-range distribution (when a GGUF store is attached) --
-//!   MANIFEST      -> MANIFEST version=<hex> size=<b> ranges=<n> range_size=<b>
+//!   MANIFEST      -> MANIFEST version=<hex> size=<b> ranges=<n> range_size=<b> mode=<fixed|expert> resident=<n>
+//!   MANIFESTFILE  -> MANIFESTFILE len=<n>\n<serialized manifest bytes> (digests + extent lists)
 //!   DIGEST <i>    -> DIGEST <i> <hex>
 //!   DIGESTS       -> DIGESTS <n>\n<hex>\n x n     (bulk, for bootstrap)
 //!   HOLDINGS      -> HOLDINGS <hex bitmap>      (bit i = holds range i; the
@@ -106,8 +107,10 @@ fn connThread(conn: *Conn) void {
 
 fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
     defer stream.close(ctx.io);
-    var rbuf: [4096]u8 = undefined;
-    var wbuf: [4096]u8 = undefined;
+    // GLM-scale holdings bitmaps make GOSSIP/HOLDINGS lines ~5 KB; size the
+    // line buffers well past that
+    var rbuf: [1 << 16]u8 = undefined;
+    var wbuf: [1 << 16]u8 = undefined;
     var r = stream.reader(ctx.io, &rbuf);
     var w = stream.writer(ctx.io, &wbuf);
     const ri = &r.interface;
@@ -145,9 +148,16 @@ fn handleLine(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
     } else if (std.mem.eql(u8, line, "MANIFEST")) {
         const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
         const m = &store.manifest;
-        try wi.print("MANIFEST version={s} size={d} ranges={d} range_size={d}\n", .{
+        try wi.print("MANIFEST version={s} size={d} ranges={d} range_size={d} mode={s} resident={d}\n", .{
             hashmod.toHex(m.version), m.file_size, m.nRanges(), m.range_size,
+            @tagName(m.mode),          m.n_resident,
         });
+    } else if (std.mem.eql(u8, line, "MANIFESTFILE")) {
+        const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
+        const text = try store.manifest.serialize(ctx.gpa);
+        defer ctx.gpa.free(text);
+        try wi.print("MANIFESTFILE len={d}\n", .{text.len});
+        try wi.writeAll(text);
     } else if (std.mem.startsWith(u8, line, "DIGEST ")) {
         const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
         const i = std.fmt.parseInt(usize, std.mem.trim(u8, line[7..], " "), 10) catch {

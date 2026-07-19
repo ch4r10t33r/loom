@@ -121,7 +121,7 @@ pub fn fetchFromPeer(gpa: std.mem.Allocator, io: Io, store: *weights.Store, addr
     var peer_holdings = try weights.Holdings.fromHex(gpa, hline[9..], n_ranges);
     defer peer_holdings.deinit(gpa);
 
-    const buf = try gpa.alloc(u8, @intCast(m.range_size));
+    const buf = try gpa.alloc(u8, @intCast(m.maxShardLen()));
     defer gpa.free(buf);
 
     var stats = FetchStats{};
@@ -144,30 +144,19 @@ pub fn fetchFromPeer(gpa: std.mem.Allocator, io: Io, store: *weights.Store, addr
     return stats;
 }
 
-/// Fetch manifest + digest set from a peer and verify the Merkle root pins the
-/// advertised version. Returns an owned Manifest.
+/// Fetch the serialized manifest (digests + extent lists) from a peer. The
+/// parser verifies the Merkle root pins the digest set. Returns an owned
+/// Manifest.
 fn adoptManifest(gpa: std.mem.Allocator, peer: *Peer) !weights.Manifest {
-    try peer.send("MANIFEST\n", .{});
-    const mline = try peer.recvLine();
-    if (!std.mem.startsWith(u8, mline, "MANIFEST ")) return error.PeerHasNoStore;
-    const version = try parseDigestHex(field(mline, "version") orelse return error.BadManifestLine);
-    const file_size = try std.fmt.parseInt(u64, field(mline, "size") orelse return error.BadManifestLine, 10);
-    const n_ranges = try std.fmt.parseInt(usize, field(mline, "ranges") orelse return error.BadManifestLine, 10);
-    const range_size = try std.fmt.parseInt(u64, field(mline, "range_size") orelse return error.BadManifestLine, 10);
-    if (n_ranges == 0 or n_ranges != (file_size + range_size - 1) / range_size) return error.BadManifestLine;
-
-    try peer.send("DIGESTS\n", .{});
-    const dline = try peer.recvLine();
-    if (!std.mem.startsWith(u8, dline, "DIGESTS ")) return error.BadDigestsLine;
-    const dn = try std.fmt.parseInt(usize, dline[8..], 10);
-    if (dn != n_ranges) return error.BadDigestsLine;
-    const digests = try gpa.alloc(hashmod.Digest, n_ranges);
-    errdefer gpa.free(digests);
-    for (digests) |*d| d.* = try parseDigestHex(try peer.recvLine());
-    const root = try hashmod.merkleRoot(gpa, digests);
-    if (!hashmod.eql(root, version)) return error.PeerManifestRootMismatch;
-
-    return .{ .version = version, .file_size = file_size, .range_size = range_size, .digests = digests };
+    try peer.send("MANIFESTFILE\n", .{});
+    const hline = try peer.recvLine();
+    if (!std.mem.startsWith(u8, hline, "MANIFESTFILE ")) return error.PeerHasNoStore;
+    const len = try std.fmt.parseInt(usize, field(hline, "len") orelse return error.BadManifestLine, 10);
+    if (len == 0 or len > 256 * 1024 * 1024) return error.BadManifestLine;
+    const bytes = try gpa.alloc(u8, len);
+    defer gpa.free(bytes);
+    try peer.r.interface.readSliceAll(bytes);
+    return weights.parseManifestBytes(gpa, bytes);
 }
 
 /// Bootstrap a local weight store from `peers`: adopt the manifest from the
@@ -196,7 +185,7 @@ pub fn bootstrap(
     var manifest_owned = true; // ownership moves into the store below
     errdefer if (manifest_owned) m.deinit(gpa);
 
-    var wanted_bits = try weights.Holdings.initRandom(gpa, m.nRanges(), fraction, seed);
+    var wanted_bits = try weights.Holdings.initWanted(gpa, m.nRanges(), m.n_resident, fraction, seed);
     var wanted_owned = true; // ownership moves into the store below
     errdefer if (wanted_owned) wanted_bits.deinit(gpa);
     const wanted = wanted_bits.count();

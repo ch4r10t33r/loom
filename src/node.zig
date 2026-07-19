@@ -153,7 +153,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     if (opts.gguf_path) |gp| {
         const store_dir = try std.fmt.allocPrint(gpa, "{s}/gguf-origin", .{opts.cache_root});
         defer gpa.free(store_dir);
-        store = weights.openFull(gpa, io, gp, store_dir, opts.range_bytes) catch |e| {
+        store = weights.openFull(gpa, io, gp, store_dir, opts.range_bytes, null) catch |e| {
             try out.print("gguf store failed ({s}): {s}\n", .{ gp, @errorName(e) });
             return;
         };
@@ -194,12 +194,14 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         advertise, peer_strs.items.len, @divTrunc(gossip.INTERVAL_NS, std.time.ns_per_s),
     });
     if (store) |*st| {
-        try out.print("  weights    version={s} ranges={d} held={d} ({d:.1}%) range_size={d:.1} MB\n", .{
-            hashmod.toHex(st.manifest.version),
+        try out.print("  weights    version={s}\n", .{hashmod.toHex(st.manifest.version)});
+        try out.print("  shards     mode={s} total={d} (resident={d}, expert={d}) held={d} ({d:.1}%)\n", .{
+            @tagName(st.manifest.mode),
             st.manifest.nRanges(),
+            st.manifest.n_resident,
+            st.manifest.nRanges() - st.manifest.n_resident,
             st.holdings.count(),
             100.0 * @as(f64, @floatFromInt(st.holdings.count())) / @as(f64, @floatFromInt(st.manifest.nRanges())),
-            @as(f64, @floatFromInt(st.manifest.range_size)) / MBf,
         });
     }
     try out.print("  serving... (Ctrl-C to stop)\n", .{});
