@@ -108,6 +108,15 @@ pub const Parsed = struct {
         };
     }
 
+    pub fn getBool(self: *const Parsed, key: []const u8) ?bool {
+        return switch (self.findMeta(key) orelse return null) {
+            .boolean => |b| b,
+            .uint => |v| v != 0,
+            .int => |v| v != 0,
+            else => null,
+        };
+    }
+
     pub fn findTensor(self: *const Parsed, name: []const u8) ?TensorInfo {
         for (self.tensors) |t| {
             if (std.mem.eql(u8, t.name, name)) return t;
@@ -322,6 +331,230 @@ pub fn writeFixture(gpa: std.mem.Allocator, io: Io, path: []const u8, seed: u64,
         try f.writeStreamingAll(io, chunk[0..n]);
         remaining -= n;
     }
+}
+
+/// Write a small, valid **deepseek2**-architecture GGUF (random f32 weights):
+/// MLA attention with q-LoRA, 1 leading dense layer + MoE layers with sigmoid
+/// gating, selection bias, shared expert, and a byte-fallback SPM vocab. Used
+/// to validate the deepseek2 engine end-to-end without a multi-GB download.
+pub fn writeDeepseekFixture(gpa: std.mem.Allocator, io: Io, path: []const u8, seed: u64) !void {
+    const alignment: u64 = 32;
+    // tiny but structurally faithful shape
+    const dim: u64 = 64;
+    const n_layers: u64 = 3;
+    const n_dense: u64 = 1;
+    const n_heads: u64 = 4;
+    const q_lora: u64 = 32;
+    const kv_lora: u64 = 32;
+    const rope_dim: u64 = 8;
+    const nope: u64 = 16;
+    const key_len: u64 = nope + rope_dim; // 24
+    const v_len: u64 = 16;
+    const ffn: u64 = 128;
+    const n_expert: u64 = 8;
+    const n_used: u64 = 2;
+    const n_shared: u64 = 1;
+    const moe_ffn: u64 = 48;
+    const vocab: u64 = 3 + 256; // <unk>, <s>, </s>, <0x00>..<0xFF>
+
+    var kv = std.ArrayList(u8).empty;
+    defer kv.deinit(gpa);
+    var kv_count: u64 = 0;
+
+    // -- metadata --
+    try kvStr(gpa, &kv, &kv_count, "general.architecture", "deepseek2");
+    try kvStr(gpa, &kv, &kv_count, "general.name", "loom deepseek2 fixture");
+    try kvU32v(gpa, &kv, &kv_count, "general.alignment", @intCast(alignment));
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.block_count", @intCast(n_layers));
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.context_length", 256);
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.embedding_length", @intCast(dim));
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.feed_forward_length", @intCast(ffn));
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.attention.head_count", @intCast(n_heads));
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.attention.head_count_kv", @intCast(n_heads));
+    try kvF32v(gpa, &kv, &kv_count, "deepseek2.attention.layer_norm_rms_epsilon", 1e-6);
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.rope.dimension_count", @intCast(rope_dim));
+    try kvF32v(gpa, &kv, &kv_count, "deepseek2.rope.freq_base", 10000.0);
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.attention.q_lora_rank", @intCast(q_lora));
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.attention.kv_lora_rank", @intCast(kv_lora));
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.attention.key_length", @intCast(key_len));
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.attention.value_length", @intCast(v_len));
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.leading_dense_block_count", @intCast(n_dense));
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.expert_count", @intCast(n_expert));
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.expert_used_count", @intCast(n_used));
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.expert_shared_count", @intCast(n_shared));
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.expert_feed_forward_length", @intCast(moe_ffn));
+    try kvF32v(gpa, &kv, &kv_count, "deepseek2.expert_weights_scale", 1.0);
+    try kvBool(gpa, &kv, &kv_count, "deepseek2.expert_weights_norm", true);
+    try kvU32v(gpa, &kv, &kv_count, "deepseek2.expert_gating_func", 2); // sigmoid
+
+    // -- tokenizer: byte-fallback SPM-style vocab --
+    try kvStr(gpa, &kv, &kv_count, "tokenizer.ggml.model", "llama");
+    {
+        // tokens
+        try appendStr(gpa, &kv, "tokenizer.ggml.tokens");
+        try appendU32(gpa, &kv, @intFromEnum(ValueType.array));
+        try appendU32(gpa, &kv, @intFromEnum(ValueType.string));
+        try appendU64(gpa, &kv, vocab);
+        try appendStr(gpa, &kv, "<unk>");
+        try appendStr(gpa, &kv, "<s>");
+        try appendStr(gpa, &kv, "</s>");
+        var b: usize = 0;
+        var nbuf: [8]u8 = undefined;
+        while (b < 256) : (b += 1) {
+            try appendStr(gpa, &kv, try std.fmt.bufPrint(&nbuf, "<0x{X:0>2}>", .{b}));
+        }
+        kv_count += 1;
+        // scores (all zero)
+        try appendStr(gpa, &kv, "tokenizer.ggml.scores");
+        try appendU32(gpa, &kv, @intFromEnum(ValueType.array));
+        try appendU32(gpa, &kv, @intFromEnum(ValueType.f32));
+        try appendU64(gpa, &kv, vocab);
+        var i: usize = 0;
+        while (i < vocab) : (i += 1) try appendU32(gpa, &kv, 0);
+        kv_count += 1;
+        // types: unk=2, control=3, byte=6
+        try appendStr(gpa, &kv, "tokenizer.ggml.token_type");
+        try appendU32(gpa, &kv, @intFromEnum(ValueType.array));
+        try appendU32(gpa, &kv, @intFromEnum(ValueType.i32));
+        try appendU64(gpa, &kv, vocab);
+        try appendU32(gpa, &kv, 2);
+        try appendU32(gpa, &kv, 3);
+        try appendU32(gpa, &kv, 3);
+        i = 0;
+        while (i < 256) : (i += 1) try appendU32(gpa, &kv, 6);
+        kv_count += 1;
+    }
+    try kvU32v(gpa, &kv, &kv_count, "tokenizer.ggml.bos_token_id", 1);
+    try kvU32v(gpa, &kv, &kv_count, "tokenizer.ggml.eos_token_id", 2);
+    try kvU32v(gpa, &kv, &kv_count, "tokenizer.ggml.unknown_token_id", 0);
+
+    // -- tensor table --
+    const T = struct { name: []const u8, dims: [3]u64, n_dims: u32 };
+    var infos = std.ArrayList(T).empty;
+    defer infos.deinit(gpa);
+    var names = std.heap.ArenaAllocator.init(gpa);
+    defer names.deinit();
+    const na = names.allocator();
+
+    try infos.append(gpa, .{ .name = "token_embd.weight", .dims = .{ dim, vocab, 0 }, .n_dims = 2 });
+    try infos.append(gpa, .{ .name = "output_norm.weight", .dims = .{ dim, 0, 0 }, .n_dims = 1 });
+    try infos.append(gpa, .{ .name = "output.weight", .dims = .{ dim, vocab, 0 }, .n_dims = 2 });
+    var li: u64 = 0;
+    while (li < n_layers) : (li += 1) {
+        const L = struct {
+            fn n(a: std.mem.Allocator, l: u64, comptime s: []const u8) []const u8 {
+                return std.fmt.allocPrint(a, "blk.{d}." ++ s, .{l}) catch unreachable;
+            }
+        };
+        try infos.append(gpa, .{ .name = L.n(na, li, "attn_norm.weight"), .dims = .{ dim, 0, 0 }, .n_dims = 1 });
+        try infos.append(gpa, .{ .name = L.n(na, li, "attn_q_a.weight"), .dims = .{ dim, q_lora, 0 }, .n_dims = 2 });
+        try infos.append(gpa, .{ .name = L.n(na, li, "attn_q_a_norm.weight"), .dims = .{ q_lora, 0, 0 }, .n_dims = 1 });
+        try infos.append(gpa, .{ .name = L.n(na, li, "attn_q_b.weight"), .dims = .{ q_lora, n_heads * key_len, 0 }, .n_dims = 2 });
+        try infos.append(gpa, .{ .name = L.n(na, li, "attn_kv_a_mqa.weight"), .dims = .{ dim, kv_lora + rope_dim, 0 }, .n_dims = 2 });
+        try infos.append(gpa, .{ .name = L.n(na, li, "attn_kv_a_norm.weight"), .dims = .{ kv_lora, 0, 0 }, .n_dims = 1 });
+        try infos.append(gpa, .{ .name = L.n(na, li, "attn_kv_b.weight"), .dims = .{ kv_lora, n_heads * (nope + v_len), 0 }, .n_dims = 2 });
+        try infos.append(gpa, .{ .name = L.n(na, li, "attn_output.weight"), .dims = .{ n_heads * v_len, dim, 0 }, .n_dims = 2 });
+        try infos.append(gpa, .{ .name = L.n(na, li, "ffn_norm.weight"), .dims = .{ dim, 0, 0 }, .n_dims = 1 });
+        if (li < n_dense) {
+            try infos.append(gpa, .{ .name = L.n(na, li, "ffn_gate.weight"), .dims = .{ dim, ffn, 0 }, .n_dims = 2 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "ffn_up.weight"), .dims = .{ dim, ffn, 0 }, .n_dims = 2 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "ffn_down.weight"), .dims = .{ ffn, dim, 0 }, .n_dims = 2 });
+        } else {
+            try infos.append(gpa, .{ .name = L.n(na, li, "ffn_gate_inp.weight"), .dims = .{ dim, n_expert, 0 }, .n_dims = 2 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "exp_probs_b.bias"), .dims = .{ n_expert, 0, 0 }, .n_dims = 1 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "ffn_gate_exps.weight"), .dims = .{ dim, moe_ffn, n_expert }, .n_dims = 3 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "ffn_up_exps.weight"), .dims = .{ dim, moe_ffn, n_expert }, .n_dims = 3 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "ffn_down_exps.weight"), .dims = .{ moe_ffn, dim, n_expert }, .n_dims = 3 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "ffn_gate_shexp.weight"), .dims = .{ dim, n_shared * moe_ffn, 0 }, .n_dims = 2 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "ffn_up_shexp.weight"), .dims = .{ dim, n_shared * moe_ffn, 0 }, .n_dims = 2 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "ffn_down_shexp.weight"), .dims = .{ n_shared * moe_ffn, dim, 0 }, .n_dims = 2 });
+        }
+    }
+
+    // header + tensor infos with aligned offsets
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(gpa);
+    try appendU32(gpa, &buf, MAGIC);
+    try appendU32(gpa, &buf, 3);
+    try appendU64(gpa, &buf, infos.items.len);
+    try appendU64(gpa, &buf, kv_count);
+    try buf.appendSlice(gpa, kv.items);
+
+    var offset: u64 = 0;
+    var sizes = std.ArrayList(u64).empty;
+    defer sizes.deinit(gpa);
+    for (infos.items) |t| {
+        try appendStr(gpa, &buf, t.name);
+        try appendU32(gpa, &buf, t.n_dims);
+        var elems: u64 = 1;
+        var d: usize = 0;
+        while (d < t.n_dims) : (d += 1) {
+            try appendU64(gpa, &buf, t.dims[d]);
+            elems *= t.dims[d];
+        }
+        try appendU32(gpa, &buf, 0); // f32
+        offset = std.mem.alignForward(u64, offset, alignment);
+        try appendU64(gpa, &buf, offset);
+        try sizes.append(gpa, elems * 4);
+        offset += elems * 4;
+    }
+    while (buf.items.len % alignment != 0) try buf.append(gpa, 0);
+
+    const f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+    defer f.close(io);
+    try f.writeStreamingAll(io, buf.items);
+
+    // tensor data: deterministic small values, per-tensor stream with padding
+    var written: u64 = 0;
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+    var chunk: [16 * 1024]u8 = undefined;
+    for (sizes.items) |sz| {
+        const aligned = std.mem.alignForward(u64, written, alignment);
+        if (aligned > written) {
+            const pad = aligned - written;
+            @memset(chunk[0..@intCast(pad)], 0);
+            try f.writeStreamingAll(io, chunk[0..@intCast(pad)]);
+            written = aligned;
+        }
+        var remaining = sz;
+        while (remaining > 0) {
+            const n: usize = @intCast(@min(remaining, chunk.len));
+            var i: usize = 0;
+            while (i + 4 <= n) : (i += 4) {
+                const v: f32 = (rnd.float(f32) - 0.5) * 0.2;
+                std.mem.writeInt(u32, chunk[i..][0..4], @bitCast(v), .little);
+            }
+            try f.writeStreamingAll(io, chunk[0..n]);
+            remaining -= n;
+        }
+        written += sz;
+    }
+}
+
+fn kvStr(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), count: *u64, key: []const u8, val: []const u8) !void {
+    try appendStr(gpa, buf, key);
+    try appendU32(gpa, buf, @intFromEnum(ValueType.string));
+    try appendStr(gpa, buf, val);
+    count.* += 1;
+}
+fn kvU32v(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), count: *u64, key: []const u8, val: u32) !void {
+    try appendStr(gpa, buf, key);
+    try appendU32(gpa, buf, @intFromEnum(ValueType.u32));
+    try appendU32(gpa, buf, val);
+    count.* += 1;
+}
+fn kvF32v(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), count: *u64, key: []const u8, val: f32) !void {
+    try appendStr(gpa, buf, key);
+    try appendU32(gpa, buf, @intFromEnum(ValueType.f32));
+    try appendU32(gpa, buf, @bitCast(val));
+    count.* += 1;
+}
+fn kvBool(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), count: *u64, key: []const u8, val: bool) !void {
+    try appendStr(gpa, buf, key);
+    try appendU32(gpa, buf, @intFromEnum(ValueType.bool));
+    try buf.append(gpa, if (val) 1 else 0);
+    count.* += 1;
 }
 
 fn appendU32(gpa: std.mem.Allocator, buf: *std.ArrayList(u8), v: u32) !void {

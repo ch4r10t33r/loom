@@ -170,7 +170,7 @@ pub const Tokenizer = struct {
 
     const BYTE_TYPE: i32 = 6;
 
-    fn init(gpa: std.mem.Allocator, parsed: *const gguf.Parsed) !Tokenizer {
+    pub fn init(gpa: std.mem.Allocator, parsed: *const gguf.Parsed) !Tokenizer {
         const tokens = switch (parsed.findMeta("tokenizer.ggml.tokens") orelse return error.NoTokenizer) {
             .array_str => |a| a,
             else => return error.NoTokenizer,
@@ -196,7 +196,7 @@ pub const Tokenizer = struct {
         };
     }
 
-    fn deinit(self: *Tokenizer, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *Tokenizer, gpa: std.mem.Allocator) void {
         _ = gpa;
         self.lookup.deinit();
     }

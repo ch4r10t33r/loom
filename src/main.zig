@@ -35,6 +35,7 @@ pub const peers = @import("peers.zig");
 pub const gossip = @import("gossip.zig");
 pub const ggml = @import("ggml.zig");
 pub const llama = @import("llama.zig");
+pub const deepseek = @import("deepseek.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MB: usize = 1024 * 1024;
@@ -86,7 +87,7 @@ fn usage(out: *Io.Writer) !void {
         \\            [--gguf FILE | --bootstrap HOST:PORT]
         \\            [--peers H:P,H:P,...] [--hold-fraction F] [--range-mb M]
         \\            [--advertise HOST:PORT]
-        \\  loom gguf gen <file> [--seed N] [--data-mb M]
+        \\  loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2]
         \\  loom gguf info <file> [--range-mb M]
         \\  loom gguf run <file.gguf> [--prompt STR] [--max-tokens N] [--temp T] [--seed S]
         \\  loom gen <dir> [--glm] [--seed N]
@@ -354,10 +355,17 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
 
     if (std.mem.eql(u8, sub, "gen")) {
         const seed = try flagU64(args, "--seed", 42);
-        const data_mb = try flagUsize(args, "--data-mb", 8);
-        try out.print("writing synthetic GGUF ({d} MB tensor data) -> {s}\n", .{ data_mb, path });
-        try out.flush();
-        try gguf.writeFixture(gpa, io, path, seed, data_mb);
+        const arch = flagStr(args, "--arch") orelse "demo";
+        if (std.mem.eql(u8, arch, "deepseek2")) {
+            try out.print("writing synthetic deepseek2 GGUF (MLA + MoE, random weights) -> {s}\n", .{path});
+            try out.flush();
+            try gguf.writeDeepseekFixture(gpa, io, path, seed);
+        } else {
+            const data_mb = try flagUsize(args, "--data-mb", 8);
+            try out.print("writing synthetic GGUF ({d} MB tensor data) -> {s}\n", .{ data_mb, path });
+            try out.flush();
+            try gguf.writeFixture(gpa, io, path, seed, data_mb);
+        }
         try out.print("done\n", .{});
         return;
     }
@@ -409,22 +417,44 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
 }
 
 fn cmdGgufRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8, args: [][]const u8) !void {
+    // peek the architecture, then dispatch to the matching engine
+    var peek = gguf.parse(gpa, io, path) catch |e| {
+        return out.print("parse failed: {s}\n", .{@errorName(e)});
+    };
+    const arch_buf: [64]u8 = undefined;
+    _ = arch_buf;
+    var arch_store: [64]u8 = undefined;
+    const arch_src = peek.getString("general.architecture") orelse "?";
+    const arch = arch_store[0..@min(arch_src.len, arch_store.len)];
+    @memcpy(@constCast(arch), arch_src[0..arch.len]);
+    peek.deinit();
+
+    if (std.mem.eql(u8, arch, "llama")) {
+        return runEngine(llama, gpa, io, out, path, args);
+    } else if (std.mem.eql(u8, arch, "deepseek2")) {
+        return runEngine(deepseek, gpa, io, out, path, args);
+    }
+    try out.print("unsupported architecture: {s} (supported: llama, deepseek2)\n", .{arch});
+}
+
+/// Generic generation loop over either engine module (same load/State/step shape).
+fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8, args: [][]const u8) !void {
     const prompt = flagStr(args, "--prompt") orelse "Once upon a time";
     const max_tokens = try flagUsize(args, "--max-tokens", 128);
     const temp: f32 = @floatCast(try flagF64(args, "--temp", 0.0));
     const seed = try flagU64(args, "--seed", 42);
 
-    var m = llama.load(gpa, io, path) catch |e| {
+    var m = eng.load(gpa, io, path) catch |e| {
         return out.print("load failed: {s}\n", .{@errorName(e)});
     };
     defer m.deinit();
     const c = m.cfg;
-    try out.print("llama gguf: dim={d} layers={d} heads={d}/{d}kv ffn={d} vocab={d} ctx={d} rope_dim={d}\n", .{
-        c.dim, c.n_layers, c.n_heads, c.n_kv_heads, c.ffn, c.vocab, c.ctx_len, c.rope_dim,
+    try out.print("gguf: dim={d} layers={d} heads={d} vocab={d} ctx={d}\n", .{
+        c.dim, c.n_layers, c.n_heads, c.vocab, c.ctx_len,
     });
     try out.flush();
 
-    var st = try llama.State.init(gpa, c);
+    var st = try eng.State.init(gpa, c);
     defer st.deinit(gpa);
 
     const prompt_toks = try m.tok.encode(gpa, prompt, true);
@@ -442,7 +472,7 @@ fn cmdGgufRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8,
     try out.print("output: ", .{});
     for (prompt_toks) |tok| {
         if (pos >= c.ctx_len) return out.print("\nprompt exceeds context\n", .{});
-        llama.step(&m, &st, tok, pos);
+        eng.step(&m, &st, tok, pos);
         try m.tok.decode(out, tok);
         pos += 1;
     }
@@ -454,7 +484,7 @@ fn cmdGgufRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8,
         if (last == m.tok.eos) break;
         try m.tok.decode(out, last);
         try out.flush();
-        llama.step(&m, &st, last, pos);
+        eng.step(&m, &st, last, pos);
         pos += 1;
         last = @intCast(sampler.sample(sample_scratch, st.logits, temp, rnd));
     }

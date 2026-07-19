@@ -238,12 +238,16 @@ loom info /tmp/ckpt
 ### `loom gguf gen` — synthetic GGUF fixture
 
 ```
-loom gguf gen <file> [--seed N] [--data-mb M]     # defaults: seed 42, 8 MB
+loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2]
 ```
 
-Writes a small valid GGUF v3 file (metadata + two f32 tensors of deterministic
-data). Used as the payload for weight-distribution demos and tests — it is
-**not** a runnable language model.
+Writes a small valid GGUF v3 file. Default (`demo`): metadata + two f32 tensors
+of deterministic data — a distribution payload, **not** a runnable model.
+`--arch deepseek2`: a structurally faithful tiny **deepseek2** model (MLA with
+q-LoRA, 1 dense + 2 MoE layers, sigmoid gating + selection bias + shared
+expert, byte-fallback SPM vocab) with random weights — runnable with
+`loom gguf run`, used to validate the deepseek2 engine without a multi-GB
+download.
 
 ### `loom gguf info` — inspect any GGUF
 
@@ -272,11 +276,22 @@ loom gguf run <file.gguf> [--prompt STR] [--max-tokens N] [--temp T] [--seed S]
 | `--temp T` | `0` (greedy) |
 | `--seed S` | `42` |
 
-Real inference over the mmap'd file: GGML **F32 / F16 / Q4_0 / Q8_0** tensors
-(fused matvec on the raw bytes — no wholesale dequantization), GQA attention,
-NORM-style RoPE, SwiGLU, and the **SentencePiece tokenizer embedded in the GGUF
-metadata** (score-based pair merging, byte fallback). Output streams as it
-generates.
+Real inference over the mmap'd file, dispatched on `general.architecture`:
+
+- **`llama`** — GQA attention, NORM-style RoPE, SwiGLU.
+- **`deepseek2`** (DeepSeek V2/V3, Kimi K2, GLM-class MoE) — MLA attention
+  (q-LoRA, compressed-KV latent cache, decoupled NEOX rope head) + MoE FFN
+  (sigmoid/softmax gating, noaux_tc selection bias, top-k with renormalized
+  scaled gates, shared experts, leading dense layers). First cut: validated
+  end-to-end on the synthetic `--arch deepseek2` fixture; running *real*
+  DeepSeek/Kimi GGUFs still needs the BPE (gpt2) tokenizer, YaRN mscale, and
+  K-quant tensor types —
+  tracked in [#1](https://github.com/ch4r10t33r/loom/issues/1).
+
+GGML **F32 / F16 / Q4_0 / Q8_0** tensors (fused matvec on the raw bytes — no
+wholesale dequantization) and the **SentencePiece tokenizer embedded in the
+GGUF metadata** (score-based pair merging, byte fallback). Output streams as
+it generates.
 
 ```sh
 curl -LO https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf
@@ -339,6 +354,7 @@ loom iobench /tmp/ckpt/experts.blob --threads 8 --block-mb 1 --reads 64
 | `gguf.zig` | GGUF v2/v3 parser (metadata incl. tokenizer arrays, tensor table) + fixture writer |
 | `ggml.zig` | GGML kernels: F32/F16/Q4_0/Q8_0 fused matvec + row dequant |
 | `llama.zig` | llama-arch engine over mmap'd GGUF: GQA, NORM RoPE, SwiGLU, SPM tokenizer |
+| `deepseek.zig` | deepseek2-arch engine (Kimi/DeepSeek/GLM): MLA + MoE routing over mmap'd GGUF |
 | `stats.zig` | RSS, usage histograms, STATS→PIN hot-set selection |
 | `iobench.zig` | parallel random-read disk profiler |
 | `gen_checkpoint.zig` | deterministic synthetic checkpoint generator |
