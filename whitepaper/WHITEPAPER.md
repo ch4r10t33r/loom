@@ -34,16 +34,27 @@
 
 ## Abstract
 
-Loom is a system for serving very large Mixture-of-Experts (MoE) language models
-across a swarm of ordinary machines by keeping computation node-local and moving
-only weights across the network. The motivation is structural: the strongest
-open-weight models — Kimi K2 [3], DeepSeek V3 [2], the GLM family [4] — are MoE
-architectures whose weights do not fit on any commodity machine, yet each token
-activates only a few percent of them, drawn from an immutable, content-addressable
-corpus. Loom treats that corpus as distributed storage: it is sharded into
-content-addressed expert blocks, replicated across coordinated "committees" of
-nodes, verified by Merkle digests at every hop, and paged into the token loop on
-demand.
+The strongest open-weight language models are now Mixture-of-Experts (MoE)
+architectures — Kimi K2 [3], DeepSeek V3 [2], the GLM family [4] — whose weights
+run to hundreds of billions or trillions of parameters. At usable quantization
+their routed experts alone are hundreds of gigabytes: they do not fit on any
+commodity machine, and running them today means renting datacenter GPUs that
+price out individuals and small teams. Multi-machine alternatives exist, but the
+prevailing approach splits the *computation* across nodes and ships activations
+between them every layer of every token, placing the network on the serial
+critical path — so a slow or lost peer stalls the whole pipeline. **The problem
+Loom addresses: how to serve a frontier MoE model that no single affordable
+machine can hold, across a pool of ordinary machines on ordinary networks,
+without putting the network in the critical path of every token.**
+
+The opportunity is structural. An MoE model activates only a few percent of its
+weights per token, and those weights form an immutable, content-addressable
+corpus — a sparsely accessed blob store, not a monolithic tensor. Loom exploits
+this by keeping computation node-local and moving only weights: the corpus is
+sharded into content-addressed expert blocks, replicated across coordinated
+"committees" of nodes, verified by Merkle digests at every hop, and paged into
+the token loop on demand. Because only immutable weights cross the network, a
+lost peer costs a re-fetch from a replica rather than a broken pipeline.
 
 *What has been demonstrated.* The inference engines produce correct output on
 reference checkpoints (the tinyllamas models, and DeepSeek-V2-Lite, a 15.7-billion-parameter
