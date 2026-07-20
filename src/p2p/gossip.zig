@@ -45,7 +45,7 @@ fn exchange(ctx: *Ctx, addr_str: []const u8) !void {
     var ann = wire.Announce{ .committee_id = ctx.committee_id, .addr = ctx.advertise };
     if (ctx.store) |st| {
         ann.manifest_version = st.manifest.version;
-        ann.holdings_seq = @intCast(st.holdings.count());
+        ann.holdings_seq = st.holdingsSeq();
         ann.holdings_bitmap = st.holdings.bits;
     }
     const body = try ann.encodeBody(gpa);
@@ -68,7 +68,7 @@ fn exchange(ctx: *Ctx, addr_str: []const u8) !void {
         const vhex = hashmod.toHex(e.manifest_version);
         const hhex = bytesToHexAlloc(gpa, e.holdings_bitmap) catch continue;
         defer gpa.free(hhex);
-        _ = ctx.table.merge(e.addr, &vhex, hhex, e.committee_id, now) catch continue;
+        _ = ctx.table.merge(e.addr, &vhex, hhex, e.committee_id, e.holdings_seq, now) catch continue;
     }
 }
 

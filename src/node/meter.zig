@@ -26,6 +26,7 @@ pub const Meter = struct {
     mutex: Io.Mutex = .init,
     free_quota: u64, // per-client free allowance, token units
     accounts: std.StringHashMap(Account),
+    max_accounts: usize, // memory-DoS bound on distinct client ids (audit #6 P0-2)
 
     pub fn init(gpa: std.mem.Allocator, io: Io, free_quota: u64) Meter {
         return .{
@@ -33,6 +34,7 @@ pub const Meter = struct {
             .io = io,
             .free_quota = free_quota,
             .accounts = std.StringHashMap(Account).init(gpa),
+            .max_accounts = 100_000,
         };
     }
 
@@ -60,6 +62,8 @@ pub const Meter = struct {
     pub fn charge(self: *Meter, client: []const u8, tokens: u64) !Charge {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
+        if (!self.accounts.contains(client) and self.accounts.count() >= self.max_accounts)
+            return error.TooManyAccounts;
         const gop = try self.accounts.getOrPut(client);
         if (!gop.found_existing) {
             gop.key_ptr.* = try self.gpa.dupe(u8, client);
@@ -67,6 +71,14 @@ pub const Meter = struct {
         }
         gop.value_ptr.used += tokens;
         return .{ .cost = tokens, .balance = self.allowance(gop.value_ptr.*) };
+    }
+
+    /// Clamp a requested generation length to the client's remaining allowance
+    /// (audit #6 P1): a single request can overdraw by at most the returned
+    /// value, never the whole `max_tokens` the caller asked for.
+    pub fn clampTokens(self: *Meter, client: []const u8, requested: u64) u64 {
+        const rem = self.remaining(client);
+        return @min(requested, rem);
     }
 
     /// Settlement seam: add purchased credits. v1 trusts the caller (the

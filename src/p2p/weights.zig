@@ -152,8 +152,11 @@ pub fn parseManifestBytes(gpa: std.mem.Allocator, bytes: []const u8) !Manifest {
         if (extent_start[i] == extents.items.len) return error.BadManifest; // no extents
     }
     extent_start[n] = @intCast(extents.items.len);
+    if (n_resident > n) return error.BadManifest;
 
-    const root = try hashmod.merkleRoot(gpa, digests);
+    // layout integrity: exact partition of the file + version binds the layout
+    try validatePartition(gpa, extents.items, file_size);
+    const root = try computeVersion(gpa, mode, file_size, n_resident, digests, extents.items, extent_start);
     if (!hashmod.eql(root, version)) return error.ManifestRootMismatch;
 
     return .{
@@ -166,6 +169,71 @@ pub fn parseManifestBytes(gpa: std.mem.Allocator, bytes: []const u8) !Manifest {
         .extents = try extents.toOwnedSlice(gpa),
         .extent_start = extent_start,
     };
+}
+
+
+/// Version id = Merkle root over per-shard *layout-committing* leaves plus a
+/// header leaf binding global fields. Binding extents/file_size/n_resident/mode
+/// into the root means a peer cannot serve digests that verify while pointing
+/// them at attacker-chosen offsets (audit #5 P0-1).
+pub fn computeVersion(
+    gpa: std.mem.Allocator,
+    mode: Mode,
+    file_size: u64,
+    n_resident: usize,
+    digests: []const hashmod.Digest,
+    extents: []const Extent,
+    extent_start: []const u32,
+) !hashmod.Digest {
+    var leaves = try gpa.alloc(hashmod.Digest, digests.len + 1);
+    defer gpa.free(leaves);
+
+    var hdr = std.ArrayList(u8).empty;
+    defer hdr.deinit(gpa);
+    try hdr.append(gpa, @intFromEnum(mode));
+    var t8: [8]u8 = undefined;
+    std.mem.writeInt(u64, &t8, file_size, .little);
+    try hdr.appendSlice(gpa, &t8);
+    std.mem.writeInt(u64, &t8, @intCast(n_resident), .little);
+    try hdr.appendSlice(gpa, &t8);
+    std.mem.writeInt(u64, &t8, @intCast(digests.len), .little);
+    try hdr.appendSlice(gpa, &t8);
+    leaves[0] = hashmod.hashBlock(hdr.items);
+
+    for (digests, 0..) |d, i| {
+        var leaf = std.ArrayList(u8).empty;
+        defer leaf.deinit(gpa);
+        try leaf.appendSlice(gpa, &d);
+        for (extents[extent_start[i]..extent_start[i + 1]]) |e| {
+            std.mem.writeInt(u64, &t8, e.offset, .little);
+            try leaf.appendSlice(gpa, &t8);
+            std.mem.writeInt(u64, &t8, e.len, .little);
+            try leaf.appendSlice(gpa, &t8);
+        }
+        leaves[i + 1] = hashmod.hashBlock(leaf.items);
+    }
+    return hashmod.merkleRoot(gpa, leaves);
+}
+
+/// Every byte of [0, file_size) belongs to exactly one shard extent: no gaps,
+/// no overlaps, no out-of-bounds (audit #5 P0-1). O(total extents log).
+pub fn validatePartition(gpa: std.mem.Allocator, extents: []const Extent, file_size: u64) !void {
+    const sorted = try gpa.dupe(Extent, extents);
+    defer gpa.free(sorted);
+    std.mem.sort(Extent, sorted, {}, struct {
+        fn lt(_: void, a: Extent, b: Extent) bool {
+            return a.offset < b.offset;
+        }
+    }.lt);
+    var cursor: u64 = 0;
+    for (sorted) |e| {
+        if (e.len == 0) return error.EmptyExtent;
+        if (e.offset != cursor) return error.ManifestNotAPartition; // gap or overlap
+        const end = std.math.add(u64, e.offset, e.len) catch return error.ExtentOverflow;
+        if (end > file_size) return error.ExtentPastEof;
+        cursor = end;
+    }
+    if (cursor != file_size) return error.ManifestNotAPartition; // does not cover EOF
 }
 
 // ---- manifest building -------------------------------------------------------
@@ -223,7 +291,7 @@ pub fn buildManifest(gpa: std.mem.Allocator, io: Io, path: []const u8, range_siz
 
     return .{
         .mode = .fixed,
-        .version = try hashmod.merkleRoot(gpa, digests),
+        .version = try computeVersion(gpa, .fixed, file_size, 0, digests, extents, extent_start),
         .file_size = file_size,
         .range_size = range_size,
         .n_resident = 0,
@@ -361,7 +429,7 @@ pub fn buildExpertManifest(gpa: std.mem.Allocator, io: Io, path: []const u8) !Ma
 
     return .{
         .mode = .expert,
-        .version = try hashmod.merkleRoot(gpa, digests),
+        .version = try computeVersion(gpa, .expert, parsed.file_size, n_resident, digests, extents_flat, extent_start),
         .file_size = parsed.file_size,
         .range_size = 0,
         .n_resident = n_resident,
@@ -415,6 +483,10 @@ pub const Holdings = struct {
         _ = @atomicRmw(u8, &self.bits[i / 8], .Or, @as(u8, 1) << @intCast(i % 8), .monotonic);
     }
 
+    pub fn clear(self: *Holdings, i: usize) void {
+        _ = @atomicRmw(u8, &self.bits[i / 8], .And, ~(@as(u8, 1) << @intCast(i % 8)), .monotonic);
+    }
+
     pub fn has(self: *const Holdings, i: usize) bool {
         if (i >= self.n) return false;
         const b = @atomicLoad(u8, &self.bits[i / 8], .monotonic);
@@ -463,6 +535,14 @@ pub const Store = struct {
     /// repair loop works to close the gap. Resident shards are always wanted.
     wanted: Holdings,
     file: Io.File, // model.gguf, open read/write
+    /// Truly monotonic sequence, bumped on every holdings mutation. Advertised
+    /// on heartbeat/gossip so a stale bitmap can never clobber a fresh one —
+    /// popcount is NOT monotonic now that verify-failures clear bits (#7 P1).
+    seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+
+    pub fn holdingsSeq(self: *Store) u64 {
+        return self.seq.load(.monotonic);
+    }
 
     pub fn deinit(self: *Store) void {
         self.file.close(self.io);
@@ -493,6 +573,35 @@ pub const Store = struct {
         return buf[0..pos];
     }
 
+    /// Read + re-hash shard `i` against its manifest digest before returning it
+    /// (audit #5 P0-2): defends the local hot path and GETR/ExpertRequest serve
+    /// against bitrot, torn pages, and a claimed-but-hole bitmap. On mismatch
+    /// the bit is cleared so eager repair re-fetches a good copy.
+    pub fn readRangeVerified(self: *Store, i: usize, buf: []u8) ![]u8 {
+        const data = try self.readRange(i, buf);
+        const got = hashmod.hashBlock(data);
+        if (!hashmod.eql(got, self.manifest.digests[i])) {
+            self.holdings.clear(i);
+            _ = self.seq.fetchAdd(1, .monotonic);
+            return error.RangeDigestMismatch;
+        }
+        return data;
+    }
+
+    /// Verify all currently-held shards; clear bits that fail (audit #5 P0-5).
+    /// Returns the number of shards that failed and were cleared.
+    pub fn auditHeld(self: *Store, scratch: []u8) !usize {
+        var failed: usize = 0;
+        var i: usize = 0;
+        while (i < self.manifest.nRanges()) : (i += 1) {
+            if (!self.holdings.has(i)) continue;
+            _ = self.readRangeVerified(i, scratch) catch {
+                failed += 1;
+            };
+        }
+        return failed;
+    }
+
     /// Verify + write shard `i` (scattering to its extents), marking it held.
     /// Rejects digest mismatches (the free poison check).
     pub fn writeRange(self: *Store, i: usize, data: []const u8) !void {
@@ -506,6 +615,7 @@ pub const Store = struct {
             pos += @intCast(e.len);
         }
         self.holdings.set(i);
+        _ = self.seq.fetchAdd(1, .monotonic);
     }
 
     pub fn saveSidecars(self: *Store) !void {
@@ -625,7 +735,7 @@ pub fn openDir(gpa: std.mem.Allocator, io: Io, store_dir: []const u8) !Store {
     const mp = try subPath(&pbuf, store_dir, "model.gguf");
     const file = try Io.Dir.cwd().openFile(io, mp, .{ .mode = .read_write });
 
-    return .{
+    var store = Store{
         .gpa = gpa,
         .io = io,
         .dir = try gpa.dupe(u8, store_dir),
@@ -634,6 +744,16 @@ pub fn openDir(gpa: std.mem.Allocator, io: Io, store_dir: []const u8) !Store {
         .wanted = wanted,
         .file = file,
     };
+    // audit #5 P0-5: never trust a persisted holdings bitmap — re-hash every
+    // claimed shard on open; failures are cleared (eager repair re-fetches).
+    const scratch = try gpa.alloc(u8, @intCast(store.manifest.maxShardLen()));
+    defer gpa.free(scratch);
+    const failed = store.auditHeld(scratch) catch 0;
+    if (failed > 0) {
+        std.debug.print("store audit: {d} held shard(s) failed digest, cleared\n", .{failed});
+        store.saveSidecars() catch {};
+    }
+    return store;
 }
 
 fn makePath(io: Io, path: []const u8) !void {
@@ -684,17 +804,18 @@ test "wanted set: resident always, experts by fraction" {
 test "manifest serialize/parse roundtrip with multi-extent shards" {
     const gpa = std.testing.allocator;
     var digests = [_]hashmod.Digest{ hashmod.hashBlock("a"), hashmod.hashBlock("b") };
-    const version = try hashmod.merkleRoot(gpa, &digests);
+    // a real partition of [0,160): shard0 = {[0,100),[100,50)}, shard1 = [150,10)
     var extents = [_]Extent{
         .{ .offset = 0, .len = 100 },
-        .{ .offset = 200, .len = 50 },
-        .{ .offset = 300, .len = 10 },
+        .{ .offset = 100, .len = 50 },
+        .{ .offset = 150, .len = 10 },
     };
     var starts = [_]u32{ 0, 2, 3 }; // shard0 = 2 extents, shard1 = 1
+    const version = try computeVersion(gpa, .expert, 160, 1, &digests, &extents, &starts);
     const m = Manifest{
         .mode = .expert,
         .version = version,
-        .file_size = 310,
+        .file_size = 160,
         .range_size = 0,
         .n_resident = 1,
         .digests = &digests,
@@ -712,6 +833,7 @@ test "manifest serialize/parse roundtrip with multi-extent shards" {
     try std.testing.expect(p.shardExtents(0).len == 2);
     try std.testing.expect(p.rangeLen(0) == 150);
     try std.testing.expect(p.rangeLen(1) == 10);
+    try std.testing.expect(p.file_size == 160);
     try std.testing.expect(hashmod.eql(p.version, version));
 }
 
@@ -756,4 +878,39 @@ test "expert manifest partitions the whole file: no gaps, no overlaps (issue #4.
     i = 0;
     while (i < m.nRanges()) : (i += 1) total += m.rangeLen(i);
     try std.testing.expectEqual(m.file_size, total);
+}
+
+
+test "malicious manifest extents rejected on parse (audit #5 P0-1)" {
+    const gpa = std.testing.allocator;
+    var digests = [_]hashmod.Digest{ hashmod.hashBlock("a"), hashmod.hashBlock("b") };
+    // overlapping extents: shard1 points back into shard0's bytes
+    var extents = [_]Extent{
+        .{ .offset = 0, .len = 100 },
+        .{ .offset = 50, .len = 50 }, // overlap with shard0
+    };
+    var starts = [_]u32{ 0, 1, 2 };
+    const version = try computeVersion(gpa, .expert, 100, 1, &digests, &extents, &starts);
+    const m = Manifest{
+        .mode = .expert, .version = version, .file_size = 100, .range_size = 0,
+        .n_resident = 1, .digests = &digests, .extents = &extents, .extent_start = &starts,
+    };
+    const text = try m.serialize(gpa);
+    defer gpa.free(text);
+    try std.testing.expectError(error.ManifestNotAPartition, parseManifestBytes(gpa, text));
+
+    // tampered extents whose Merkle-verifying digests still parse: flip an
+    // offset in the serialized text but keep the (now-wrong) version -> the
+    // recomputed layout-committed root no longer matches
+    var digests2 = [_]hashmod.Digest{hashmod.hashBlock("x")};
+    var ex2 = [_]Extent{.{ .offset = 0, .len = 64 }};
+    var st2 = [_]u32{ 0, 1 };
+    const v2 = try computeVersion(gpa, .expert, 64, 0, &digests2, &ex2, &st2);
+    const m2 = Manifest{ .mode = .expert, .version = v2, .file_size = 64, .range_size = 0, .n_resident = 0, .digests = &digests2, .extents = &ex2, .extent_start = &st2 };
+    const t2 = try m2.serialize(gpa);
+    defer gpa.free(t2);
+    // corrupt the extent "0:64" -> "0:63" (past-EOF/short) without touching version
+    const bad = try std.mem.replaceOwned(u8, gpa, t2, "0:64", "0:60");
+    defer gpa.free(bad);
+    try std.testing.expectError(error.ManifestNotAPartition, parseManifestBytes(gpa, bad));
 }

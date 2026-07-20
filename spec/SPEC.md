@@ -49,15 +49,18 @@ used unit         = prompt tokens processed + tokens generated
 - Light nodes tally their own spend from response `cost` fields, so both
   sides of the ledger exist independently.
 
-**v1 is a trusted-operator accounting demo, not a settlement system.** Known
-gaps, all in scope for a later hardening pass, none defended today:
-client ids are self-asserted (rotate to reset the free quota); ledgers are
-per-provider (round-robin across N nodes ⇒ N× free quota); `credit` accepts
-an unverified `proof` (RPC reachability ⇒ credit minting); no signed
-receipts (neither side can prove the other's ledger wrong). Prerequisites
-for real compensation: client keypair/HMAC identity, payment-proof
-verification, signed usage receipts. Overdraw is bounded to one request's
-`prompt + max_tokens`.
+**v1 is a trusted-operator accounting demo, not a settlement system.**
+Hardened since the initial cut: `credit` is now **admin-token gated** (no
+token ⇒ the op is disabled; a payment rail replaces the token check),
+`max_tokens` is **clamped to the client's remaining allowance** (overdraw
+bounded to the prompt), the account map is **capped** and the default free
+quota lowered, and the **light node force-stamps its own client id** (a
+caller-supplied `client` is dropped, so light nodes can't be open proxies).
+Still gaps, none defended today: client ids are self-asserted strings
+(rotate to reset the free quota); ledgers are per-provider (round-robin
+across N nodes ⇒ N× free quota); no signed receipts. Prerequisites for real
+compensation: client keypair/HMAC identity, payment-proof verification,
+signed usage receipts.
 
 
 ## Trust model & manifest bootstrap (v1)
@@ -131,15 +134,25 @@ are distinct states — a node may serve while its committee is technically
 incomplete, and eager repair (2 s) works to restore the invariant. This is
 eventual, not synchronous with death.
 
+**Weight integrity, end to end.** The version id now **binds the shard layout**
+(extents, file_size, n_resident, mode) into the Merkle root, and parse rejects
+any manifest that is not an exact partition of `[0, file_size)` — a peer can no
+longer serve digests that verify while pointing at attacker-chosen offsets. The
+**hot path re-verifies**: `readRangeVerified` re-hashes on local read and on
+`GETR`/`ExpertRequest` serve (clearing the bit + triggering repair on
+mismatch); store-open **re-audits every held shard**; the distributed run
+**fails closed** unless all resident shards are held+verified; the loom-format
+ExpertCache **publishes a slot only after a successful verify**. All
+implemented and tested (a corrupted on-disk shard is caught on open, cleared,
+and re-fetched).
+
 **Disk cap for organic replicas.** Fetched shards are persisted (organic heat
-replication), which without a bound drives busy nodes toward the full corpus
-and past the "commodity disk" envelope. The intended model (v1 gap — **not
-yet enforced**): a `max_shard_bytes` cap above which opportunistically-fetched
-shards are LRU-evicted, while **assigned want-set shards are pinned and never
-evicted**. Organic replicas are opportunistic cache and do **not** count
-toward a committee's R target; only assigned holdings do. Until the cap
-ships, operators must size disk for worst-case (near-full-corpus) growth on
-hot nodes.
+replication), which without a bound drives busy nodes toward the full corpus.
+Still a v1 gap (**not yet enforced**): a `max_shard_bytes` cap above which
+opportunistically-fetched shards are LRU-evicted while **assigned want-set
+shards are pinned**. Organic replicas are cache and do **not** count toward a
+committee's R target. Until the cap ships, operators must size disk for
+worst-case growth on hot nodes.
 
 **Admission control & priority.** ExpertResponse carries a `busy` status, but
 v1 has no rate limiting, per-peer quota, or bandwidth reservation. The
@@ -148,15 +161,15 @@ sync**, with per-peer request quotas, so a light node or attacker cannot soak
 expert-serving capacity and starve inference. Not implemented; documented as
 required.
 
-**Peer-table bounds & mesh authenticity.** The eager-repair/gossip design
-retains peers and never forgets dead ones. Without bounds this is a growth /
-amplification risk (AnnounceBatch returns whole tables; announces are
-unauthenticated → fake-holder poisoning). Required (v1 gap): a bounded peer
-table with LRU/decay eviction and a probation state for repeatedly-dead
-peers (so "never forgotten" means "retried with backoff", not "retained
-forever"), exponential backoff on unreachable peers, and — for untrusted
-deployments — authenticated announces. v1 runs LAN-scale and operator-trusted,
-where these are latent rather than active risks.
+**Peer-table bounds & mesh authenticity.** The peer table is now **bounded**
+(`MAX_PEERS`, coldest-`last_seen` eviction on overflow) and holdings updates
+carry a **monotonic sequence** so a stale/replayed bitmap cannot clobber a
+fresh one (implemented). Frame decode is snappy-capped (`decodeWithMax`,
+`MAX_BODY_BYTES`) against decompression bombs, and connection handlers are
+semaphore-bounded against thread-per-accept floods (implemented). Still a v1
+gap: **authenticated announces** (fake-holder mesh poisoning is possible on an
+untrusted network) and exponential backoff / probation on repeatedly-dead
+peers. v1 runs LAN-scale and operator-trusted.
 
 **Transport security.** The RPC and P2P transports are plaintext TCP with no
 TLS and no authentication — acceptable for a lab/LAN operator-run swarm,

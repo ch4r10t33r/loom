@@ -419,6 +419,7 @@ deleted.*
 | 2026-07-20 | Redundancy is **R = 3 target / R = 2 floor**, default `--r-target 2`; completeness = R ≥ 1 | Resolve the R inconsistency across docs; completeness and redundancy are distinct thresholds |
 | 2026-07-20 | Placement is **least-covered-first committee assignment**; random `--hold-fraction` is the legacy/no-bootnode fallback | One live placement policy; random ranges deprecated to fallback status |
 | 2026-07-20 | **Binary frames are normative**; the line protocol is legacy/debug (still serves `JOIN`/`GETR`/`GOSSIP`/`TABLE` today during migration) | Prevent forked implementations; state migration status |
+| 2026-07-20 | Code-audit hardening (#5/#6/#7): version root binds extents+layout; hot-path + GETR re-verify; store-open re-hashes held shards; resident completeness gate; ExpertCache publishes only after verify; credit admin-gated; light node force-stamps client id; max_tokens clamped to allowance; account cap + lower default quota; snappy `decodeWithMax` cap; bounded peer table (LRU); monotonic holdings seq (reject-stale); connection semaphores; death→wanted re-replication | Close the gap between "digest-verified before use" and the code; ship the availability/DoS bounds the spec already named |
 
 ## Appendix B — Provenance
 

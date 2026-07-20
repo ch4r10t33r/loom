@@ -26,6 +26,10 @@ pub const Ctx = struct {
     addr: []const u8,
     port: u16,
     seed: u64,
+    /// Admin token gating the `credit` op (audit #6 P0-1). Empty = credit
+    /// disabled entirely; non-empty = request must present a matching
+    /// "admin_token". A payment rail replaces this with proof verification.
+    admin_token: []const u8 = "",
     /// Per-client metering (SPEC.md node classes). When set, requests carry a
     /// "client" id, responses carry cost/balance, and exhausted clients get
     /// {"error":"payment_required"} until credited.
@@ -38,6 +42,10 @@ pub const Ctx = struct {
 
 const Conn = struct { ctx: *Ctx, stream: net.Stream };
 
+/// Bound concurrent RPC handlers (audit #7 P1 thread-per-accept DoS).
+const MAX_CONNS: u32 = 128;
+var live_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
 pub fn serve(ctx: *Ctx) !void {
     var address = try net.IpAddress.parse(ctx.addr, ctx.port);
     var server = try address.listen(ctx.io, .{ .reuse_address = true });
@@ -45,12 +53,19 @@ pub fn serve(ctx: *Ctx) !void {
 
     while (true) {
         const stream = server.accept(ctx.io) catch continue;
+        if (live_conns.fetchAdd(1, .monotonic) >= MAX_CONNS) {
+            _ = live_conns.fetchSub(1, .monotonic);
+            stream.close(ctx.io);
+            continue;
+        }
         const conn = ctx.gpa.create(Conn) catch {
+            _ = live_conns.fetchSub(1, .monotonic);
             stream.close(ctx.io);
             continue;
         };
         conn.* = .{ .ctx = ctx, .stream = stream };
         const t = std.Thread.spawn(.{}, connThread, .{conn}) catch {
+            _ = live_conns.fetchSub(1, .monotonic);
             stream.close(ctx.io);
             ctx.gpa.destroy(conn);
             continue;
@@ -62,6 +77,7 @@ pub fn serve(ctx: *Ctx) !void {
 fn connThread(conn: *Conn) void {
     handleConn(conn.ctx, conn.stream) catch {};
     conn.ctx.gpa.destroy(conn);
+    _ = live_conns.fetchSub(1, .monotonic);
 }
 
 fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
@@ -111,8 +127,20 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
     if (obj.get("method")) |mv| {
         if (mv == .string and std.mem.eql(u8, mv.string, "credit")) {
             const m = ctx.meter orelse return wi.print("{{\"ok\":false,\"error\":\"no_meter\"}}\n", .{});
-            const amount = jsonUint64(obj.get("amount"), 0);
+            // audit #6 P0-1: credit is admin-gated. No token configured -> the
+            // op is disabled (v1 has no payment proof to verify).
+            const supplied: []const u8 = switch (obj.get("admin_token") orelse .null) {
+                .string => |s2| s2,
+                else => "",
+            };
+            if (ctx.admin_token.len == 0 or !constEql(ctx.admin_token, supplied)) {
+                try wi.print("{{\"ok\":false,\"error\":\"credit_forbidden\"}}\n", .{});
+                try wi.flush();
+                return;
+            }
+            const amount = @min(jsonUint64(obj.get("amount"), 0), @as(u64, 1) << 40); // cap
             const bal = try m.credit(client, amount);
+            std.debug.print("meter: credited client={s} amount={d} balance={d}\n", .{ client, amount, bal });
             try wi.print("{{\"ok\":true,\"credited\":{d},\"balance\":{d}}}\n", .{ amount, bal });
             try wi.flush();
             return;
@@ -135,20 +163,25 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
         },
     };
 
-    // metering gate: exhausted clients are refused before any compute
+    var max_tokens: usize = jsonUint(obj.get("max_tokens"), 32);
+    const temp: f32 = @floatCast(jsonFloat(obj.get("temp"), 0.0));
+    const seed: u64 = jsonUint64(obj.get("seed"), ctx.seed);
+
+    const prompt = try tokenizer.encode(gpa, prompt_str);
+    defer gpa.free(prompt);
+
+    // metering gate: exhausted clients are refused before any compute, and the
+    // generation length is clamped to what the client can pay for (audit #6 P1)
     if (ctx.meter) |m| {
         if (m.remaining(client) == 0) {
             try wi.print("{{\"ok\":false,\"error\":\"payment_required\",\"balance\":0}}\n", .{});
             try wi.flush();
             return;
         }
+        const rem = m.remaining(client);
+        const budget = if (rem > prompt.len) rem - prompt.len else 0;
+        max_tokens = @intCast(@min(@as(u64, max_tokens), budget));
     }
-    const max_tokens: usize = jsonUint(obj.get("max_tokens"), 32);
-    const temp: f32 = @floatCast(jsonFloat(obj.get("temp"), 0.0));
-    const seed: u64 = jsonUint64(obj.get("seed"), ctx.seed);
-
-    const prompt = try tokenizer.encode(gpa, prompt_str);
-    defer gpa.free(prompt);
 
     var produced = std.ArrayList(usize).empty;
     defer produced.deinit(gpa);
@@ -199,6 +232,14 @@ fn writeJsonString(wi: *Io.Writer, tokens: []const usize) !void {
         }
     }
     try wi.print("\"", .{});
+}
+
+/// Constant-time-ish equality for the admin token (avoids trivial early-exit).
+fn constEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= x ^ y;
+    return diff == 0;
 }
 
 fn jsonUint(v: ?std.json.Value, default: usize) usize {

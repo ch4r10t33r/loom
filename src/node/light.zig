@@ -33,6 +33,9 @@ pub const Ctx = struct {
 
 const Conn = struct { ctx: *Ctx, stream: net.Stream };
 
+const MAX_CONNS: u32 = 128;
+var live_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
 pub fn serve(ctx: *Ctx) !void {
     var address = try net.IpAddress.parse(ctx.opts.rpc_addr, ctx.opts.rpc_port);
     var server = try address.listen(ctx.io, .{ .reuse_address = true });
@@ -40,12 +43,19 @@ pub fn serve(ctx: *Ctx) !void {
 
     while (true) {
         const stream = server.accept(ctx.io) catch continue;
+        if (live_conns.fetchAdd(1, .monotonic) >= MAX_CONNS) {
+            _ = live_conns.fetchSub(1, .monotonic);
+            stream.close(ctx.io);
+            continue;
+        }
         const conn = ctx.gpa.create(Conn) catch {
+            _ = live_conns.fetchSub(1, .monotonic);
             stream.close(ctx.io);
             continue;
         };
         conn.* = .{ .ctx = ctx, .stream = stream };
         const t = std.Thread.spawn(.{}, connThread, .{conn}) catch {
+            _ = live_conns.fetchSub(1, .monotonic);
             stream.close(ctx.io);
             ctx.gpa.destroy(conn);
             continue;
@@ -57,6 +67,7 @@ pub fn serve(ctx: *Ctx) !void {
 fn connThread(conn: *Conn) void {
     handleConn(conn.ctx, conn.stream) catch {};
     conn.ctx.gpa.destroy(conn);
+    _ = live_conns.fetchSub(1, .monotonic);
 }
 
 fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
@@ -82,22 +93,16 @@ fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
 fn delegate(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
     const gpa = ctx.gpa;
 
-    // inject "client" right after the opening brace unless already present
-    const request = blk: {
-        if (std.mem.indexOf(u8, line, "\"client\"") != null) {
-            break :blk try gpa.dupe(u8, line);
-        }
-        const brace = std.mem.indexOfScalar(u8, line, '{') orelse return error.BadRequest;
-        break :blk try std.fmt.allocPrint(gpa, "{s}\"client\":\"{s}\",{s}", .{
-            line[0 .. brace + 1], ctx.opts.client_id, line[brace + 1 ..],
-        });
-    };
-    defer gpa.free(request);
-    // degenerate case: "{}" became {"client":"x",} — fix trailing comma
-    const fixed = if (std.mem.endsWith(u8, request, ",}"))
-        try std.fmt.allocPrint(gpa, "{s}}}", .{request[0 .. request.len - 2]})
-    else
-        try gpa.dupe(u8, request);
+    // FORCE our configured client id (audit #6 P0-3): a caller-supplied
+    // "client" field is never honored, so a light node cannot be used as an
+    // open proxy to spend/mint under arbitrary identities on full nodes.
+    // Parse the object, drop any inbound "client", stamp ours.
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, line, .{}) catch
+        return error.BadRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.BadRequest;
+    try parsed.value.object.put(parsed.arena.allocator(), "client", .{ .string = ctx.opts.client_id });
+    const fixed = try std.json.Stringify.valueAlloc(gpa, parsed.value, .{});
     defer gpa.free(fixed);
 
     const n_backends = ctx.opts.full_nodes.len;

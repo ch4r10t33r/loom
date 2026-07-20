@@ -21,8 +21,13 @@ pub const PeerInfo = struct {
     version_hex: [64]u8, // manifest version the peer advertises (zeros if none)
     holdings_hex: []u8, // owned; may be empty if peer has no store
     committee_id: u32, // NO_COMMITTEE when unknown / not in one
+    holdings_seq: u64, // monotonic per-peer; a lower seq never overwrites bits
     last_seen_ns: i128,
 };
+
+/// Bound on distinct peers retained (audit #7 P1 unbounded table): beyond this
+/// the coldest (oldest last_seen) entry is evicted on insert.
+pub const MAX_PEERS: usize = 4096;
 
 pub const Table = struct {
     gpa: std.mem.Allocator,
@@ -45,7 +50,7 @@ pub const Table = struct {
 
     /// Insert or refresh a peer. Skips our own address. Returns true if the
     /// entry was new (useful for logging discovery).
-    pub fn merge(self: *Table, addr: []const u8, version_hex: []const u8, holdings_hex: []const u8, committee_id: u32, now_ns: i128) !bool {
+    pub fn merge(self: *Table, addr: []const u8, version_hex: []const u8, holdings_hex: []const u8, committee_id: u32, holdings_seq: u64, now_ns: i128) !bool {
         if (std.mem.eql(u8, addr, self.self_addr)) return false;
         if (version_hex.len != 64) return error.BadVersionHex;
 
@@ -54,22 +59,28 @@ pub const Table = struct {
 
         for (self.entries.items) |*e| {
             if (std.mem.eql(u8, e.addr, addr)) {
+                e.last_seen_ns = now_ns; // liveness always refreshes
+                // a strictly-lower seq must not clobber fresher holdings/version
+                // (audit #7 P1); seq 0 (text GOSSIP) never regresses a known seq
+                if (holdings_seq < e.holdings_seq) return false;
                 @memcpy(&e.version_hex, version_hex);
                 if (!std.mem.eql(u8, e.holdings_hex, holdings_hex)) {
                     self.gpa.free(e.holdings_hex);
                     e.holdings_hex = try self.gpa.dupe(u8, holdings_hex);
                 }
-                // an unknown committee never downgrades a known one
                 if (committee_id != NO_COMMITTEE) e.committee_id = committee_id;
-                e.last_seen_ns = now_ns;
+                e.holdings_seq = holdings_seq;
                 return false;
             }
         }
+        // bounded insert: evict the coldest entry when full
+        if (self.entries.items.len >= MAX_PEERS) self.evictColdest();
         var info = PeerInfo{
             .addr = try self.gpa.dupe(u8, addr),
             .version_hex = undefined,
             .holdings_hex = try self.gpa.dupe(u8, holdings_hex),
             .committee_id = committee_id,
+            .holdings_seq = holdings_seq,
             .last_seen_ns = now_ns,
         };
         @memcpy(&info.version_hex, version_hex);
@@ -94,6 +105,53 @@ pub const Table = struct {
             }
         }
         return out.toOwnedSlice(gpa);
+    }
+
+    /// Drop the entry with the oldest last_seen. Caller holds the mutex.
+    fn evictColdest(self: *Table) void {
+        if (self.entries.items.len == 0) return;
+        var oldest: usize = 0;
+        for (self.entries.items, 0..) |e, i| {
+            if (e.last_seen_ns < self.entries.items[oldest].last_seen_ns) oldest = i;
+        }
+        const e = self.entries.swapRemove(oldest);
+        self.gpa.free(e.addr);
+        self.gpa.free(e.holdings_hex);
+    }
+
+    /// Addresses of peers whose advertised holdings bitmap covers shard `id`
+    /// (audit #7 P1 holdings-filtered candidates). Bit i in the hex bitmap.
+    /// Caller frees each string and the slice.
+    pub fn holdersOf(self: *Table, gpa: std.mem.Allocator, id: usize) ![][]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var out = std.ArrayList([]u8).empty;
+        errdefer {
+            for (out.items) |a| gpa.free(a);
+            out.deinit(gpa);
+        }
+        const byte_i = id / 8;
+        const bit: u8 = @as(u8, 1) << @intCast(id % 8);
+        for (self.entries.items) |e| {
+            if (byte_i * 2 + 1 >= e.holdings_hex.len) continue;
+            const b = std.fmt.parseInt(u8, e.holdings_hex[byte_i * 2 ..][0..2], 16) catch continue;
+            if (b & bit != 0) try out.append(gpa, try gpa.dupe(u8, e.addr));
+        }
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// Copy of a peer's advertised holdings bitmap (hex), or null if unknown.
+    /// Caller frees. Used by death re-replication (audit #7 P1).
+    pub fn peerBitmapAlloc(self: *Table, gpa: std.mem.Allocator, addr: []const u8) !?[]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        for (self.entries.items) |e| {
+            if (std.mem.eql(u8, e.addr, addr)) {
+                if (e.holdings_hex.len == 0) return null;
+                return try gpa.dupe(u8, e.holdings_hex);
+            }
+        }
+        return null;
     }
 
     /// Copy of all peer addresses. Caller frees each string and the slice.
@@ -125,7 +183,7 @@ pub const Table = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (self.entries.items) |e| {
-            try list.print(gpa, "addr={s} version={s} holdings={s} committee={d}\n", .{ e.addr, e.version_hex, e.holdings_hex, e.committee_id });
+            try list.print(gpa, "addr={s} version={s} holdings={s} committee={d} seq={d}\n", .{ e.addr, e.version_hex, e.holdings_hex, e.committee_id, e.holdings_seq });
         }
         return self.entries.items.len;
     }
@@ -144,9 +202,9 @@ test "table merges, dedupes, refuses self" {
     defer t.deinit();
 
     const v = "aa" ** 32;
-    try std.testing.expect(try t.merge("127.0.0.1:9001", v, "ff01", 2, 1)); // new
-    try std.testing.expect(!try t.merge("127.0.0.1:9001", v, "ab00", NO_COMMITTEE, 2)); // refresh keeps committee
-    try std.testing.expect(!try t.merge("127.0.0.1:9000", v, "ff01", 2, 3)); // self
+    try std.testing.expect(try t.merge("127.0.0.1:9001", v, "ff01", 2, 1, 1)); // new
+    try std.testing.expect(!try t.merge("127.0.0.1:9001", v, "ab00", NO_COMMITTEE, 2, 2)); // refresh keeps committee
+    try std.testing.expect(!try t.merge("127.0.0.1:9000", v, "ff01", 2, 1, 3)); // self
     try std.testing.expect(t.count() == 1);
 
     var out = std.ArrayList(u8).empty;

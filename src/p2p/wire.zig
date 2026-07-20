@@ -11,6 +11,12 @@ pub const PROTO: u8 = 1;
 pub const HEADER_LEN: usize = 8;
 pub const FLAG_SNAPPY: u8 = 0x01;
 
+/// Hard cap on a decompressed frame body (audit #7 P0 snappy bomb). The
+/// largest legitimate body is a holdings bitmap or a small shard payload;
+/// 64 MiB is far above any real message and bounds a malicious peer's
+/// declared-uncompressed size.
+pub const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
 pub const MsgType = enum(u8) {
     heartbeat = 0x01,
     heartbeat_resp = 0x02,
@@ -71,8 +77,9 @@ pub fn decodeFrame(gpa: std.mem.Allocator, frame: []const u8) !Decoded {
     const body_len = std.mem.readInt(u32, frame[4..8], .little);
     if (frame.len != HEADER_LEN + body_len) return error.LengthMismatch;
     const raw = frame[HEADER_LEN..];
+    if (body_len > MAX_BODY_BYTES) return error.FrameTooLarge;
     const body = if (flags & FLAG_SNAPPY != 0)
-        try snappy.decode(gpa, raw)
+        try snappy.decodeWithMax(gpa, raw, MAX_BODY_BYTES) // caps declared size
     else
         try gpa.dupe(u8, raw);
     return .{ .ty = ty, .body = body };

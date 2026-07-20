@@ -43,6 +43,7 @@ pub const Options = struct {
     advertise: ?[]const u8, // our dialable "host:port" (default 127.0.0.1:<p2p_port>)
     r_target: u16, // committee redundancy target when acting as bootnode
     free_quota: u64, // per-client free token allowance (metering)
+    admin_token: []const u8, // gates the credit op (empty = credit disabled)
 };
 
 /// Committee heartbeat (SPEC.md): PING each committee member on a fixed
@@ -139,6 +140,29 @@ fn heartbeatThread(ctx: *HeartbeatCtx) void {
             if (ok != st.alive) {
                 std.debug.print("heartbeat: committee member {s} {s}\n", .{ m, if (ok) "alive" else "DEAD" });
                 st.alive = ok;
+                // death re-replication (audit #7 P1 / SPEC): survivors adopt the
+                // dead member's advertised shards into their want-set so eager
+                // repair re-replicates them from another live holder.
+                if (!ok) {
+                    if (ctx.p2p_ctx.store) |store| {
+                        if (ctx.table.peerBitmapAlloc(ctx.gpa, m) catch null) |hex| {
+                            defer ctx.gpa.free(hex);
+                            var adopted: usize = 0;
+                            var sid: usize = 0;
+                            const nsh = store.manifest.nRanges();
+                            while (sid < nsh) : (sid += 1) {
+                                const bi = sid / 8;
+                                if (bi * 2 + 1 >= hex.len) break;
+                                const byte = std.fmt.parseInt(u8, hex[bi * 2 ..][0..2], 16) catch 0;
+                                if (byte & (@as(u8, 1) << @intCast(sid % 8)) == 0) continue;
+                                if (store.wanted.has(sid) or store.holdings.has(sid)) continue;
+                                store.wanted.set(sid);
+                                adopted += 1;
+                            }
+                            if (adopted > 0) std.debug.print("heartbeat: adopted {d} shard(s) from dead {s} into wanted\n", .{ adopted, m });
+                        }
+                    }
+                }
             }
             if (resp) |hb| {
                 if (hb.holdings_seq != st.last_seq) {
@@ -267,7 +291,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     defer table.deinit();
     const zero_version = "0" ** 64;
     for (peer_strs.items) |ps| {
-        _ = table.merge(ps, zero_version, "", peers.NO_COMMITTEE, stats.nowNs(io)) catch {};
+        _ = table.merge(ps, zero_version, "", peers.NO_COMMITTEE, 0, stats.nowNs(io)) catch {};
     }
 
     if (opts.gguf_path) |gp| {
@@ -311,7 +335,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                 if (sync.PeerAddr.parse(m)) |a| {
                     try srcs.append(gpa, a);
                     // committee members seed the table WITH their committee id
-                    _ = table.merge(m, "0" ** 64, "", joined_committee_id, stats.nowNs(io)) catch {};
+                    _ = table.merge(m, "0" ** 64, "", joined_committee_id, 0, stats.nowNs(io)) catch {};
                 } else |_| {}
             }
             try srcs.appendSlice(gpa, peer_list.items);
@@ -359,7 +383,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     try out.print("  cache      expert_bytes={d} lru_capacity={d} pinned={d} ram_budget={d:.2} GB\n", .{
         s.expert_bytes, s.lru_capacity, s.pinned_experts, @as(f64, @floatFromInt(opts.ram_bytes)) / GB,
     });
-    try out.print("  rpc        tcp://{s}:{d}   (json: {{\"prompt\":\"..\",\"max_tokens\":32}}; metered, free quota {d} tokens/client)\n", .{ opts.rpc_addr, opts.rpc_port, opts.free_quota });
+    try out.print("  rpc        tcp://{s}:{d}   (metered; free quota {d} tokens/client; credit {s})\n", .{ opts.rpc_addr, opts.rpc_port, opts.free_quota, if (opts.admin_token.len > 0) "admin-gated" else "disabled" });
     try out.print("  p2p        tcp://{s}:{d}   (HELLO | HAS | MANIFEST | DIGESTS | HOLDINGS | GETR | GOSSIP | TABLE | PING)\n", .{ opts.p2p_addr, opts.p2p_port });
     try out.print("  gossip     advertising as {s}, {d} seed peer(s), every {d}s\n", .{
         advertise, peer_strs.items.len, @divTrunc(gossip.INTERVAL_NS, std.time.ns_per_s),
@@ -452,6 +476,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .port = opts.rpc_port,
         .seed = opts.seed,
         .meter = &meter,
+        .admin_token = opts.admin_token,
     };
     rpc.serve(&rpc_ctx) catch |e| {
         try out.print("rpc server error: {s}\n", .{@errorName(e)});

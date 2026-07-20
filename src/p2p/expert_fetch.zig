@@ -67,8 +67,12 @@ pub const Source = struct {
     /// Returns a slice of `self.scratch` (valid until the next get()).
     pub fn get(self: *Source, id: usize) ![]const u8 {
         if (self.store.holdings.has(id)) {
-            self.stats.local += 1;
-            return self.store.readRange(id, self.scratch);
+            // verify the local block before matmul (audit #5 P0-2); on failure
+            // fall through to a peer fetch (the bit was cleared by the verify)
+            if (self.store.readRangeVerified(id, self.scratch)) |data| {
+                self.stats.local += 1;
+                return data;
+            } else |_| {}
         }
         const n = try self.fetchShard(id, self.scratch);
         return self.scratch[0..n];

@@ -94,7 +94,7 @@ fn usage(out: *Io.Writer) !void {
         \\            [--seed S] [--stats FILE] [--no-verify]
         \\            [--gguf FILE | --bootstrap HOST:PORT]
         \\            [--peers H:P,H:P,...] [--hold-fraction F] [--range-mb M]
-        \\            [--advertise HOST:PORT] [--r-target N] [--free-quota TOKENS]
+        \\            [--advertise HOST:PORT] [--r-target N] [--free-quota TOKENS] [--admin-token TOK]
         \\  loom light --full-nodes H:P[,H:P...] [--rpc-addr A] [--rpc-port P] [--client-id ID]
         \\  loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2]
         \\  loom gguf info <file> [--range-mb M]
@@ -353,7 +353,8 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .peers = flagStr(args, "--peers"),
         .advertise = flagStr(args, "--advertise"),
         .r_target = @intCast(try flagU64(args, "--r-target", 2)),
-        .free_quota = try flagU64(args, "--free-quota", 1_000_000),
+        .free_quota = try flagU64(args, "--free-quota", 100_000),
+        .admin_token = flagStr(args, "--admin-token") orelse "",
         .hold_fraction = @floatCast(std.math.clamp(hold_fraction, 0.0, 1.0)),
         .range_bytes = @intFromFloat(range_mb * @as(f64, MB)),
     });
@@ -582,6 +583,26 @@ fn runDeepseekStore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, dir: []cons
 
     var src = try expert_fetch.Source.init(gpa, io, &store, peer_list.items);
     src.committee = committee_list.items;
+
+    // resident completeness gate (audit #5 P0-4): the resident bundle
+    // (attention, shared experts, embeddings, router) is mmap'd — a missing
+    // extent would read as file-hole zeros and silently corrupt inference.
+    // Fail closed unless every resident shard is held+verified, fetching any
+    // gaps from peers first.
+    {
+        var missing_resident: usize = 0;
+        var i: usize = 0;
+        while (i < store.manifest.n_resident) : (i += 1) {
+            _ = src.get(i) catch {
+                missing_resident += 1;
+            };
+        }
+        if (missing_resident > 0) {
+            return out.print("refusing to run: {d}/{d} resident shards unavailable (mmap'd bundle would read as zeros)\n", .{
+                missing_resident, store.manifest.n_resident,
+            });
+        }
+    }
     defer src.deinit();
 
     const mpath = try std.fmt.allocPrint(gpa, "{s}/model.gguf", .{dir});

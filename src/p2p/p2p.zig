@@ -91,6 +91,12 @@ fn sendPeerList(ctx: *Ctx, wi: *Io.Writer) !void {
 
 const Conn = struct { ctx: *Ctx, stream: net.Stream };
 
+/// Bound on concurrent connection-handler threads (audit #7 P1 thread-per-
+/// accept DoS). Excess connections are refused (closed) rather than spawning
+/// unbounded threads.
+const MAX_CONNS: u32 = 256;
+var live_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
+
 pub fn serve(ctx: *Ctx) !void {
     var address = try net.IpAddress.parse(ctx.addr, ctx.port);
     var server = try address.listen(ctx.io, .{ .reuse_address = true });
@@ -98,12 +104,19 @@ pub fn serve(ctx: *Ctx) !void {
 
     while (true) {
         const stream = server.accept(ctx.io) catch continue;
+        if (live_conns.fetchAdd(1, .monotonic) >= MAX_CONNS) {
+            _ = live_conns.fetchSub(1, .monotonic);
+            stream.close(ctx.io); // over capacity — shed load
+            continue;
+        }
         const conn = ctx.gpa.create(Conn) catch {
+            _ = live_conns.fetchSub(1, .monotonic);
             stream.close(ctx.io);
             continue;
         };
         conn.* = .{ .ctx = ctx, .stream = stream };
         const t = std.Thread.spawn(.{}, connThread, .{conn}) catch {
+            _ = live_conns.fetchSub(1, .monotonic);
             stream.close(ctx.io);
             ctx.gpa.destroy(conn);
             continue;
@@ -115,6 +128,7 @@ pub fn serve(ctx: *Ctx) !void {
 fn connThread(conn: *Conn) void {
     handleConn(conn.ctx, conn.stream) catch {};
     conn.ctx.gpa.destroy(conn);
+    _ = live_conns.fetchSub(1, .monotonic);
 }
 
 fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
@@ -195,12 +209,12 @@ fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer) !void
         if (!store.holdings.has(i)) return wi.print("ERR not_held\n", .{});
         const buf = try ctx.gpa.alloc(u8, @intCast(store.manifest.rangeLen(i)));
         defer ctx.gpa.free(buf);
-        const data = store.readRange(i, buf) catch return wi.print("ERR read\n", .{});
+        const data = store.readRangeVerified(i, buf) catch return wi.print("ERR read\n", .{});
         try wi.print("DATA {d} len={d} sha256={s}\n", .{ i, data.len, hashmod.toHex(store.manifest.digests[i]) });
         try wi.writeAll(data);
     } else if (std.mem.startsWith(u8, line, "FRAME ")) {
         const len = std.fmt.parseInt(usize, line[6..], 10) catch return wi.print("ERR bad_frame\n", .{});
-        if (len < wire.HEADER_LEN or len > 512 * 1024 * 1024) return wi.print("ERR bad_frame\n", .{});
+        if (len < wire.HEADER_LEN or len > wire.MAX_BODY_BYTES + wire.HEADER_LEN) return wi.print("ERR bad_frame\n", .{});
         const raw = try ctx.gpa.alloc(u8, len);
         defer ctx.gpa.free(raw);
         try ri.readSliceAll(raw);
@@ -235,7 +249,7 @@ fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer) !void
         const addr = fieldOf(line, "addr") orelse return wi.print("ERR bad_gossip\n", .{});
         const version = fieldOf(line, "version") orelse return wi.print("ERR bad_gossip\n", .{});
         const holdings = fieldOf(line, "holdings") orelse "";
-        _ = table.merge(addr, version, holdings, peers.NO_COMMITTEE, stats.nowNs(ctx.io)) catch {
+        _ = table.merge(addr, version, holdings, peers.NO_COMMITTEE, 0, stats.nowNs(ctx.io)) catch {
             return wi.print("ERR bad_gossip\n", .{});
         };
         try sendPeerList(ctx, wi);
@@ -266,7 +280,7 @@ fn handleFrame(ctx: *Ctx, raw: []const u8, wi: *Io.Writer) !void {
             const vhex = hashmod.toHex(ann.manifest_version);
             const hhex = try bytesToHexAlloc(ctx.gpa, ann.holdings_bitmap);
             defer ctx.gpa.free(hhex);
-            _ = table.merge(ann.addr, &vhex, hhex, ann.committee_id, stats.nowNs(ctx.io)) catch {};
+            _ = table.merge(ann.addr, &vhex, hhex, ann.committee_id, ann.holdings_seq, stats.nowNs(ctx.io)) catch {};
             try sendAnnounceBatch(ctx, wi);
         },
         .expert_request => {
@@ -286,7 +300,7 @@ fn handleFrame(ctx: *Ctx, raw: []const u8, wi: *Io.Writer) !void {
             defer _ = ctx.load.fetchSub(1, .monotonic);
             const buf = try ctx.gpa.alloc(u8, @intCast(store.manifest.rangeLen(req.shard_id)));
             defer ctx.gpa.free(buf);
-            const data = store.readRange(req.shard_id, buf) catch {
+            const data = store.readRangeVerified(req.shard_id, buf) catch {
                 return sendExpertResponse(ctx, wi, .{ .request_id = req.request_id, .status = .not_held, .shard_id = req.shard_id });
             };
             try sendExpertResponse(ctx, wi, .{ .request_id = req.request_id, .status = .ok, .shard_id = req.shard_id, .payload = data });
@@ -305,7 +319,7 @@ pub fn selfHeartbeat(ctx: *Ctx) wire.Heartbeat {
     };
     if (ctx.store) |st| {
         hb.manifest_version = st.manifest.version;
-        hb.holdings_seq = @intCast(st.holdings.count()); // holdings only grow: count is monotonic
+        hb.holdings_seq = st.holdingsSeq(); // truly monotonic (audit #7 P1)
         hb.holdings_digest = hashmod.hashBlock(st.holdings.bits);
     }
     return hb;

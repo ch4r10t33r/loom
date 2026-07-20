@@ -124,6 +124,17 @@ const Lru = struct {
         self.pushFront(slot);
         return .{ slot, self.buf(slot) };
     }
+
+    /// Undo a reserve whose fill failed (e.g. a poisoned expert): unmap and
+    /// unlink the slot so a later get() re-fetches instead of returning the
+    /// unverified buffer (audit #5 P0-3).
+    fn abort(self: *Lru, id: usize) void {
+        if (self.map.fetchRemove(id)) |kv| {
+            self.unlink(kv.value);
+            // return the slot to the free pool if it was the newest allocation
+            if (kv.value + 1 == self.free_top) self.free_top -= 1;
+        }
+    }
 };
 
 pub const ExpertCache = struct {
@@ -218,7 +229,12 @@ pub const ExpertCache = struct {
             return blk;
         }
         const slot_buf = try self.lru.reserve(id);
-        try self.readBlock(id, slot_buf[1], false);
+        // publish-after-verify: on a digest failure, unmap the slot so the
+        // poison is not returned by a later LRU hit (audit #5 P0-3)
+        self.readBlock(id, slot_buf[1], false) catch |e| {
+            self.lru.abort(id);
+            return e;
+        };
         return slot_buf[1];
     }
 
