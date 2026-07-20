@@ -101,9 +101,12 @@ path, wire protocol).
 
 Two loops run alongside the servers:
 
-- **Gossip (every 3 s):** dial every known peer, announce `addr/version/holdings`,
-  merge the peer's table back. Discovery is transitive — a node told only about
-  B learns everything B knows within one round.
+- **Gossip (every 3 s):** dial every known peer, exchange binary Announce /
+  AnnounceBatch frames (addr, committee id, manifest version, holdings seq +
+  bitmap; snappy-compressed). Discovery is transitive, and because announces
+  carry committee ids the table doubles as the **gossip-derived committee
+  view** — earlier committee members discover later joiners automatically and
+  start heartbeating them.
 - **Eager churn repair (every 2 s):** whenever `wanted − held ≠ ∅`, retry every
   peer in the live table (including ones discovered via gossip and ones
   currently down — they're retried, not forgotten). Peers advertising a

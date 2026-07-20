@@ -37,10 +37,12 @@ shard set* — a self-sufficient serving cell for one model version.
 - **Committee lifecycle:** joiners go to the first committee whose minimum
   shard coverage is below `R`. When every shard in every existing committee
   has coverage ≥ `R` (saturated), the next joiner opens a new committee.
-- **Heartbeats:** every node maintains a regular heartbeat (`PING`/`PONG`,
-  5 s interval) with its committee members and tracks their liveness.
-  A member that stops answering is marked dead locally (and its shards
-  become candidates for re-replication via the eager repair loop).
+- **Heartbeats:** every node maintains a regular heartbeat (wire Heartbeat
+  frames, 5 s interval) with its committee members — the member set is the
+  join-time seed plus the gossip-derived committee view, so membership stays
+  current as the committee grows. A member that stops answering is marked
+  dead locally (and its shards become candidates for re-replication via the
+  eager repair loop).
 
 ## Global gossip network
 
@@ -140,6 +142,23 @@ holdings_bitmap:  [bitmap_len]u8   (1 bit per shard; frame-level snappy
 Receivers keep the entry with the highest `holdings_seq` per addr. ENR
 (planned) carries `manifest_version + holdings_seq + holdings_digest` only
 (fits the 300-byte limit); the gossip announce carries the full bitmap.
+
+**AnnounceBatch — type 0x04.** The gossip exchange response: the responder's
+own Announce followed by its whole table, so one round trip both announces
+and syncs the mesh view. Frame-level snappy compresses across the similar
+bitmaps of many peers.
+
+```
+count:   u32
+entries: count x { len: u32, body: [len]u8 }   (each an Announce body)
+```
+
+Because announces carry `committee_id`, the mesh table doubles as the
+**gossip-derived committee view**: committee membership is not static-at-join —
+earlier members learn later joiners from their announces, and the heartbeat
+loop targets `seed ∪ {table entries with my committee_id}`. This view (not
+the bootnode) is what members rely on after joining, so a dead bootnode
+still strands nothing.
 
 **ExpertRequest — type 0x10.** Ask a remote peer (committee member first,
 then mesh) for one expert shard the requester doesn't hold.

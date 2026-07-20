@@ -19,7 +19,9 @@ committee-first sync, 5 s heartbeats with death detection, committee-then-mesh
 fetch order; **wire messages v1**: binary frames with adaptive snappy —
 heartbeat carries committee id, manifest version, holdings seq+digest, and a
 load hint; expert request/response carries version-pinned shard queries with
-typed statuses; `wire.zig` + blockblaz/zig-snappy). Verified live: B+C formed a complete committee with
+typed statuses; the gossip loop speaks Announce/AnnounceBatch frames and the
+committee view is gossip-derived — membership is dynamic, not static-at-join;
+`wire.zig` + blockblaz/zig-snappy). Verified live: B+C formed a complete committee with
 complementary assignments; D saturated it to R=2; E opened committee 1;
 C detected B's death via heartbeat; a fetch with a dead committee peer fell
 through to the mesh and completed inference.

@@ -235,7 +235,7 @@ fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer) !void
         const addr = fieldOf(line, "addr") orelse return wi.print("ERR bad_gossip\n", .{});
         const version = fieldOf(line, "version") orelse return wi.print("ERR bad_gossip\n", .{});
         const holdings = fieldOf(line, "holdings") orelse "";
-        _ = table.merge(addr, version, holdings, stats.nowNs(ctx.io)) catch {
+        _ = table.merge(addr, version, holdings, peers.NO_COMMITTEE, stats.nowNs(ctx.io)) catch {
             return wi.print("ERR bad_gossip\n", .{});
         };
         try sendPeerList(ctx, wi);
@@ -259,6 +259,15 @@ fn handleFrame(ctx: *Ctx, raw: []const u8, wi: *Io.Writer) !void {
             const frame = try wire.encodeFrame(ctx.gpa, .heartbeat_resp, body);
             defer ctx.gpa.free(frame);
             try wire.writeFrame(wi, frame);
+        },
+        .announce => {
+            const table = ctx.table orelse return wi.print("ERR no_gossip\n", .{});
+            const ann = wire.Announce.parseBody(dec.body) catch return wi.print("ERR bad_frame\n", .{});
+            const vhex = hashmod.toHex(ann.manifest_version);
+            const hhex = try bytesToHexAlloc(ctx.gpa, ann.holdings_bitmap);
+            defer ctx.gpa.free(hhex);
+            _ = table.merge(ann.addr, &vhex, hhex, ann.committee_id, stats.nowNs(ctx.io)) catch {};
+            try sendAnnounceBatch(ctx, wi);
         },
         .expert_request => {
             const req = wire.ExpertRequest.parseBody(dec.body) catch {
@@ -300,6 +309,76 @@ pub fn selfHeartbeat(ctx: *Ctx) wire.Heartbeat {
         hb.holdings_digest = hashmod.hashBlock(st.holdings.bits);
     }
     return hb;
+}
+
+fn bytesToHexAlloc(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    const hex = "0123456789abcdef";
+    const out = try gpa.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |b, i| {
+        out[i * 2] = hex[b >> 4];
+        out[i * 2 + 1] = hex[b & 0xf];
+    }
+    return out;
+}
+
+fn hexToBytesAlloc(gpa: std.mem.Allocator, hexs: []const u8) ![]u8 {
+    if (hexs.len % 2 != 0) return error.BadHex;
+    const out = try gpa.alloc(u8, hexs.len / 2);
+    errdefer gpa.free(out);
+    for (out, 0..) |*b, i| {
+        b.* = std.fmt.parseInt(u8, hexs[i * 2 ..][0..2], 16) catch return error.BadHex;
+    }
+    return out;
+}
+
+/// Respond to a gossip announce: our own entry + the whole table as an
+/// AnnounceBatch frame (snappy compresses across the similar bitmaps).
+fn sendAnnounceBatch(ctx: *Ctx, wi: *Io.Writer) !void {
+    const gpa = ctx.gpa;
+    var bodies = std.ArrayList([]u8).empty;
+    defer {
+        for (bodies.items) |b| gpa.free(b);
+        bodies.deinit(gpa);
+    }
+
+    // self entry
+    {
+        var self_ann = wire.Announce{ .committee_id = ctx.committee_id, .addr = ctx.advertise };
+        if (ctx.store) |st| {
+            self_ann.manifest_version = st.manifest.version;
+            self_ann.holdings_seq = @intCast(st.holdings.count());
+            self_ann.holdings_bitmap = st.holdings.bits;
+        }
+        try bodies.append(gpa, try self_ann.encodeBody(gpa));
+    }
+
+    // table entries
+    const table = ctx.table.?;
+    {
+        table.mutex.lockUncancelable(ctx.io);
+        defer table.mutex.unlock(ctx.io);
+        for (table.entries.items) |e| {
+            var ver: [32]u8 = undefined;
+            for (&ver, 0..) |*b, i| {
+                b.* = std.fmt.parseInt(u8, e.version_hex[i * 2 ..][0..2], 16) catch 0;
+            }
+            const bitmap = hexToBytesAlloc(gpa, e.holdings_hex) catch continue;
+            defer gpa.free(bitmap);
+            const ann = wire.Announce{
+                .committee_id = e.committee_id,
+                .manifest_version = ver,
+                .addr = e.addr,
+                .holdings_bitmap = bitmap,
+            };
+            try bodies.append(gpa, try ann.encodeBody(gpa));
+        }
+    }
+
+    const batch = try wire.AnnounceBatch.encodeBodies(gpa, bodies.items);
+    defer gpa.free(batch);
+    const frame = try wire.encodeFrame(gpa, .announce_batch, batch);
+    defer gpa.free(frame);
+    try wire.writeFrame(wi, frame);
 }
 
 fn sendExpertResponse(ctx: *Ctx, wi: *Io.Writer, resp: wire.ExpertResponse) !void {

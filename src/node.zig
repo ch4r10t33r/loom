@@ -48,12 +48,15 @@ pub const Options = struct {
 /// is marked dead locally; its shards become repair candidates.
 const HEARTBEAT_INTERVAL_NS: i96 = 5 * std.time.ns_per_s;
 
+const MemberState = struct { alive: bool = true, last_seq: u64 = 0 };
+
 const HeartbeatCtx = struct {
     gpa: std.mem.Allocator,
     io: Io,
-    members: [][]u8, // owned addr strings
-    alive: []bool,
-    last_seq: []u64,
+    seed: [][]u8, // members known at join time
+    table: *peers.Table, // gossip-derived committee view (later joiners)
+    committee_id: u32,
+    state: std.StringHashMap(MemberState), // key = owned addr string
     p2p_ctx: *p2p.Ctx, // our own state rides the heartbeat (SPEC.md container)
 
     /// One wire-frame heartbeat exchange. Returns the peer's heartbeat.
@@ -90,19 +93,57 @@ const HeartbeatCtx = struct {
 fn heartbeatThread(ctx: *HeartbeatCtx) void {
     while (true) {
         Io.sleep(ctx.io, .{ .nanoseconds = HEARTBEAT_INTERVAL_NS }, .awake) catch return;
-        for (ctx.members, 0..) |m, i| {
+
+        // membership = static seed ∪ gossip-derived view (SPEC.md): earlier
+        // members learn later joiners from their committee-tagged announces
+        var members = std.ArrayList([]u8).empty;
+        defer {
+            for (members.items) |m| ctx.gpa.free(m);
+            members.deinit(ctx.gpa);
+        }
+        for (ctx.seed) |m| {
+            members.append(ctx.gpa, ctx.gpa.dupe(u8, m) catch continue) catch continue;
+        }
+        if (ctx.table.committeeMembersAlloc(ctx.gpa, ctx.committee_id)) |derived| {
+            defer ctx.gpa.free(derived);
+            outer: for (derived) |d| {
+                for (members.items) |m| {
+                    if (std.mem.eql(u8, m, d)) {
+                        ctx.gpa.free(d);
+                        continue :outer;
+                    }
+                }
+                members.append(ctx.gpa, d) catch {
+                    ctx.gpa.free(d);
+                    continue;
+                };
+            }
+        } else |_| {}
+
+        for (members.items) |m| {
+            const gop = ctx.state.getOrPut(m) catch continue;
+            if (!gop.found_existing) {
+                gop.key_ptr.* = ctx.gpa.dupe(u8, m) catch {
+                    _ = ctx.state.remove(m);
+                    continue;
+                };
+                gop.value_ptr.* = .{};
+                std.debug.print("heartbeat: committee member {s} discovered\n", .{m});
+            }
+            const st = gop.value_ptr;
+
             const resp = ctx.exchange(m);
             const ok = resp != null;
-            if (ok != ctx.alive[i]) {
+            if (ok != st.alive) {
                 std.debug.print("heartbeat: committee member {s} {s}\n", .{ m, if (ok) "alive" else "DEAD" });
-                ctx.alive[i] = ok;
+                st.alive = ok;
             }
             if (resp) |hb| {
-                if (hb.holdings_seq != ctx.last_seq[i]) {
+                if (hb.holdings_seq != st.last_seq) {
                     std.debug.print("heartbeat: {s} holdings_seq {d} -> {d} (load {d})\n", .{
-                        m, ctx.last_seq[i], hb.holdings_seq, hb.load,
+                        m, st.last_seq, hb.holdings_seq, hb.load,
                     });
-                    ctx.last_seq[i] = hb.holdings_seq;
+                    st.last_seq = hb.holdings_seq;
                 }
             }
         }
@@ -224,7 +265,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     defer table.deinit();
     const zero_version = "0" ** 64;
     for (peer_strs.items) |ps| {
-        _ = table.merge(ps, zero_version, "", stats.nowNs(io)) catch {};
+        _ = table.merge(ps, zero_version, "", peers.NO_COMMITTEE, stats.nowNs(io)) catch {};
     }
 
     if (opts.gguf_path) |gp| {
@@ -267,7 +308,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             for (ji.members) |m| {
                 if (sync.PeerAddr.parse(m)) |a| {
                     try srcs.append(gpa, a);
-                    _ = table.merge(m, "0" ** 64, "", stats.nowNs(io)) catch {};
+                    // committee members seed the table WITH their committee id
+                    _ = table.merge(m, "0" ** 64, "", joined_committee_id, stats.nowNs(io)) catch {};
                 } else |_| {}
             }
             try srcs.appendSlice(gpa, peer_list.items);
@@ -361,6 +403,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .table = &table,
         .store = if (store) |*st| st else null,
         .advertise = advertise,
+        .committee_id = joined_committee_id,
     };
     {
         const t = try std.Thread.spawn(.{}, gossip.loop, .{&gossip_ctx});
@@ -369,17 +412,14 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
 
     // committee heartbeats (SPEC.md)
     var hb_ctx: HeartbeatCtx = undefined;
-    if (committee_members.len > 0) {
-        const alive = try gpa.alloc(bool, committee_members.len);
-        @memset(alive, true);
-        const last_seq = try gpa.alloc(u64, committee_members.len);
-        @memset(last_seq, 0);
+    if (joined_committee_id != wire.NO_COMMITTEE) {
         hb_ctx = .{
             .gpa = gpa,
             .io = io,
-            .members = committee_members,
-            .alive = alive,
-            .last_seq = last_seq,
+            .seed = committee_members,
+            .table = &table,
+            .committee_id = joined_committee_id,
+            .state = std.StringHashMap(MemberState).init(gpa),
             .p2p_ctx = &p2p_ctx,
         };
         const t = try std.Thread.spawn(.{}, heartbeatThread, .{&hb_ctx});

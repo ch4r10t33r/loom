@@ -15,6 +15,7 @@ pub const MsgType = enum(u8) {
     heartbeat = 0x01,
     heartbeat_resp = 0x02,
     announce = 0x03,
+    announce_batch = 0x04,
     expert_request = 0x10,
     expert_response = 0x11,
     _,
@@ -206,6 +207,43 @@ pub const Announce = struct {
     }
 };
 
+// ---- AnnounceBatch (0x04) ------------------------------------------------------
+// The gossip exchange response: a batch of Announce bodies (u32 count, then
+// count x [u32 len + body]). Snappy at the frame level compresses across the
+// similar bitmaps of many peers.
+
+pub const AnnounceBatch = struct {
+    pub fn encodeBodies(gpa: std.mem.Allocator, bodies: []const []const u8) ![]u8 {
+        var b = std.ArrayList(u8).empty;
+        errdefer b.deinit(gpa);
+        try appendU32(gpa, &b, @intCast(bodies.len));
+        for (bodies) |body| {
+            try appendU32(gpa, &b, @intCast(body.len));
+            try b.appendSlice(gpa, body);
+        }
+        return b.toOwnedSlice(gpa);
+    }
+
+    pub const Iter = struct {
+        c: Cursor,
+        remaining: u32,
+
+        pub fn next(self: *Iter) !?[]const u8 {
+            if (self.remaining == 0) return null;
+            self.remaining -= 1;
+            const len = try self.c.u32v();
+            return try self.c.need(len);
+        }
+    };
+
+    pub fn iterate(body: []const u8) !Iter {
+        var c = Cursor{ .buf = body };
+        const n = try c.u32v();
+        if (n > 65536) return error.Truncated;
+        return .{ .c = c, .remaining = n };
+    }
+};
+
 // ---- ExpertRequest (0x10) / ExpertResponse (0x11) ------------------------------
 
 pub const ExpertRequest = struct {
@@ -368,6 +406,26 @@ test "expert request/response roundtrip; incompressible payload stays raw" {
     const back = try ExpertResponse.parseBody(dec.body);
     try std.testing.expect(back.status == .ok);
     try std.testing.expectEqualSlices(u8, &payload, back.payload);
+}
+
+test "announce batch roundtrip" {
+    const gpa = std.testing.allocator;
+    const a1 = Announce{ .committee_id = 0, .holdings_seq = 1, .addr = "a:1", .holdings_bitmap = &.{ 0xFF, 0x01 } };
+    const a2 = Announce{ .committee_id = 1, .holdings_seq = 2, .addr = "b:2", .holdings_bitmap = &.{0x0F} };
+    const b1 = try a1.encodeBody(gpa);
+    defer gpa.free(b1);
+    const b2 = try a2.encodeBody(gpa);
+    defer gpa.free(b2);
+    const batch = try AnnounceBatch.encodeBodies(gpa, &.{ b1, b2 });
+    defer gpa.free(batch);
+
+    var it = try AnnounceBatch.iterate(batch);
+    const e1 = try Announce.parseBody((try it.next()).?);
+    try std.testing.expectEqualStrings("a:1", e1.addr);
+    try std.testing.expect(e1.committee_id == 0);
+    const e2 = try Announce.parseBody((try it.next()).?);
+    try std.testing.expect(e2.holdings_seq == 2);
+    try std.testing.expect((try it.next()) == null);
 }
 
 test "corrupt frames are rejected" {

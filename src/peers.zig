@@ -14,10 +14,13 @@
 const std = @import("std");
 const Io = std.Io;
 
+pub const NO_COMMITTEE: u32 = 0xFFFF_FFFF;
+
 pub const PeerInfo = struct {
     addr: []u8, // owned "host:port"
     version_hex: [64]u8, // manifest version the peer advertises (zeros if none)
     holdings_hex: []u8, // owned; may be empty if peer has no store
+    committee_id: u32, // NO_COMMITTEE when unknown / not in one
     last_seen_ns: i128,
 };
 
@@ -42,7 +45,7 @@ pub const Table = struct {
 
     /// Insert or refresh a peer. Skips our own address. Returns true if the
     /// entry was new (useful for logging discovery).
-    pub fn merge(self: *Table, addr: []const u8, version_hex: []const u8, holdings_hex: []const u8, now_ns: i128) !bool {
+    pub fn merge(self: *Table, addr: []const u8, version_hex: []const u8, holdings_hex: []const u8, committee_id: u32, now_ns: i128) !bool {
         if (std.mem.eql(u8, addr, self.self_addr)) return false;
         if (version_hex.len != 64) return error.BadVersionHex;
 
@@ -56,6 +59,8 @@ pub const Table = struct {
                     self.gpa.free(e.holdings_hex);
                     e.holdings_hex = try self.gpa.dupe(u8, holdings_hex);
                 }
+                // an unknown committee never downgrades a known one
+                if (committee_id != NO_COMMITTEE) e.committee_id = committee_id;
                 e.last_seen_ns = now_ns;
                 return false;
             }
@@ -64,11 +69,31 @@ pub const Table = struct {
             .addr = try self.gpa.dupe(u8, addr),
             .version_hex = undefined,
             .holdings_hex = try self.gpa.dupe(u8, holdings_hex),
+            .committee_id = committee_id,
             .last_seen_ns = now_ns,
         };
         @memcpy(&info.version_hex, version_hex);
         try self.entries.append(self.gpa, info);
         return true;
+    }
+
+    /// Addresses of known peers in `committee_id` — the gossip-derived
+    /// committee view (SPEC.md): earlier members learn later joiners from
+    /// their announces. Caller frees each string and the slice.
+    pub fn committeeMembersAlloc(self: *Table, gpa: std.mem.Allocator, committee_id: u32) ![][]u8 {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var out = std.ArrayList([]u8).empty;
+        errdefer {
+            for (out.items) |a| gpa.free(a);
+            out.deinit(gpa);
+        }
+        for (self.entries.items) |e| {
+            if (e.committee_id == committee_id) {
+                try out.append(gpa, try gpa.dupe(u8, e.addr));
+            }
+        }
+        return out.toOwnedSlice(gpa);
     }
 
     /// Copy of all peer addresses. Caller frees each string and the slice.
@@ -100,7 +125,7 @@ pub const Table = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         for (self.entries.items) |e| {
-            try list.print(gpa, "addr={s} version={s} holdings={s}\n", .{ e.addr, e.version_hex, e.holdings_hex });
+            try list.print(gpa, "addr={s} version={s} holdings={s} committee={d}\n", .{ e.addr, e.version_hex, e.holdings_hex, e.committee_id });
         }
         return self.entries.items.len;
     }
@@ -119,9 +144,9 @@ test "table merges, dedupes, refuses self" {
     defer t.deinit();
 
     const v = "aa" ** 32;
-    try std.testing.expect(try t.merge("127.0.0.1:9001", v, "ff01", 1)); // new
-    try std.testing.expect(!try t.merge("127.0.0.1:9001", v, "ab00", 2)); // refresh
-    try std.testing.expect(!try t.merge("127.0.0.1:9000", v, "ff01", 3)); // self
+    try std.testing.expect(try t.merge("127.0.0.1:9001", v, "ff01", 2, 1)); // new
+    try std.testing.expect(!try t.merge("127.0.0.1:9001", v, "ab00", NO_COMMITTEE, 2)); // refresh keeps committee
+    try std.testing.expect(!try t.merge("127.0.0.1:9000", v, "ff01", 2, 3)); // self
     try std.testing.expect(t.count() == 1);
 
     var out = std.ArrayList(u8).empty;
@@ -129,4 +154,13 @@ test "table merges, dedupes, refuses self" {
     const n = try t.dump(gpa, &out);
     try std.testing.expect(n == 1);
     try std.testing.expect(std.mem.indexOf(u8, out.items, "holdings=ab00") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.items, "committee=2") != null);
+
+    const members = try t.committeeMembersAlloc(gpa, 2);
+    defer {
+        for (members) |m| gpa.free(m);
+        gpa.free(members);
+    }
+    try std.testing.expect(members.len == 1);
+    try std.testing.expectEqualStrings("127.0.0.1:9001", members[0]);
 }
