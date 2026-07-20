@@ -1,436 +1,576 @@
-# Loom: Running Frontier Mixture-of-Experts Models on Commodity Swarms
+# Loom: A Distributed Expert-Cache Architecture for Frontier Mixture-of-Experts Models
 
-**Version 0.10 — 2026-07-20 (living document)**
+*Technical design and preliminary validation*
 
-> This whitepaper is maintained alongside the code. Every design decision is
-> reflected here: the affected section is updated and a dated entry is appended
-> to the [Decision Log](#appendix-a--decision-log). Where this document, the
-> [spec](../spec/SPEC.md), and the [roadmap](../docs/ROADMAP.md) differ in
-> detail, the spec governs the p2p layer and the roadmap governs status; this
-> document governs intent.
+**Author:** Parthasarathy Ramanujam
+**Draft v0.2 — 2026-07-20**
+**Status:** design complete for v1; partial implementation; preliminary single-machine and localhost validation. Implementation progress is tracked in [ROADMAP](https://github.com/ch4r10t33r/loom/blob/main/docs/ROADMAP.md); the wire protocol is specified in [SPEC](https://github.com/ch4r10t33r/loom/blob/main/spec/SPEC.md). A dated design-decision log for contributors is in [Appendix A](#appendix-a--decision-log).
+
+---
+
+## Contents
+
+- [Abstract](#abstract)
+- [Glossary](#glossary)
+- [1. Introduction](#1-introduction)
+- [2. Related work](#2-related-work)
+- [3. Core thesis: experts flow, not activations](#3-core-thesis-experts-flow-not-activations)
+- [4. System architecture](#4-system-architecture)
+- [5. Expert-aligned sharding](#5-expert-aligned-sharding)
+- [6. Distribution protocol](#6-distribution-protocol)
+- [7. Trust and security model](#7-trust-and-security-model)
+- [8. Node classes and compensation](#8-node-classes-and-compensation)
+- [9. Deployment and performance model](#9-deployment-and-performance-model)
+- [10. Preliminary results](#10-preliminary-results)
+- [11. Limitations](#11-limitations)
+- [12. Roadmap](#12-roadmap)
+- [13. Conclusion](#13-conclusion)
+- [References](#references)
+- [Appendix A — Decision log](#appendix-a--decision-log)
+- [Appendix B — Source layout](#appendix-b--source-layout)
+- [Appendix C — Provenance](#appendix-c--provenance)
+
+---
 
 ## Abstract
 
-**What is proven.** Loom keeps **compute node-local** and makes **weights the
-only thing that moves**: an MoE model is sharded into content-addressed
-*expert blocks*, distributed with committee-based redundancy, verified by
-Merkle digests at every hop, gossiped, repaired eagerly, and fetched into the
-token loop on demand. The claims we have demonstrated, on real weights, are
-scoped precisely: the inference engines produce correct output on reference
-checkpoints (tinyllamas; DeepSeek-V2-Lite, a 15.7 B-parameter MoE, Q4_K_M);
-and a node holding **33 % of that model's shards produced token-identical,
-factually correct completions while fetching the missing experts from a
-single LAN peer mid-inference**, every block digest-verified before use.
-This is a *correctness and integration* result obtained with scalar kernels
-(~0.3 tok/s on one CPU core) on localhost — not a throughput or
-network-performance result (§6, §10).
+Loom is a system for serving very large Mixture-of-Experts (MoE) language models
+across a swarm of ordinary machines by keeping computation node-local and moving
+only weights across the network. The motivation is structural: the strongest
+open-weight models — Kimi K2 [3], DeepSeek V3 [2], the GLM family [4] — are MoE
+architectures whose weights do not fit on any commodity machine, yet each token
+activates only a few percent of them, drawn from an immutable, content-addressable
+corpus. Loom treats that corpus as distributed storage: it is sharded into
+content-addressed expert blocks, replicated across coordinated "committees" of
+nodes, verified by Merkle digests at every hop, and paged into the token loop on
+demand.
 
-**What is targeted.** The design goal is serving frontier MoE models
-(GLM 5.2-class: 744 B parameters, 19,200 experts) on swarms of ordinary
-16–32 GB machines. That goal is *architecturally supported but not yet
-demonstrated*: GLM 5.2 has never been run, kernels lack SIMD, batching is
-unimplemented. And the bandwidth arithmetic must be read before the vision:
-on ordinary gigabit Ethernet, distribution buys **capacity — the model fits
-where it never could — not speed**; competitive throughput additionally
-requires 10 GbE+, an aggressively pinned hot set, and batched serving. §10
-maintains the exact measured/unmeasured boundary.
+*What has been demonstrated.* The inference engines produce correct output on
+reference checkpoints (the tinyllamas models, and DeepSeek-V2-Lite, a 15.7-billion-parameter
+MoE, at Q4_K_M quantization). A node holding 33% of that model's shards produced the
+*expected*, token-identical completion while fetching the missing experts from a single
+LAN peer during inference, with every block digest-verified before use. This is a
+correctness-and-integration result on localhost with scalar CPU kernels (~0.3 tok/s
+on one core), not a throughput or wide-area result (§10).
 
-## 1. Motivation
+*What is targeted, and not yet demonstrated.* The design goal is serving GLM-5.2-class
+models (744 billion parameters; ~19,200 experts) on swarms of 16–32 GB machines. That
+model has not been run, kernels are not yet vectorized, and there is no batching. One
+caveat governs expectations throughout (§9): on ordinary gigabit Ethernet, distribution
+buys **capacity** — the model fits where it otherwise could not — **not speed**;
+competitive throughput additionally requires 10-gigabit-class fabric, a pinned hot set,
+and batched serving.
 
-Three facts collide:
+---
 
-1. **The best open models are MoE.** Kimi K2 (~1 T total / ~32 B active),
-   DeepSeek V3 (671 B / 37 B), GLM 5.2 (744 B / ~40 B). The frontier of
-   open-weight capability activates 3–5 % of its parameters per token.
-2. **The weights don't fit anywhere cheap.** At int4, GLM 5.2's routed experts
-   alone are ~370 GB. A 16 GB laptop cannot hold them; even a 192 GB
-   workstation cannot.
-3. **The activated set is small and skewed.** Per token, GLM 5.2 reads
-   600 expert blocks (~11.4 GB), drawn Zipf-like from the 19,200-block corpus
-   — a *sparsely accessed, immutable, content-addressable blob store*.
+## Glossary
 
-The conclusion Loom is built on: this is a **distributed storage and caching
-problem wearing an inference costume**. The corpus should be stored once
-across a swarm, replicated by policy, verified cryptographically, and paged
-into compute on demand — the way distributed filesystems treat cold blocks,
-not the way tensor-parallel runtimes treat shards.
+| Term | Meaning |
+|---|---|
+| **Expert** | One routed feed-forward sub-network (gate/up/down matrices) in one MoE layer. GLM 5.2 has 256 per layer; 8 activate per token. |
+| **Expert shard** | The unit of distribution and compute: one expert's weights, ~19 MB at int4. A fetched expert shard is exactly what a MoE matmul consumes. |
+| **Resident chunk** | A ~16 MB piece of the *resident bundle* — the non-expert weights (attention, embeddings, shared experts, router, norms) that every full node holds in full. |
+| **Manifest / version id** | The list of shard digests plus layout; its Merkle root is the model's version identity, which nodes pin requests to. |
+| **Full node** | Holds the resident bundle and a subset of expert shards; runs local inference; serves shards to peers. The supply side. |
+| **Light node** | Holds no weights and runs no engine; exposes the same local API and delegates to full nodes. The demand side. |
+| **Committee** | A group of full nodes that collectively holds the complete shard set — a self-sufficient serving cell. |
+| **MLA** | Multi-head Latent Attention [1]: attention with a low-rank compressed key/value cache (~576 values/token/layer), used by the target models. |
+| **Mesh** | The peer table each node builds from gossip announcements, used for discovery and fallback routing. |
 
-## 2. Core thesis: experts flow — not activations, not KV
+---
 
-Existing approaches to multi-machine inference split the *computation*:
-pipeline-parallel and layer-split systems (Petals, exo) place layers on
-different machines and ship **activations** across the network every layer of
-every token. These systems work and ship today — the comparison here is
-structural, not a claim that they fail. Activation-shipping puts the network
-in the serial critical path: total latency is the sum over layers of the
-slowest link, and a slow or lost peer stalls every token in flight.
+## 1. Introduction
 
-Loom inverts this. Every node runs the **complete forward pass** locally. The
-only thing that ever crosses the network is an **expert block**: immutable,
-content-addressed, cacheable, prefetchable, and identical for every user of
-the model. Three consequences:
+**Who this is for.** Loom targets operators who want to run frontier open-weight
+MoE models on hardware they already have — a homelab, a research group's
+workstations, a small trusted cluster — rather than renting datacenter GPUs.
+It is *not* for interactive single-user chat on a cold model over a slow link
+(§9 explains why), and v1 assumes a cooperative, operator-run swarm rather than
+an open adversarial network (§7).
 
-- **Failure is soft.** A lost peer costs a re-fetch from a replica, not a
-  broken pipeline. A lone node still works — it just streams from its own
-  disk.
-- **Caching compounds.** Hot experts end up resident on many nodes; the
-  network is touched only on the cold tail.
-- **KV never moves.** The target models use Multi-head Latent Attention
-  (MLA), which compresses the KV cache to ~576 floats per token per layer —
-  a few GB even at long context. Distributing KV would put mutable,
-  latency-critical, per-session state on the network for negligible capacity
-  gain; Loom forbids it by design.
+Three facts frame the problem.
 
-The honest counterweight, measured and documented from day one: on slow
-networks (1 GbE), distribution buys **capacity, not speed** — the swarm lets
-the model *fit* where it never could, while throughput requires 10 GbE+,
-batching, and a pinned hot set. Loom is a serving-throughput architecture
-first, an interactive-latency one second.
+1. **The best open models are MoE.** Kimi K2 (~1T total / ~32B active),
+   DeepSeek V3 (671B / 37B), and the GLM family activate roughly 3–5% of their
+   parameters per token [2][3][4].
+2. **The weights do not fit cheaply.** At int4, the routed experts of a
+   GLM-5.2-class model total ~370 GB — beyond any commodity machine, and beyond
+   most workstations.
+3. **The activated set is small and skewed.** A single token reads on the order
+   of 600 expert blocks (~11.4 GB for GLM 5.2), drawn Zipf-like from a fixed
+   corpus of ~19,200 — a sparsely accessed, immutable, content-addressable blob
+   store.
 
-## 3. System architecture
+Loom's premise follows: this is a distributed storage and caching problem in the
+shape of an inference problem. The corpus is stored once across a swarm,
+replicated by policy, cryptographically verified, and paged into computation on
+demand — the way a distributed filesystem treats cold blocks, not the way a
+tensor-parallel runtime treats a partitioned weight matrix.
 
-Loom is a single Zig binary organized into five planes:
+---
 
-| Plane | Folder | Role |
-|---|---|---|
-| Core | `src/core/` | SHA-256/Merkle, tensor math, int4 quantization, measurement |
-| Inference engines | `src/engine/`, `src/gguf/` | node-local forward passes (below) |
-| Distribution | `src/p2p/` | shard store, wire protocol, gossip, committees, repair |
-| Daemon | `src/node/` | node orchestration, RPC serving, model resolution |
-| CLI | `src/main.zig` | `loom node / gguf / run / gen / info / iobench` |
+## 2. Related work
 
-Two inference engines share the kernels:
+Systems that run large models across multiple machines can be organized by their
+*unit of distribution* and the failure and trust properties that follow from it.
 
-- **`llama` architecture** — GQA attention, NORM RoPE, SwiGLU; validated
-  against reference models (tinyllamas) in F32, Q4_0, Q8_0.
-- **`deepseek2` architecture** — the Kimi/DeepSeek/GLM family: MLA attention
-  (q/kv-LoRA, compressed-KV latent cache, decoupled rope head), sparse MoE
-  routing (sigmoid/softmax gating, noaux_tc selection bias, shared experts),
-  YaRN context extension, byte-level BPE tokenizer from GGUF metadata.
-  Validated on real DeepSeek-V2-Lite weights (Q4_K_M).
+| System | Unit distributed | What crosses the network per token | Failure model | Commodity-NIC friendly |
+|---|---|---|---|---|
+| Petals [5] | Transformer layers | Activations, every layer | Serial: a slow/lost stage stalls the token | Partially (activations are small but on the critical path) |
+| exo [6] | Layer partitions | Activations | Serial pipeline | Partially |
+| FlexGen [9] | Offloaded tensors (single node) | Nothing (host↔device) | N/A (not distributed) | N/A |
+| PowerInfer [8] | Hot/cold neurons (single node) | Nothing (GPU/CPU split) | N/A | N/A |
+| llama.cpp [7] | None (single node) or layer-split | Activations if split | Serial if split | Yes single-node |
+| **Loom** | **Expert block (weights)** | **Expert blocks only** (cacheable, immutable) | **Soft: re-fetch from a replica** | **Yes (capacity); speed needs 10 GbE** |
 
-Weights stay in their GGML quantized formats (F32/F16/Q4_0/Q5_0/Q8_0/
-Q4_K/Q5_K/Q6_K) in a read-only memory map; every matmul is a fused kernel
-over the raw bytes — nothing is dequantized wholesale.
+Loom **reuses** the GGUF weight format and GGML quantization layouts [7] and the
+DeepSeek MLA / sparse-routing model shape [1][2]. It **introduces** the
+expert-block-as-distribution-unit, committee-based redundancy with
+coverage-by-construction, and a token-loop fetch that doubles as organic
+replication. The closest philosophical relative is content-addressed storage
+(Merkle-verified immutable blocks [10]) applied to model weights rather than files.
 
-## 4. Expert-aligned sharding
+Layer-split systems such as Petals and exo are deployed and effective; the
+distinction Loom draws is structural, not a claim that they do not work. Because
+they ship *activations* — mutable, per-request, order-dependent data — the
+network sits on the serial critical path. Loom ships only immutable weights, so a
+lost peer costs a re-fetch rather than a broken pipeline.
 
-The distribution unit equals the compute unit. A **shard is one expert
-block**: the gate/up/down matrices of a single expert in a single layer,
-expressed as an extent list over the GGUF file's 3-D expert tensors. A fetched
-shard is exactly what a MoE matmul consumes — no assembly, no coding, no
-partial reads in the hot path.
+---
 
-Everything that is *not* a routed expert — attention, norms, shared experts,
-embeddings, router weights, the GGUF header — forms the **resident bundle**,
-chunked into 16 MB shards that **every node holds in full**. This is what
-keeps compute node-local: any node can run the dense path and the router
-alone; only routed-expert reads may leave the machine.
+## 3. Core thesis: experts flow, not activations
 
-Every byte of the file belongs to exactly one shard. Each shard carries a
-SHA-256 digest; the Merkle root over the digest list is the **model version
-id** — the identity nodes gossip, pin their requests to, and (planned)
-hardfork on. Integrity is therefore free at every hop: any shard from any
-peer is verified against the local manifest before it touches disk or a
-matmul.
+Every full node runs the complete forward pass locally. The only data that
+crosses the network during inference is an expert block: immutable,
+content-addressed, cacheable, and identical for every user of the model. Three
+properties follow.
 
-**GLM 5.2 numbers** (the target deployment):
+- **Soft failure.** A lost peer costs a re-fetch from a replica, not a broken
+  pipeline. A lone node still functions, streaming experts from its own disk.
+- **Compounding cache.** Frequently used experts come to reside on many nodes;
+  the network is touched only on the cold tail of the access distribution.
+- **KV stays home.** The target models use MLA [1], compressing the key/value
+  cache to ~576 values per token per layer. Distributing that mutable,
+  latency-critical, per-session state would put it on the network for a
+  negligible capacity gain, so Loom does not.
+
+The governing caveat (developed in §9): on gigabit Ethernet the swarm buys
+capacity, not speed. Loom is a serving-throughput architecture first and an
+interactive-latency one second.
+
+**Figure 1 — inference data path (one full node).** Only routed-expert reads may
+leave the machine; everything else is local.
+
+```
+ prompt
+   │
+   ▼
+ embed ──► for each layer:  RMSNorm ─► MLA attention ─► (local KV cache)
+                                           │
+                                           ▼
+                              router ─► top-k experts ─┐
+                                                       │  held?  ── yes ─► local pread ─┐
+                                                       ▼                                 ▼
+                                              expert access tier          ─► SwiGLU matmul ─► residual
+                                                       │  no                             ▲
+                                                       └─► fetch from peer ──► verify ────┘
+                                                            (committee → mesh)   + persist
+   │
+   ▼
+ final norm ─► logits ─► sampled token
+```
+
+---
+
+## 4. System architecture
+
+Loom is a single binary written in Zig. Conceptually it separates a **data
+plane** (weights at rest and in flight, and the local forward pass) from a
+**control plane** (membership, gossip, repair, metering). Two inference engines
+share a common set of quantized-matmul kernels:
+
+- The **llama** engine — grouped-query attention, rotary embeddings, SwiGLU —
+  validated against the tinyllamas reference models at F32, Q4_0, and Q8_0.
+- The **deepseek2** engine — the Kimi/DeepSeek/GLM family: MLA attention, sparse
+  MoE routing with sigmoid/softmax gating and shared experts, YaRN context
+  extension [11], and a byte-level BPE tokenizer read from GGUF metadata —
+  validated on real DeepSeek-V2-Lite weights (Q4_K_M).
+
+Weights remain in their GGML quantized formats
+(F32/F16/Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K) in a read-only memory map; each matmul
+is a fused kernel over the raw bytes, so no tensor is dequantized wholesale. The
+concrete source layout appears in [Appendix B](#appendix-b--source-layout).
+
+---
+
+## 5. Expert-aligned sharding
+
+The unit of distribution equals the unit of computation. An **expert shard** is
+one expert's gate/up/down matrices in one layer, described as a byte-extent list
+over the GGUF file's three-dimensional expert tensors. A fetched expert shard is
+precisely what a MoE matmul consumes — no reassembly, no erasure coding, no
+partial reads on the token path.
+
+Everything that is not a routed expert — attention, norms, shared experts,
+embeddings, router weights, the file header — forms the **resident bundle**,
+split into ~16 MB **resident chunks** that every full node holds in full. This is
+what keeps compute node-local: any node can run the dense path and the router by
+itself; only routed-expert reads may leave the machine.
+
+Every byte of the file belongs to exactly one shard (expert shard or resident
+chunk). Each shard carries a SHA-256 digest, and the Merkle root over the digest
+list — together with the layout — is the model's version identity, which nodes
+gossip and pin their requests to. Integrity is therefore free at every hop: a
+shard from any source is checked against the local manifest before it reaches
+disk or a matmul.
+
+**Sizing for the GLM-5.2-class target:**
 
 | Quantity | Value |
 |---|---|
-| Routed shards | 19,200 (75 MoE layers × 256 experts) |
-| Shard size | ~19 MB int4 |
+| Expert shards | 19,200 (75 MoE layers × 256 experts) |
+| Expert-shard size | ~19 MB (int4) |
 | Routed corpus | ~370 GB, stored once across the swarm |
-| Resident bundle | ~10 GB, on every node |
-| Logical GGUF | ~380 GB; each node's copy is sparse (~60 GB real bytes at defaults) |
+| Resident bundle | ~10 GB, on every full node |
+| Logical file | ~380 GB; each node's copy is sparse (~60 GB of real bytes at defaults) |
 | Manifest / holdings bitmap | ~1 MB / 2.4 KB |
 
 Measured on real DeepSeek-V2-Lite Q4_K_M (10.4 GB): 1,664 expert shards of
-4.98–6.02 MB plus 73 resident chunks (0.78 GB), manifest 204 KB, bitmap 218 B.
+4.98–6.02 MB, plus 73 resident chunks totaling 0.78 GB; manifest 204 KB; holdings
+bitmap 218 B.
 
-## 5. The p2p layer: committees, gossip, and the mesh
+---
 
-Full detail in the [spec](../spec/SPEC.md); the shape:
+## 6. Distribution protocol
 
-**Bootnode.** In v1 the bootnode is a **trusted placement service** — this
-is stated plainly rather than by analogy. It serves the manifest and assigns
-each joining node to a **shard committee** with a **least-covered-first**
-want-set, so coverage is achieved by construction rather than probability.
-Two properties hold and two do not: it is *not* in the token-loop inference
-path, and joined nodes survive its death (gossip-derived membership, mesh
-routing); but until a committee reaches completeness the bootnode *is* in
-the availability path (it covers coverage gaps as origin holder), and a
-malicious bootnode could assign adversarial or incomplete want-sets — v1
-assumes it is operated by the swarm operator. Verifiable assignment (signed
-manifests and assignments, multiple registries, coverage challenges) is
-future work, recorded in the spec's threat model.
+This section states the protocol's shape and invariants; field-level detail is
+in [SPEC](https://github.com/ch4r10t33r/loom/blob/main/spec/SPEC.md).
 
-**Committees.** A committee is a group of nodes that *collectively holds the
-complete shard set* — a self-sufficient serving cell. Invariants: every shard
-has ≥ 1 holder per committee (completeness); the bootnode fills committees
-toward a redundancy target R (default 2); when all committees are saturated,
-the next joiner opens a new one. Members exchange **heartbeats** (5 s):
-liveness plus manifest version, a monotonic holdings sequence number + bitmap
-digest, and a load hint for client-side spreading. Committee membership is
-**gossip-derived**, not static: announces carry committee ids, so earlier
-members discover later joiners automatically, and the view survives bootnode
-death.
-
-**Global gossip mesh.** Independently of committees, every node announces its
-holdings (full bitmap + version + committee id) on the gossip network every
-3 s; receivers merge announces into a peer table — the **mesh**. Discovery is
-transitive. ENR records (planned) will carry only the compact summary
-(version + holdings seq + digest, fitting the 300-byte ENR limit); the gossip
-topic carries the full bitmap.
-
-**Query path.** A node needing a shard asks (1) committee members first,
-round-robin across replicas; (2) the mesh as fallback; every response is
-digest-verified. A request fails only if *no reachable peer anywhere* holds
-the shard — and the **eager repair loop** (2 s) works continuously to make
-that state transient, re-fetching any unsatisfied want-set from every known
-peer. Churn policy is deliberately maximal: dead peers are retried, never
-forgotten; a returning holder is drained within one tick.
-
-**Wire messages v1.** All structured messages are binary frames (8-byte
-envelope, adaptive snappy: compressed only when smaller — holdings bitmaps
-compress > 4×, quantized payloads ship raw): Heartbeat, Announce,
-AnnounceBatch, ExpertRequest/ExpertResponse with typed statuses
-(`ok / not_held / version_mismatch / busy / bad_request`). Requests pin the
-manifest version — a peer on a different model version is refused wholesale,
-which is the hardfork guard operating at the message level. Responses carry
-no digest by design: the local manifest is the only trust root.
-
-## 6. Distributed inference in the token loop — a correctness and integration result
-
-The piece that makes the rest matter: a node whose local store lacks an
-expert **fetches it mid-token**. Inside each MoE layer, after the router
-selects its experts, missing shards are prefetched **in parallel** (per-layer
-miss latency is max(fetch), not sum), pulled committee-first with round-robin
-spreading, digest-verified, then **persisted into the local sparse store** —
-so the node's holdings grow with use and are advertised on the next gossip
-round. Fetch-on-demand is thereby also **organic heat replication**: hot
-experts gain holders because they are hot.
-
-Measured result (single peer, localhost, scalar kernels): a node holding
-**573 of 1,737 shards (33 %)** of DeepSeek-V2-Lite completed
-*"The capital of France is" → "Paris."* — streaming 641 experts (3.5 GB,
-29 ms average) with zero failures, token-identical to a full-copy run, and
-finishing at 1,214 shards held. The architecture's core promise — *compute
-local, experts flow, correctness preserved* — holds on real weights.
-
-**What this result does and does not validate.** It validates digest-verified
-mid-token fetch, sparse-store persistence, shard/engine alignment, and
-end-to-end correctness under a partial store. It does **not** validate:
-miss latency on 1 GbE/10 GbE under contention; concurrent fetches from many
-requesters (hot-expert hotspotting); committee failover under real RTT and
-loss; or whether Zipf skew plus pinning keeps token-loop misses rare enough
-for acceptable throughput. Those are network-bound measurements that have
-not been made; the analytical model in §9 states the expectations they must
-be tested against.
-
-## 7. Trust model
-
-**v1 (current): trusted-swarm with cryptographic *intra-manifest* integrity.**
-Content addressing + the Merkle-rooted manifest make corruption and poisoning
-detectable for free *relative to a manifest you already trust*: a bad shard
-fails its digest before use, from disk or from any peer, and version pinning
-prevents cross-model mixing. Two boundaries must be stated honestly:
-
-- **Which manifest is trusted is not free.** Content addressing secures
-  integrity *within* a manifest, not the choice *of* manifest. A node
-  bootstraps its Merkle root from the bootnode's `MANIFESTFILE` (or operator
-  config); a hostile bootstrap could pin an alternate,
-  internally-consistent-but-poisoned root. v1's answer is trust-on-first-use
-  plus operator configuration; signed roots / out-of-band pinning are future
-  work. The spec's *Manifest trust bootstrap* section is normative here.
-- **Holdings claims are unverified.** Peers can lie about which shards they
-  hold (the heartbeat carries a *digest* of the bitmap, not a proof of
-  possession). Completeness, committee-first routing, and load spreading all
-  assume honest bitmaps. A lying holder is caught only on `GETR` (wrong or
-  absent bytes → fall through to the next peer); there is no reputation,
-  challenge, or probe-on-suspicion yet. **Committee completeness is a
-  construction-time property under honest participation, not a
-  cryptographically enforced invariant.**
-
-Beyond these, v1 does not defend against availability attacks (refuse
-service, mesh poisoning with fake holders, RPC flooding) — the swarm is
-assumed cooperative and operator-run.
-
-**v2 (designed, not built): untrusted peers.** Planned per the
-[design doc](../CLAUDE.md): RLNC-based WAN propagation gated behind
-homomorphic-hash pollution defenses, redundant recompute with M-of-N voting
-on sampled tokens, TEE attestation, and a zkML interface stub. Coding
-(EC/RLNC) is confined to propagation and durability planes — principle 7
-forbids it in the token loop, where only direct addressed fetch of original
-blocks is permitted.
-
-## 8. Node classes and the service economy
-
-Loom distinguishes two node classes:
-
-**Full nodes** hold the resident bundle plus their assigned expert shards,
-join committees, serve shards to peers, and run inference. They are the
-supply side of the network.
-
-**Light nodes** are the demand side: anyone wanting local inference on a
-low-memory device (a laptop, a phone-class box) runs one. A light node holds
-*no weights, no store, and no engine* — its footprint is a few megabytes. It
-exposes the **same local RPC** a full node does, so applications are
-oblivious to the difference, and **delegates** every request to a full node
-with round-robin failover across its configured backends. It stamps a client
-identity onto each request.
-
-**Compensation.** Full nodes must be compensated by light nodes for serviced
-requests. What v1 ships is a **trusted-operator accounting demo** — the
-ledger mechanics and enforcement path, with *none* of the adversarial
-hardening a real service economy needs. Specifically, v1 is trivially
-gameable and says so: client ids are self-asserted strings (rotate the id,
-reset the free quota); ledgers are per-provider (N full nodes ⇒ N× free
-quota under round-robin); the `credit` op accepts an unverified proof
-(anyone who can reach the RPC can mint credits); and there are no signed
-receipts, so neither side can prove the other's ledger wrong. Cryptographic
-client identity (at minimum a shared-secret HMAC, properly a keypair),
-proof-of-payment verification, and signed usage receipts are prerequisites
-before "compensation" can be described as implemented. The overdraw window
-is bounded: at most one request's `prompt + max_tokens`. What exists today:
-
-- Every full node runs a per-client **metering ledger**: allowance =
-  free quota (`--free-quota`, default 1 M tokens) + purchased credits −
-  usage, where usage is prompt-plus-generated tokens. Every metered response
-  carries `cost` and `balance`; an exhausted client receives
-  `payment_required` before any compute is spent. Each full node meters its
-  own service — ledgers are per-provider, not global.
-- The `credit` RPC op (`{"method":"credit","client":…,"amount":…,"proof":…}`)
-  is the settlement integration point: v1 accepts the proof unverified
-  (trusted swarm); a payment rail (invoice/receipt verification, on-chain or
-  Lightning-style) replaces exactly that trust check without touching the
-  ledger, the gate, or the wire format. A `tab` op exposes any client's
-  used/balance.
-- Light nodes independently tally their own spend from response `cost`
-  fields — both sides of the ledger exist from day one, which is the
-  precondition for any dispute-free settlement scheme later.
-
-Measured end-to-end: a light node delegated inference transparently
-(identical protocol, `cost`/`balance` appended), spread load round-robin
-across two full nodes with independent ledgers, hit a deterministic
-`payment_required` when its only backend's allowance was exhausted, and
-resumed service after a `credit` top-up.
-
-**Light nodes are thin clients, not swarm participants.** They contribute no
-storage, no serving, and no redundancy; every token they consume is load on
-a full node. Capacity planning must size the full-node fleet for aggregate
-light-node QPS — light nodes amplify demand and add nothing to supply.
-
-## 9. Deployment model and sizing
-
-Held shards are a **disk** budget; RAM carries only the compute working set.
-
-| | Minimum | Recommended |
+| Component | Role | Key property |
 |---|---|---|
-| RAM | 16 GB (≈10 GB mmap'd dense + ~0.7 GB MLA KV + 2–3 GB expert cache) | 24–32 GB |
-| Disk | 75 GB NVMe (resident + ~50 GB shards) | 150 GB NVMe |
-| Experts held | ~1,300 (25 GB) | ~2,600 (50 GB) — 13.7 % of GLM 5.2 |
-| Network | 1 GbE (capacity win) | 10 GbE+ (latency win too) |
+| **Bootnode** | Onboards joiners; assigns each a committee and a least-covered-first want-set | Coverage by construction; not in the inference path; trusted in v1 |
+| **Committee** | A group of full nodes that collectively holds every shard | Completeness = ≥1 holder per shard; filled toward redundancy R (default 2) |
+| **Gossip mesh** | Every node announces its holdings every 3 s; peers merge into a peer table | Transitive discovery; carries committee membership |
+| **Query path** | Fetch a missing shard: committee members first, then the mesh | Digest-verified; fails only if no reachable holder exists anywhere |
+| **Eager repair** | A 2 s loop re-fetches any wanted-but-missing shard from all known peers | Dead peers retried, never forgotten; a returning holder is drained within one tick |
+| **Wire messages** | Binary frames (Heartbeat, Announce, ExpertRequest/Response) with adaptive Snappy [13] | Requests pin the version — a cross-version peer is refused (the hardfork guard) |
 
-Swarm sizing against R over the 370 GB corpus (R = 3 target, R = 2 floor —
-see the spec): at 50 GB/node, **completeness (R = 1) needs ≥ 8 nodes, R = 2
-needs ≥ 15, R = 3 needs ≥ 22**; 8 nodes at 100 GB reach R = 2. The
-bootnode's least-covered-first assignment makes these guarantees
-constructive.
+Two design choices deserve emphasis, because they are the reason the protocol
+holds together.
 
-### Performance model (analytical — not yet measured)
+**Coverage by construction.** Rather than hope that random placement covers every
+shard, the bootnode assigns each joiner the shards its committee currently covers
+least. Completeness (every shard has a holder) and redundancy (R holders) are
+distinct thresholds a committee crosses as it fills; when all committees are
+saturated at R, the next joiner opens a new one.
 
-Per-token time ≈ `t_compute + misses × t_fetch`, where `misses` is the number
-of routed experts (of 600 for GLM 5.2) not in the local store/page cache, and
-`t_fetch ≈ RTT + shard_size / bandwidth` per miss (fetches within a layer
-parallelize to max, not sum, across that layer's ≤ 8 misses). Indicative
-cold-miss cost for a 19 MB shard: ~160 ms on 1 GbE, ~16 ms on 10 GbE, before
-protocol overhead. The implications are stated, not hidden: with a cold
-working set on 1 GbE, a single stream is seconds per token — unusable
-interactively; serving becomes viable exactly insofar as pinning + Zipf skew
-+ organic replication drive the steady-state miss rate toward zero and
-batching amortizes what remains. **No network-tier measurements exist yet**
-(the table of GbE-tier × miss-rate × tok/s is future work); until they do,
-every throughput expectation should be derived from this model, not from
-the localhost result in §6. The `t_compute` term is itself scalar today
-(~0.3 tok/s on a 15.7 B model, one core); hardware-tailored backends —
-CPU SIMD (NEON/AVX) and the platform GPU (Metal/Vulkan/CUDA), staged behind
-one `Backend` seam (roadmap; issues #10–#14) — are the throughput lever that
-makes both `t_compute` and the miss-amortization regime viable.
+**Membership is gossip-derived, not static.** Announcements carry committee ids,
+so earlier members learn later joiners automatically and the committee view
+survives the bootnode's departure. Heartbeats (5 s) carry liveness plus the
+manifest version, a monotonic holdings sequence number, a bitmap digest, and a
+load hint — enough to detect staleness and spread load without shipping the full
+bitmap on every beat.
 
-Positioning, stated honestly: *run trillion-parameter open MoE models on the
-machines you already have* — a pooling story, not a magic-laptop story. One
-node alone gets disk-streaming; the value curve starts at a handful of boxes
-on a LAN. The differentiators against layer-split systems are structural
-(experts-not-activations, soft failure, verified weights, self-healing
-membership); the differentiator against single-box streaming is capacity.
+**Figure 2 — committee and mesh.**
 
-## 10. Validation status
+```
+        ┌──────────┐   JOIN → committee id + least-covered want-set
+ join ─►│ BOOTNODE │   (out of the inference path)
+        └────┬─────┘
+             │ manifest + initial shards
+    ┌────────┴──────── committee 0 (complete: every shard ≥1 holder) ────────┐
+    │  full node A ◄─── 5 s heartbeat ───► full node B ◄──► full node C       │
+    │   shards A..M         shard fetch          N..Z            A..K          │
+    └───────────────────────────┬─────────────────────────────────────────────┘
+                                 │ global gossip mesh (3 s: addr · version ·
+                                 │ committee · holdings bitmap)
+    ┌────────────────────────────┴──────── committee 1 · light clients ───────┐
+    │  full node D        full node E        light node (delegates to a full) │
+    └──────────────────────────────────────────────────────────────────────────┘
+```
 
-**Proven, on real weights or live multi-node runs:**
-llama + deepseek2 engines produce correct output on reference checkpoints
-(tinyllamas; DeepSeek-V2-Lite Q4_K_M — including the NORM-rope finding, K-
-quants, BPE, YaRN); expert-aligned sharding round-trips a real 10.4 GB model;
-bootstrap, gossip discovery, committee formation/saturation, heartbeat death
-detection, eager repair, mesh fallback, and 33 %-store distributed inference
-all demonstrated end-to-end.
+---
 
-**Honest gaps:** GLM 5.2 itself has not been run (no public weights
-converted; the deepseek2 path is the architectural proxy); kernels are
-scalar (no SIMD) — ~0.3 tok/s on a 15.7 B model on one core; single-sequence
-only (no batching); the loom-format v0 engine lacks token-exact oracle
-validation; distributed inference is served via `loom gguf run`, not yet
-through the node's RPC; ENR and hardfork coordination are designed but
-unimplemented.
+## 7. Trust and security model
 
-## 11. Roadmap
+v1 assumes a **cooperative, operator-run swarm** and provides cryptographic
+integrity *relative to a trusted manifest*. Stating the boundary once:
 
-Near-term: heartbeat-triggered re-replication (a dead member's shards
-re-covered proactively by its committee); hardfork coordination (majority of
-nodes adopting a new manifest version, with the version guard already
-enforcing isolation); serving the distributed engine through node RPC; SIMD
-kernels; continuous batching. Mid-term: ENR integration (`blockblaz/enr`) and
-gossipsub/discv5 transports — the containers and table semantics are already
-transport-agnostic. Long-term: the v2 trust layer (§7). Authoritative
-tracking: [docs/ROADMAP.md](../docs/ROADMAP.md).
+**Assumptions.** The bootnode is operated by the swarm operator; peers report
+their holdings honestly; the transport is a trusted LAN.
 
-## Appendix A — Decision Log
+**Guarantees.** Every shard is checked against its manifest digest before disk or
+matmul, so corruption, bit-rot, or a wrong-bytes peer is caught at every hop. The
+manifest's version id binds the shard layout, so a manifest whose extents do not
+tile the file exactly is rejected on parse. Version pinning on every request
+isolates model versions (and, later, hardforks).
 
-Every design decision is recorded here with its date and rationale. Newest
-last. *This log is append-only; superseded decisions are struck through, not
-deleted.*
+**Non-guarantees.** *Which* manifest is trusted is not free: content addressing
+secures integrity within a manifest, not the choice of manifest. A node adopts
+its Merkle root on first contact (trust-on-first-use) or from operator config; a
+hostile first contact could pin an alternate, internally-consistent-but-poisoned
+root. Holdings claims are unverified — a peer can advertise shards it lacks; this
+is caught reactively (a fetch returns wrong or absent bytes and the requester
+falls through to the next peer), so **committee completeness is a construction-time
+property under honest participation, not a cryptographic invariant**. v1 does not
+defend against availability attacks (service refusal, mesh poisoning with fake
+holders, request flooding).
+
+**v2 (designed, not built): untrusted peers.** The planned untrusted-peer layer
+adds rateless (RLNC) wide-area propagation gated behind homomorphic-hash
+pollution defenses [14], redundant recompute with M-of-N voting on sampled
+tokens, and TEE attestation. Erasure/network coding is confined to the
+propagation and durability planes; it is never permitted on the token path, where
+only direct fetch of an original block is allowed.
+
+Known limitations of the current implementation are consolidated in §11.
+
+---
+
+## 8. Node classes and compensation
+
+Loom defines two node classes.
+
+**Full nodes** hold the resident bundle and their assigned expert shards, join
+committees, serve shards to peers, and run inference. They are the supply side.
+The "compute node-local, only expert blocks cross the network" property of §3
+applies to the full-node inference data path; request, response, and control
+traffic naturally also cross the network.
+
+**Light nodes** hold no weights, no store, and no engine — a footprint of a few
+megabytes, suitable for a low-memory device. A light node exposes the same local
+API a full node does, so applications are unaware of the distinction, and
+delegates each request to a full node with round-robin failover across its
+configured backends. It stamps its own client identity on every request (a
+caller-supplied identity is dropped). Light nodes are thin clients, not swarm
+participants: they contribute no storage or serving, so capacity planning must
+size the full-node fleet for aggregate light-node demand.
+
+**Compensation.** Full nodes are meant to be compensated by light nodes for the
+inference they serve. v1 implements the *accounting* mechanics and leaves
+*settlement* as an integration seam. Each full node keeps a per-client ledger
+(allowance = free quota + purchased credits − token usage); a metered response
+carries its cost and the remaining balance, and an exhausted client is refused
+with `payment_required` before any compute. Credits are added through an
+admin-gated `credit` operation whose proof field a real payment rail would verify.
+This is deliberately scoped as a **trusted-operator accounting demonstration**,
+not a settlement system; its limitations are enumerated in §11.
+
+---
+
+## 9. Deployment and performance model
+
+Held shards are a **disk** budget served by `pread`; RAM carries only the compute
+working set.
+
+| Resource | Minimum | Recommended |
+|---|---|---|
+| RAM | 16 GB (≈10 GB mmap'd resident bundle + ~0.7 GB MLA KV + 2–3 GB expert cache) | 24–32 GB |
+| Disk | 75 GB NVMe (resident bundle + ~50 GB expert shards) | 150 GB NVMe |
+| Experts held | ~1,300 (25 GB) | ~2,600 (50 GB) — 13.7% of GLM 5.2 |
+| Network | 1 GbE (capacity only) | 10 GbE+ (also latency) |
+
+The 16 GB minimum is conditional on the resident bundle: a per-tensor-class
+breakdown from the real converted GLM 5.2 file is required before it is asserted
+as a default rather than a target (for DeepSeek-V2-Lite the measured resident
+bundle is 0.78 GB).
+
+Swarm sizing against redundancy R over the 370 GB corpus (R = 3 target, R = 2
+floor): at 50 GB per node, completeness (R = 1) needs ≥ 8 nodes, R = 2 needs ≥
+15, and R = 3 needs ≥ 22; eight nodes at 100 GB reach R = 2.
+
+**Performance model (analytical; not yet measured).** Per-token time is
+approximately `t_compute + misses × t_fetch`, where `misses` is the number of a
+token's routed experts absent from the local store and page cache, and `t_fetch ≈
+RTT + shard_size / bandwidth` per miss (fetches within a layer parallelize, so the
+layer cost is the maximum, not the sum, over its ≤ 8 misses). A cold 19 MB miss
+costs roughly 160 ms on 1 GbE and 16 ms on 10 GbE before protocol overhead. The
+consequence is direct: with a cold working set on gigabit Ethernet a single
+stream is seconds per token, unusable interactively. Serving becomes viable
+exactly insofar as pinning, the Zipfian access skew, and organic replication
+drive the steady-state miss rate toward zero, and batching amortizes what
+remains. The `t_compute` term is itself scalar today; hardware-tailored backends
+(CPU SIMD, and GPU via Metal/Vulkan/CUDA, staged behind one interface — roadmap
+issues #10–#14) are the lever that reduces it. No network-tier throughput
+measurements exist yet; §10 lists them as the primary measurement agenda.
+
+Positioning follows from the model: pool commodity machines so a frontier MoE
+fits where it otherwise could not; speed is a separate, network- and
+pinning-bound problem. The differentiators against layer-split systems are
+structural (weights not activations, soft failure, verified weights, self-healing
+membership); the differentiator against single-box streaming is aggregate
+capacity.
+
+---
+
+## 10. Preliminary results
+
+These are early results — a case study plus live single-machine and localhost
+multi-node runs — not a throughput evaluation. The evidence and its boundaries:
+
+| Claim | Configuration | Evidence | Boundary |
+|---|---|---|---|
+| Engine correctness | DeepSeek-V2-Lite Q4_K_M; tinyllamas F32/Q4_0/Q8_0 | Coherent, expected completions on real weights (validates kernels, MLA, RoPE convention, K-quants, BPE, YaRN) | Not a factual-accuracy benchmark; single-sequence; scalar kernels |
+| Expert-aligned sharding | Real 10.4 GB model | Round-trips to 1,664 expert shards + 73 resident chunks; layout partition property-tested | — |
+| Partial-store inference | 33% store (573/1,737 shards), localhost, one peer, scalar | Token-identical to a full-copy run while fetching 641 experts (3.5 GB, ~29 ms/fetch, 0 failures); grew to 1,214 shards held | Not NIC throughput or failover under WAN-like RTT/loss |
+| Committee & repair behavior | Live multi-node runs | Observed: bootstrap, gossip discovery, committee formation/saturation, heartbeat death detection, eager repair, mesh fallback | Not adversarial availability |
+| Weight-integrity defenses | Live | A corrupted on-disk shard is caught on store-open, cleared, and re-fetched; malicious (non-partition) manifests rejected on parse | — |
+| Metering | Live, two full nodes + one light node | Transparent delegation with cost/balance; per-provider ledgers; deterministic `payment_required` on exhaustion; resume after credit | Trusted-operator only (§11) |
+| Target frontier deployment | GLM-5.2-class | Analytical sizing only | Not run |
+
+The abstract's headline — the "Paris." completion — should be read as *expected,
+token-identical output under a partial store*, demonstrating the fetch/verify/persist
+loop and engine correctness, not as a factual-accuracy evaluation.
+
+**Measurement agenda (not yet done).** Tokens/second as a function of miss rate and
+NIC tier; repair time after killing a sole holder; the committee-saturation join
+sequence at scale; and end-to-end throughput once hardware-tailored kernels land.
+
+---
+
+## 11. Limitations
+
+Consolidated so a reader sees the full picture in one place.
+
+**Compute and coverage.**
+- Kernels are scalar (no SIMD/GPU) — ~0.3 tok/s on a 15.7B model on one core.
+- Single-sequence only; no continuous batching.
+- GLM 5.2 itself has not been run; the deepseek2 path is the architectural proxy.
+- No wide-area or contended-network measurements exist.
+
+**Trust (v1 is operator-trusted).**
+- Manifest choice is trust-on-first-use; a hostile bootstrap can pin a poisoned root.
+- Holdings claims are unverified; committee completeness assumes honesty.
+- No transport encryption or authentication (plaintext TCP) — LAN-appropriate, not public.
+- Availability attacks (service refusal, mesh poisoning, flooding) are not defended.
+
+**Metering (trusted-operator accounting demo).**
+- Client ids are self-asserted strings — rotating an id resets the free quota.
+- Ledgers are per-provider — round-robin across N full nodes yields N× the free quota.
+- `credit` is admin-gated but its payment proof is unverified in v1.
+- No signed receipts — neither party can prove the other's ledger wrong.
+- Prerequisites for real compensation: cryptographic client identity, payment-proof
+  verification, and signed usage receipts.
+
+**Operational.**
+- The distributed engine is exercised via `loom gguf run`, not yet the node's RPC path.
+- Persisted organic replicas have no disk cap or eviction yet, so a hot node's disk grows.
+- ENR advertising and hardfork coordination are designed but unimplemented.
+
+---
+
+## 12. Roadmap
+
+Milestones with exit criteria; full tracking in
+[ROADMAP](https://github.com/ch4r10t33r/loom/blob/main/docs/ROADMAP.md).
+
+1. **Hardware-tailored kernels** (issues #10–#14). *Exit:* a measured tok/s
+   improvement over scalar on DeepSeek-V2-Lite on a single node, via a backend
+   interface with a scalar differential oracle; CPU SIMD first, then GPU.
+2. **Serve the distributed engine through node RPC.** *Exit:* `loom node` answers
+   inference requests using the token-loop peer fetch, not only `loom gguf run`.
+3. **Network-tier evaluation.** *Exit:* a published table of tok/s vs miss rate
+   across 1/10 GbE, and repair time after a sole-holder failure.
+4. **Hardfork coordination.** *Exit:* a majority of nodes adopting a new manifest
+   version, with the existing version guard enforcing isolation during transition.
+5. **v2 trust layer.** *Exit:* untrusted-peer serving with pollution-resistant
+   propagation and sampled compute verification.
+
+---
+
+## 13. Conclusion
+
+Loom reframes frontier-MoE inference as a distributed-storage problem: store the
+expert corpus once across a swarm, verify it cryptographically, and page it into
+node-local computation on demand. The consequences — soft failure, a compounding
+cache, and a self-healing committee membership — follow from moving immutable
+weights rather than mutable activations. The implementation demonstrates the core
+loop end-to-end on real weights under a partial store, and is honest about the
+boundary: today's result is correctness and integration on localhost with scalar
+kernels, and the pitch is capacity, not speed. Pooling ordinary machines lets a
+frontier MoE model *fit* where it otherwise could not; making it *fast* is a
+separate, network- and kernel-bound problem, and the roadmap treats it as such.
+
+---
+
+## References
+
+1. DeepSeek-AI. *DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model.* 2024. https://arxiv.org/abs/2405.04434 (Multi-head Latent Attention).
+2. DeepSeek-AI. *DeepSeek-V3 Technical Report.* 2024. https://arxiv.org/abs/2412.19437
+3. Moonshot AI. *Kimi K2.* 2025. https://github.com/MoonshotAI/Kimi-K2
+4. GLM Team, Zhipu AI. *ChatGLM / GLM-4 family.* 2024. https://arxiv.org/abs/2406.12793 (GLM 5.2 is the design target; the GLM-4 report is the cited real family.)
+5. Borzunov et al. *Petals: Collaborative Inference and Fine-tuning of Large Models.* 2022. https://arxiv.org/abs/2209.01188
+6. exo-explore. *exo: run your own AI cluster at home.* https://github.com/exo-explore/exo
+7. Gerganov et al. *llama.cpp / GGML / GGUF.* https://github.com/ggml-org/llama.cpp
+8. Song et al. *PowerInfer: Fast Large Language Model Serving with a Consumer-grade GPU.* 2023. https://arxiv.org/abs/2312.12456
+9. Sheng et al. *FlexGen: High-Throughput Generative Inference of Large Language Models with a Single GPU.* 2023. https://arxiv.org/abs/2303.06865
+10. Merkle, R. *A Digital Signature Based on a Conventional Encryption Function.* CRYPTO 1987 (Merkle trees / content addressing).
+11. Peng et al. *YaRN: Efficient Context Window Extension of Large Language Models.* 2023. https://arxiv.org/abs/2309.00071
+12. Ethereum. *EIP-778: Ethereum Node Records (ENR).* https://eips.ethereum.org/EIPS/eip-778 ; libp2p gossipsub. https://github.com/libp2p/specs/tree/master/pubsub/gossipsub
+13. Google. *Snappy compression.* https://github.com/google/snappy (Zig binding: https://github.com/blockblaz/zig-snappy)
+14. Krohn, Freedman, Mazières. *On-the-fly Verification of Rateless Erasure Codes for Efficient Content Distribution.* IEEE S&P 2004 (homomorphic hashing).
+
+---
+
+## Appendix A — Decision log
+
+*For contributors.* This append-only log records design decisions with dates and
+rationale; it is maintained alongside the code and is not part of the paper's
+narrative. Superseded decisions are struck through, not deleted. Where this log,
+the [spec](https://github.com/ch4r10t33r/loom/blob/main/spec/SPEC.md), and the
+[roadmap](https://github.com/ch4r10t33r/loom/blob/main/docs/ROADMAP.md) differ,
+the spec governs the p2p protocol and the roadmap governs status.
 
 | Date | Decision | Rationale |
 |---|---|---|
-| 2026-07-11 | Distribution unit = the **expert**, not the layer; compute node-local; never distribute KV | MoE sparsity + MLA's tiny KV; avoids activations in the serial network path (CLAUDE.md core thesis) |
-| 2026-07-11 | Content-addressed shards + Merkle-rooted manifest | Free integrity/poisoning check at every hop; manifest root doubles as model version id |
-| 2026-07-11 | No coding (EC/RLNC) in the token loop, ever | Decode-before-use adds latency exactly where it cannot be hidden; coding confined to propagation/durability |
-| 2026-07-12 | Target toolchain: Zig 0.16.0 (dev), matching the user's zeam project | Shared toolchain + reusable deps (enr, ssz, snappy) outweigh 0.16 API churn |
-| 2026-07-12 | v1 direction: GGUF as interchange format; ENR + gossip + req-resp (Ethereum-style) p2p; majority hardforks; boot-time peer sync | User requirements of record; supersedes Hyperswarm/Hyperbee sketch |
-| 2026-07-12 | Weight advertising: **both** ENR (compact summary — 300 B limit → bitmap digest + seq) and a global gossip topic (full bitmap) | ENR for discovery-time selection; gossip for live freshness |
-| 2026-07-13 | Churn repair: **maximally eager** — always-on loop retries all known peers; dead peers retried, never forgotten | User decision ("as eagerly as possible"); lazy repair-on-miss rejected |
-| 2026-07-13 | Gossip: epidemic announce-and-exchange over the peer table; transport swappable for gossipsub later | Table semantics are transport-independent; LAN-scale first |
-| 2026-07-19 | deepseek2 rope is **NORM (adjacent-pair)**, not NEOX | Empirical: DeepSeek's (d/2,2)-transpose before rotate_half nets to adjacent-pair on stored layout; NEOX degenerates |
-| 2026-07-19 | Response payloads carry **no digest**; the requester verifies against its own manifest | The manifest is the only trust root; a peer-supplied digest adds nothing |
-| 2026-07-19 | Shard = one expert block (extent list over 3-D exps tensors) + mandatory 16 MB resident chunks; ~19 MB for GLM 5.2 → 19,200 shards | Shard unit must equal the matmul's consumption unit (principle 7); metadata stays trivial |
-| 2026-07-19 | Bootnode assigns committees **least-covered-first** toward R = 3 target / R = 2 floor; saturated committees spawn new ones | Coverage by construction instead of probabilistic overlap; Ethereum-bootnode discipline (out of inference path) |
-| 2026-07-19 | Fetched shards are **persisted** (not LRU-evicted): fetch-on-demand = organic heat replication | Disk is the cheap resource; hot experts should gain holders by being used |
-| 2026-07-20 | Wire messages v1: binary frames, **adaptive snappy** (compress only when smaller); heartbeat carries seq+digest+load but **not** the bitmap; the bitmap rides gossip announces | Quantized payloads are incompressible; heartbeats stay ~90 B; staleness detected cheaply |
-| 2026-07-20 | Committee membership is **gossip-derived** (announces carry committee id), heartbeat set = seed ∪ table view | Fixes static-at-join membership; no bootnode push protocol; survives bootnode death |
-| 2026-07-20 | Two node classes: **light nodes** (no weights/engine; same local RPC; delegate to full nodes with failover) and **full nodes** (shards + inference) | Local inference for low-memory devices without weakening the supply side |
-| 2026-07-20 | Compensation: per-client **metering ledger on each full node** (free quota + credits − token usage), `payment_required` enforcement, `credit` op as the unverified-in-v1 settlement seam | Accounting must precede payment rails; ledgers are per-provider; both sides tally independently |
-| 2026-07-20 | Docs honesty pass (adversarial review #4): abstract split into proven/targeted with capacity-first caveat up front; §6 relabeled correctness-not-throughput; v1 metering re-scoped as a trusted-operator demo with the id-rotation / multi-provider / unverified-credit games named; bootnode documented as a v1 trusted placement service (not an Ethereum analogy); trust §7 split into intra-manifest integrity vs manifest-choice and holdings-honesty | Documents must be adversarially honest before external readers; scope claims to evidence |
-| 2026-07-20 | Redundancy is **R = 3 target / R = 2 floor**, default `--r-target 2`; completeness = R ≥ 1 | Resolve the R inconsistency across docs; completeness and redundancy are distinct thresholds |
-| 2026-07-20 | Placement is **least-covered-first committee assignment**; random `--hold-fraction` is the legacy/no-bootnode fallback | One live placement policy; random ranges deprecated to fallback status |
-| 2026-07-20 | **Binary frames are normative**; the line protocol is legacy/debug (still serves `JOIN`/`GETR`/`GOSSIP`/`TABLE` today during migration) | Prevent forked implementations; state migration status |
-| 2026-07-20 | Hardware-tailored compute backends behind one `Backend` seam: runtime detection → CPU SIMD (NEON/AVX via `@Vector`) + platform GPU (Metal/Vulkan/CUDA); scalar is the permanent fallback and the token-identical differential oracle; selection is reported, never silent; the streamed int4 expert block stays the kernel's consumed unit (principle 7). Planned, staged as issues #10–#14 | Per-node throughput gates the whole distribution story (§9); tailor to the machine the way a cross-platform GPU abstraction does, without weakening correctness or the fetch-path invariant |
-| 2026-07-20 | Code-audit hardening (#5/#6/#7): version root binds extents+layout; hot-path + GETR re-verify; store-open re-hashes held shards; resident completeness gate; ExpertCache publishes only after verify; credit admin-gated; light node force-stamps client id; max_tokens clamped to allowance; account cap + lower default quota; snappy `decodeWithMax` cap; bounded peer table (LRU); monotonic holdings seq (reject-stale); connection semaphores; death→wanted re-replication | Close the gap between "digest-verified before use" and the code; ship the availability/DoS bounds the spec already named |
+| 2026-07-11 | Distribution unit = the expert, not the layer; compute node-local; never distribute KV | MoE sparsity + MLA's tiny KV; avoids activations in the serial network path |
+| 2026-07-11 | Content-addressed shards + Merkle-rooted manifest | Free integrity/poisoning check at every hop; root doubles as version id |
+| 2026-07-11 | No coding (EC/RLNC) in the token loop, ever | Decode-before-use adds latency where it cannot be hidden; coding stays in propagation/durability |
+| 2026-07-12 | Target toolchain: Zig 0.16.0, matching the sibling zeam project | Shared toolchain + reusable deps (ENR, SSZ, snappy) |
+| 2026-07-12 | v1 direction: GGUF interchange format; ENR + gossip + request-response p2p; majority hardforks; boot-time peer sync | Requirements of record; supersedes an earlier Hyperswarm/Hyperbee sketch |
+| 2026-07-12 | Weight advertising: both ENR (compact summary — 300 B limit → bitmap digest + seq) and a global gossip topic (full bitmap) | ENR for discovery-time selection; gossip for live freshness |
+| 2026-07-13 | Churn repair: maximally eager — always-on loop retries all known peers; dead peers retried, never forgotten | Chosen over lazy repair-on-miss |
+| 2026-07-13 | Gossip: epidemic announce-and-exchange over the peer table; transport swappable for gossipsub later | Table semantics are transport-independent |
+| 2026-07-19 | deepseek2 rope is NORM (adjacent-pair), not NEOX | Empirical: DeepSeek's (d/2,2)-transpose before rotate_half nets to adjacent-pair on the stored layout; NEOX degenerates |
+| 2026-07-19 | Response payloads carry no digest; the requester verifies against its own manifest | The manifest is the only trust root |
+| 2026-07-19 | Shard = one expert block + mandatory 16 MB resident chunks; ~19 MB per expert → 19,200 shards for GLM 5.2 | Shard unit must equal the matmul's consumption unit; metadata stays trivial |
+| 2026-07-19 | Bootnode assigns committees least-covered-first toward R = 3 target / R = 2 floor; saturated committees spawn new ones | Coverage by construction; bootnode out of the inference path |
+| 2026-07-19 | Fetched shards are persisted (not evicted): fetch-on-demand = organic heat replication | Disk is the cheap resource; hot experts gain holders by being used |
+| 2026-07-20 | Wire messages v1: binary frames, adaptive snappy; heartbeat carries seq+digest+load but not the bitmap | Quantized payloads are incompressible; heartbeats stay small; staleness detected cheaply |
+| 2026-07-20 | Committee membership is gossip-derived (announces carry committee id) | Fixes static-at-join membership; survives bootnode death |
+| 2026-07-20 | Two node classes: light nodes (no weights/engine; delegate) and full nodes (shards + inference) | Local inference for low-memory devices without weakening supply |
+| 2026-07-20 | Compensation: per-client metering ledger on each full node; `payment_required` enforcement; `credit` op as the settlement seam | Accounting precedes payment rails; ledgers per-provider |
+| 2026-07-20 | Redundancy R = 3 target / R = 2 floor (default 2); completeness = R ≥ 1 | Completeness and redundancy are distinct thresholds |
+| 2026-07-20 | Placement is least-covered-first committee assignment; random `--hold-fraction` is the no-bootnode fallback | One live placement policy |
+| 2026-07-20 | Binary frames are normative; the line protocol is legacy/debug during migration | Prevent forked implementations |
+| 2026-07-20 | Hardware-tailored compute backends behind one `Backend` seam (scalar oracle; CPU SIMD then GPU); planned as issues #10–#14 | Per-node throughput gates the distribution story |
+| 2026-07-20 | Code-audit hardening: version root binds layout; hot-path + serve re-verify; store-open re-audits held shards; resident completeness gate; publish-after-verify cache; credit admin-gated; light node forces client id; token clamp; account cap; snappy decode cap; bounded peer table; monotonic holdings seq; connection caps; death → wanted re-replication | Close the gap between "verified before use" and the code; ship the availability bounds the spec named |
+| 2026-07-20 | Documents restructured to standard whitepaper format (front matter, TOC, glossary, related work, references, claim→evidence table, limitations section); terminology split (expert shard vs resident chunk); decision log demoted to a contributor appendix | Editorial reviews #8/#9: read as a whitepaper, scope claims precisely, cite external work |
 
-## Appendix B — Provenance
+---
 
-Loom's design draws on: colibri (expert streaming technique), llama.cpp/GGML
-(GGUF format, quantization layouts, reference kernels semantics), DeepSeek
-V2/V3 papers (MLA, noaux_tc routing), Ethereum networking (bootnodes, ENR,
-gossip, committees), and content-addressed storage systems (Merkle
-verification, manifest-pinned versions). Implementation is original Zig with
-one dependency (blockblaz/zig-snappy).
+## Appendix B — Source layout
+
+```
+spec/          protocol specification (SPEC.md)
+docs/          roadmap and planning
+whitepaper/    this document
+src/main.zig   CLI entry
+src/core/      hashing/Merkle, tensor math, int4 quant, stats, iobench
+src/engine/    loom-format MoE engine (MLA, router, expert cache, checkpoints)
+src/gguf/      GGUF parser, GGML kernels, llama + deepseek2 engines, BPE
+src/p2p/       distribution: wire frames, gossip, committees, sync, token-loop fetch
+src/node/      daemon: node orchestration, RPC, model resolver, light node, metering
+```
+
+---
+
+## Appendix C — Provenance
+
+Loom's design draws on: the colibri expert-streaming technique; llama.cpp / GGML
+for the GGUF format, quantization layouts, and reference kernel semantics [7]; the
+DeepSeek V2/V3 model architecture (MLA, sparse routing) [1][2]; Ethereum
+networking patterns (bootnodes, ENR, gossip, committees) [12]; and
+content-addressed storage (Merkle verification, version-pinned manifests) [10].
+The implementation is original Zig with a single dependency
+(blockblaz/zig-snappy [13]).
