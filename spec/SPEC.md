@@ -341,7 +341,10 @@ another replica (pairs with the heartbeat `load` hint).
 The same ops move to gossipsub/discv5 transports later; the semantics above
 are the spec.
 
-## Sizing (GLM 5.2 target; see ../docs/ROADMAP.md for derivation)
+## Sizing (GLM 5.2 target)
+
+Derivation and the full deployment plan live in
+[../docs/ROADMAP.md](../docs/ROADMAP.md).
 
 19,200 expert shards (~19 MB each) + ~10 GB resident bundle. A complete
 committee at 50 GB/node needs ≥8 nodes (≈2,600 expert shards each); at `R=2`
