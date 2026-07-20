@@ -134,10 +134,24 @@ The inference kernels are currently portable scalar (`ggml.zig`), ~0.3 tok/s on
 a 15.7 B model on one core. The engine should select the best available compute
 path for the machine it runs on — CPU SIMD (NEON on Apple Silicon, AVX2/AVX-512
 on x86) and, where present, the platform GPU (Metal on Apple, Vulkan on
-AMD/others, CUDA on NVIDIA) — the way a cross-platform GPU abstraction does.
+AMD/others, CUDA on NVIDIA) — the way a platform-tuned GPU engine does.
 This is a **serving-throughput** requirement: the whole distribution story is
 gated on per-node inference being fast enough to matter (see the §9 performance
 model in the whitepaper).
+
+**Reference implementation: ZINC** ([github.com/zolotukhin/zinc](https://github.com/zolotukhin/zinc)).
+ZINC (Zig INferenCe) is the closest existing proof point for this strategy and
+the reference for the per-platform GPU backend work below: a Zig engine over
+GGUF weights that ships platform-tuned compute shaders — Vulkan for AMD RDNA3/4
+and Intel Arc, Metal for Apple Silicon (Wave64 / cooperative-matrix tiling on
+RDNA, simdgroup reductions + zero-copy mmap on Apple) — and reports beating
+llama.cpp on RDNA4. Two differences bound how much transfers to Loom: (1) ZINC
+is **GPU-only, single-stream** (no CPU fallback), whereas Loom keeps a scalar
+CPU path as correctness oracle and targets batched serving; (2) its catalog is
+Qwen / Gemma, not the DeepSeek/GLM **MLA + sparse-routing** shape Loom's
+deepseek2 engine needs, so MLA-attention and DeepSeek-router kernels do not come
+for free. Reuse its backend-selection and shader-tuning approach, not its
+GPU-or-nothing constraint.
 
 Staged so each piece is independently useful and the GPU work slots behind a
 stable seam:
