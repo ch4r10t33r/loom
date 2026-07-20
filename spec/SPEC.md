@@ -49,6 +49,119 @@ used unit         = prompt tokens processed + tokens generated
 - Light nodes tally their own spend from response `cost` fields, so both
   sides of the ledger exist independently.
 
+
+## Architecture diagrams
+
+### Full node
+
+```
+                                ┌─────────────────────────────────────────────────────┐
+                                │                      FULL NODE                      │
+                                │                                                     │
+   apps / light nodes ─────────▶│  ┌───────────────┐      ┌──────────────────────┐    │
+   {"prompt",...,"client":ID}   │  │  RPC server   │─────▶│   Metering ledger    │    │
+   ◀── {..,"cost","balance"} ───│  │  (JSON, TCP)  │ gate │ quota+credits−usage  │    │
+                                │  └──────┬────────┘      │ payment_required     │    │
+                                │         │ generate      │ credit / tab ops     │    │
+                                │         ▼               └──────────────────────┘    │
+                                │  ┌────────────────────────────────┐                 │
+                                │  │        Inference engine        │                 │
+                                │  │  dense path (mmap resident):   │                 │
+                                │  │  MLA attn · router · shared    │                 │
+                                │  │  KV cache (compressed, local)  │                 │
+                                │  └───────┬────────────────────────┘                 │
+                                │          │ routed-expert reads (per MoE layer)      │
+                                │          ▼                                          │
+                                │  ┌────────────────────────────────┐                 │
+                                │  │  Expert access (tiered)        │                 │
+                                │  │  1. held shard → pread         │                 │
+                                │  │     (page cache = RAM tier)    │                 │
+                                │  │  2. miss → parallel prefetch ──┼──────────┐      │
+                                │  └───────┬────────────────────────┘          │      │
+                                │          │ verified writes                   │      │
+                                │          ▼                                   ▼      │
+                                │  ┌────────────────────────────────┐   ┌───────────┐ │
+                                │  │  Weight store (sparse GGUF)    │   │  Expert   │ │
+                                │  │  manifest (digests+extents,    │   │  fetch    │ │
+                                │  │  Merkle version id)            │   │ committee │ │
+                                │  │  holdings / wanted bitmaps     │   │ first,    │ │
+                                │  └───────────────▲────────────────┘   │ then mesh │ │
+                                │                  │ serve / repair     └─────┬─────┘ │
+                                │  ┌───────────────┴────────────────┐         │       │
+   peers ──────────────────────▶│  │  P2P server (TCP, frames+text) │         │       │
+   GETR/ExpertRequest, GOSSIP,  │  │  shard serving · gossip ·      │         │       │
+   Heartbeat, JOIN (bootnode)   │  │  heartbeat answers · JOIN      │         │       │
+                                │  └───────────────┬────────────────┘         │       │
+                                │                  │                          │       │
+                                │  ┌───────────────▼────────────────┐         │       │
+                                │  │  Peer table (mesh)             │◀────────┘       │
+                                │  │  addr·version·holdings·        │  holder lookup  │
+                                │  │  committee id                  │                 │
+                                │  └───────▲────────▲───────▲───────┘                 │
+                                │          │        │       │                         │
+                                │   ┌──────┴──┐ ┌───┴────┐ ┌┴─────────┐               │
+                                │   │ gossip  │ │ heart- │ │  eager   │               │
+                                │   │ loop 3s │ │ beat 5s│ │ repair 2s│               │
+                                │   └─────────┘ └────────┘ └──────────┘               │
+                                └─────────────────────────────────────────────────────┘
+```
+
+### Light node
+
+```
+                       ┌───────────────────────────────────────────┐
+                       │                LIGHT NODE                 │
+                       │   (no weights · no store · no engine)     │
+                       │                                           │
+  local apps ─────────▶│  ┌─────────────────┐   ┌───────────────┐  │
+  {"prompt",...}       │  │ Local RPC       │──▶│  Delegator    │  │
+  ◀── full response ───│  │ (same protocol) │   │ stamp client  │  │
+      + cost/balance   │  └─────────────────┘   │ id · round-   │  │
+                       │                        │ robin +       │  │
+                       │  ┌─────────────────┐   │ failover      │  │
+                       │  │  Spend tally    │◀──┤               │  │
+                       │  │ (from "cost")   │   └───────┬───────┘  │
+                       │  └─────────────────┘           │          │
+                       └────────────────────────────────┼──────────┘
+                                                        │ metered JSON RPC
+                                     ┌──────────────────┼──────────────────┐
+                                     ▼                  ▼                  ▼
+                               ┌───────────┐      ┌───────────┐      ┌───────────┐
+                               │ FULL NODE │      │ FULL NODE │      │ FULL NODE │
+                               │ (ledger A)│      │ (ledger B)│      │ (ledger C)│
+                               └───────────┘      └───────────┘      └───────────┘
+                                 per-provider ledgers: each full node meters
+                                 the service it renders
+```
+
+### Swarm topology
+
+```
+                       ┌────────────┐  JOIN → committee id,
+        new node ─────▶│  BOOTNODE  │  members, assigned want-set
+                       │ (registry, │  (least-covered-first)
+                       │  full GGUF)│  never in the inference path
+                       └─────┬──────┘
+                             │ manifest + initial shards
+        ┌────────────────────┼─────────────────────┐
+        ▼                    ▼                     ▼
+  ┌───────────┐  heartbeat ┌───────────┐         ┌───────────┐
+  │ FULL NODE │◀──── 5s ──▶│ FULL NODE │   ...   │ FULL NODE │   committee 0
+  │  shards   │  shard     │  shards   │         │  shards   │   (complete: every
+  │  A..M     │  fetch     │  N..Z     │         │  A..K     │    shard ≥1 holder)
+  └─────▲─────┘            └─────▲─────┘         └─────▲─────┘
+        │                        │                     │
+        └────────────────────────┼─────────────────────┘
+                                 │ global gossip mesh (3 s announces:
+                                 │ addr · version · committee · holdings bitmap)
+        ┌────────────────────────┼─────────────────────┐
+        ▼                        ▼                     ▼
+  ┌───────────┐            ┌───────────┐         ┌───────────┐
+  │ FULL NODE │            │ FULL NODE │   ...   │ light     │   committee 1 +
+  │           │            │           │         │ nodes     │   light clients
+  └───────────┘            └───────────┘         └───────────┘
+```
+
 ## Shard committees
 
 A **committee** is a group of nodes that *collectively holds the complete
