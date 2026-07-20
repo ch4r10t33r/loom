@@ -128,6 +128,46 @@ rotate_half nets out to that; NEOX produces degenerate output. Still todo:
 serve GGUF models through `loom node`'s RPC; batch >1; SIMD kernels;
 IQ-quants.
 
+### Hardware-tailored compute backends (planned)
+
+The inference kernels are currently portable scalar (`ggml.zig`), ~0.3 tok/s on
+a 15.7 B model on one core. The engine should select the best available compute
+path for the machine it runs on — CPU SIMD (NEON on Apple Silicon, AVX2/AVX-512
+on x86) and, where present, the platform GPU (Metal on Apple, Vulkan on
+AMD/others, CUDA on NVIDIA) — the way a cross-platform GPU abstraction does.
+This is a **serving-throughput** requirement: the whole distribution story is
+gated on per-node inference being fast enough to matter (see the §9 performance
+model in the whitepaper).
+
+Staged so each piece is independently useful and the GPU work slots behind a
+stable seam:
+
+1. **Backend abstraction + runtime hardware detection**
+   ([#10](https://github.com/ch4r10t33r/loom/issues/10)). A `Backend` interface
+   over the hot ops (quant matvec, elementwise, softmax) selected at startup
+   from detected arch / CPU features / GPU vendor; a `loom backends` command
+   reporting what was detected and chosen; scalar stays the always-correct
+   fallback and the differential oracle for every other backend.
+2. **CPU SIMD kernels** ([#11](https://github.com/ch4r10t33r/loom/issues/11)).
+   `@Vector`-based F32/F16/Q8_0/Q4_0 (then K-quant) matvec that the compiler
+   lowers to NEON/AVX per target; bit-parity-tested against scalar; benchmarked.
+   This is the platform tailoring that ships without a GPU.
+3. **Metal backend (Apple GPU)**
+   ([#12](https://github.com/ch4r10t33r/loom/issues/12)) — MSL compute kernels
+   for the resident dense path + expert FFNs, `MTLBuffer`-mapped weights.
+4. **Vulkan backend (AMD / cross-vendor)**
+   ([#13](https://github.com/ch4r10t33r/loom/issues/13)) — SPIR-V compute; same
+   backend interface.
+5. **CUDA backend (NVIDIA)**
+   ([#14](https://github.com/ch4r10t33r/loom/issues/14)) — optional, behind the
+   same seam.
+
+Non-negotiables carried from the design: scalar remains the correctness oracle
+(every backend must match it token-for-token on a fixed seed/prompt); backend
+selection is reported, never silent; the streamed int4 expert block stays the
+unit the kernel consumes (no backend may require decode-before-use on the token
+path — CLAUDE principle 7).
+
 ### Bootnode onboarding + GLM 5.2 sharding plan (decided)
 
 Base model: **GLM 5.2** (744B MoE; 75 MoE layers × 256 experts, 8+1 active).

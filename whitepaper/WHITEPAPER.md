@@ -352,7 +352,11 @@ interactively; serving becomes viable exactly insofar as pinning + Zipf skew
 batching amortizes what remains. **No network-tier measurements exist yet**
 (the table of GbE-tier × miss-rate × tok/s is future work); until they do,
 every throughput expectation should be derived from this model, not from
-the localhost result in §6.
+the localhost result in §6. The `t_compute` term is itself scalar today
+(~0.3 tok/s on a 15.7 B model, one core); hardware-tailored backends —
+CPU SIMD (NEON/AVX) and the platform GPU (Metal/Vulkan/CUDA), staged behind
+one `Backend` seam (roadmap; issues #10–#14) — are the throughput lever that
+makes both `t_compute` and the miss-amortization regime viable.
 
 Positioning, stated honestly: *run trillion-parameter open MoE models on the
 machines you already have* — a pooling story, not a magic-laptop story. One
@@ -419,6 +423,7 @@ deleted.*
 | 2026-07-20 | Redundancy is **R = 3 target / R = 2 floor**, default `--r-target 2`; completeness = R ≥ 1 | Resolve the R inconsistency across docs; completeness and redundancy are distinct thresholds |
 | 2026-07-20 | Placement is **least-covered-first committee assignment**; random `--hold-fraction` is the legacy/no-bootnode fallback | One live placement policy; random ranges deprecated to fallback status |
 | 2026-07-20 | **Binary frames are normative**; the line protocol is legacy/debug (still serves `JOIN`/`GETR`/`GOSSIP`/`TABLE` today during migration) | Prevent forked implementations; state migration status |
+| 2026-07-20 | Hardware-tailored compute backends behind one `Backend` seam: runtime detection → CPU SIMD (NEON/AVX via `@Vector`) + platform GPU (Metal/Vulkan/CUDA); scalar is the permanent fallback and the token-identical differential oracle; selection is reported, never silent; the streamed int4 expert block stays the kernel's consumed unit (principle 7). Planned, staged as issues #10–#14 | Per-node throughput gates the whole distribution story (§9); tailor to the machine the way a cross-platform GPU abstraction does, without weakening correctness or the fetch-path invariant |
 | 2026-07-20 | Code-audit hardening (#5/#6/#7): version root binds extents+layout; hot-path + GETR re-verify; store-open re-hashes held shards; resident completeness gate; ExpertCache publishes only after verify; credit admin-gated; light node force-stamps client id; max_tokens clamped to allowance; account cap + lower default quota; snappy `decodeWithMax` cap; bounded peer table (LRU); monotonic holdings seq (reject-stale); connection semaphores; death→wanted re-replication | Close the gap between "digest-verified before use" and the code; ship the availability/DoS bounds the spec already named |
 
 ## Appendix B — Provenance
