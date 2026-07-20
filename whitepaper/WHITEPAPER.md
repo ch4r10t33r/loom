@@ -1,6 +1,6 @@
 # Loom: Running Frontier Mixture-of-Experts Models on Commodity Swarms
 
-**Version 0.9 — 2026-07-20 (living document)**
+**Version 0.10 — 2026-07-20 (living document)**
 
 > This whitepaper is maintained alongside the code. Every design decision is
 > reflected here: the affected section is updated and a dated entry is appended
@@ -11,21 +11,29 @@
 
 ## Abstract
 
-Frontier open-weight language models — Kimi K2, DeepSeek V3, GLM 5.2 — are
-Mixture-of-Experts (MoE) architectures with hundreds of billions to a trillion
-total parameters. No commodity machine can hold them, and the standard answer
-(a multi-GPU datacenter server) prices out individuals and small teams. Loom
-is a system for serving these models on a **swarm of ordinary machines** —
-16–32 GB of RAM, NVMe storage, ordinary Ethernet — by exploiting the one
-structural fact that makes it possible: an MoE model activates only a few
-percent of its weights per token. Loom keeps **compute node-local** and makes
-**weights the only thing that moves**: the model is sharded into
-content-addressed *expert blocks*, distributed with committee-based redundancy,
-verified by Merkle proofs, gossiped, repaired eagerly, and fetched into the
-token loop on demand. We have validated the full pipeline end-to-end on real
-weights: a node holding **33 % of a 15.7 B-parameter DeepSeek MoE produced
-correct completions while streaming the missing experts from a peer during
-inference**, with every block digest-verified before use.
+**What is proven.** Loom keeps **compute node-local** and makes **weights the
+only thing that moves**: an MoE model is sharded into content-addressed
+*expert blocks*, distributed with committee-based redundancy, verified by
+Merkle digests at every hop, gossiped, repaired eagerly, and fetched into the
+token loop on demand. The claims we have demonstrated, on real weights, are
+scoped precisely: the inference engines produce correct output on reference
+checkpoints (tinyllamas; DeepSeek-V2-Lite, a 15.7 B-parameter MoE, Q4_K_M);
+and a node holding **33 % of that model's shards produced token-identical,
+factually correct completions while fetching the missing experts from a
+single LAN peer mid-inference**, every block digest-verified before use.
+This is a *correctness and integration* result obtained with scalar kernels
+(~0.3 tok/s on one CPU core) on localhost — not a throughput or
+network-performance result (§6, §10).
+
+**What is targeted.** The design goal is serving frontier MoE models
+(GLM 5.2-class: 744 B parameters, 19,200 experts) on swarms of ordinary
+16–32 GB machines. That goal is *architecturally supported but not yet
+demonstrated*: GLM 5.2 has never been run, kernels lack SIMD, batching is
+unimplemented. And the bandwidth arithmetic must be read before the vision:
+on ordinary gigabit Ethernet, distribution buys **capacity — the model fits
+where it never could — not speed**; competitive throughput additionally
+requires 10 GbE+, an aggressively pinned hot set, and batched serving. §10
+maintains the exact measured/unmeasured boundary.
 
 ## 1. Motivation
 
@@ -52,9 +60,10 @@ not the way tensor-parallel runtimes treat shards.
 Existing approaches to multi-machine inference split the *computation*:
 pipeline-parallel and layer-split systems (Petals, exo) place layers on
 different machines and ship **activations** across the network every layer of
-every token. That puts the network in the serial critical path — total latency
-is the sum over layers of the slowest link, and a slow or lost peer stalls
-every token.
+every token. These systems work and ship today — the comparison here is
+structural, not a claim that they fail. Activation-shipping puts the network
+in the serial critical path: total latency is the sum over layers of the
+slowest link, and a slow or lost peer stalls every token in flight.
 
 Loom inverts this. Every node runs the **complete forward pass** locally. The
 only thing that ever crosses the network is an **expert block**: immutable,
@@ -143,11 +152,18 @@ Measured on real DeepSeek-V2-Lite Q4_K_M (10.4 GB): 1,664 expert shards of
 
 Full detail in the [spec](../spec/SPEC.md); the shape:
 
-**Bootnode.** An onboarding authority with Ethereum-bootnode discipline:
-never in the inference path, no dependency after join. It serves the
-manifest and assigns each joining node to a **shard committee** with a
-**least-covered-first** want-set — so coverage is guaranteed by construction,
-not probability.
+**Bootnode.** In v1 the bootnode is a **trusted placement service** — this
+is stated plainly rather than by analogy. It serves the manifest and assigns
+each joining node to a **shard committee** with a **least-covered-first**
+want-set, so coverage is achieved by construction rather than probability.
+Two properties hold and two do not: it is *not* in the token-loop inference
+path, and joined nodes survive its death (gossip-derived membership, mesh
+routing); but until a committee reaches completeness the bootnode *is* in
+the availability path (it covers coverage gaps as origin holder), and a
+malicious bootnode could assign adversarial or incomplete want-sets — v1
+assumes it is operated by the swarm operator. Verifiable assignment (signed
+manifests and assignments, multiple registries, coverage challenges) is
+future work, recorded in the spec's threat model.
 
 **Committees.** A committee is a group of nodes that *collectively holds the
 complete shard set* — a self-sufficient serving cell. Invariants: every shard
@@ -184,7 +200,7 @@ manifest version — a peer on a different model version is refused wholesale,
 which is the hardfork guard operating at the message level. Responses carry
 no digest by design: the local manifest is the only trust root.
 
-## 6. Distributed inference in the token loop
+## 6. Distributed inference in the token loop — a correctness and integration result
 
 The piece that makes the rest matter: a node whose local store lacks an
 expert **fetches it mid-token**. Inside each MoE layer, after the router
@@ -202,15 +218,43 @@ Measured result (single peer, localhost, scalar kernels): a node holding
 finishing at 1,214 shards held. The architecture's core promise — *compute
 local, experts flow, correctness preserved* — holds on real weights.
 
+**What this result does and does not validate.** It validates digest-verified
+mid-token fetch, sparse-store persistence, shard/engine alignment, and
+end-to-end correctness under a partial store. It does **not** validate:
+miss latency on 1 GbE/10 GbE under contention; concurrent fetches from many
+requesters (hot-expert hotspotting); committee failover under real RTT and
+loss; or whether Zipf skew plus pinning keeps token-loop misses rare enough
+for acceptable throughput. Those are network-bound measurements that have
+not been made; the analytical model in §9 states the expectations they must
+be tested against.
+
 ## 7. Trust model
 
-**v1 (current): trusted-swarm with cryptographic integrity.** Content
-addressing + the Merkle-rooted manifest make corruption and poisoning
-detectable for free: a bad shard fails its digest before use, from disk or
-from any peer. Version pinning prevents cross-model mixing. What v1 does
-*not* defend against: a malicious peer serving *correctly-hashed* weights it
-computed adversarially cannot exist (the manifest pins content), but peers
-can lie about holdings, refuse service, or attack availability.
+**v1 (current): trusted-swarm with cryptographic *intra-manifest* integrity.**
+Content addressing + the Merkle-rooted manifest make corruption and poisoning
+detectable for free *relative to a manifest you already trust*: a bad shard
+fails its digest before use, from disk or from any peer, and version pinning
+prevents cross-model mixing. Two boundaries must be stated honestly:
+
+- **Which manifest is trusted is not free.** Content addressing secures
+  integrity *within* a manifest, not the choice *of* manifest. A node
+  bootstraps its Merkle root from the bootnode's `MANIFESTFILE` (or operator
+  config); a hostile bootstrap could pin an alternate,
+  internally-consistent-but-poisoned root. v1's answer is trust-on-first-use
+  plus operator configuration; signed roots / out-of-band pinning are future
+  work. The spec's *Manifest trust bootstrap* section is normative here.
+- **Holdings claims are unverified.** Peers can lie about which shards they
+  hold (the heartbeat carries a *digest* of the bitmap, not a proof of
+  possession). Completeness, committee-first routing, and load spreading all
+  assume honest bitmaps. A lying holder is caught only on `GETR` (wrong or
+  absent bytes → fall through to the next peer); there is no reputation,
+  challenge, or probe-on-suspicion yet. **Committee completeness is a
+  construction-time property under honest participation, not a
+  cryptographically enforced invariant.**
+
+Beyond these, v1 does not defend against availability attacks (refuse
+service, mesh poisoning with fake holders, RPC flooding) — the swarm is
+assumed cooperative and operator-run.
 
 **v2 (designed, not built): untrusted peers.** Planned per the
 [design doc](../CLAUDE.md): RLNC-based WAN propagation gated behind
@@ -237,8 +281,18 @@ with round-robin failover across its configured backends. It stamps a client
 identity onto each request.
 
 **Compensation.** Full nodes must be compensated by light nodes for serviced
-requests. v1 implements the *accounting* half completely and the *settlement*
-half as an explicit seam:
+requests. What v1 ships is a **trusted-operator accounting demo** — the
+ledger mechanics and enforcement path, with *none* of the adversarial
+hardening a real service economy needs. Specifically, v1 is trivially
+gameable and says so: client ids are self-asserted strings (rotate the id,
+reset the free quota); ledgers are per-provider (N full nodes ⇒ N× free
+quota under round-robin); the `credit` op accepts an unverified proof
+(anyone who can reach the RPC can mint credits); and there are no signed
+receipts, so neither side can prove the other's ledger wrong. Cryptographic
+client identity (at minimum a shared-secret HMAC, properly a keypair),
+proof-of-payment verification, and signed usage receipts are prerequisites
+before "compensation" can be described as implemented. The overdraw window
+is bounded: at most one request's `prompt + max_tokens`. What exists today:
 
 - Every full node runs a per-client **metering ledger**: allowance =
   free quota (`--free-quota`, default 1 M tokens) + purchased credits −
@@ -262,6 +316,11 @@ across two full nodes with independent ledgers, hit a deterministic
 `payment_required` when its only backend's allowance was exhausted, and
 resumed service after a `credit` top-up.
 
+**Light nodes are thin clients, not swarm participants.** They contribute no
+storage, no serving, and no redundancy; every token they consume is load on
+a full node. Capacity planning must size the full-node fleet for aggregate
+light-node QPS — light nodes amplify demand and add nothing to supply.
+
 ## 9. Deployment model and sizing
 
 Held shards are a **disk** budget; RAM carries only the compute working set.
@@ -273,9 +332,27 @@ Held shards are a **disk** budget; RAM carries only the compute working set.
 | Experts held | ~1,300 (25 GB) | ~2,600 (50 GB) — 13.7 % of GLM 5.2 |
 | Network | 1 GbE (capacity win) | 10 GbE+ (latency win too) |
 
-Swarm sizing against R over the 370 GB corpus: at 50 GB/node, **R = 2 needs
-≥ 15 nodes, R = 3 needs ≥ 22**; 8 nodes at 100 GB reach R = 2. The bootnode's
-least-covered-first assignment makes these guarantees constructive.
+Swarm sizing against R over the 370 GB corpus (R = 3 target, R = 2 floor —
+see the spec): at 50 GB/node, **completeness (R = 1) needs ≥ 8 nodes, R = 2
+needs ≥ 15, R = 3 needs ≥ 22**; 8 nodes at 100 GB reach R = 2. The
+bootnode's least-covered-first assignment makes these guarantees
+constructive.
+
+### Performance model (analytical — not yet measured)
+
+Per-token time ≈ `t_compute + misses × t_fetch`, where `misses` is the number
+of routed experts (of 600 for GLM 5.2) not in the local store/page cache, and
+`t_fetch ≈ RTT + shard_size / bandwidth` per miss (fetches within a layer
+parallelize to max, not sum, across that layer's ≤ 8 misses). Indicative
+cold-miss cost for a 19 MB shard: ~160 ms on 1 GbE, ~16 ms on 10 GbE, before
+protocol overhead. The implications are stated, not hidden: with a cold
+working set on 1 GbE, a single stream is seconds per token — unusable
+interactively; serving becomes viable exactly insofar as pinning + Zipf skew
++ organic replication drive the steady-state miss rate toward zero and
+batching amortizes what remains. **No network-tier measurements exist yet**
+(the table of GbE-tier × miss-rate × tok/s is future work); until they do,
+every throughput expectation should be derived from this model, not from
+the localhost result in §6.
 
 Positioning, stated honestly: *run trillion-parameter open MoE models on the
 machines you already have* — a pooling story, not a magic-laptop story. One
@@ -338,6 +415,10 @@ deleted.*
 | 2026-07-20 | Committee membership is **gossip-derived** (announces carry committee id), heartbeat set = seed ∪ table view | Fixes static-at-join membership; no bootnode push protocol; survives bootnode death |
 | 2026-07-20 | Two node classes: **light nodes** (no weights/engine; same local RPC; delegate to full nodes with failover) and **full nodes** (shards + inference) | Local inference for low-memory devices without weakening the supply side |
 | 2026-07-20 | Compensation: per-client **metering ledger on each full node** (free quota + credits − token usage), `payment_required` enforcement, `credit` op as the unverified-in-v1 settlement seam | Accounting must precede payment rails; ledgers are per-provider; both sides tally independently |
+| 2026-07-20 | Docs honesty pass (adversarial review #4): abstract split into proven/targeted with capacity-first caveat up front; §6 relabeled correctness-not-throughput; v1 metering re-scoped as a trusted-operator demo with the id-rotation / multi-provider / unverified-credit games named; bootnode documented as a v1 trusted placement service (not an Ethereum analogy); trust §7 split into intra-manifest integrity vs manifest-choice and holdings-honesty | Documents must be adversarially honest before external readers; scope claims to evidence |
+| 2026-07-20 | Redundancy is **R = 3 target / R = 2 floor**, default `--r-target 2`; completeness = R ≥ 1 | Resolve the R inconsistency across docs; completeness and redundancy are distinct thresholds |
+| 2026-07-20 | Placement is **least-covered-first committee assignment**; random `--hold-fraction` is the legacy/no-bootnode fallback | One live placement policy; random ranges deprecated to fallback status |
+| 2026-07-20 | **Binary frames are normative**; the line protocol is legacy/debug (still serves `JOIN`/`GETR`/`GOSSIP`/`TABLE` today during migration) | Prevent forked implementations; state migration status |
 
 ## Appendix B — Provenance
 

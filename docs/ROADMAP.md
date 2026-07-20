@@ -13,6 +13,10 @@
 ## v1 — distributed weight sharing (requirements of record)
 
 These supersede the original CLAUDE.md v1 sketch where they conflict.
+**This document tracks status and history; normative behavior lives in
+[../spec/SPEC.md](../spec/SPEC.md) (p2p) and design intent in
+[../whitepaper/WHITEPAPER.md](../whitepaper/WHITEPAPER.md).** Where wording
+here still reads as a live requirement, the spec is authoritative.
 The p2p layer's committee spec lives in [../spec/SPEC.md](../spec/SPEC.md) — **✅ first cut
 implemented** (`bootnode.zig` registry, JOIN protocol, assigned want-sets,
 committee-first sync, 5 s heartbeats with death detection, committee-then-mesh
@@ -30,9 +34,12 @@ through to the mesh and completed inference.
    storage, load it from there; only download from remote otherwise.
    (Implemented in `hf.zig::resolve`; a standing contract as features grow.)
 2. **GGUF weight distribution.** ✅ *first cut implemented.* A loaded **GGUF**
-   file's weights are distributed across multiple nodes. Ranges are chosen
-   **randomly** (`--hold-fraction F`, seeded), and the same range may be held by
-   several nodes for **redundancy** (independent random subsets overlap).
+   file's weights are distributed across multiple nodes. **Live placement
+   policy: least-covered-first committee assignment** (bootnode, R = 3 target /
+   R = 2 floor) — see [../spec/SPEC.md](../spec/SPEC.md). Random
+   `--hold-fraction` subsets are the **legacy / no-bootnode fallback** only,
+   not the primary policy. The same shard may be held by several nodes for
+   **redundancy**.
    Implemented: `gguf.zig` (v2/v3 parser + fixture writer), `weights.zig` (range
    manifest, SHA-256/range, Merkle-root version id, holdings bitmap), P2P ops
    `MANIFEST`/`DIGEST`/`DIGESTS`/`HOLDINGS`/`GETR`.

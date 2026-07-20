@@ -714,3 +714,46 @@ test "manifest serialize/parse roundtrip with multi-extent shards" {
     try std.testing.expect(p.rangeLen(1) == 10);
     try std.testing.expect(hashmod.eql(p.version, version));
 }
+
+
+test "expert manifest partitions the whole file: no gaps, no overlaps (issue #4.14)" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // a real (synthetic) deepseek2 GGUF with 3-D expert tensors + resident bytes
+    const path = "test-partition.gguf";
+    try gguf.writeDeepseekFixture(gpa, io, path, 7);
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+
+    var m = try buildExpertManifest(gpa, io, path);
+    defer m.deinit(gpa);
+
+    // collect every extent across every shard, sort by offset, and assert the
+    // union is exactly [0, file_size) with no overlaps.
+    var extents = std.ArrayList(Extent).empty;
+    defer extents.deinit(gpa);
+    var i: usize = 0;
+    while (i < m.nRanges()) : (i += 1) {
+        for (m.shardExtents(i)) |e| try extents.append(gpa, e);
+    }
+    std.mem.sort(Extent, extents.items, {}, struct {
+        fn lt(_: void, a: Extent, b: Extent) bool {
+            return a.offset < b.offset;
+        }
+    }.lt);
+
+    var cursor: u64 = 0;
+    for (extents.items) |e| {
+        try std.testing.expectEqual(cursor, e.offset); // no gap, no overlap
+        cursor += e.len;
+    }
+    try std.testing.expectEqual(m.file_size, cursor); // covers to EOF
+
+    // and the total sharded bytes equal the file size (independent check)
+    var total: u64 = 0;
+    i = 0;
+    while (i < m.nRanges()) : (i += 1) total += m.rangeLen(i);
+    try std.testing.expectEqual(m.file_size, total);
+}

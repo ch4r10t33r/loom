@@ -49,6 +49,131 @@ used unit         = prompt tokens processed + tokens generated
 - Light nodes tally their own spend from response `cost` fields, so both
   sides of the ledger exist independently.
 
+**v1 is a trusted-operator accounting demo, not a settlement system.** Known
+gaps, all in scope for a later hardening pass, none defended today:
+client ids are self-asserted (rotate to reset the free quota); ledgers are
+per-provider (round-robin across N nodes ⇒ N× free quota); `credit` accepts
+an unverified `proof` (RPC reachability ⇒ credit minting); no signed
+receipts (neither side can prove the other's ledger wrong). Prerequisites
+for real compensation: client keypair/HMAC identity, payment-proof
+verification, signed usage receipts. Overdraw is bounded to one request's
+`prompt + max_tokens`.
+
+
+## Trust model & manifest bootstrap (v1)
+
+v1 assumes a **cooperative, operator-run swarm** with cryptographic integrity
+*relative to a trusted manifest*. This section is normative about what is and
+is not defended.
+
+**Assets:** model correctness (served weights match the intended model);
+availability (a needed shard is reachable); metering integrity (accounting is
+honest). **Adversaries considered:** corrupt storage / bit-rot; a peer
+serving wrong bytes; a peer lying about holdings; RPC abuse. **Out of scope
+for v1** (deferred to v2, see [../CLAUDE.md](../CLAUDE.md)): Byzantine
+compute, Sybil identities, coordinated availability attacks, an untrusted
+bootnode, payment fraud.
+
+**What content addressing buys.** Every shard is verified against its
+manifest digest before disk or matmul, so a wrong-bytes peer or corrupt disk
+is caught for free — *given a trusted manifest*. Version pinning
+(`manifest_version` on every ExpertRequest and on gossip/heartbeat) refuses
+cross-version peers, isolating hardforks and alternate swarms.
+
+**Manifest trust bootstrap.** Content addressing secures integrity *within* a
+manifest, not the *choice* of manifest — a poisoned-but-internally-consistent
+alternate root would verify against itself. v1 establishes the root by:
+
+1. **Origin/operator config** — the operator running `loom node --gguf` on a
+   known-good file is the root of trust; its Merkle root is authoritative for
+   that swarm.
+2. **Trust-on-first-use (TOFU)** — a bootstrapping node adopts the root from
+   the first responsive peer's `MANIFESTFILE` and pins it; every subsequent
+   peer must match (`PeerVersionMismatch` otherwise). A hostile *first*
+   contact can pin a bad root — the known v1 weakness.
+
+On root mismatch a node refuses the peer wholesale (it never mixes roots).
+Future hardening (not in v1): operator-signed roots distributed out-of-band,
+multiple independent registries, and a coverage-challenge protocol so a
+committee can prove completeness rather than assert it.
+
+**Bootnode as a trusted placement service.** The bootnode assigns committees
+and want-sets and, until a committee is complete, backstops coverage as
+origin holder — so it *is* trusted for placement and *is* in the availability
+path pre-completeness. It is *not* in the token-loop inference path, and
+joined nodes survive its death. A malicious bootnode can strand or bias
+committees; v1 assumes it is honest and operator-run. Verifiable/redundant
+assignment is future work.
+
+**False-holdings failure mode.** Holdings bitmaps (gossip announces,
+heartbeat digests) are unverified claims — no proof of possession. A lying
+holder is detected only reactively: a `GETR`/ExpertRequest returns
+`not_held` or wrong bytes, and the requester falls through to the next peer
+(digest verification blocks the wrong bytes; availability degrades, integrity
+does not). There is no reputation, periodic challenge, or probe-on-suspicion
+yet — so **committee completeness is a construction-time property under
+honest participation, not a cryptographic guarantee.** Adding a sampled-`GETR`
+challenge + holder reputation is the planned mitigation.
+
+## Resource governance & failure modes (v1 status)
+
+Several safety limits are **specified here but only partially enforced in v1**;
+they are called out so implementations and readers do not assume protection
+that is absent.
+
+**Serving SLA under incomplete committees.** Completeness at R = 1 is one
+death from a hole, and heartbeat detection lags up to one interval (5 s).
+During a gap, a token-loop fetch for the missing shard: (1) tries committee
+holders, (2) falls through to the mesh, (3) if no reachable holder anywhere,
+**the token-loop fetch errors** (inference fails loudly; it is not silently
+wrong). "Can still serve via the mesh" and "the committee invariant holds"
+are distinct states — a node may serve while its committee is technically
+incomplete, and eager repair (2 s) works to restore the invariant. This is
+eventual, not synchronous with death.
+
+**Disk cap for organic replicas.** Fetched shards are persisted (organic heat
+replication), which without a bound drives busy nodes toward the full corpus
+and past the "commodity disk" envelope. The intended model (v1 gap — **not
+yet enforced**): a `max_shard_bytes` cap above which opportunistically-fetched
+shards are LRU-evicted, while **assigned want-set shards are pinned and never
+evicted**. Organic replicas are opportunistic cache and do **not** count
+toward a committee's R target; only assigned holdings do. Until the cap
+ships, operators must size disk for worst-case (near-full-corpus) growth on
+hot nodes.
+
+**Admission control & priority.** ExpertResponse carries a `busy` status, but
+v1 has no rate limiting, per-peer quota, or bandwidth reservation. The
+intended priority order (v1 gap): **token-loop fetch > eager repair > bulk
+sync**, with per-peer request quotas, so a light node or attacker cannot soak
+expert-serving capacity and starve inference. Not implemented; documented as
+required.
+
+**Peer-table bounds & mesh authenticity.** The eager-repair/gossip design
+retains peers and never forgets dead ones. Without bounds this is a growth /
+amplification risk (AnnounceBatch returns whole tables; announces are
+unauthenticated → fake-holder poisoning). Required (v1 gap): a bounded peer
+table with LRU/decay eviction and a probation state for repeatedly-dead
+peers (so "never forgotten" means "retried with backoff", not "retained
+forever"), exponential backoff on unreachable peers, and — for untrusted
+deployments — authenticated announces. v1 runs LAN-scale and operator-trusted,
+where these are latent rather than active risks.
+
+**Transport security.** The RPC and P2P transports are plaintext TCP with no
+TLS and no authentication — acceptable for a lab/LAN operator-run swarm,
+unacceptable for a public "service economy." TLS + peer authentication is a
+prerequisite for any untrusted deployment.
+
+**Failure-mode catalog (v1 behavior):**
+
+| Failure | v1 behavior |
+|---|---|
+| Bootnode down (post-join) | No effect on joined nodes; gossip mesh + repair continue; new joins blocked until it returns or another registry exists |
+| Network partition | Each side serves from its own holdings + reachable mesh; repair reconverges on heal |
+| Peer lies about holdings | Caught on fetch (`not_held`/wrong bytes → digest reject → next peer); availability dips, integrity preserved |
+| Disk full | Writes fail; the shard stays unheld and is retried; no cap/eviction yet (see above) |
+| Version skew mid-fetch | ExpertRequest pins version; a re-versioned peer returns `version_mismatch` → fall through |
+| Committee hole (member died) | Token fetch → mesh fallback; errors only if no holder anywhere; repair restores R eventually |
+| RPC/expert flooding | No admission control in v1; capacity can be soaked (documented gap) |
 
 ## Architecture diagrams
 
@@ -173,7 +298,11 @@ shard set* — a self-sufficient serving cell for one model version.
   gaps.
 - **Intra-committee redundancy:** more than one node in a committee may hold
   the same shard. The bootnode fills a committee toward a redundancy target
-  `R` (default 2): joiners are assigned the currently least-covered shards.
+  `R` (**R = 3 target, R = 2 floor; `--r-target` default 2**): joiners are
+  assigned the currently least-covered shards. *Completeness* (every shard
+  held by ≥ 1 member, i.e. R ≥ 1) and *redundancy* (R ≥ 2) are distinct
+  thresholds. Only **assigned** holdings count toward R; opportunistic
+  organic replicas (§ Resource governance) are cache, not coverage.
 - **Committee lifecycle:** joiners go to the first committee whose minimum
   shard coverage is below `R`. When every shard in every existing committee
   has coverage ≥ `R` (saturated), the next joiner opens a new committee.
@@ -327,7 +456,13 @@ The requester MUST verify the payload against its own manifest digest for
 manifest is the only trust root. `busy` tells the client to spread to
 another replica (pairs with the heartbeat `load` hint).
 
-## Wire protocol (current line-protocol form)
+## Wire protocol (legacy / debug line form)
+
+> **Normative transport is the binary frame protocol above.** This
+> line-delimited form is transitional: it still serves `JOIN`, `GETR`,
+> `GOSSIP`/`TABLE`, `PING`, and the `MANIFEST*` ops today (migration in
+> progress), and is convenient for `nc`-driven debugging. New message types
+> are defined as frames; do not add line ops.
 
 | Op | Response | Purpose |
 |---|---|---|
@@ -346,6 +481,18 @@ are the spec.
 Derivation and the full deployment plan live in
 [../docs/ROADMAP.md](../docs/ROADMAP.md).
 
-19,200 expert shards (~19 MB each) + ~10 GB resident bundle. A complete
-committee at 50 GB/node needs ≥8 nodes (≈2,600 expert shards each); at `R=2`
-inside one committee, ≥15. Holdings bitmap 2.4 KB; manifest ~1 MB.
+19,200 expert shards (~19 MB each) + a resident bundle. Committee sizing at
+50 GB/node: **completeness (R ≥ 1) needs ≥ 8 nodes** (≈2,600 expert shards
+each), **R = 2 needs ≥ 15**, **R = 3 needs ≥ 22**. Holdings bitmap 2.4 KB;
+manifest ~1 MB.
+
+**The resident bundle is the real floor, and the 16 GB minimum is
+conditional on it.** Every node holds it in full, in RAM (mmap'd). It is
+*not* free — DeepSeek/GLM shared experts and embeddings dominate it, and MLA
+KV grows with context. A per-tensor-class breakdown for the target GGUF
+(embeddings, attention projections incl. q/kv-LoRA, shared-expert FFNs,
+router, norms) and a KV-bytes-vs-context table **must be published from the
+real converted GLM 5.2 GGUF before the 16 GB row in the deployment table is
+asserted as a default** rather than a conditional target. For
+DeepSeek-V2-Lite the measured resident bundle is 0.78 GB (73 chunks); the
+GLM 5.2 ~10 GB figure is an int4 estimate pending the real file.
