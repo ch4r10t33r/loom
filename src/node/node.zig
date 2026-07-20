@@ -17,6 +17,7 @@ const peers = @import("../p2p/peers.zig");
 const gossip = @import("../p2p/gossip.zig");
 const bootnode = @import("../p2p/bootnode.zig");
 const wire = @import("../p2p/wire.zig");
+const meter_mod = @import("meter.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MBf: f64 = 1024.0 * 1024.0;
@@ -41,6 +42,7 @@ pub const Options = struct {
     range_bytes: u64, // range size when building a fresh manifest
     advertise: ?[]const u8, // our dialable "host:port" (default 127.0.0.1:<p2p_port>)
     r_target: u16, // committee redundancy target when acting as bootnode
+    free_quota: u64, // per-client free token allowance (metering)
 };
 
 /// Committee heartbeat (SPEC.md): PING each committee member on a fixed
@@ -357,7 +359,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     try out.print("  cache      expert_bytes={d} lru_capacity={d} pinned={d} ram_budget={d:.2} GB\n", .{
         s.expert_bytes, s.lru_capacity, s.pinned_experts, @as(f64, @floatFromInt(opts.ram_bytes)) / GB,
     });
-    try out.print("  rpc        tcp://{s}:{d}   (json: {{\"prompt\":\"..\",\"max_tokens\":32}})\n", .{ opts.rpc_addr, opts.rpc_port });
+    try out.print("  rpc        tcp://{s}:{d}   (json: {{\"prompt\":\"..\",\"max_tokens\":32}}; metered, free quota {d} tokens/client)\n", .{ opts.rpc_addr, opts.rpc_port, opts.free_quota });
     try out.print("  p2p        tcp://{s}:{d}   (HELLO | HAS | MANIFEST | DIGESTS | HOLDINGS | GETR | GOSSIP | TABLE | PING)\n", .{ opts.p2p_addr, opts.p2p_port });
     try out.print("  gossip     advertising as {s}, {d} seed peer(s), every {d}s\n", .{
         advertise, peer_strs.items.len, @divTrunc(gossip.INTERVAL_NS, std.time.ns_per_s),
@@ -439,6 +441,9 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         t.detach();
     }
 
+    var meter = meter_mod.Meter.init(gpa, io, opts.free_quota);
+    defer meter.deinit();
+
     var rpc_ctx = rpc.Ctx{
         .gpa = gpa,
         .io = io,
@@ -446,6 +451,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .addr = opts.rpc_addr,
         .port = opts.rpc_port,
         .seed = opts.seed,
+        .meter = &meter,
     };
     rpc.serve(&rpc_ctx) catch |e| {
         try out.print("rpc server error: {s}\n", .{@errorName(e)});

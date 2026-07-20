@@ -18,9 +18,36 @@ holder of the full GGUF. Responsibilities:
 3. Track per-committee coverage so redundancy targets are met by construction,
    not probability.
 
-**Node** — holds the resident bundle (mandatory) plus its assigned expert
-shards; serves them to peers; runs inference locally, fetching experts it
-lacks at token time.
+**Full node** — holds the resident bundle (mandatory) plus its assigned
+expert shards; serves them to peers; runs inference locally, fetching experts
+it lacks at token time; **meters** the inference it serves (below).
+
+**Light node** — no weights, no store, no engine; runs on low-memory devices.
+Serves the same local JSON RPC as a full node and **delegates** every request
+to a full node (round-robin with failover across configured backends; gossip
+discovery of RPC-serving full nodes is a follow-up). Stamps its client id on
+each request so the serving full node can meter it.
+
+## Metering & compensation
+
+Full nodes are compensated by light nodes for serviced requests. Per-client
+ledger on each full node (per-provider, not global):
+
+```
+allowance(client) = free_quota + credits(client) − used(client)
+used unit         = prompt tokens processed + tokens generated
+```
+
+- Gate: a request from a client with `allowance == 0` is refused with
+  `{"ok":false,"error":"payment_required"}` before any compute. The final
+  request may overdraw by one generation (charged from actuals, clamped).
+- Every metered response appends `"cost"` and `"balance"`.
+- `{"method":"credit","client":C,"amount":N,"proof":P}` adds credits.
+  **v1 does not verify `proof`** (trusted swarm); a settlement rail replaces
+  exactly this verification. `{"method":"tab","client":C}` returns
+  used/balance.
+- Light nodes tally their own spend from response `cost` fields, so both
+  sides of the ledger exist independently.
 
 ## Shard committees
 

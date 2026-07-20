@@ -40,6 +40,8 @@ pub const expert_fetch = @import("p2p/expert_fetch.zig");
 pub const bpe = @import("gguf/bpe.zig");
 pub const bootnode = @import("p2p/bootnode.zig");
 pub const wire = @import("p2p/wire.zig");
+pub const light = @import("node/light.zig");
+pub const meter = @import("node/meter.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MB: usize = 1024 * 1024;
@@ -74,6 +76,8 @@ pub fn main(init: std.process.Init) !void {
         try cmdNode(gpa, io, out, args, init.environ_map);
     } else if (std.mem.eql(u8, cmd, "gguf")) {
         try cmdGguf(gpa, io, out, args);
+    } else if (std.mem.eql(u8, cmd, "light")) {
+        try cmdLight(gpa, io, out, args);
     } else {
         try out.print("unknown command: {s}\n\n", .{cmd});
         try usage(out);
@@ -90,7 +94,8 @@ fn usage(out: *Io.Writer) !void {
         \\            [--seed S] [--stats FILE] [--no-verify]
         \\            [--gguf FILE | --bootstrap HOST:PORT]
         \\            [--peers H:P,H:P,...] [--hold-fraction F] [--range-mb M]
-        \\            [--advertise HOST:PORT] [--r-target N]
+        \\            [--advertise HOST:PORT] [--r-target N] [--free-quota TOKENS]
+        \\  loom light --full-nodes H:P[,H:P...] [--rpc-addr A] [--rpc-port P] [--client-id ID]
         \\  loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2]
         \\  loom gguf info <file> [--range-mb M]
         \\  loom gguf shard <file>
@@ -348,9 +353,52 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .peers = flagStr(args, "--peers"),
         .advertise = flagStr(args, "--advertise"),
         .r_target = @intCast(try flagU64(args, "--r-target", 2)),
+        .free_quota = try flagU64(args, "--free-quota", 1_000_000),
         .hold_fraction = @floatCast(std.math.clamp(hold_fraction, 0.0, 1.0)),
         .range_bytes = @intFromFloat(range_mb * @as(f64, MB)),
     });
+}
+
+// ---- light -----------------------------------------------------------------
+
+/// Light node (SPEC.md node classes): no weights, no engine — a local RPC that
+/// delegates to full nodes and gets metered by them.
+fn cmdLight(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) !void {
+    const fn_csv = flagStr(args, "--full-nodes") orelse
+        return out.print("light: need --full-nodes HOST:RPC_PORT[,...]\n", .{});
+    var backends = std.ArrayList(sync.PeerAddr).empty;
+    defer backends.deinit(gpa);
+    var it = std.mem.splitScalar(u8, fn_csv, ',');
+    while (it.next()) |tok| {
+        const t = std.mem.trim(u8, tok, " ");
+        if (t.len == 0) continue;
+        const a = sync.PeerAddr.parse(t) catch return out.print("bad --full-nodes entry: {s}\n", .{t});
+        try backends.append(gpa, a);
+    }
+    const rpc_addr = flagStr(args, "--rpc-addr") orelse "127.0.0.1";
+    const rpc_port = try flagU16(args, "--rpc-port", 8768);
+    const client_id = flagStr(args, "--client-id") orelse "light-anon";
+
+    try out.print("loom light node up (no weights, no engine)\n", .{});
+    try out.print("  local rpc  tcp://{s}:{d}   (same JSON protocol; requests delegated)\n", .{ rpc_addr, rpc_port });
+    try out.print("  backends   {d} full node(s), round-robin with failover\n", .{backends.items.len});
+    try out.print("  client id  {s}  (stamped on requests; metered by full nodes)\n", .{client_id});
+    try out.print("  serving... (Ctrl-C to stop)\n", .{});
+    try out.flush();
+
+    var ctx = light.Ctx{
+        .gpa = gpa,
+        .io = io,
+        .opts = .{
+            .rpc_addr = rpc_addr,
+            .rpc_port = rpc_port,
+            .full_nodes = backends.items,
+            .client_id = client_id,
+        },
+    };
+    light.serve(&ctx) catch |e| {
+        try out.print("light rpc error: {s}\n", .{@errorName(e)});
+    };
 }
 
 // ---- gguf ------------------------------------------------------------------

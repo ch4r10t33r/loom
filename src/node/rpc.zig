@@ -17,6 +17,7 @@ const engine_mod = @import("../engine/engine.zig");
 const Engine = engine_mod.Engine;
 const tokenizer = @import("../engine/tokenizer.zig");
 const stats = @import("../core/stats.zig");
+const meter_mod = @import("meter.zig");
 
 pub const Ctx = struct {
     gpa: std.mem.Allocator,
@@ -25,6 +26,10 @@ pub const Ctx = struct {
     addr: []const u8,
     port: u16,
     seed: u64,
+    /// Per-client metering (SPEC.md node classes). When set, requests carry a
+    /// "client" id, responses carry cost/balance, and exhausted clients get
+    /// {"error":"payment_required"} until credited.
+    meter: ?*meter_mod.Meter = null,
     /// The engine holds mutable per-request state, so generation is serialized
     /// across connections by this mutex; connections otherwise run concurrently
     /// so one idle/slow client never blocks the accept loop.
@@ -95,6 +100,32 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
     }
     const obj = parsed.value.object;
 
+    const client: []const u8 = switch (obj.get("client") orelse .null) {
+        .string => |s| s,
+        else => "anon",
+    };
+
+    // settlement seam: {"method":"credit","client":X,"amount":N,"proof":...}
+    // v1 accepts the proof unverified (trusted swarm); a payment rail replaces
+    // exactly this check.
+    if (obj.get("method")) |mv| {
+        if (mv == .string and std.mem.eql(u8, mv.string, "credit")) {
+            const m = ctx.meter orelse return wi.print("{{\"ok\":false,\"error\":\"no_meter\"}}\n", .{});
+            const amount = jsonUint64(obj.get("amount"), 0);
+            const bal = try m.credit(client, amount);
+            try wi.print("{{\"ok\":true,\"credited\":{d},\"balance\":{d}}}\n", .{ amount, bal });
+            try wi.flush();
+            return;
+        }
+        if (mv == .string and std.mem.eql(u8, mv.string, "tab")) {
+            const m = ctx.meter orelse return wi.print("{{\"ok\":false,\"error\":\"no_meter\"}}\n", .{});
+            const acc = m.account(client);
+            try wi.print("{{\"ok\":true,\"used\":{d},\"balance\":{d}}}\n", .{ acc.used, acc.balance });
+            try wi.flush();
+            return;
+        }
+    }
+
     const prompt_str = switch (obj.get("prompt") orelse .null) {
         .string => |s| s,
         else => {
@@ -103,6 +134,15 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
             return;
         },
     };
+
+    // metering gate: exhausted clients are refused before any compute
+    if (ctx.meter) |m| {
+        if (m.remaining(client) == 0) {
+            try wi.print("{{\"ok\":false,\"error\":\"payment_required\",\"balance\":0}}\n", .{});
+            try wi.flush();
+            return;
+        }
+    }
     const max_tokens: usize = jsonUint(obj.get("max_tokens"), 32);
     const temp: f32 = @floatCast(jsonFloat(obj.get("temp"), 0.0));
     const seed: u64 = jsonUint64(obj.get("seed"), ctx.seed);
@@ -133,7 +173,13 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
         if (i != 0) try wi.print(",", .{});
         try wi.print("{d}", .{tok});
     }
-    try wi.print("],\"tok_per_s\":{d:.2},\"hit_rate\":{d:.4}}}\n", .{ tok_s, hit_rate });
+    try wi.print("],\"tok_per_s\":{d:.2},\"hit_rate\":{d:.4}", .{ tok_s, hit_rate });
+    if (ctx.meter) |m| {
+        // cost = prompt tokens processed + tokens generated
+        const ch = try m.charge(client, @intCast(prompt.len + n));
+        try wi.print(",\"cost\":{d},\"balance\":{d}", .{ ch.cost, ch.balance });
+    }
+    try wi.print("}}\n", .{});
     try wi.flush();
 }
 

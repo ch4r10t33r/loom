@@ -220,7 +220,49 @@ on sampled tokens, TEE attestation, and a zkML interface stub. Coding
 forbids it in the token loop, where only direct addressed fetch of original
 blocks is permitted.
 
-## 8. Deployment model and sizing
+## 8. Node classes and the service economy
+
+Loom distinguishes two node classes:
+
+**Full nodes** hold the resident bundle plus their assigned expert shards,
+join committees, serve shards to peers, and run inference. They are the
+supply side of the network.
+
+**Light nodes** are the demand side: anyone wanting local inference on a
+low-memory device (a laptop, a phone-class box) runs one. A light node holds
+*no weights, no store, and no engine* — its footprint is a few megabytes. It
+exposes the **same local RPC** a full node does, so applications are
+oblivious to the difference, and **delegates** every request to a full node
+with round-robin failover across its configured backends. It stamps a client
+identity onto each request.
+
+**Compensation.** Full nodes must be compensated by light nodes for serviced
+requests. v1 implements the *accounting* half completely and the *settlement*
+half as an explicit seam:
+
+- Every full node runs a per-client **metering ledger**: allowance =
+  free quota (`--free-quota`, default 1 M tokens) + purchased credits −
+  usage, where usage is prompt-plus-generated tokens. Every metered response
+  carries `cost` and `balance`; an exhausted client receives
+  `payment_required` before any compute is spent. Each full node meters its
+  own service — ledgers are per-provider, not global.
+- The `credit` RPC op (`{"method":"credit","client":…,"amount":…,"proof":…}`)
+  is the settlement integration point: v1 accepts the proof unverified
+  (trusted swarm); a payment rail (invoice/receipt verification, on-chain or
+  Lightning-style) replaces exactly that trust check without touching the
+  ledger, the gate, or the wire format. A `tab` op exposes any client's
+  used/balance.
+- Light nodes independently tally their own spend from response `cost`
+  fields — both sides of the ledger exist from day one, which is the
+  precondition for any dispute-free settlement scheme later.
+
+Measured end-to-end: a light node delegated inference transparently
+(identical protocol, `cost`/`balance` appended), spread load round-robin
+across two full nodes with independent ledgers, hit a deterministic
+`payment_required` when its only backend's allowance was exhausted, and
+resumed service after a `credit` top-up.
+
+## 9. Deployment model and sizing
 
 Held shards are a **disk** budget; RAM carries only the compute working set.
 
@@ -242,7 +284,7 @@ on a LAN. The differentiators against layer-split systems are structural
 (experts-not-activations, soft failure, verified weights, self-healing
 membership); the differentiator against single-box streaming is capacity.
 
-## 9. Validation status
+## 10. Validation status
 
 **Proven, on real weights or live multi-node runs:**
 llama + deepseek2 engines produce correct output on reference checkpoints
@@ -260,7 +302,7 @@ validation; distributed inference is served via `loom gguf run`, not yet
 through the node's RPC; ENR and hardfork coordination are designed but
 unimplemented.
 
-## 10. Roadmap
+## 11. Roadmap
 
 Near-term: heartbeat-triggered re-replication (a dead member's shards
 re-covered proactively by its committee); hardfork coordination (majority of
@@ -294,6 +336,8 @@ deleted.*
 | 2026-07-19 | Fetched shards are **persisted** (not LRU-evicted): fetch-on-demand = organic heat replication | Disk is the cheap resource; hot experts should gain holders by being used |
 | 2026-07-20 | Wire messages v1: binary frames, **adaptive snappy** (compress only when smaller); heartbeat carries seq+digest+load but **not** the bitmap; the bitmap rides gossip announces | Quantized payloads are incompressible; heartbeats stay ~90 B; staleness detected cheaply |
 | 2026-07-20 | Committee membership is **gossip-derived** (announces carry committee id), heartbeat set = seed ∪ table view | Fixes static-at-join membership; no bootnode push protocol; survives bootnode death |
+| 2026-07-20 | Two node classes: **light nodes** (no weights/engine; same local RPC; delegate to full nodes with failover) and **full nodes** (shards + inference) | Local inference for low-memory devices without weakening the supply side |
+| 2026-07-20 | Compensation: per-client **metering ledger on each full node** (free quota + credits − token usage), `payment_required` enforcement, `credit` op as the unverified-in-v1 settlement seam | Accounting must precede payment rails; ledgers are per-provider; both sides tally independently |
 
 ## Appendix B — Provenance
 

@@ -15,6 +15,7 @@ One binary, `loom`, provides:
 | [`loom run`](#loom-run--one-shot-local-inference) | one-shot local inference against a loom checkpoint (no servers) |
 | [`loom gen`](#loom-gen--generate-a-synthetic-checkpoint) / [`loom info`](#loom-info--inspect--verify-a-checkpoint) | create / inspect+verify loom-format checkpoints |
 | [`loom gguf`](#loom-gguf--gguf-tools-gen--info--shard--run) | GGUF tools: make a fixture, inspect a file, **shard by expert**, run llama/deepseek2 models |
+| [`loom light`](#loom-light--delegating-light-node) | **light node**: no weights/engine; same local RPC, delegates to full nodes, metered by them |
 | [`loom iobench`](#loom-iobench--disk-profiler) | disk profiler for the random-read pattern the engine issues |
 
 ## Build
@@ -213,6 +214,30 @@ and peak RSS. `--stats` also writes `<FILE>.txt`, a human-readable heat
 histogram (rank, expert id, count, cumulative coverage, cumulative pin bytes).
 
 ---
+
+## `loom light` — delegating light node
+
+```
+loom light --full-nodes H:RPC_PORT[,H:P...] [--rpc-addr A] [--rpc-port P] [--client-id ID]
+```
+
+For low-memory devices: holds no weights, no store, no engine (megabytes of
+footprint). Serves the same line-delimited JSON RPC locally (default port
+8768) and delegates every request to a full node — round-robin with failover
+— stamping `--client-id` on each request. Full nodes **meter** clients:
+responses carry `cost` (prompt + generated tokens) and `balance`; when a
+client's allowance (`--free-quota` on the full node + credits − usage) hits
+zero, requests get `{"error":"payment_required"}` until credited via the
+settlement stub (`{"method":"credit","client":ID,"amount":N}` — proof
+verification is the planned payment-rail integration point;
+`{"method":"tab","client":ID}` shows the ledger).
+
+```sh
+loom node --free-quota 5000 &                # full node, metered
+loom light --full-nodes 127.0.0.1:8770 --client-id alice &
+printf '{"prompt":"hi","max_tokens":16}\n' | nc -w 3 127.0.0.1 8768
+# {"ok":true,...,"cost":18,"balance":4982}
+```
 
 ## `loom gen` — generate a synthetic checkpoint
 

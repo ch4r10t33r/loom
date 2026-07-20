@@ -1,0 +1,151 @@
+//! Light node (SPEC.md node classes): local inference for low-memory devices.
+//!
+//! A light node holds NO weights, NO store, and runs NO engine — its memory
+//! footprint is a few megabytes. It serves the exact same line-delimited JSON
+//! RPC as a full node on localhost, and **delegates** every request to a full
+//! node, with round-robin failover across the configured backends. It stamps
+//! its client identity onto each request so the serving full node can meter
+//! it (the compensation ledger lives on the full node; the light node tracks
+//! its own spend from the cost/balance fields in responses).
+//!
+//! v1 backends are configured statically (`--full-nodes`); discovering
+//! RPC-serving full nodes via the gossip mesh is a noted follow-up.
+
+const std = @import("std");
+const Io = std.Io;
+const net = std.Io.net;
+const sync = @import("../p2p/sync.zig");
+
+pub const Options = struct {
+    rpc_addr: []const u8,
+    rpc_port: u16,
+    full_nodes: []const sync.PeerAddr, // full-node RPC endpoints
+    client_id: []const u8,
+};
+
+pub const Ctx = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    opts: Options,
+    rr: usize = 0, // round-robin start across backends
+    spent: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+};
+
+const Conn = struct { ctx: *Ctx, stream: net.Stream };
+
+pub fn serve(ctx: *Ctx) !void {
+    var address = try net.IpAddress.parse(ctx.opts.rpc_addr, ctx.opts.rpc_port);
+    var server = try address.listen(ctx.io, .{ .reuse_address = true });
+    defer server.deinit(ctx.io);
+
+    while (true) {
+        const stream = server.accept(ctx.io) catch continue;
+        const conn = ctx.gpa.create(Conn) catch {
+            stream.close(ctx.io);
+            continue;
+        };
+        conn.* = .{ .ctx = ctx, .stream = stream };
+        const t = std.Thread.spawn(.{}, connThread, .{conn}) catch {
+            stream.close(ctx.io);
+            ctx.gpa.destroy(conn);
+            continue;
+        };
+        t.detach();
+    }
+}
+
+fn connThread(conn: *Conn) void {
+    handleConn(conn.ctx, conn.stream) catch {};
+    conn.ctx.gpa.destroy(conn);
+}
+
+fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
+    defer stream.close(ctx.io);
+    var rbuf: [1 << 16]u8 = undefined;
+    var wbuf: [1 << 16]u8 = undefined;
+    var r = stream.reader(ctx.io, &rbuf);
+    var w = stream.writer(ctx.io, &wbuf);
+
+    while (true) {
+        const raw = r.interface.takeDelimiterInclusive('\n') catch return;
+        const line = std.mem.trimEnd(u8, raw, "\r\n");
+        if (line.len == 0) continue;
+        delegate(ctx, line, &w.interface) catch |e| {
+            try w.interface.print("{{\"ok\":false,\"error\":\"{s}\"}}\n", .{@errorName(e)});
+            try w.interface.flush();
+        };
+    }
+}
+
+/// Stamp our client id onto the request (unless the caller set one), forward
+/// to the first responsive backend (round-robin start), relay the response.
+fn delegate(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
+    const gpa = ctx.gpa;
+
+    // inject "client" right after the opening brace unless already present
+    const request = blk: {
+        if (std.mem.indexOf(u8, line, "\"client\"") != null) {
+            break :blk try gpa.dupe(u8, line);
+        }
+        const brace = std.mem.indexOfScalar(u8, line, '{') orelse return error.BadRequest;
+        break :blk try std.fmt.allocPrint(gpa, "{s}\"client\":\"{s}\",{s}", .{
+            line[0 .. brace + 1], ctx.opts.client_id, line[brace + 1 ..],
+        });
+    };
+    defer gpa.free(request);
+    // degenerate case: "{}" became {"client":"x",} — fix trailing comma
+    const fixed = if (std.mem.endsWith(u8, request, ",}"))
+        try std.fmt.allocPrint(gpa, "{s}}}", .{request[0 .. request.len - 2]})
+    else
+        try gpa.dupe(u8, request);
+    defer gpa.free(fixed);
+
+    const n_backends = ctx.opts.full_nodes.len;
+    if (n_backends == 0) return error.NoFullNodes;
+    const start = ctx.rr;
+    ctx.rr +%= 1;
+
+    var attempt: usize = 0;
+    while (attempt < n_backends) : (attempt += 1) {
+        const backend = ctx.opts.full_nodes[(start + attempt) % n_backends];
+        const resp = forwardTo(ctx, backend, fixed) catch continue;
+        defer gpa.free(resp);
+        trackSpend(ctx, resp);
+        try wi.print("{s}\n", .{resp});
+        try wi.flush();
+        return;
+    }
+    return error.NoFullNodeReachable;
+}
+
+fn forwardTo(ctx: *Ctx, backend: sync.PeerAddr, request: []const u8) ![]u8 {
+    const io = ctx.io;
+    const ip = try net.IpAddress.parse(backend.host, backend.port);
+    const stream = try ip.connect(io, .{ .mode = .stream });
+    defer stream.close(io);
+    var rbuf: [1 << 16]u8 = undefined;
+    var wbuf: [1 << 16]u8 = undefined;
+    var r = stream.reader(io, &rbuf);
+    var w = stream.writer(io, &wbuf);
+
+    try w.interface.print("{s}\n", .{request});
+    try w.interface.flush();
+    const line = std.mem.trimEnd(u8, try r.interface.takeDelimiterInclusive('\n'), "\r\n");
+    return ctx.gpa.dupe(u8, line);
+}
+
+/// Pull "cost" out of the response to keep a local spend tally — the light
+/// node's own view of what it owes across backends.
+fn trackSpend(ctx: *Ctx, resp: []const u8) void {
+    const key = "\"cost\":";
+    const idx = std.mem.indexOf(u8, resp, key) orelse return;
+    var end = idx + key.len;
+    var cost: u64 = 0;
+    while (end < resp.len and resp[end] >= '0' and resp[end] <= '9') : (end += 1) {
+        cost = cost * 10 + (resp[end] - '0');
+    }
+    if (cost > 0) {
+        const total = ctx.spent.fetchAdd(cost, .monotonic) + cost;
+        std.debug.print("light: spent {d} tokens this request ({d} total)\n", .{ cost, total });
+    }
+}

@@ -78,6 +78,19 @@ through to the mesh and completed inference.
    learned B and C. Swapping this for real gossipsub/discv5 replaces the
    transport, not the table.
 
+### Node classes: light + full, with metering (✅ first cut implemented)
+
+`loom light` (src/node/light.zig) + per-client metering on full nodes
+(src/node/meter.zig): light nodes hold nothing and delegate the same local
+RPC to full nodes with round-robin failover, stamping a client id; full
+nodes enforce allowance = free-quota + credits − token-usage with
+`payment_required`, expose `credit` (settlement seam, proof unverified in
+v1) and `tab`. Verified live: transparent delegation with cost/balance,
+independent per-provider ledgers under round-robin, deterministic
+`payment_required` on exhaustion, resume after credit. Follow-ups: gossip
+discovery of RPC-serving full nodes (announce lacks an RPC endpoint field);
+payment-proof verification; persistent ledgers.
+
 ### Token-loop peer fetch (✅ first cut implemented — issue #3)
 
 `expert_fetch.zig` + `loom gguf run <store-dir> --peers`: a node running a
