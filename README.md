@@ -443,6 +443,7 @@ loom iobench /tmp/ckpt/experts.blob --threads 8 --block-mb 1 --reads 64
 ## Repository layout
 
 ```
+whitepaper/   the living whitepaper (updated with every design decision)
 spec/         p2p-layer specification (SPEC.md)
 docs/         roadmap and planning documents
 src/main.zig  CLI entry point

@@ -151,6 +151,15 @@ Two distinct axes, often conflated. Neither is allowed in the per-token fetch pa
 - **Storage & coding:** RS-EC (cold durability + systematic LAN bulk), heat-based replication (hot), Merkle/SSZ manifest; RLNC + homomorphic hashing (WAN/untrusted propagation, v2). No coding in the token loop.
 - **Daemon/router:** Rust or Zig (aligns with zig-libp2p / zquic); Python only where wrapping an engine.
 
+## Standing rule: keep the whitepaper current
+
+[whitepaper/WHITEPAPER.md](whitepaper/WHITEPAPER.md) is a **living document**.
+Every design decision made in this repo MUST be reflected there in the same
+change set: update the affected section AND append a dated row to
+`Appendix A — Decision Log` (append-only; strike through superseded rows,
+never delete). Where documents disagree: spec/SPEC.md governs the p2p layer,
+docs/ROADMAP.md governs status, the whitepaper governs intent.
+
 ## Open questions / risks
 - **Slow fabric kills the network tier.** On ≤25 GbE the win is capacity/dedup, not speed. Size expectations to measured bandwidth.
 - **colibri is a PoC.** Re-validate on real weights; treat as reference, not production.
