@@ -11,7 +11,7 @@ const std = @import("std");
 const Io = std.Io;
 const model = @import("model.zig");
 const ckpt = @import("checkpoint.zig");
-const quant = @import("quant.zig");
+const quant = @import("../core/quant.zig");
 const ModelConfig = model.ModelConfig;
 
 fn fillSmall(rnd: std.Random, dst: []f32, scale: f32) void {

@@ -35,11 +35,11 @@
 const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
-const checkpoint = @import("checkpoint.zig");
-const hashmod = @import("hash.zig");
+const checkpoint = @import("../engine/checkpoint.zig");
+const hashmod = @import("../core/hash.zig");
 const weights = @import("weights.zig");
 const peers = @import("peers.zig");
-const stats = @import("stats.zig");
+const stats = @import("../core/stats.zig");
 const bootnode = @import("bootnode.zig");
 const wire = @import("wire.zig");
 

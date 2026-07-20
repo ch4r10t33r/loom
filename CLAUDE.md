@@ -118,7 +118,7 @@ Two distinct axes, often conflated. Neither is allowed in the per-token fetch pa
 
 ### v1 — Distributed weight sharing
 
-> **Revised — [ROADMAP.md](ROADMAP.md) holds the requirements of record; where the two
+> **Revised — [docs/ROADMAP.md](docs/ROADMAP.md) holds the requirements of record; where the two
 > conflict, ROADMAP.md wins.** Key changes from the original sketch kept below:
 > **GGUF** is the interchange weight format; placement is **random ranges with
 > redundancy** (heat-proportional replication becomes an optional layer on top, not
@@ -146,7 +146,7 @@ Two distinct axes, often conflated. Neither is allowed in the per-token fetch pa
 ## Tech stack summary
 - **Engine:** colibri technique (CPU) and/or SGLang/vLLM (GPU); `transformers>=5.3.0` for `glm_moe_dsa`.
 - **Weights:** FP8/NVFP4 checkpoints → int4 via colibri converter.
-- **p2p / directory:** ENR + gossip + request-response (Ethereum-style; see ROADMAP.md — supersedes the original Hyperswarm/HyperDHT/Hyperbee choice).
+- **p2p / directory:** ENR + gossip + request-response (Ethereum-style; see docs/ROADMAP.md — supersedes the original Hyperswarm/HyperDHT/Hyperbee choice).
 - **Transport:** Mooncake Transfer Engine / NIXL / RDMA on fast fabrics.
 - **Storage & coding:** RS-EC (cold durability + systematic LAN bulk), heat-based replication (hot), Merkle/SSZ manifest; RLNC + homomorphic hashing (WAN/untrusted propagation, v2). No coding in the token loop.
 - **Daemon/router:** Rust or Zig (aligns with zig-libp2p / zquic); Python only where wrapping an engine.

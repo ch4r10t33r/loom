@@ -10,7 +10,7 @@ const std = @import("std");
 const Io = std.Io;
 const gguf = @import("gguf.zig");
 const ggml = @import("ggml.zig");
-const tensor = @import("tensor.zig");
+const tensor = @import("../core/tensor.zig");
 
 pub const Config = struct {
     dim: usize,

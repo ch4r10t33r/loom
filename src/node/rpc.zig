@@ -13,10 +13,10 @@
 const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
-const engine_mod = @import("engine.zig");
+const engine_mod = @import("../engine/engine.zig");
 const Engine = engine_mod.Engine;
-const tokenizer = @import("tokenizer.zig");
-const stats = @import("stats.zig");
+const tokenizer = @import("../engine/tokenizer.zig");
+const stats = @import("../core/stats.zig");
 
 pub const Ctx = struct {
     gpa: std.mem.Allocator,

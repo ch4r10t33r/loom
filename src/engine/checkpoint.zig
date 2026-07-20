@@ -13,7 +13,7 @@
 const std = @import("std");
 const Io = std.Io;
 const model = @import("model.zig");
-const hashmod = @import("hash.zig");
+const hashmod = @import("../core/hash.zig");
 const ModelConfig = model.ModelConfig;
 
 pub const MAGIC: [8]u8 = "LOOMCKP1".*;

@@ -13,7 +13,7 @@
 ## v1 — distributed weight sharing (requirements of record)
 
 These supersede the original CLAUDE.md v1 sketch where they conflict.
-The p2p layer's committee spec lives in [SPEC.md](SPEC.md) — **✅ first cut
+The p2p layer's committee spec lives in [../spec/SPEC.md](../spec/SPEC.md) — **✅ first cut
 implemented** (`bootnode.zig` registry, JOIN protocol, assigned want-sets,
 committee-first sync, 5 s heartbeats with death detection, committee-then-mesh
 fetch order; **wire messages v1**: binary frames with adaptive snappy —
@@ -171,4 +171,4 @@ extra replicas on top (see tension below).
 
 Merkle-root integrity on read (already free from v0's store), RLNC WAN
 propagation gated behind homomorphic-hash pollution defense, redundant
-recompute + M-of-N voting, TEE attestation. See CLAUDE.md.
+recompute + M-of-N voting, TEE attestation. See ../CLAUDE.md.

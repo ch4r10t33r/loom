@@ -20,9 +20,9 @@
 
 const std = @import("std");
 const Io = std.Io;
-const hashmod = @import("hash.zig");
-const gguf = @import("gguf.zig");
-const ggml = @import("ggml.zig");
+const hashmod = @import("../core/hash.zig");
+const gguf = @import("../gguf/gguf.zig");
+const ggml = @import("../gguf/ggml.zig");
 
 pub const DEFAULT_RANGE_BYTES: u64 = 4 * 1024 * 1024;
 pub const RESIDENT_CHUNK_BYTES: u64 = 16 * 1024 * 1024;

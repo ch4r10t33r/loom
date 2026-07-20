@@ -4,19 +4,19 @@
 
 const std = @import("std");
 const Io = std.Io;
-const engine_mod = @import("engine.zig");
+const engine_mod = @import("../engine/engine.zig");
 const Engine = engine_mod.Engine;
 const hf = @import("hf.zig");
 const rpc = @import("rpc.zig");
-const p2p = @import("p2p.zig");
-const stats = @import("stats.zig");
-const weights = @import("weights.zig");
-const sync = @import("sync.zig");
-const hashmod = @import("hash.zig");
-const peers = @import("peers.zig");
-const gossip = @import("gossip.zig");
-const bootnode = @import("bootnode.zig");
-const wire = @import("wire.zig");
+const p2p = @import("../p2p/p2p.zig");
+const stats = @import("../core/stats.zig");
+const weights = @import("../p2p/weights.zig");
+const sync = @import("../p2p/sync.zig");
+const hashmod = @import("../core/hash.zig");
+const peers = @import("../p2p/peers.zig");
+const gossip = @import("../p2p/gossip.zig");
+const bootnode = @import("../p2p/bootnode.zig");
+const wire = @import("../p2p/wire.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
 const MBf: f64 = 1024.0 * 1024.0;

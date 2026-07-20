@@ -23,8 +23,8 @@ const Io = std.Io;
 const net = std.Io.net;
 const weights = @import("weights.zig");
 const sync = @import("sync.zig");
-const hashmod = @import("hash.zig");
-const stats_mod = @import("stats.zig");
+const hashmod = @import("../core/hash.zig");
+const stats_mod = @import("../core/stats.zig");
 const wire = @import("wire.zig");
 
 pub const Stats = struct {

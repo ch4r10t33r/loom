@@ -12,7 +12,7 @@
 
 const std = @import("std");
 const model = @import("model.zig");
-const tensor = @import("tensor.zig");
+const tensor = @import("../core/tensor.zig");
 const ckpt = @import("checkpoint.zig");
 const ModelConfig = model.ModelConfig;
 

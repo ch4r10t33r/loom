@@ -2,7 +2,7 @@
 //! harness); temperature sampling when a positive temperature is set.
 
 const std = @import("std");
-const tensor = @import("tensor.zig");
+const tensor = @import("../core/tensor.zig");
 
 pub fn argmax(logits: []const f32) usize {
     var best: usize = 0;

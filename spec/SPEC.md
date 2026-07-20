@@ -1,7 +1,7 @@
 # Loom p2p layer — spec
 
-Architecture spec for the weight-distribution p2p layer. CLAUDE.md holds the
-inference-side design; ROADMAP.md tracks status. Where this document and older
+Architecture spec for the weight-distribution p2p layer. [../CLAUDE.md](../CLAUDE.md) holds the
+inference-side design; [../docs/ROADMAP.md](../docs/ROADMAP.md) tracks status. Where this document and older
 sketches conflict, this document wins for the p2p layer.
 
 ## Roles
@@ -201,7 +201,7 @@ another replica (pairs with the heartbeat `load` hint).
 The same ops move to gossipsub/discv5 transports later; the semantics above
 are the spec.
 
-## Sizing (GLM 5.2 target; see ROADMAP for derivation)
+## Sizing (GLM 5.2 target; see ../docs/ROADMAP.md for derivation)
 
 19,200 expert shards (~19 MB each) + ~10 GB resident bundle. A complete
 committee at 50 GB/node needs ≥8 nodes (≈2,600 expert shards each); at `R=2`

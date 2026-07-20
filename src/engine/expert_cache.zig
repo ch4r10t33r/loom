@@ -13,7 +13,7 @@
 const std = @import("std");
 const Io = std.Io;
 const checkpoint = @import("checkpoint.zig");
-const hashmod = @import("hash.zig");
+const hashmod = @import("../core/hash.zig");
 
 pub const Stats = struct {
     pin_hits: u64 = 0,

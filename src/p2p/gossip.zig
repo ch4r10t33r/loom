@@ -12,8 +12,8 @@ const net = std.Io.net;
 const peers = @import("peers.zig");
 const weights = @import("weights.zig");
 const sync = @import("sync.zig");
-const hashmod = @import("hash.zig");
-const stats = @import("stats.zig");
+const hashmod = @import("../core/hash.zig");
+const stats = @import("../core/stats.zig");
 const wire = @import("wire.zig");
 
 pub const INTERVAL_NS: i96 = 3 * std.time.ns_per_s;

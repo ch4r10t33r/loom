@@ -9,8 +9,8 @@
 
 const std = @import("std");
 const model = @import("model.zig");
-const tensor = @import("tensor.zig");
-const quant = @import("quant.zig");
+const tensor = @import("../core/tensor.zig");
+const quant = @import("../core/quant.zig");
 const ckpt = @import("checkpoint.zig");
 const ExpertCache = @import("expert_cache.zig").ExpertCache;
 const ModelConfig = model.ModelConfig;

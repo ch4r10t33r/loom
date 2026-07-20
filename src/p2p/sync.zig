@@ -11,7 +11,7 @@
 const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
-const hashmod = @import("hash.zig");
+const hashmod = @import("../core/hash.zig");
 const weights = @import("weights.zig");
 
 pub const Result = struct {

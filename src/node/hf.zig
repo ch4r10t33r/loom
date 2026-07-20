@@ -13,8 +13,8 @@
 
 const std = @import("std");
 const Io = std.Io;
-const model = @import("model.zig");
-const gen = @import("gen_checkpoint.zig");
+const model = @import("../engine/model.zig");
+const gen = @import("../engine/gen_checkpoint.zig");
 
 pub const files = [_][]const u8{ "manifest.loom", "dense.blob", "experts.blob" };
 

@@ -23,10 +23,10 @@ const std = @import("std");
 const Io = std.Io;
 const gguf = @import("gguf.zig");
 const ggml = @import("ggml.zig");
-const tensor = @import("tensor.zig");
+const tensor = @import("../core/tensor.zig");
 const llama = @import("llama.zig");
 const bpe = @import("bpe.zig");
-const expert_fetch = @import("expert_fetch.zig");
+const expert_fetch = @import("../p2p/expert_fetch.zig");
 
 /// Real DeepSeek/Kimi GGUFs ship a gpt2-style BPE tokenizer; fixtures (and
 /// some conversions) use SPM. Selected by `tokenizer.ggml.model`.

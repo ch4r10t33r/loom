@@ -9,7 +9,7 @@
 //! the hot path is a direct addressed fetch of an original block — no coding).
 
 const std = @import("std");
-const model = @import("model.zig");
+const model = @import("../engine/model.zig");
 
 pub const QK = model.QK; // 32
 pub const BLOCK_BYTES: usize = QK / 2 + 4; // 20

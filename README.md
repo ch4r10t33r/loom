@@ -5,7 +5,7 @@ in [`CLAUDE.md`](CLAUDE.md): for a huge Mixture-of-Experts model like GLM-5.2,
 keep **compute node-local** and make the **weights** the thing that moves —
 streamed from disk through a tiered cache on one box (v0), and shared across
 nodes as content-addressed byte ranges of a GGUF file (v1, in progress — see
-[`ROADMAP.md`](ROADMAP.md)).
+[`docs/ROADMAP.md`](docs/ROADMAP.md)).
 
 One binary, `loom`, provides:
 
@@ -96,7 +96,7 @@ complete shard set with redundancy `--r-target` (default 2) by construction.
 Joiners sync from committee members first, then the bootnode; committee
 members heartbeat each other every 5 s and log liveness transitions. When all
 committees are saturated, the next joiner opens a new one. See
-[SPEC.md](SPEC.md) for the full p2p-layer spec (roles, invariants, query
+[spec/SPEC.md](spec/SPEC.md) for the full p2p-layer spec (roles, invariants, query
 path, wire protocol).
 
 Two loops run alongside the servers:
@@ -377,7 +377,7 @@ loom gguf run ~/.cache/loom/models/gguf-synced --peers 127.0.0.1:8771 \
 
 ## Target deployment: GLM 5.2 on a swarm of 16 GB machines (plan)
 
-The end-state this repo is building toward (see [ROADMAP.md](ROADMAP.md);
+The end-state this repo is building toward (see [docs/ROADMAP.md](docs/ROADMAP.md);
 expert-aligned shards are [#2](https://github.com/ch4r10t33r/loom/issues/2),
 token-loop peer fetch is [#3](https://github.com/ch4r10t33r/loom/issues/3)):
 GLM 5.2 — 744B-param MoE, 75 MoE layers × 256 experts, 8+1 active — served by
@@ -440,35 +440,48 @@ loom iobench /tmp/ckpt/experts.blob --threads 8 --block-mb 1 --reads 64
 
 ---
 
+## Repository layout
+
+```
+spec/         p2p-layer specification (SPEC.md)
+docs/         roadmap and planning documents
+src/main.zig  CLI entry point
+src/core/     primitives: hashing/Merkle, tensor math, int4 quant, stats, iobench
+src/engine/   the loom-format MoE engine (MLA, router, expert cache, checkpoints)
+src/gguf/     GGUF plane: parser, GGML kernels, llama + deepseek2 engines, BPE
+src/p2p/      distribution: wire frames, gossip, committees, sync, token-loop fetch
+src/node/     the daemon: node orchestration, RPC server, model resolver
+```
+
 ## Source map
 
 | Module | Role |
 |---|---|
-| `model.zig` | `ModelConfig`; GLM-5.2 shape + runnable `tiny` shape; expert/working-set sizing |
-| `quant.zig` | loom int4 expert format (f32 scale/32 weights) quantize + fused matvec |
-| `tensor.zig` | RMSNorm, softmax, SwiGLU, dense matvec, partial RoPE |
-| `attention.zig` | MLA: q/kv-LoRA, partial RoPE, compressed-latent KV cache |
-| `moe.zig` | DeepSeek-V3 sigmoid router (top-k + shared expert); streamed int4 expert FFN |
-| `checkpoint.zig` | loom on-disk format: content-addressed, Merkle-rooted, deduped |
-| `expert_cache.zig` | tiered expert cache: pinned hot-set → LRU → pread, usage stats, digest verify |
-| `forward.zig` / `engine.zig` | forward step wiring; engine lifecycle, RAM-budget → cache sizing |
-| `node.zig` | `loom node` orchestration: model → engine → RPC/P2P/gossip/repair |
-| `hf.zig` | model resolver: local dir / synthetic / Hugging Face download (local-first) |
-| `rpc.zig` | JSON-over-TCP inference server (concurrent connections, serialized generate) |
-| `p2p.zig` | P2P line protocol: expert directory, weight ranges, gossip |
-| `weights.zig` | range-sharded GGUF store: manifest, version id, holdings/wanted bitmaps, verified IO |
-| `sync.zig` | peer sync client: manifest adoption, root verification, multi-peer range fetch |
-| `peers.zig` | dynamic peer table shared by gossip/repair/P2P threads |
-| `gossip.zig` | 3 s gossip loop: announce self, merge peers-of-peers |
-| `gguf.zig` | GGUF v2/v3 parser (metadata incl. tokenizer arrays, tensor table) + fixture writer |
-| `ggml.zig` | GGML kernels: F32/F16/Q4_0/Q8_0 fused matvec + row dequant |
-| `llama.zig` | llama-arch engine over mmap'd GGUF: GQA, NORM RoPE, SwiGLU, SPM tokenizer |
-| `deepseek.zig` | deepseek2-arch engine (Kimi/DeepSeek/GLM): MLA + MoE routing over mmap'd GGUF |
-| `stats.zig` | RSS, usage histograms, STATS→PIN hot-set selection |
-| `iobench.zig` | parallel random-read disk profiler |
-| `gen_checkpoint.zig` | deterministic synthetic checkpoint generator |
-| `hash.zig` | SHA-256 content addressing + Merkle root |
-| `sampler.zig` / `tokenizer.zig` | greedy/temperature sampling; byte-level tokenizer (synthetic model) |
+| `engine/model.zig` | `ModelConfig`; GLM-5.2 shape + runnable `tiny` shape; expert/working-set sizing |
+| `core/quant.zig` | loom int4 expert format (f32 scale/32 weights) quantize + fused matvec |
+| `core/tensor.zig` | RMSNorm, softmax, SwiGLU, dense matvec, partial RoPE |
+| `engine/attention.zig` | MLA: q/kv-LoRA, partial RoPE, compressed-latent KV cache |
+| `engine/moe.zig` | DeepSeek-V3 sigmoid router (top-k + shared expert); streamed int4 expert FFN |
+| `engine/checkpoint.zig` | loom on-disk format: content-addressed, Merkle-rooted, deduped |
+| `engine/expert_cache.zig` | tiered expert cache: pinned hot-set → LRU → pread, usage stats, digest verify |
+| `engine/forward.zig` / `engine/engine.zig` | forward step wiring; engine lifecycle, RAM-budget → cache sizing |
+| `node/node.zig` | `loom node` orchestration: model → engine → RPC/P2P/gossip/repair |
+| `node/hf.zig` | model resolver: local dir / synthetic / Hugging Face download (local-first) |
+| `node/rpc.zig` | JSON-over-TCP inference server (concurrent connections, serialized generate) |
+| `p2p/p2p.zig` | P2P line protocol: expert directory, weight ranges, gossip |
+| `p2p/weights.zig` | range-sharded GGUF store: manifest, version id, holdings/wanted bitmaps, verified IO |
+| `p2p/sync.zig` | peer sync client: manifest adoption, root verification, multi-peer range fetch |
+| `p2p/peers.zig` | dynamic peer table shared by gossip/repair/P2P threads |
+| `p2p/gossip.zig` | 3 s gossip loop: announce self, merge peers-of-peers |
+| `gguf/gguf.zig` | GGUF v2/v3 parser (metadata incl. tokenizer arrays, tensor table) + fixture writer |
+| `gguf/ggml.zig` | GGML kernels: F32/F16/Q4_0/Q8_0 fused matvec + row dequant |
+| `gguf/llama.zig` | llama-arch engine over mmap'd GGUF: GQA, NORM RoPE, SwiGLU, SPM tokenizer |
+| `gguf/deepseek.zig` | deepseek2-arch engine (Kimi/DeepSeek/GLM): MLA + MoE routing over mmap'd GGUF |
+| `core/stats.zig` | RSS, usage histograms, STATS→PIN hot-set selection |
+| `core/iobench.zig` | parallel random-read disk profiler |
+| `engine/gen_checkpoint.zig` | deterministic synthetic checkpoint generator |
+| `core/hash.zig` | SHA-256 content addressing + Merkle root |
+| `engine/sampler.zig` / `tokenizer.zig` | greedy/temperature sampling; byte-level tokenizer (synthetic model) |
 
 ## Status & honest gaps
 
@@ -481,7 +494,7 @@ loom iobench /tmp/ckpt/experts.blob --threads 8 --block-mb 1 --reads 64
   sharding, multi-peer boot sync, gossip discovery, eager churn repair, and
   the version guard that will enforce hardforks. Remaining: ENR integration,
   real gossipsub transport, majority-hardfork coordination, serving GGUF
-  models through the node's RPC. See [`ROADMAP.md`](ROADMAP.md) for the
+  models through the node's RPC. See [`docs/ROADMAP.md`](docs/ROADMAP.md) for the
   requirements of record and decisions (random+redundant placement, ENR +
   global gossip topic, maximally eager repair).
 - **v2 (untrusted peers)** is design-only (see `CLAUDE.md`).
