@@ -90,6 +90,7 @@ fn usage(out: *Io.Writer) !void {
         \\
         \\usage:
         \\  loom node [--model SPEC] [--rpc-addr A] [--rpc-port P]
+        \\            [--openai-addr A] [--openai-port P]
         \\            [--p2p-addr A] [--p2p-port P] [--ram-gb X] [--pin-gb Y]
         \\            [--seed S] [--stats FILE] [--no-verify]
         \\            [--gguf FILE | --bootstrap HOST:PORT]
@@ -313,6 +314,8 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
     const model_spec = flagStr(args, "--model") orelse env.get("MODEL") orelse "tiny";
     const rpc_addr = flagStr(args, "--rpc-addr") orelse "127.0.0.1";
     const rpc_port = try flagU16(args, "--rpc-port", 8770);
+    const openai_addr = flagStr(args, "--openai-addr") orelse rpc_addr;
+    const openai_port = try flagU16(args, "--openai-port", 0); // 0 = disabled
     const p2p_addr = flagStr(args, "--p2p-addr") orelse "0.0.0.0";
     const p2p_port = try flagU16(args, "--p2p-port", 8771);
     const ram_gb = try flagF64(args, "--ram-gb", try envF64(env, "RAM_BUDGET_GB", 4.0));
@@ -340,6 +343,8 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .model = model_spec,
         .rpc_addr = rpc_addr,
         .rpc_port = rpc_port,
+        .openai_addr = openai_addr,
+        .openai_port = openai_port,
         .p2p_addr = p2p_addr,
         .p2p_port = p2p_port,
         .ram_bytes = @intFromFloat(ram_gb * GB),

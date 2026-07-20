@@ -28,6 +28,52 @@ full node (round-robin with failover across configured backends; gossip discover
 of RPC-serving full nodes is a follow-up). Stamps its client id on each request so
 the serving full node can meter it.
 
+## Client API (north-facing)
+
+A node exposes two request-serving surfaces over TCP. Both sit in front of the
+same engine and the same metering ledger; both are orthogonal to the p2p wire
+protocol (the south-facing expert-fetch frames), which is unchanged by anything
+here.
+
+1. **Native JSON RPC** (`--rpc-port`, default 8770). The line-delimited
+   `{"prompt":...}` protocol described under Metering below. This is the
+   internal protocol light nodes delegate over.
+2. **OpenAI-compatible HTTP API** (`--openai-port`, off by default in v1). An
+   HTTP/1.1 endpoint that speaks the OpenAI schema so existing clients
+   (OpenWebUI, Continue, aider, the OpenAI SDKs, curl) talk to a Loom node with
+   no adapter. Routes: `GET /v1/models`, `POST /v1/chat/completions`,
+   `POST /v1/completions`, `GET /health`. It is a thin translation over the same
+   `engine.generate` path and the same `Meter`, not a second engine.
+
+**Why OpenAI-compatible and not MCP.** MCP is a tool/context protocol; a node
+serving completions is more naturally an MCP client (a model that can call
+tools) than an MCP server. The OpenAI HTTP schema is the de-facto local-inference
+serving contract (llama.cpp server, ollama, vLLM, ZINC all expose it), so it is
+the correct north-facing surface for request serving. MCP-client support is a
+separate, later concern and does not belong on the serving path.
+
+**Identity and metering.** The OpenAI surface carries client identity in the
+`Authorization: Bearer <token>` header rather than a request-body field. The
+bearer token is the client id and credit key, so it is out-of-band from the
+prompt and not forgeable by prompt content, an improvement over the native RPC's
+self-asserted `client` string. Usage maps directly onto the OpenAI `usage`
+object (`prompt_tokens` + `completion_tokens`), which is already the ledger's
+cost unit; the `model` field maps to the manifest version and a mismatch is
+refused the same way a cross-version peer is.
+
+**Request-to-prompt mapping.** `messages[]` are rendered to the model's prompt
+via its chat template (read from GGUF metadata alongside the tokenizer).
+Token-by-token generation maps to OpenAI SSE streaming (`stream: true`) as
+`data:` chunks terminated by `data: [DONE]`.
+
+**v1 status: skeleton.** The component ([src/node/openai.zig](../src/node/openai.zig))
+implements the HTTP transport, routing, the OpenAI request/response structs, and
+bearer-token identity extraction. It returns well-formed OpenAI-shaped responses
+with a placeholder completion (`loom_status: "skeleton"`); the engine-generation
+path, chat-template rendering, and SSE streaming are marked TODO. Light-node
+delegation of the OpenAI surface is a follow-up (light nodes currently delegate
+only the native RPC).
+
 ## Metering and compensation
 
 Full nodes are compensated by light nodes for serviced requests. Each full node

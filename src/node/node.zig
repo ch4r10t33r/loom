@@ -8,6 +8,7 @@ const engine_mod = @import("../engine/engine.zig");
 const Engine = engine_mod.Engine;
 const hf = @import("hf.zig");
 const rpc = @import("rpc.zig");
+const openai = @import("openai.zig");
 const p2p = @import("../p2p/p2p.zig");
 const stats = @import("../core/stats.zig");
 const weights = @import("../p2p/weights.zig");
@@ -26,6 +27,8 @@ pub const Options = struct {
     model: []const u8,
     rpc_addr: []const u8,
     rpc_port: u16,
+    openai_addr: []const u8, // OpenAI-compatible HTTP API bind addr
+    openai_port: u16, // 0 = OpenAI surface disabled (SPEC.md client API)
     p2p_addr: []const u8,
     p2p_port: u16,
     ram_bytes: u64,
@@ -220,6 +223,10 @@ fn p2pThread(ctx: *p2p.Ctx) void {
     p2p.serve(ctx) catch |e| std.debug.print("p2p: {s}\n", .{@errorName(e)});
 }
 
+fn openaiThread(ctx: *openai.Ctx) void {
+    openai.serve(ctx) catch |e| std.debug.print("openai: {s}\n", .{@errorName(e)});
+}
+
 pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void {
     const resolved = hf.resolve(gpa, io, opts.model, opts.cache_root) catch |e| {
         try out.print("model resolve failed ({s}): {s}\n", .{ opts.model, @errorName(e) });
@@ -384,6 +391,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         s.expert_bytes, s.lru_capacity, s.pinned_experts, @as(f64, @floatFromInt(opts.ram_bytes)) / GB,
     });
     try out.print("  rpc        tcp://{s}:{d}   (metered; free quota {d} tokens/client; credit {s})\n", .{ opts.rpc_addr, opts.rpc_port, opts.free_quota, if (opts.admin_token.len > 0) "admin-gated" else "disabled" });
+    if (opts.openai_port != 0) try out.print("  openai     http://{s}:{d}/v1  (OpenAI-compatible; SKELETON: stub completions)\n", .{ opts.openai_addr, opts.openai_port });
     try out.print("  p2p        tcp://{s}:{d}   (HELLO | HAS | MANIFEST | DIGESTS | HOLDINGS | GETR | GOSSIP | TABLE | PING)\n", .{ opts.p2p_addr, opts.p2p_port });
     try out.print("  gossip     advertising as {s}, {d} seed peer(s), every {d}s\n", .{
         advertise, peer_strs.items.len, @divTrunc(gossip.INTERVAL_NS, std.time.ns_per_s),
@@ -468,6 +476,29 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     var meter = meter_mod.Meter.init(gpa, io, opts.free_quota);
     defer meter.deinit();
 
+    // One engine mutex shared by every serve path (rpc + openai): the engine
+    // holds mutable per-request state, so generation must be serialized.
+    var engine_lock: Io.Mutex = .init;
+
+    // OpenAI-compatible HTTP surface (SPEC.md client API), off unless a port is
+    // set. Skeleton: well-formed OpenAI responses with stub completions.
+    var openai_ctx: openai.Ctx = undefined;
+    if (opts.openai_port != 0) {
+        openai_ctx = .{
+            .gpa = gpa,
+            .io = io,
+            .engine = &eng,
+            .addr = opts.openai_addr,
+            .port = opts.openai_port,
+            .seed = opts.seed,
+            .model_id = opts.model,
+            .engine_lock = &engine_lock,
+            .meter = &meter,
+        };
+        const t = try std.Thread.spawn(.{}, openaiThread, .{&openai_ctx});
+        t.detach();
+    }
+
     var rpc_ctx = rpc.Ctx{
         .gpa = gpa,
         .io = io,
@@ -477,6 +508,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .seed = opts.seed,
         .meter = &meter,
         .admin_token = opts.admin_token,
+        .engine_lock = &engine_lock,
     };
     rpc.serve(&rpc_ctx) catch |e| {
         try out.print("rpc server error: {s}\n", .{@errorName(e)});

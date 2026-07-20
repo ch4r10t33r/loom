@@ -35,9 +35,10 @@ pub const Ctx = struct {
     /// {"error":"payment_required"} until credited.
     meter: ?*meter_mod.Meter = null,
     /// The engine holds mutable per-request state, so generation is serialized
-    /// across connections by this mutex; connections otherwise run concurrently
-    /// so one idle/slow client never blocks the accept loop.
-    engine_lock: Io.Mutex = .init,
+    /// by this mutex; connections otherwise run concurrently so one idle/slow
+    /// client never blocks the accept loop. Shared (by pointer) with the
+    /// OpenAI surface (openai.zig) so both serve paths serialize on one engine.
+    engine_lock: *Io.Mutex,
 };
 
 const Conn = struct { ctx: *Ctx, stream: net.Stream };

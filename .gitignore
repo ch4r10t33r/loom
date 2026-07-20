@@ -4,3 +4,6 @@ zig-out/
 
 # locally extracted package cache
 zig-pkg/
+
+# macOS
+.DS_Store
