@@ -15,7 +15,7 @@ One binary, `loom`, provides:
 | [`loom run`](#loom-run--one-shot-local-inference) | one-shot local inference against a loom checkpoint (no servers) |
 | [`loom gen`](#loom-gen--generate-a-synthetic-checkpoint) / [`loom info`](#loom-info--inspect--verify-a-checkpoint) | create / inspect+verify loom-format checkpoints |
 | [`loom gguf`](#loom-gguf--gguf-tools-gen--info--shard--run) | GGUF tools: make a fixture, inspect a file, **shard by expert**, run llama/deepseek2 models |
-| [`loom light`](#loom-light--delegating-light-node) | **light node**: no weights/engine; same local RPC, delegates to full nodes, metered by them |
+| [`loom light`](#loom-light--delegating-light-node) | **light node**: no weights/engine; delegates the native RPC and/or OpenAI API to full nodes, metered by them |
 | [`loom iobench`](#loom-iobench--disk-profiler) | disk profiler for the random-read pattern the engine issues |
 
 ## Build
@@ -47,16 +47,17 @@ loom gguf run stories15M-q4_0.gguf --prompt "Once upon a time"
 ## `loom node` — run an inference + weight-sharing node
 
 ```
-loom node [--model SPEC] [--rpc-addr A] [--rpc-port P] [--p2p-addr A] [--p2p-port P]
-          [--ram-gb X] [--pin-gb Y] [--seed S] [--stats FILE] [--no-verify]
-          [--gguf FILE | --bootstrap HOST:PORT] [--peers H:P,H:P,...]
-          [--hold-fraction F] [--range-mb M] [--advertise HOST:PORT]
+loom node [--model SPEC] [--rpc-addr A] [--rpc-port P] [--openai-addr A] [--openai-port P]
+          [--p2p-addr A] [--p2p-port P] [--ram-gb X] [--pin-gb Y] [--seed S]
+          [--stats FILE] [--no-verify] [--gguf FILE | --bootstrap HOST:PORT]
+          [--peers H:P,H:P,...] [--hold-fraction F] [--range-mb M] [--advertise HOST:PORT]
 ```
 
 Starts a long-running node that (a) loads a loom-format model and serves
-inference over **RPC**, (b) optionally participates in **GGUF weight
-distribution** over **P2P**, with gossip-based peer discovery and eager churn
-repair. Every flag has a default, so `loom node` alone works.
+inference over the native **RPC** and an optional **OpenAI-compatible HTTP
+API**, (b) optionally participates in **GGUF weight distribution** over **P2P**,
+with gossip-based peer discovery and eager churn repair. Every flag has a
+default, so `loom node` alone works.
 
 ### Model & engine flags
 
@@ -76,6 +77,7 @@ Env overrides (flags win): `MODEL`, `RAM_BUDGET_GB`, `PIN_GB`, `SEED`, `STATS`.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--rpc-addr` / `--rpc-port` | `127.0.0.1` / `8770` | Where the JSON inference RPC listens. Bind `0.0.0.0` to accept remote clients. |
+| `--openai-addr` / `--openai-port` | `<rpc-addr>` / `0` (off) | Where the **OpenAI-compatible HTTP API** listens. Set `--openai-port` to enable it (e.g. `8772`). Serves the same engine as the RPC, metered by `Authorization: Bearer` client id. |
 | `--p2p-addr` / `--p2p-port` | `0.0.0.0` / `8771` | Where the P2P line protocol listens (expert directory, weight ranges, gossip). |
 | `--advertise HOST:PORT` | `127.0.0.1:<p2p-port>` | The dialable address this node announces to peers via gossip. Set it to your LAN/public address when peers are on other machines. |
 
@@ -125,6 +127,33 @@ printf '{"prompt":"Loom weaves","max_tokens":24,"temp":0.0,"seed":7}\n' | nc -w 
 
 `temp <= 0` = greedy (deterministic); `hit_rate` is the expert-cache hit rate
 for the connection so far. Errors come back as `{"ok":false,"error":"..."}`.
+
+### OpenAI-compatible API
+
+Enable with `--openai-port` to let off-the-shelf clients (OpenWebUI, Continue,
+aider, the OpenAI SDKs, curl) talk to the node with no adapter. It serves the
+same engine as the native RPC and is metered by the same ledger, using the
+`Authorization: Bearer <token>` header as the client id (out-of-band, so it is
+not forgeable by prompt content). Routes: `GET /v1/models`,
+`POST /v1/chat/completions`, `POST /v1/completions`, `GET /health`.
+
+```sh
+loom node --openai-port 8772 &
+
+curl -s http://127.0.0.1:8772/v1/chat/completions \
+  -H 'Authorization: Bearer sk-alice' \
+  -d '{"model":"tiny","messages":[{"role":"user","content":"hi"}],"max_tokens":16,"seed":7}'
+# {"id":"chatcmpl-loom-1","object":"chat.completion","created":0,"model":"tiny",
+#  "choices":[{"index":0,"message":{"role":"assistant","content":"..."},"finish_reason":"length"}],
+#  "usage":{"prompt_tokens":19,"completion_tokens":16,"total_tokens":35}}
+```
+
+Output is byte-identical to the native RPC path for the same prompt/seed/params.
+`usage` is the real token count and the ledger's cost unit; an exhausted client
+gets HTTP `402`. `stream:true` returns `501` for now (the engine generates
+non-incrementally; SSE streaming is tracked separately). Chat `messages[]` are
+assembled into a basic role-labeled prompt in v1; full per-model chat templates
+are a follow-up.
 
 ### P2P protocol (line-based; one command per line)
 
@@ -218,25 +247,39 @@ histogram (rank, expert id, count, cumulative coverage, cumulative pin bytes).
 ## `loom light` — delegating light node
 
 ```
-loom light --full-nodes H:RPC_PORT[,H:P...] [--rpc-addr A] [--rpc-port P] [--client-id ID]
+loom light [--full-nodes H:RPC_PORT[,...]] [--openai-port P --openai-full-nodes H:OPENAI_PORT[,...]]
+           [--rpc-addr A] [--rpc-port P] [--openai-addr A] [--client-id ID]
 ```
 
 For low-memory devices: holds no weights, no store, no engine (megabytes of
-footprint). Serves the same line-delimited JSON RPC locally (default port
-8768) and delegates every request to a full node — round-robin with failover
-— stamping `--client-id` on each request. Full nodes **meter** clients:
-responses carry `cost` (prompt + generated tokens) and `balance`; when a
-client's allowance (`--free-quota` on the full node + credits − usage) hits
-zero, requests get `{"error":"payment_required"}` until credited via the
+footprint). It exposes the native line-JSON RPC and/or an **OpenAI-compatible
+HTTP API**, and transparently delegates every request to a full node — round-robin
+with failover — forcing its `--client-id` so a caller cannot spend under another
+identity (a caller-supplied `client` field or `Authorization` bearer is dropped).
+Configure at least one surface: `--full-nodes` for the native RPC (default port
+8768), and/or `--openai-port` with `--openai-full-nodes` for the OpenAI surface.
+
+Full nodes **meter** clients: the native RPC responses carry `cost` (prompt +
+generated tokens) and `balance`, the OpenAI responses carry the `usage` object;
+when a client's allowance (`--free-quota` on the full node + credits − usage)
+hits zero, requests get `payment_required` / HTTP `402` until credited via the
 settlement stub (`{"method":"credit","client":ID,"amount":N}` — proof
 verification is the planned payment-rail integration point;
 `{"method":"tab","client":ID}` shows the ledger).
 
 ```sh
+# native RPC delegation
 loom node --free-quota 5000 &                # full node, metered
 loom light --full-nodes 127.0.0.1:8770 --client-id alice &
 printf '{"prompt":"hi","max_tokens":16}\n' | nc -w 3 127.0.0.1 8768
 # {"ok":true,...,"cost":18,"balance":4982}
+
+# OpenAI delegation (light node proxies to a full node's OpenAI port)
+loom node --openai-port 8772 --free-quota 5000 &
+loom light --openai-port 9000 --openai-full-nodes 127.0.0.1:8772 --client-id alice &
+curl -s http://127.0.0.1:9000/v1/chat/completions \
+  -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
+# metered as 'alice' on the full node, regardless of any bearer the caller sends
 ```
 
 ## `loom gen` — generate a synthetic checkpoint
@@ -494,6 +537,9 @@ src/node/     the daemon: node orchestration, RPC server, model resolver
 | `node/node.zig` | `loom node` orchestration: model → engine → RPC/P2P/gossip/repair |
 | `node/hf.zig` | model resolver: local dir / synthetic / Hugging Face download (local-first) |
 | `node/rpc.zig` | JSON-over-TCP inference server (concurrent connections, serialized generate) |
+| `node/openai.zig` | OpenAI-compatible HTTP API: `/v1/chat/completions`, `/v1/completions`, `/v1/models` (shares the engine + meter with `rpc.zig`) |
+| `node/light.zig` | light-node native-RPC delegator (forces client id, round-robin failover) |
+| `node/light_openai.zig` | light-node OpenAI delegator: metered reverse proxy to full-node OpenAI endpoints |
 | `p2p/p2p.zig` | P2P line protocol: expert directory, weight ranges, gossip |
 | `p2p/weights.zig` | range-sharded GGUF store: manifest, version id, holdings/wanted bitmaps, verified IO |
 | `p2p/sync.zig` | peer sync client: manifest adoption, root verification, multi-peer range fetch |
