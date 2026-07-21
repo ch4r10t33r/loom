@@ -14,20 +14,22 @@
 //! `client` field). Usage maps onto the OpenAI `usage` object, which is already
 //! the ledger's cost unit.
 //!
-//! v1 STATUS: SKELETON. Transport, routing, request/response shapes, and bearer
-//! identity are implemented; the responses are well-formed OpenAI envelopes with
-//! a placeholder completion (`loom_status:"skeleton"`). The following are TODO,
-//! called out at their call sites:
-//!   - render `messages[]` -> prompt via the model chat template, then
-//!     `engine.generate` (serialized on the shared `engine_lock`);
-//!   - charge the meter from real prompt+completion token counts;
-//!   - SSE streaming for `stream:true` (`data:` chunks + `data: [DONE]`).
+//! v1 STATUS: generation wired (issue #15). `POST /v1/chat/completions` and
+//! `POST /v1/completions` run the loaded model over the shared `engine_lock` and
+//! return real completions with a real `usage` object, metered by bearer id.
+//! Still TODO (separate issues):
+//!   - SSE streaming for `stream:true` (`data:` chunks + `data: [DONE]`); the
+//!     engine generates non-incrementally today, so streaming stays 501;
+//!   - full per-model chat-template fidelity (v1 assembles a basic role-labeled
+//!     prompt from `messages[]`);
+//!   - light-node delegation of the OpenAI surface.
 
 const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
 const engine_mod = @import("../engine/engine.zig");
 const Engine = engine_mod.Engine;
+const tokenizer = @import("../engine/tokenizer.zig");
 const meter_mod = @import("meter.zig");
 
 pub const Ctx = struct {
@@ -223,9 +225,7 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool) !Response {
     // Identity from the bearer token (SPEC.md: out-of-band, not prompt-forgeable).
     const client: []const u8 = if (req.bearer.len > 0) req.bearer else "anon";
 
-    // Metering gate: refuse an exhausted client before any work. In the
-    // skeleton nothing is charged, so this only trips a pre-credited-to-zero
-    // client; it wires the integration point.
+    // Metering gate: refuse an exhausted client before any work.
     if (ctx.meter) |m| {
         if (m.remaining(client) == 0) {
             const b = try errorJson(gpa, "insufficient balance", "insufficient_quota", "payment_required");
@@ -233,44 +233,147 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool) !Response {
         }
     }
 
-    // Model override from the request body (best-effort; defaults to ours).
+    // Parse the body once for model / stream / params / prompt.
     var model_id: []const u8 = ctx.model_id;
     var stream = false;
+    var max_tokens: usize = 128;
+    var temp: f32 = 0.0;
+    var seed: u64 = ctx.seed;
     var parsed: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(std.json.Value, gpa, req.body, .{}) catch null;
     defer if (parsed) |*p| p.deinit();
     if (parsed) |p| if (p.value == .object) {
-        if (p.value.object.get("model")) |mv| if (mv == .string) {
-            model_id = mv.string;
+        const o = p.value.object;
+        if (o.get("model")) |v| if (v == .string) {
+            model_id = v.string;
         };
-        if (p.value.object.get("stream")) |sv| if (sv == .bool) {
-            stream = sv.bool;
+        if (o.get("stream")) |v| if (v == .bool) {
+            stream = v.bool;
+        };
+        if (o.get("max_tokens")) |v| if (v == .integer and v.integer > 0) {
+            max_tokens = @intCast(v.integer);
+        };
+        if (o.get("temperature")) |v| switch (v) {
+            .float => temp = @floatCast(v.float),
+            .integer => temp = @floatFromInt(v.integer),
+            else => {},
+        };
+        if (o.get("seed")) |v| if (v == .integer and v.integer >= 0) {
+            seed = @intCast(v.integer);
         };
     };
 
-    // TODO(stream): SSE streaming will emit `data:` chunks + `data: [DONE]`.
-    // Until then a streaming client is told plainly rather than left hanging.
+    // The engine generates non-incrementally, so true token streaming is not
+    // possible yet; a streaming client is told plainly rather than left hanging.
     if (stream) {
-        const b = try errorJson(gpa, "streaming not yet implemented (skeleton)", "invalid_request_error", "not_implemented");
+        const b = try errorJson(gpa, "streaming not yet implemented", "invalid_request_error", "not_implemented");
         return .{ .status = 501, .body = b };
     }
 
-    // TODO(generate): render messages[]/prompt via the model chat template,
-    // then serialize on ctx.engine_lock and call ctx.engine.generate(...); map
-    // token counts onto the usage object and charge ctx.meter. Until then, a
-    // well-formed OpenAI envelope with a placeholder completion.
+    // Assemble the prompt: chat messages -> role-labeled text, or the raw
+    // `prompt` field for the completions endpoint.
+    const prompt_text = if (is_chat)
+        try assembleChatPrompt(gpa, parsed)
+    else
+        try gpa.dupe(u8, promptField(parsed));
+    defer gpa.free(prompt_text);
+
+    const prompt_tok = try tokenizer.encode(gpa, prompt_text);
+    defer gpa.free(prompt_tok);
+
+    // Clamp the generation length to what the client can pay for (mirrors rpc).
+    if (ctx.meter) |m| {
+        const rem = m.remaining(client);
+        const budget = if (rem > prompt_tok.len) rem - prompt_tok.len else 0;
+        max_tokens = @intCast(@min(@as(u64, max_tokens), budget));
+    }
+
+    // Generate under the shared engine mutex (rpc + openai serialize here).
+    var produced = std.ArrayList(usize).empty;
+    defer produced.deinit(gpa);
+    ctx.engine_lock.lockUncancelable(ctx.io);
+    const n = ctx.engine.generate(prompt_tok, max_tokens, temp, seed, &produced) catch |e| {
+        ctx.engine_lock.unlock(ctx.io);
+        return e;
+    };
+    ctx.engine_lock.unlock(ctx.io);
+
+    // Decode produced token bytes and JSON-escape them for the envelope.
+    const out_bytes = try gpa.alloc(u8, produced.items.len);
+    defer gpa.free(out_bytes);
+    for (produced.items, 0..) |tok, i| out_bytes[i] = tokenizer.decodeByte(tok);
+    const content = try jsonEscapeAlloc(gpa, out_bytes);
+    defer gpa.free(content);
+
+    // Charge the ledger: prompt tokens processed + tokens generated.
+    if (ctx.meter) |m| {
+        _ = try m.charge(client, @intCast(prompt_tok.len + n));
+    }
+
+    const finish: []const u8 = if (n < max_tokens) "stop" else "length";
     const id = id_counter.fetchAdd(1, .monotonic) + 1;
-    const placeholder = "loom OpenAI-compatible endpoint is a skeleton: generation is not yet wired to the engine.";
 
     const body = if (is_chat)
         try std.fmt.allocPrint(gpa,
-            \\{{"id":"chatcmpl-loom-{d}","object":"chat.completion","created":0,"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}},"loom_status":"skeleton"}}
-        , .{ id, model_id, placeholder })
+            \\{{"id":"chatcmpl-loom-{d}","object":"chat.completion","created":0,"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+        , .{ id, model_id, content, finish, prompt_tok.len, n, prompt_tok.len + n })
     else
         try std.fmt.allocPrint(gpa,
-            \\{{"id":"cmpl-loom-{d}","object":"text_completion","created":0,"model":"{s}","choices":[{{"index":0,"text":"{s}","finish_reason":"stop"}}],"usage":{{"prompt_tokens":0,"completion_tokens":0,"total_tokens":0}},"loom_status":"skeleton"}}
-        , .{ id, model_id, placeholder });
+            \\{{"id":"cmpl-loom-{d}","object":"text_completion","created":0,"model":"{s}","choices":[{{"index":0,"text":"{s}","finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+        , .{ id, model_id, content, finish, prompt_tok.len, n, prompt_tok.len + n });
 
     return .{ .status = 200, .body = body };
+}
+
+/// Flatten OpenAI chat `messages[]` into a role-labeled prompt. v1 is a basic
+/// template (a per-model chat template from GGUF metadata is a follow-up); the
+/// resident engine is byte-level, so exact formatting is not load-bearing yet.
+fn assembleChatPrompt(gpa: std.mem.Allocator, parsed: ?std.json.Parsed(std.json.Value)) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(gpa);
+    if (parsed) |p| if (p.value == .object) {
+        if (p.value.object.get("messages")) |mv| if (mv == .array) {
+            for (mv.array.items) |el| {
+                if (el != .object) continue;
+                const role = switch (el.object.get("role") orelse .null) {
+                    .string => |s| s,
+                    else => "user",
+                };
+                const content = switch (el.object.get("content") orelse .null) {
+                    .string => |s| s,
+                    else => continue, // array/structured content: unsupported in v1
+                };
+                try buf.print(gpa, "{s}: {s}\n", .{ role, content });
+            }
+        };
+    };
+    try buf.appendSlice(gpa, "assistant:");
+    return buf.toOwnedSlice(gpa);
+}
+
+fn promptField(parsed: ?std.json.Parsed(std.json.Value)) []const u8 {
+    if (parsed) |p| if (p.value == .object) {
+        if (p.value.object.get("prompt")) |v| if (v == .string) return v.string;
+    };
+    return "";
+}
+
+/// JSON-escape a raw byte slice into an owned string (no surrounding quotes).
+fn jsonEscapeAlloc(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(gpa);
+    for (bytes) |b| switch (b) {
+        '"' => try buf.appendSlice(gpa, "\\\""),
+        '\\' => try buf.appendSlice(gpa, "\\\\"),
+        '\n' => try buf.appendSlice(gpa, "\\n"),
+        '\r' => try buf.appendSlice(gpa, "\\r"),
+        '\t' => try buf.appendSlice(gpa, "\\t"),
+        0x20...0x21, 0x23...0x5b, 0x5d...0x7e => try buf.append(gpa, b),
+        else => {
+            var tmp: [6]u8 = undefined;
+            try buf.appendSlice(gpa, try std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{b}));
+        },
+    };
+    return buf.toOwnedSlice(gpa);
 }
 
 // ---- helpers ---------------------------------------------------------------

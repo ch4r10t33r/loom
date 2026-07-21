@@ -391,7 +391,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         s.expert_bytes, s.lru_capacity, s.pinned_experts, @as(f64, @floatFromInt(opts.ram_bytes)) / GB,
     });
     try out.print("  rpc        tcp://{s}:{d}   (metered; free quota {d} tokens/client; credit {s})\n", .{ opts.rpc_addr, opts.rpc_port, opts.free_quota, if (opts.admin_token.len > 0) "admin-gated" else "disabled" });
-    if (opts.openai_port != 0) try out.print("  openai     http://{s}:{d}/v1  (OpenAI-compatible; SKELETON: stub completions)\n", .{ opts.openai_addr, opts.openai_port });
+    if (opts.openai_port != 0) try out.print("  openai     http://{s}:{d}/v1  (OpenAI-compatible; metered; non-streaming)\n", .{ opts.openai_addr, opts.openai_port });
     try out.print("  p2p        tcp://{s}:{d}   (HELLO | HAS | MANIFEST | DIGESTS | HOLDINGS | GETR | GOSSIP | TABLE | PING)\n", .{ opts.p2p_addr, opts.p2p_port });
     try out.print("  gossip     advertising as {s}, {d} seed peer(s), every {d}s\n", .{
         advertise, peer_strs.items.len, @divTrunc(gossip.INTERVAL_NS, std.time.ns_per_s),
