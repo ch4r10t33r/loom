@@ -41,6 +41,7 @@ pub const bpe = @import("gguf/bpe.zig");
 pub const bootnode = @import("p2p/bootnode.zig");
 pub const wire = @import("p2p/wire.zig");
 pub const light = @import("node/light.zig");
+pub const light_openai = @import("node/light_openai.zig");
 pub const meter = @import("node/meter.zig");
 
 const GB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -96,7 +97,8 @@ fn usage(out: *Io.Writer) !void {
         \\            [--gguf FILE | --bootstrap HOST:PORT]
         \\            [--peers H:P,H:P,...] [--hold-fraction F] [--range-mb M]
         \\            [--advertise HOST:PORT] [--r-target N] [--free-quota TOKENS] [--admin-token TOK]
-        \\  loom light --full-nodes H:P[,H:P...] [--rpc-addr A] [--rpc-port P] [--client-id ID]
+        \\  loom light [--full-nodes H:P[,...]] [--openai-port P --openai-full-nodes H:P[,...]]
+        \\             [--rpc-addr A] [--rpc-port P] [--openai-addr A] [--client-id ID]
         \\  loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2]
         \\  loom gguf info <file> [--range-mb M]
         \\  loom gguf shard <file>
@@ -369,42 +371,90 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
 
 /// Light node (SPEC.md node classes): no weights, no engine — a local RPC that
 /// delegates to full nodes and gets metered by them.
-fn cmdLight(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) !void {
-    const fn_csv = flagStr(args, "--full-nodes") orelse
-        return out.print("light: need --full-nodes HOST:RPC_PORT[,...]\n", .{});
+fn parseBackends(gpa: std.mem.Allocator, out: *Io.Writer, csv: []const u8, label: []const u8) !?std.ArrayList(sync.PeerAddr) {
     var backends = std.ArrayList(sync.PeerAddr).empty;
-    defer backends.deinit(gpa);
-    var it = std.mem.splitScalar(u8, fn_csv, ',');
+    errdefer backends.deinit(gpa);
+    var it = std.mem.splitScalar(u8, csv, ',');
     while (it.next()) |tok| {
         const t = std.mem.trim(u8, tok, " ");
         if (t.len == 0) continue;
-        const a = sync.PeerAddr.parse(t) catch return out.print("bad --full-nodes entry: {s}\n", .{t});
+        const a = sync.PeerAddr.parse(t) catch {
+            try out.print("bad {s} entry: {s}\n", .{ label, t });
+            backends.deinit(gpa);
+            return null;
+        };
         try backends.append(gpa, a);
     }
+    return backends;
+}
+
+fn lightOpenaiThread(ctx: *light_openai.Ctx) void {
+    light_openai.serve(ctx) catch |e| std.debug.print("light-openai: {s}\n", .{@errorName(e)});
+}
+
+fn cmdLight(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) !void {
     const rpc_addr = flagStr(args, "--rpc-addr") orelse "127.0.0.1";
     const rpc_port = try flagU16(args, "--rpc-port", 8768);
+    const openai_addr = flagStr(args, "--openai-addr") orelse rpc_addr;
+    const openai_port = try flagU16(args, "--openai-port", 0); // 0 = OpenAI off
     const client_id = flagStr(args, "--client-id") orelse "light-anon";
 
+    // Native RPC backends (--full-nodes) and/or OpenAI backends
+    // (--openai-full-nodes). At least one serving surface must be configured.
+    var rpc_backends: ?std.ArrayList(sync.PeerAddr) = null;
+    defer if (rpc_backends) |*b| b.deinit(gpa);
+    if (flagStr(args, "--full-nodes")) |csv| {
+        rpc_backends = (try parseBackends(gpa, out, csv, "--full-nodes")) orelse return;
+    }
+    var oai_backends: ?std.ArrayList(sync.PeerAddr) = null;
+    defer if (oai_backends) |*b| b.deinit(gpa);
+    if (flagStr(args, "--openai-full-nodes")) |csv| {
+        oai_backends = (try parseBackends(gpa, out, csv, "--openai-full-nodes")) orelse return;
+    }
+
+    const serve_rpc = rpc_backends != null;
+    const serve_openai = openai_port != 0;
+    if (!serve_rpc and !serve_openai) {
+        return out.print("light: configure --full-nodes (native RPC) and/or --openai-port with --openai-full-nodes\n", .{});
+    }
+    if (serve_openai and oai_backends == null) {
+        return out.print("light: --openai-port needs --openai-full-nodes HOST:OPENAI_PORT[,...]\n", .{});
+    }
+
     try out.print("loom light node up (no weights, no engine)\n", .{});
-    try out.print("  local rpc  tcp://{s}:{d}   (same JSON protocol; requests delegated)\n", .{ rpc_addr, rpc_port });
-    try out.print("  backends   {d} full node(s), round-robin with failover\n", .{backends.items.len});
-    try out.print("  client id  {s}  (stamped on requests; metered by full nodes)\n", .{client_id});
+    if (serve_rpc) try out.print("  local rpc  tcp://{s}:{d}   ({d} backend(s); JSON protocol delegated)\n", .{ rpc_addr, rpc_port, rpc_backends.?.items.len });
+    if (serve_openai) try out.print("  openai     http://{s}:{d}/v1  ({d} backend(s); OpenAI requests delegated)\n", .{ openai_addr, openai_port, oai_backends.?.items.len });
+    try out.print("  client id  {s}  (forced on requests; metered by full nodes)\n", .{client_id});
     try out.print("  serving... (Ctrl-C to stop)\n", .{});
     try out.flush();
 
-    var ctx = light.Ctx{
-        .gpa = gpa,
-        .io = io,
-        .opts = .{
+    // OpenAI delegator on a thread; native RPC delegator blocks (or OpenAI does
+    // if native is not configured).
+    var oai_ctx: light_openai.Ctx = undefined;
+    if (serve_openai) {
+        oai_ctx = .{ .gpa = gpa, .io = io, .opts = .{
+            .addr = openai_addr,
+            .port = openai_port,
+            .backends = oai_backends.?.items,
+            .client_id = client_id,
+        } };
+        if (serve_rpc) {
+            const t = try std.Thread.spawn(.{}, lightOpenaiThread, .{&oai_ctx});
+            t.detach();
+        }
+    }
+
+    if (serve_rpc) {
+        var ctx = light.Ctx{ .gpa = gpa, .io = io, .opts = .{
             .rpc_addr = rpc_addr,
             .rpc_port = rpc_port,
-            .full_nodes = backends.items,
+            .full_nodes = rpc_backends.?.items,
             .client_id = client_id,
-        },
-    };
-    light.serve(&ctx) catch |e| {
-        try out.print("light rpc error: {s}\n", .{@errorName(e)});
-    };
+        } };
+        light.serve(&ctx) catch |e| try out.print("light rpc error: {s}\n", .{@errorName(e)});
+    } else {
+        lightOpenaiThread(&oai_ctx); // OpenAI-only: block here
+    }
 }
 
 // ---- gguf ------------------------------------------------------------------
