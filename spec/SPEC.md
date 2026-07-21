@@ -66,13 +66,16 @@ via its chat template (read from GGUF metadata alongside the tokenizer).
 Token-by-token generation maps to OpenAI SSE streaming (`stream: true`) as
 `data:` chunks terminated by `data: [DONE]`.
 
-**v1 status: skeleton.** The component ([src/node/openai.zig](../src/node/openai.zig))
-implements the HTTP transport, routing, the OpenAI request/response structs, and
-bearer-token identity extraction. It returns well-formed OpenAI-shaped responses
-with a placeholder completion (`loom_status: "skeleton"`); the engine-generation
-path, chat-template rendering, and SSE streaming are marked TODO. Light-node
-delegation of the OpenAI surface is a follow-up (light nodes currently delegate
-only the native RPC).
+**v1 status.** The component ([src/node/openai.zig](../src/node/openai.zig))
+implements the HTTP transport, routing, the OpenAI request/response structs,
+bearer-token identity, and real generation for `POST /v1/chat/completions` and
+`POST /v1/completions`: the loaded model runs over the shared engine mutex and
+returns a real `usage` object, metered by bearer id, byte-identical to the native
+RPC path for the same prompt/seed. Still TODO: SSE streaming (`stream:true`
+returns 501, since the engine generates non-incrementally today), full per-model
+chat-template fidelity (v1 assembles a basic role-labeled prompt from
+`messages[]`), and light-node delegation of the OpenAI surface (light nodes
+currently delegate only the native RPC).
 
 ## Metering and compensation
 
