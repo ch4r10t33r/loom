@@ -180,7 +180,7 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
 
     ctx.engine_lock.lockUncancelable(ctx.io);
     const t0 = stats.nowNs(ctx.io);
-    var res = ctx.gen.generate(gpa, ctx.io, prompt_str, max_tokens, temp, seed, budget) catch |e| {
+    var res = ctx.gen.generate(gpa, ctx.io, prompt_str, max_tokens, temp, seed, budget, null) catch |e| {
         ctx.engine_lock.unlock(ctx.io);
         return e;
     };

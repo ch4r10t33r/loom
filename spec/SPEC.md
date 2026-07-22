@@ -71,11 +71,11 @@ implements the HTTP transport, routing, the OpenAI request/response structs,
 bearer-token identity, and real generation for `POST /v1/chat/completions` and
 `POST /v1/completions`: the loaded model runs over the shared engine mutex and
 returns a real `usage` object, metered by bearer id, byte-identical to the native
-RPC path for the same prompt/seed. Still TODO: SSE streaming (`stream:true`
-returns 501, since the engine generates non-incrementally today), full per-model
-chat-template fidelity (v1 assembles a basic role-labeled prompt from
-`messages[]`), and light-node delegation of the OpenAI surface (light nodes
-currently delegate only the native RPC).
+RPC path for the same prompt/seed. `stream:true` streams the completion as OpenAI
+Server-Sent Events (one `data:` chunk per token, then `[DONE]`) over both the
+loom and distributed-GGUF engines. Light nodes delegate the OpenAI surface to
+full nodes (metered reverse proxy). Still TODO: full per-model chat-template
+fidelity (v1 assembles a basic role-labeled prompt from `messages[]`).
 
 ## Metering and compensation
 

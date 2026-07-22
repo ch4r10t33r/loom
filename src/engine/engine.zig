@@ -141,6 +141,12 @@ pub const Engine = struct {
 
     /// Feed `prompt` tokens then generate up to `max_new` tokens, appending each
     /// generated token to `out`. Returns the number generated. Greedy if temp<=0.
+    /// Per-token callback for streaming (fires as each token is committed).
+    pub const TokenCb = struct {
+        ctx: *anyopaque,
+        cb: *const fn (ctx: *anyopaque, token: usize) anyerror!void,
+    };
+
     pub fn generate(
         self: *Engine,
         prompt: []const usize,
@@ -148,6 +154,7 @@ pub const Engine = struct {
         temp: f32,
         seed: u64,
         out: *std.ArrayList(usize),
+        on_token: ?TokenCb,
     ) !usize {
         self.kv.len = 0;
         var s = self.state();
@@ -169,6 +176,7 @@ pub const Engine = struct {
         while (produced < max_new) : (produced += 1) {
             if (pos >= self.cfg.max_seq_len) break;
             try out.append(self.gpa, last);
+            if (on_token) |t| try t.cb(t.ctx, last);
             try forward.step(&s, last, pos, self.logits);
             pos += 1;
             last = sampler.sample(sample_scratch, self.logits, temp, rnd);

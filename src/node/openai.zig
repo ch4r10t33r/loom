@@ -14,15 +14,13 @@
 //! `client` field). Usage maps onto the OpenAI `usage` object, which is already
 //! the ledger's cost unit.
 //!
-//! v1 STATUS: generation wired (issue #15). `POST /v1/chat/completions` and
-//! `POST /v1/completions` run the loaded model over the shared `engine_lock` and
-//! return real completions with a real `usage` object, metered by bearer id.
-//! Still TODO (separate issues):
-//!   - SSE streaming for `stream:true` (`data:` chunks + `data: [DONE]`); the
-//!     engine generates non-incrementally today, so streaming stays 501;
-//!   - full per-model chat-template fidelity (v1 assembles a basic role-labeled
-//!     prompt from `messages[]`);
-//!   - light-node delegation of the OpenAI surface.
+//! STATUS: generation wired (issue #15) with SSE streaming (issue #18).
+//! `POST /v1/chat/completions` and `POST /v1/completions` run the loaded model
+//! over the shared `engine_lock` and return real completions with a real `usage`
+//! object, metered by bearer id. `stream:true` writes an OpenAI `text/event-stream`
+//! (one `data:` chunk per token, then `data: [DONE]`) over both the loom and
+//! distributed-GGUF engines. Still TODO: full per-model chat-template fidelity
+//! (v1 assembles a basic role-labeled prompt from `messages[]`).
 
 const std = @import("std");
 const Io = std.Io;
@@ -111,9 +109,12 @@ fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
     };
     defer req.deinit(ctx.gpa);
 
-    const resp = route(ctx, req);
-    defer ctx.gpa.free(resp.body);
-    try writeHttp(wi, resp.status, resp.body);
+    // A streaming handler writes the SSE response to `wi` itself and returns
+    // null; otherwise we get a buffered Response to write here.
+    if (try route(ctx, req, wi)) |resp| {
+        defer ctx.gpa.free(resp.body);
+        try writeHttp(wi, resp.status, resp.body);
+    }
 }
 
 // ---- request parsing -------------------------------------------------------
@@ -192,7 +193,9 @@ fn headerValue(h: []const u8) []const u8 {
 
 const Response = struct { status: u16, body: []u8 };
 
-fn route(ctx: *Ctx, req: Request) Response {
+/// Returns a buffered Response to write, or null if the handler already wrote
+/// the response to `wi` (streaming).
+fn route(ctx: *Ctx, req: Request, wi: *Io.Writer) !?Response {
     const gpa = ctx.gpa;
     const path = stripQuery(req.path);
 
@@ -203,7 +206,7 @@ fn route(ctx: *Ctx, req: Request) Response {
         return handleModels(ctx) catch fallback();
     }
     if (eql(req.method, "POST") and (eql(path, "/v1/chat/completions") or eql(path, "/v1/completions"))) {
-        return handleCompletions(ctx, req, eql(path, "/v1/chat/completions")) catch fallback();
+        return handleCompletions(ctx, req, eql(path, "/v1/chat/completions"), wi) catch fallback();
     }
 
     const b = errorJson(gpa, "unknown route", "invalid_request_error", "not_found") catch return fallback();
@@ -217,7 +220,7 @@ fn handleModels(ctx: *Ctx) !Response {
     return .{ .status = 200, .body = body };
 }
 
-fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool) !Response {
+fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer) !?Response {
     const gpa = ctx.gpa;
 
     // Identity from the bearer token (SPEC.md: out-of-band, not prompt-forgeable).
@@ -260,26 +263,26 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool) !Response {
         };
     };
 
-    // The engine generates non-incrementally, so true token streaming is not
-    // possible yet; a streaming client is told plainly rather than left hanging.
-    if (stream) {
-        const b = try errorJson(gpa, "streaming not yet implemented", "invalid_request_error", "not_implemented");
-        return .{ .status = 501, .body = b };
-    }
-
     // Assemble the prompt: chat messages -> role-labeled text, or the raw
-    // `prompt` field for the completions endpoint.
+    // `prompt` field for the completions endpoint. Shared by both paths.
     const prompt_text = if (is_chat)
         try assembleChatPrompt(gpa, parsed)
     else
         try gpa.dupe(u8, promptField(parsed));
     defer gpa.free(prompt_text);
 
-    // Generate under the shared engine mutex (rpc + openai serialize here). The
-    // metering budget clamps completion length to the remaining allowance.
+    // Metering budget clamps completion length to the remaining allowance.
     const budget: ?u64 = if (ctx.meter) |m| m.remaining(client) else null;
+
+    // Streaming: write the SSE response to the connection and return null.
+    if (stream) {
+        streamCompletions(ctx, wi, is_chat, model_id, client, prompt_text, max_tokens, temp, seed, budget);
+        return null;
+    }
+
+    // Generate under the shared engine mutex (rpc + openai serialize here).
     ctx.engine_lock.lockUncancelable(ctx.io);
-    var res = ctx.gen.generate(gpa, ctx.io, prompt_text, max_tokens, temp, seed, budget) catch |e| {
+    var res = ctx.gen.generate(gpa, ctx.io, prompt_text, max_tokens, temp, seed, budget, null) catch |e| {
         ctx.engine_lock.unlock(ctx.io);
         return e;
     };
@@ -309,6 +312,80 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool) !Response {
         , .{ id, model_id, content, finish, pt, n, pt + n });
 
     return .{ .status = 200, .body = body };
+}
+
+/// SSE streaming sink: emits one `chat.completion.chunk` / `text_completion`
+/// event per token as it is produced. A write error (client disconnected)
+/// propagates out and aborts generation.
+const StreamCtx = struct {
+    wi: *Io.Writer,
+    gpa: std.mem.Allocator,
+    id: u64,
+    model: []const u8,
+    is_chat: bool,
+
+    fn emit(ptr: *anyopaque, bytes: []const u8) anyerror!void {
+        const self: *StreamCtx = @ptrCast(@alignCast(ptr));
+        const esc = try jsonEscapeAlloc(self.gpa, bytes);
+        defer self.gpa.free(esc);
+        if (self.is_chat) {
+            try self.wi.print("data: {{\"id\":\"chatcmpl-loom-{d}\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{s}\"}},\"finish_reason\":null}}]}}\n\n", .{ self.id, self.model, esc });
+        } else {
+            try self.wi.print("data: {{\"id\":\"cmpl-loom-{d}\",\"object\":\"text_completion\",\"created\":0,\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"text\":\"{s}\",\"finish_reason\":null}}]}}\n\n", .{ self.id, self.model, esc });
+        }
+        try self.wi.flush();
+    }
+};
+
+/// Write an OpenAI SSE stream: `text/event-stream` head, one delta event per
+/// token, a final finish_reason event, then `[DONE]`. All connection writes are
+/// best-effort (a dead client just ends the stream); metering is still charged.
+fn streamCompletions(
+    ctx: *Ctx,
+    wi: *Io.Writer,
+    is_chat: bool,
+    model_id: []const u8,
+    client: []const u8,
+    prompt_text: []const u8,
+    max_tokens: usize,
+    temp: f32,
+    seed: u64,
+    budget: ?u64,
+) void {
+    const gpa = ctx.gpa;
+    const id = id_counter.fetchAdd(1, .monotonic) + 1;
+
+    wi.print("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", .{}) catch return;
+    if (is_chat) {
+        wi.print("data: {{\"id\":\"chatcmpl-loom-{d}\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\n", .{ id, model_id }) catch return;
+    }
+    wi.flush() catch return;
+
+    var sctx = StreamCtx{ .wi = wi, .gpa = gpa, .id = id, .model = model_id, .is_chat = is_chat };
+    const sink = generator.TokenSink{ .ctx = &sctx, .emit = StreamCtx.emit };
+
+    ctx.engine_lock.lockUncancelable(ctx.io);
+    var res = ctx.gen.generate(gpa, ctx.io, prompt_text, max_tokens, temp, seed, budget, sink) catch |e| {
+        ctx.engine_lock.unlock(ctx.io);
+        wi.print("data: {{\"error\":{{\"message\":\"{s}\",\"type\":\"server_error\"}}}}\n\ndata: [DONE]\n\n", .{@errorName(e)}) catch {};
+        wi.flush() catch {};
+        return;
+    };
+    ctx.engine_lock.unlock(ctx.io);
+    defer res.deinit(gpa);
+
+    if (ctx.meter) |m| {
+        _ = m.charge(client, @intCast(res.prompt_tokens + res.completion_tokens)) catch {};
+    }
+
+    const finish: []const u8 = if (res.stop) "stop" else "length";
+    if (is_chat) {
+        wi.print("data: {{\"id\":\"chatcmpl-loom-{d}\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}]}}\n\n", .{ id, model_id, finish }) catch return;
+    } else {
+        wi.print("data: {{\"id\":\"cmpl-loom-{d}\",\"object\":\"text_completion\",\"created\":0,\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"text\":\"\",\"finish_reason\":\"{s}\"}}]}}\n\n", .{ id, model_id, finish }) catch return;
+    }
+    wi.print("data: [DONE]\n\n", .{}) catch return;
+    wi.flush() catch return;
 }
 
 /// Flatten OpenAI chat `messages[]` into a role-labeled prompt. v1 is a basic
