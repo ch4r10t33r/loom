@@ -416,8 +416,9 @@ loom gguf run stories15M-q4_0.gguf --prompt "Once upon a time" --max-tokens 100
 Validated against real reference models (`ggml-org/models` tinyllamas:
 stories260K F32/GQA, stories15M Q4_0 and Q8_0, DeepSeek-V2-Lite Q4_K_M) —
 coherent English confirms kernels, attention, RoPE convention, and tokenizer
-simultaneously. Serving GGUF models through `loom node`'s RPC is the next
-integration step.
+simultaneously. `loom node` can also serve the distributed GGUF (deepseek2)
+engine directly over its RPC and OpenAI surfaces — see [Serving a distributed
+GGUF model through the node](#serving-a-distributed-gguf-model-through-the-node).
 
 ### Distributed run: inference from a partial store
 
@@ -440,6 +441,37 @@ loom gguf run ~/.cache/loom/models/gguf-synced --peers 127.0.0.1:8771 \
 # expert tiers: local=2184 peer_fetched=641 (3512.6 MB, avg 29.2 ms/fetch) failures=0
 # holdings grew 573 -> 1214 shards (fetched experts persisted + advertised)
 ```
+
+### Serving a distributed GGUF model through the node
+
+`loom gguf run` above is a one-shot CLI. The **node** serves the same
+distributed engine as a long-running service over its RPC and OpenAI surfaces:
+when `loom node` is given an expert-sharded GGUF (`--gguf` origin, or
+`--bootstrap` to sync a partial store) and its resident bundle is complete, it
+serves the deepseek2 engine and **fetches missing experts from peers inside the
+token loop**. Otherwise it serves the loom-format `--model`. `--ctx N` caps the
+context length (default 4096).
+
+```sh
+# origin: holds the whole expert-sharded model, serves it + acts as bootnode
+loom node --gguf DeepSeek-V2-Lite.Q4_K_M.gguf \
+          --rpc-port 8770 --openai-port 8772 --p2p-port 8771 --advertise 127.0.0.1:8771
+
+# partial node: syncs ~30% of experts, serves the same model; the missing
+# experts stream from the origin during generation (output identical to a full copy)
+HOME=/tmp/nodeB loom node --bootstrap 127.0.0.1:8771 --hold-fraction 0.3 \
+          --rpc-port 8780 --openai-port 8782 --p2p-port 8781 --advertise 127.0.0.1:8781
+
+curl -s http://127.0.0.1:8782/v1/completions -d '{"prompt":"the","max_tokens":8}'
+# a hit_rate below 1.0 on the partial node's RPC response is the token-loop
+# peer fetch at work (experts read from the origin, not held locally)
+```
+
+Store mutation from the token-loop fetch and the eager-repair loop is serialized
+on one engine mutex. The first request on a cold partial node is slow (many
+sequential cold expert fetches); it warms as fetched experts are persisted. This
+is the serving-first, latency-later behavior the design calls for. SSE streaming
+and full per-model chat templates remain follow-ups.
 
 ---
 
@@ -536,6 +568,7 @@ src/node/     the daemon: node orchestration, RPC server, model resolver
 | `engine/forward.zig` / `engine/engine.zig` | forward step wiring; engine lifecycle, RAM-budget → cache sizing |
 | `node/node.zig` | `loom node` orchestration: model → engine → RPC/P2P/gossip/repair |
 | `node/hf.zig` | model resolver: local dir / synthetic / Hugging Face download (local-first) |
+| `node/generator.zig` | generation abstraction over the loom-format engine and the distributed GGUF (deepseek2) engine; both serve paths call it |
 | `node/rpc.zig` | JSON-over-TCP inference server (concurrent connections, serialized generate) |
 | `node/openai.zig` | OpenAI-compatible HTTP API: `/v1/chat/completions`, `/v1/completions`, `/v1/models` (shares the engine + meter with `rpc.zig`) |
 | `node/light.zig` | light-node native-RPC delegator (forces client id, round-robin failover) |

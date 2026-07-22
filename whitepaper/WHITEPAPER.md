@@ -478,8 +478,11 @@ Milestones with exit criteria; full tracking in
 1. **Hardware-tailored kernels** (issues #10 to #14). Exit: a measured
    tokens/sec improvement over scalar on DeepSeek-V2-Lite on a single node, via a
    backend interface with a scalar differential oracle; CPU SIMD first, then GPU.
-2. **Serve the distributed engine through node RPC.** Exit: `loom node` answers
-   inference requests using the token-loop peer fetch, not only `loom gguf run`.
+2. **Serve the distributed engine through node RPC.** Done: `loom node` serves
+   the distributed GGUF (deepseek2) engine over its RPC and OpenAI surfaces,
+   answering inference requests via the token-loop peer fetch, not only
+   `loom gguf run`. A partial-store node's output is byte-identical to a
+   full-store node's for the same prompt.
 3. **Network-tier evaluation.** Exit: a published table of tokens/sec vs miss
    rate across 1 and 10 GbE, and repair time after a sole-holder failure.
 4. **Hardfork coordination.** Exit: a majority of nodes adopting a new manifest
@@ -558,6 +561,7 @@ the spec governs the p2p protocol and the roadmap governs status.
 | 2026-07-20 | Code-audit hardening: version root binds layout; hot-path and serve re-verify; store-open re-audits held shards; resident completeness gate; publish-after-verify cache; credit admin-gated; light node forces client id; token clamp; account cap; snappy decode cap; bounded peer table; monotonic holdings seq; connection caps; death triggers wanted re-replication | Close the gap between "verified before use" and the code; ship the availability bounds the spec named |
 | 2026-07-20 | Documents restructured to standard whitepaper format (front matter, TOC, glossary, related work, references, claim-to-evidence table, limitations); terminology split (expert shard vs resident chunk); decision log demoted to a contributor appendix | Editorial reviews: read as a whitepaper, scope claims precisely, cite external work |
 | 2026-07-20 | Add an OpenAI-compatible HTTP API as the north-facing client surface (`--openai-port`); client identity moves to `Authorization: Bearer`; MCP is not the serving path (a node is more naturally an MCP client) | Ecosystem clients work with no adapter; bearer identity is out-of-band and not prompt-forgeable, unlike the native RPC `client` field. Shipped as a skeleton (`src/node/openai.zig`): transport, routing, shapes, identity; generation/streaming TODO |
+| 2026-07-21 | A `Generator` abstraction (`src/node/generator.zig`) unifies the loom-format and distributed GGUF (deepseek2) engines; both RPC and OpenAI serve through it; the node auto-serves the GGUF engine when an expert-sharded store is attached and its resident bundle is complete | Serves the distributed engine (token-loop peer fetch) through the node, not only `loom gguf run` (roadmap item 2). Store mutation from serving-fetch and eager repair serialize on one engine mutex |
 
 ---
 

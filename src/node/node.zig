@@ -9,6 +9,9 @@ const Engine = engine_mod.Engine;
 const hf = @import("hf.zig");
 const rpc = @import("rpc.zig");
 const openai = @import("openai.zig");
+const generator = @import("generator.zig");
+const deepseek = @import("../gguf/deepseek.zig");
+const expert_fetch = @import("../p2p/expert_fetch.zig");
 const p2p = @import("../p2p/p2p.zig");
 const stats = @import("../core/stats.zig");
 const weights = @import("../p2p/weights.zig");
@@ -47,6 +50,7 @@ pub const Options = struct {
     r_target: u16, // committee redundancy target when acting as bootnode
     free_quota: u64, // per-client free token allowance (metering)
     admin_token: []const u8, // gates the credit op (empty = credit disabled)
+    ctx_cap: usize, // context-length cap when serving a distributed GGUF engine
 };
 
 /// Committee heartbeat (SPEC.md): PING each committee member on a fixed
@@ -192,6 +196,10 @@ const RepairCtx = struct {
     /// Candidate holders come from the live gossip table, so repair reaches
     /// peers this node was never explicitly told about.
     table: *peers.Table,
+    /// Shared with the serving path: repair mutates the store (fetching shards)
+    /// and so does the token-loop expert fetch during generation. Serialize both
+    /// on the one engine mutex so their store writes never interleave.
+    engine_lock: *Io.Mutex,
 };
 
 fn repairThread(ctx: *RepairCtx) void {
@@ -203,6 +211,8 @@ fn repairThread(ctx: *RepairCtx) void {
             for (addrs) |a| ctx.gpa.free(a);
             ctx.gpa.free(addrs);
         }
+        ctx.engine_lock.lockUncancelable(ctx.io);
+        defer ctx.engine_lock.unlock(ctx.io);
         var repaired: usize = 0;
         for (addrs) |addr_str| {
             if (ctx.store.missingCount() == 0) break;
@@ -460,6 +470,79 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         t.detach();
     }
 
+    // One engine mutex shared by every serve path (rpc + openai) AND the eager
+    // repair loop: generation holds mutable per-request state and mutates the
+    // store (token-loop fetch), and repair mutates the store too, so all of it
+    // serializes here.
+    var engine_lock: Io.Mutex = .init;
+
+    // Choose what serves inference. Default: the loom-format engine. If an
+    // expert-sharded GGUF store is attached and its resident bundle is complete,
+    // serve the distributed GGUF (deepseek2) engine with token-loop peer fetch.
+    var gen = generator.Generator{ .loom = &eng };
+    var gguf_gen: generator.GgufGen = undefined;
+    var gguf_src: expert_fetch.Source = undefined;
+    var committee_peers = std.ArrayList(sync.PeerAddr).empty;
+    defer committee_peers.deinit(gpa);
+    var serve_gguf = false;
+    if (store) |*st| {
+        if (st.manifest.mode == .expert) {
+            for (committee_members) |m| {
+                if (sync.PeerAddr.parse(m)) |a| {
+                    committee_peers.append(gpa, a) catch {};
+                } else |_| {}
+            }
+            gguf_src = try expert_fetch.Source.init(gpa, io, st, peer_list.items);
+            gguf_src.committee = committee_peers.items;
+            // resident gate (audit #5 P0-4): the mmap'd resident bundle must be
+            // present+verified, fetching gaps from peers, or inference reads
+            // file-hole zeros. Fail closed on the serve path (fall back to loom).
+            var missing_resident: usize = 0;
+            var ri: usize = 0;
+            while (ri < st.manifest.n_resident) : (ri += 1) {
+                _ = gguf_src.get(ri) catch {
+                    missing_resident += 1;
+                };
+            }
+            if (missing_resident == 0) {
+                // origin serves the original --gguf file (openFull leaves it in
+                // place); a bootstrapped node serves the sparse copy synced into
+                // its store dir.
+                const mpath = if (opts.gguf_path) |gp|
+                    try gpa.dupe(u8, gp)
+                else
+                    try std.fmt.allocPrint(gpa, "{s}/model.gguf", .{st.dir});
+                defer gpa.free(mpath);
+                if (deepseek.load(gpa, io, mpath)) |mdl| {
+                    gguf_gen = .{ .m = mdl, .src = &gguf_src, .ctx_cap = opts.ctx_cap };
+                    gguf_gen.m.cfg.ctx_len = @min(gguf_gen.m.cfg.ctx_len, opts.ctx_cap);
+                    if (deepseek.attachDist(&gguf_gen.m, gpa, &gguf_src)) |_| {
+                        gen = .{ .gguf = &gguf_gen };
+                        serve_gguf = true;
+                        try out.print("  serving    distributed GGUF (deepseek2): dim={d} layers={d} vocab={d} ctx={d}\n", .{
+                            gguf_gen.m.cfg.dim, gguf_gen.m.cfg.n_layers, gguf_gen.m.cfg.vocab, gguf_gen.m.cfg.ctx_len,
+                        });
+                    } else |e| {
+                        try out.print("  gguf serve disabled: attach failed ({s})\n", .{@errorName(e)});
+                        gguf_gen.m.deinit();
+                        gguf_src.deinit();
+                    }
+                } else |e| {
+                    try out.print("  gguf serve disabled: model load failed ({s}); serving loom engine\n", .{@errorName(e)});
+                    gguf_src.deinit();
+                }
+            } else {
+                try out.print("  gguf serve disabled: {d}/{d} resident shards unavailable; serving loom engine\n", .{ missing_resident, st.manifest.n_resident });
+                gguf_src.deinit();
+            }
+        }
+    }
+    defer if (serve_gguf) {
+        gguf_gen.m.deinit();
+        gguf_src.deinit();
+    };
+    try out.flush();
+
     // eager churn repair, drawing candidates from the live gossip table
     var repair_ctx: RepairCtx = undefined;
     if (store != null) {
@@ -468,6 +551,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             .io = io,
             .store = &store.?,
             .table = &table,
+            .engine_lock = &engine_lock,
         };
         const t = try std.Thread.spawn(.{}, repairThread, .{&repair_ctx});
         t.detach();
@@ -476,18 +560,13 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     var meter = meter_mod.Meter.init(gpa, io, opts.free_quota);
     defer meter.deinit();
 
-    // One engine mutex shared by every serve path (rpc + openai): the engine
-    // holds mutable per-request state, so generation must be serialized.
-    var engine_lock: Io.Mutex = .init;
-
-    // OpenAI-compatible HTTP surface (SPEC.md client API), off unless a port is
-    // set. Skeleton: well-formed OpenAI responses with stub completions.
+    // OpenAI-compatible HTTP surface (SPEC.md client API), off unless a port is set.
     var openai_ctx: openai.Ctx = undefined;
     if (opts.openai_port != 0) {
         openai_ctx = .{
             .gpa = gpa,
             .io = io,
-            .engine = &eng,
+            .gen = &gen,
             .addr = opts.openai_addr,
             .port = opts.openai_port,
             .seed = opts.seed,
@@ -502,7 +581,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     var rpc_ctx = rpc.Ctx{
         .gpa = gpa,
         .io = io,
-        .engine = &eng,
+        .gen = &gen,
         .addr = opts.rpc_addr,
         .port = opts.rpc_port,
         .seed = opts.seed,

@@ -364,6 +364,7 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .admin_token = flagStr(args, "--admin-token") orelse "",
         .hold_fraction = @floatCast(std.math.clamp(hold_fraction, 0.0, 1.0)),
         .range_bytes = @intFromFloat(range_mb * @as(f64, MB)),
+        .ctx_cap = try flagUsize(args, "--ctx", 4096),
     });
 }
 

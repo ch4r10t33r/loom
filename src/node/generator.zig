@@ -1,0 +1,174 @@
+//! Generation abstraction (issue #17): one `generate` call over two engines,
+//! so the serving surfaces (rpc.zig, openai.zig) work with either.
+//!
+//!   - `loom`  the loom-format byte-tokenizer engine (engine.zig)
+//!   - `gguf`  the distributed GGUF deepseek2 engine, whose routed-expert reads
+//!             are fetched from peers at token time (expert_fetch + attachDist)
+//!
+//! Both return the detokenized completion text plus prompt/completion token
+//! counts; the loom path also returns the token-id list (the native RPC schema),
+//! left empty for gguf.
+
+const std = @import("std");
+const Io = std.Io;
+const engine_mod = @import("../engine/engine.zig");
+const Engine = engine_mod.Engine;
+const tokenizer = @import("../engine/tokenizer.zig");
+const sampler = @import("../engine/sampler.zig");
+const deepseek = @import("../gguf/deepseek.zig");
+const expert_fetch = @import("../p2p/expert_fetch.zig");
+
+pub const Result = struct {
+    text: []u8, // owned detokenized completion bytes
+    token_ids: []usize, // owned; loom fills, gguf leaves empty
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    stop: bool, // true = natural stop/eos, false = length cap
+
+    pub fn deinit(self: *Result, gpa: std.mem.Allocator) void {
+        gpa.free(self.text);
+        if (self.token_ids.len > 0) gpa.free(self.token_ids);
+    }
+};
+
+/// Distributed GGUF (deepseek2) generator: the model plus its token-loop expert
+/// fetch source. A fresh `State` (KV cache) is built per request.
+pub const GgufGen = struct {
+    m: deepseek.Model,
+    src: *expert_fetch.Source,
+    ctx_cap: usize,
+};
+
+pub const Generator = union(enum) {
+    loom: *Engine,
+    gguf: *GgufGen,
+
+    /// Generate a completion. `budget`, when set (the client's remaining metering
+    /// allowance), clamps completion length to `budget - prompt_tokens`.
+    pub fn generate(
+        self: Generator,
+        gpa: std.mem.Allocator,
+        io: Io,
+        prompt_text: []const u8,
+        max_tokens: usize,
+        temp: f32,
+        seed: u64,
+        budget: ?u64,
+    ) !Result {
+        return switch (self) {
+            .loom => |e| genLoom(e, gpa, prompt_text, max_tokens, temp, seed, budget),
+            .gguf => |g| genGguf(g, gpa, io, prompt_text, max_tokens, temp, seed, budget),
+        };
+    }
+
+    /// A serving-side cache/locality hit rate for logging (loom: expert-cache
+    /// hit rate; gguf: fraction of expert reads served locally vs peer-fetched).
+    pub fn hitRate(self: Generator) f64 {
+        return switch (self) {
+            .loom => |e| e.cache.stats.hitRate(),
+            .gguf => |g| blk: {
+                const s = g.src.stats;
+                const tot = s.local + s.fetched;
+                break :blk if (tot == 0) 0 else @as(f64, @floatFromInt(s.local)) / @as(f64, @floatFromInt(tot));
+            },
+        };
+    }
+};
+
+fn clampMax(max_tokens: usize, budget: ?u64, prompt_tokens: usize) usize {
+    if (budget) |b| {
+        const room = if (b > prompt_tokens) b - prompt_tokens else 0;
+        return @intCast(@min(@as(u64, max_tokens), room));
+    }
+    return max_tokens;
+}
+
+fn genLoom(
+    e: *Engine,
+    gpa: std.mem.Allocator,
+    prompt_text: []const u8,
+    max_tokens: usize,
+    temp: f32,
+    seed: u64,
+    budget: ?u64,
+) !Result {
+    const toks = try tokenizer.encode(gpa, prompt_text);
+    defer gpa.free(toks);
+    const maxn = clampMax(max_tokens, budget, toks.len);
+
+    var produced = std.ArrayList(usize).empty;
+    errdefer produced.deinit(gpa);
+    const n = try e.generate(toks, maxn, temp, seed, &produced);
+
+    const text = try gpa.alloc(u8, produced.items.len);
+    errdefer gpa.free(text);
+    for (produced.items, 0..) |t, i| text[i] = tokenizer.decodeByte(t);
+
+    return .{
+        .text = text,
+        .token_ids = try produced.toOwnedSlice(gpa),
+        .prompt_tokens = toks.len,
+        .completion_tokens = n,
+        .stop = n < maxn,
+    };
+}
+
+fn genGguf(
+    g: *GgufGen,
+    gpa: std.mem.Allocator,
+    io: Io,
+    prompt_text: []const u8,
+    max_tokens: usize,
+    temp: f32,
+    seed: u64,
+    budget: ?u64,
+) !Result {
+    _ = io;
+    const m = &g.m;
+    const c = m.cfg;
+
+    const toks = try m.encodePrompt(gpa, prompt_text);
+    defer gpa.free(toks);
+    const maxn = clampMax(max_tokens, budget, toks.len);
+
+    var st = try deepseek.State.init(gpa, c);
+    defer st.deinit(gpa);
+    const scratch = try gpa.alloc(f32, c.vocab);
+    defer gpa.free(scratch);
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+
+    // prefill (routed-expert reads fault in from peers via attachDist)
+    var pos: usize = 0;
+    for (toks) |t| {
+        if (pos >= c.ctx_len) break;
+        try deepseek.step(m, &st, t, pos);
+        pos += 1;
+    }
+
+    var aw = std.Io.Writer.Allocating.init(gpa);
+    defer aw.deinit();
+    var produced: usize = 0;
+    var eos = false;
+    if (toks.len > 0) {
+        var last: u32 = @intCast(sampler.sample(scratch, st.logits, temp, rnd));
+        while (produced < maxn and pos < c.ctx_len) : (produced += 1) {
+            if (last == m.eosToken()) {
+                eos = true;
+                break;
+            }
+            try m.decodeToken(&aw.writer, last);
+            try deepseek.step(m, &st, last, pos);
+            pos += 1;
+            last = @intCast(sampler.sample(scratch, st.logits, temp, rnd));
+        }
+    }
+
+    return .{
+        .text = try aw.toOwnedSlice(),
+        .token_ids = &.{},
+        .prompt_tokens = toks.len,
+        .completion_tokens = produced,
+        .stop = eos or produced < maxn,
+    };
+}
