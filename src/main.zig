@@ -91,7 +91,7 @@ fn usage(out: *Io.Writer) !void {
         \\
         \\usage:
         \\  loom node [--model SPEC] [--rpc-addr A] [--rpc-port P]
-        \\            [--openai-addr A] [--openai-port P]
+        \\            [--openai-addr A] [--openai-port P] [--ctx N] [--chat-format F]
         \\            [--p2p-addr A] [--p2p-port P] [--ram-gb X] [--pin-gb Y]
         \\            [--seed S] [--stats FILE] [--no-verify]
         \\            [--gguf FILE | --bootstrap HOST:PORT]
@@ -365,6 +365,7 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .hold_fraction = @floatCast(std.math.clamp(hold_fraction, 0.0, 1.0)),
         .range_bytes = @intFromFloat(range_mb * @as(f64, MB)),
         .ctx_cap = try flagUsize(args, "--ctx", 4096),
+        .chat_format = flagStr(args, "--chat-format"),
     });
 }
 

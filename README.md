@@ -78,6 +78,8 @@ Env overrides (flags win): `MODEL`, `RAM_BUDGET_GB`, `PIN_GB`, `SEED`, `STATS`.
 |---|---|---|
 | `--rpc-addr` / `--rpc-port` | `127.0.0.1` / `8770` | Where the JSON inference RPC listens. Bind `0.0.0.0` to accept remote clients. |
 | `--openai-addr` / `--openai-port` | `<rpc-addr>` / `0` (off) | Where the **OpenAI-compatible HTTP API** listens. Set `--openai-port` to enable it (e.g. `8772`). Serves the same engine as the RPC, metered by `Authorization: Bearer` client id. |
+| `--ctx N` | `4096` | Context-length cap when serving a distributed GGUF engine. |
+| `--chat-format F` | auto | Override the chat template (`deepseek`/`chatml`/`llama2`/`llama3`/`gemma`/`mistral`/`generic`); default auto-detects from GGUF metadata. |
 | `--p2p-addr` / `--p2p-port` | `0.0.0.0` / `8771` | Where the P2P line protocol listens (expert directory, weight ranges, gossip). |
 | `--advertise HOST:PORT` | `127.0.0.1:<p2p-port>` | The dialable address this node announces to peers via gossip. Set it to your LAN/public address when peers are on other machines. |
 
@@ -164,8 +166,13 @@ curl -sN http://127.0.0.1:8772/v1/chat/completions \
 # data: [DONE]
 ```
 
-Chat `messages[]` are assembled into a basic role-labeled prompt in v1; full
-per-model chat templates are a follow-up.
+Chat `messages[]` are rendered with the model's chat template. The format is
+auto-detected from the GGUF `tokenizer.chat_template` metadata (or the arch),
+overridable with `--chat-format {deepseek|chatml|llama2|llama3|gemma|mistral|generic}`.
+Text-marker formats (deepseek, llama2, mistral) render faithfully; special-token
+formats (chatml, llama3, gemma) render structurally but need special-token-aware
+tokenization for exact ids (a follow-up). The validated target, DeepSeek-V2, is
+text-marker and renders faithfully.
 
 ### P2P protocol (line-based; one command per line)
 
@@ -482,8 +489,9 @@ curl -s http://127.0.0.1:8782/v1/completions -d '{"prompt":"the","max_tokens":8}
 Store mutation from the token-loop fetch and the eager-repair loop is serialized
 on one engine mutex. The first request on a cold partial node is slow (many
 sequential cold expert fetches); it warms as fetched experts are persisted. This
-is the serving-first, latency-later behavior the design calls for. Full
-per-model chat templates remain a follow-up.
+is the serving-first, latency-later behavior the design calls for. Chat requests
+are rendered with the model's detected chat template (`--chat-format` to
+override); `--ctx N` caps context length.
 
 ---
 
@@ -581,6 +589,7 @@ src/node/     the daemon: node orchestration, RPC server, model resolver
 | `node/node.zig` | `loom node` orchestration: model → engine → RPC/P2P/gossip/repair |
 | `node/hf.zig` | model resolver: local dir / synthetic / Hugging Face download (local-first) |
 | `node/generator.zig` | generation abstraction over the loom-format engine and the distributed GGUF (deepseek2) engine; both serve paths call it |
+| `gguf/chat_template.zig` | per-model chat-template detection + rendering for OpenAI `messages[]` (deepseek/chatml/llama2/llama3/gemma/mistral/generic) |
 | `node/rpc.zig` | JSON-over-TCP inference server (concurrent connections, serialized generate) |
 | `node/openai.zig` | OpenAI-compatible HTTP API: `/v1/chat/completions`, `/v1/completions`, `/v1/models` (shares the engine + meter with `rpc.zig`) |
 | `node/light.zig` | light-node native-RPC delegator (forces client id, round-robin failover) |
