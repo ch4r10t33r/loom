@@ -265,7 +265,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, e
     defer produced.deinit(gpa);
 
     const t0 = stats.nowNs(io);
-    const n = eng.generate(prompt, max_tokens, @floatCast(temp), seed, &produced) catch |e| {
+    const n = eng.generate(prompt, max_tokens, @floatCast(temp), seed, &produced, null) catch |e| {
         try out.print("generate failed: {s}\n", .{@errorName(e)});
         return;
     };

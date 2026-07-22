@@ -31,6 +31,14 @@ pub const Result = struct {
     }
 };
 
+/// Per-token byte sink for streaming: `emit` receives each token's detokenized
+/// bytes as they are produced (used by the OpenAI SSE path). Errors propagate,
+/// aborting generation (e.g. the client disconnected).
+pub const TokenSink = struct {
+    ctx: *anyopaque,
+    emit: *const fn (ctx: *anyopaque, bytes: []const u8) anyerror!void,
+};
+
 /// Distributed GGUF (deepseek2) generator: the model plus its token-loop expert
 /// fetch source. A fresh `State` (KV cache) is built per request.
 pub const GgufGen = struct {
@@ -54,10 +62,11 @@ pub const Generator = union(enum) {
         temp: f32,
         seed: u64,
         budget: ?u64,
+        sink: ?TokenSink,
     ) !Result {
         return switch (self) {
-            .loom => |e| genLoom(e, gpa, prompt_text, max_tokens, temp, seed, budget),
-            .gguf => |g| genGguf(g, gpa, io, prompt_text, max_tokens, temp, seed, budget),
+            .loom => |e| genLoom(e, gpa, prompt_text, max_tokens, temp, seed, budget, sink),
+            .gguf => |g| genGguf(g, gpa, io, prompt_text, max_tokens, temp, seed, budget, sink),
         };
     }
 
@@ -83,6 +92,17 @@ fn clampMax(max_tokens: usize, budget: ?u64, prompt_tokens: usize) usize {
     return max_tokens;
 }
 
+/// Adapts a token-id callback (engine.TokenCb) to a byte-level TokenSink by
+/// detokenizing each loom token to its single byte.
+const LoomSinkAdapter = struct {
+    sink: TokenSink,
+    fn cb(ctx: *anyopaque, token: usize) anyerror!void {
+        const self: *LoomSinkAdapter = @ptrCast(@alignCast(ctx));
+        const b = [_]u8{tokenizer.decodeByte(token)};
+        try self.sink.emit(self.sink.ctx, &b);
+    }
+};
+
 fn genLoom(
     e: *Engine,
     gpa: std.mem.Allocator,
@@ -91,6 +111,7 @@ fn genLoom(
     temp: f32,
     seed: u64,
     budget: ?u64,
+    sink: ?TokenSink,
 ) !Result {
     const toks = try tokenizer.encode(gpa, prompt_text);
     defer gpa.free(toks);
@@ -98,7 +119,12 @@ fn genLoom(
 
     var produced = std.ArrayList(usize).empty;
     errdefer produced.deinit(gpa);
-    const n = try e.generate(toks, maxn, temp, seed, &produced);
+    var adapter: LoomSinkAdapter = undefined;
+    const on_token: ?Engine.TokenCb = if (sink) |s| blk: {
+        adapter = .{ .sink = s };
+        break :blk .{ .ctx = &adapter, .cb = LoomSinkAdapter.cb };
+    } else null;
+    const n = try e.generate(toks, maxn, temp, seed, &produced, on_token);
 
     const text = try gpa.alloc(u8, produced.items.len);
     errdefer gpa.free(text);
@@ -122,6 +148,7 @@ fn genGguf(
     temp: f32,
     seed: u64,
     budget: ?u64,
+    sink: ?TokenSink,
 ) !Result {
     _ = io;
     const m = &g.m;
@@ -157,7 +184,9 @@ fn genGguf(
                 eos = true;
                 break;
             }
+            const before = aw.writer.buffered().len;
             try m.decodeToken(&aw.writer, last);
+            if (sink) |s| try s.emit(s.ctx, aw.writer.buffered()[before..]);
             try deepseek.step(m, &st, last, pos);
             pos += 1;
             last = @intCast(sampler.sample(scratch, st.logits, temp, rnd));

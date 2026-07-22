@@ -150,10 +150,22 @@ curl -s http://127.0.0.1:8772/v1/chat/completions \
 
 Output is byte-identical to the native RPC path for the same prompt/seed/params.
 `usage` is the real token count and the ledger's cost unit; an exhausted client
-gets HTTP `402`. `stream:true` returns `501` for now (the engine generates
-non-incrementally; SSE streaming is tracked separately). Chat `messages[]` are
-assembled into a basic role-labeled prompt in v1; full per-model chat templates
-are a follow-up.
+gets HTTP `402`. `stream:true` streams the completion as OpenAI Server-Sent
+Events (`text/event-stream`: one `chat.completion.chunk` / `text_completion`
+event per token, then `data: [DONE]`), over both the loom and distributed-GGUF
+engines:
+
+```sh
+curl -sN http://127.0.0.1:8772/v1/chat/completions \
+  -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":8,"stream":true}'
+# data: {...,"choices":[{"index":0,"delta":{"role":"assistant"},...}]}
+# data: {...,"choices":[{"index":0,"delta":{"content":"..."},...}]}   (per token)
+# data: {...,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+# data: [DONE]
+```
+
+Chat `messages[]` are assembled into a basic role-labeled prompt in v1; full
+per-model chat templates are a follow-up.
 
 ### P2P protocol (line-based; one command per line)
 
@@ -470,8 +482,8 @@ curl -s http://127.0.0.1:8782/v1/completions -d '{"prompt":"the","max_tokens":8}
 Store mutation from the token-loop fetch and the eager-repair loop is serialized
 on one engine mutex. The first request on a cold partial node is slow (many
 sequential cold expert fetches); it warms as fetched experts are persisted. This
-is the serving-first, latency-later behavior the design calls for. SSE streaming
-and full per-model chat templates remain follow-ups.
+is the serving-first, latency-later behavior the design calls for. Full
+per-model chat templates remain a follow-up.
 
 ---
 
