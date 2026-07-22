@@ -7,12 +7,10 @@
 //! scope). The format is detected from that template string (or the model
 //! arch), with a CLI override.
 //!
-//! LIMITATION: Loom's BPE tokenizer does not splice special tokens, so the BOS
-//! is added by the tokenizer (not embedded here) and text-marker formats
-//! (deepseek, llama2, mistral) render faithfully, while special-token-marker
-//! formats (chatml, llama3, gemma) render structurally but need special-token-
-//! aware tokenization for exact token ids (a follow-up). The validated target,
-//! DeepSeek-V2, is a text-marker format and renders faithfully.
+//! The BOS is added by the tokenizer (not embedded here). Special-token markers
+//! this emits (chatml `<|im_start|>`, llama3 `<|start_header_id|>`, gemma
+//! `<start_of_turn>`) tokenize to their atomic ids via special.zig when the
+//! model's vocab contains them as control / user-defined tokens.
 
 const std = @import("std");
 

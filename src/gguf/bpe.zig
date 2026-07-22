@@ -16,6 +16,7 @@
 const std = @import("std");
 const Io = std.Io;
 const gguf = @import("gguf.zig");
+const special = @import("special.zig");
 
 /// GPT-2 byte -> unicode codepoint table.
 fn byteToUnicode(b: u8) u21 {
@@ -39,6 +40,7 @@ pub const Bpe = struct {
     lookup: std.StringHashMap(u32), // byte-level token string -> id
     merge_rank: std.StringHashMap(u32), // "left right" -> rank
     unicode_to_byte: std.AutoHashMap(u21, u8),
+    specials: special.Set,
     bos: u32,
     eos: u32,
     add_bos: bool,
@@ -72,12 +74,16 @@ pub const Bpe = struct {
             try u2b.put(byteToUnicode(@intCast(b)), @intCast(b));
         }
 
+        var specials = try special.Set.build(gpa, tokens, types);
+        errdefer specials.deinit(gpa);
+
         return .{
             .tokens = tokens,
             .types = types,
             .lookup = lookup,
             .merge_rank = merge_rank,
             .unicode_to_byte = u2b,
+            .specials = specials,
             .bos = @intCast(parsed.getUint("tokenizer.ggml.bos_token_id") orelse 0),
             .eos = @intCast(parsed.getUint("tokenizer.ggml.eos_token_id") orelse 0),
             .add_bos = parsed.getBool("tokenizer.ggml.add_bos_token") orelse true,
@@ -85,10 +91,10 @@ pub const Bpe = struct {
     }
 
     pub fn deinit(self: *Bpe, gpa: std.mem.Allocator) void {
-        _ = gpa;
         self.lookup.deinit();
         self.merge_rank.deinit();
         self.unicode_to_byte.deinit();
+        self.specials.deinit(gpa);
     }
 
     const CharClass = enum { letter, digit, space, other };
@@ -182,16 +188,33 @@ pub const Bpe = struct {
         }
     }
 
+    /// BPE-encode a normal (non-special) text segment.
+    fn encodeNormal(self: *const Bpe, gpa: std.mem.Allocator, text: []const u8, out: *std.ArrayList(u32)) !void {
+        var ranges = try pretokenize(gpa, text);
+        defer ranges.deinit(gpa);
+        for (ranges.items) |r| {
+            try self.encodePiece(gpa, text[r[0]..r[1]], out);
+        }
+    }
+
     pub fn encode(self: *const Bpe, gpa: std.mem.Allocator, text: []const u8, add_bos: bool) ![]u32 {
         var out = std.ArrayList(u32).empty;
         errdefer out.deinit(gpa);
         if (add_bos and self.add_bos) try out.append(gpa, self.bos);
 
-        var ranges = try pretokenize(gpa, text);
-        defer ranges.deinit(gpa);
-        for (ranges.items) |r| {
-            try self.encodePiece(gpa, text[r[0]..r[1]], &out);
+        // Split on special tokens (chat-template markers, control tokens),
+        // emitting their ids atomically and BPE-encoding the text between.
+        var seg_start: usize = 0;
+        var i: usize = 0;
+        while (i < text.len) {
+            if (self.specials.matchAt(text[i..])) |sp| {
+                if (i > seg_start) try self.encodeNormal(gpa, text[seg_start..i], &out);
+                try out.append(gpa, sp.id);
+                i += sp.text.len;
+                seg_start = i;
+            } else i += 1;
         }
+        if (seg_start < text.len) try self.encodeNormal(gpa, text[seg_start..], &out);
         return out.toOwnedSlice(gpa);
     }
 
