@@ -16,6 +16,7 @@ const Engine = engine_mod.Engine;
 const tokenizer = @import("../engine/tokenizer.zig");
 const sampler = @import("../engine/sampler.zig");
 const deepseek = @import("../gguf/deepseek.zig");
+const chat_template = @import("../gguf/chat_template.zig");
 const expert_fetch = @import("../p2p/expert_fetch.zig");
 
 pub const Result = struct {
@@ -45,6 +46,7 @@ pub const GgufGen = struct {
     m: deepseek.Model,
     src: *expert_fetch.Source,
     ctx_cap: usize,
+    chat_format: chat_template.Format = .generic,
 };
 
 pub const Generator = union(enum) {
@@ -67,6 +69,15 @@ pub const Generator = union(enum) {
         return switch (self) {
             .loom => |e| genLoom(e, gpa, prompt_text, max_tokens, temp, seed, budget, sink),
             .gguf => |g| genGguf(g, gpa, io, prompt_text, max_tokens, temp, seed, budget, sink),
+        };
+    }
+
+    /// The chat template to render `messages[]` with. The loom byte engine has
+    /// no template (generic); the GGUF engine's is detected at load.
+    pub fn chatFormat(self: Generator) chat_template.Format {
+        return switch (self) {
+            .loom => .generic,
+            .gguf => |g| g.chat_format,
         };
     }
 

@@ -11,6 +11,7 @@ const rpc = @import("rpc.zig");
 const openai = @import("openai.zig");
 const generator = @import("generator.zig");
 const deepseek = @import("../gguf/deepseek.zig");
+const chat_template = @import("../gguf/chat_template.zig");
 const expert_fetch = @import("../p2p/expert_fetch.zig");
 const p2p = @import("../p2p/p2p.zig");
 const stats = @import("../core/stats.zig");
@@ -51,6 +52,7 @@ pub const Options = struct {
     free_quota: u64, // per-client free token allowance (metering)
     admin_token: []const u8, // gates the credit op (empty = credit disabled)
     ctx_cap: usize, // context-length cap when serving a distributed GGUF engine
+    chat_format: ?[]const u8, // --chat-format override (null = auto-detect)
 };
 
 /// Committee heartbeat (SPEC.md): PING each committee member on a fixed
@@ -517,10 +519,14 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                     gguf_gen = .{ .m = mdl, .src = &gguf_src, .ctx_cap = opts.ctx_cap };
                     gguf_gen.m.cfg.ctx_len = @min(gguf_gen.m.cfg.ctx_len, opts.ctx_cap);
                     if (deepseek.attachDist(&gguf_gen.m, gpa, &gguf_src)) |_| {
+                        gguf_gen.chat_format = if (opts.chat_format) |cf|
+                            chat_template.parse(cf) orelse chat_template.detect(gguf_gen.m.chatTemplate(), "deepseek2")
+                        else
+                            chat_template.detect(gguf_gen.m.chatTemplate(), "deepseek2");
                         gen = .{ .gguf = &gguf_gen };
                         serve_gguf = true;
-                        try out.print("  serving    distributed GGUF (deepseek2): dim={d} layers={d} vocab={d} ctx={d}\n", .{
-                            gguf_gen.m.cfg.dim, gguf_gen.m.cfg.n_layers, gguf_gen.m.cfg.vocab, gguf_gen.m.cfg.ctx_len,
+                        try out.print("  serving    distributed GGUF (deepseek2): dim={d} layers={d} vocab={d} ctx={d} chat={s}\n", .{
+                            gguf_gen.m.cfg.dim, gguf_gen.m.cfg.n_layers, gguf_gen.m.cfg.vocab, gguf_gen.m.cfg.ctx_len, @tagName(gguf_gen.chat_format),
                         });
                     } else |e| {
                         try out.print("  gguf serve disabled: attach failed ({s})\n", .{@errorName(e)});

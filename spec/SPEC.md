@@ -74,8 +74,12 @@ returns a real `usage` object, metered by bearer id, byte-identical to the nativ
 RPC path for the same prompt/seed. `stream:true` streams the completion as OpenAI
 Server-Sent Events (one `data:` chunk per token, then `[DONE]`) over both the
 loom and distributed-GGUF engines. Light nodes delegate the OpenAI surface to
-full nodes (metered reverse proxy). Still TODO: full per-model chat-template
-fidelity (v1 assembles a basic role-labeled prompt from `messages[]`).
+full nodes (metered reverse proxy). Chat `messages[]` are rendered with the
+model's chat template, auto-detected from the GGUF `tokenizer.chat_template`
+metadata (overridable via `--chat-format`). Text-marker formats (deepseek,
+llama2, mistral) render faithfully; special-token formats (chatml, llama3,
+gemma) render structurally and need special-token-aware tokenization for exact
+ids, a follow-up.
 
 ## Metering and compensation
 

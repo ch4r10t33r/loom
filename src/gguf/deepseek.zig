@@ -167,6 +167,10 @@ pub const Model = struct {
     pub fn eosToken(self: *const Model) u32 {
         return self.tok.eosId();
     }
+    /// The GGUF `tokenizer.chat_template` string, if the model carries one.
+    pub fn chatTemplate(self: *const Model) ?[]const u8 {
+        return self.parsed.getString("tokenizer.chat_template");
+    }
 
     pub fn deinit(self: *Model) void {
         if (self.expert_shard.len > 0) self.gpa.free(self.expert_shard);

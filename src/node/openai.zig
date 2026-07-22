@@ -19,13 +19,14 @@
 //! over the shared `engine_lock` and return real completions with a real `usage`
 //! object, metered by bearer id. `stream:true` writes an OpenAI `text/event-stream`
 //! (one `data:` chunk per token, then `data: [DONE]`) over both the loom and
-//! distributed-GGUF engines. Still TODO: full per-model chat-template fidelity
-//! (v1 assembles a basic role-labeled prompt from `messages[]`).
+//! distributed-GGUF engines. Chat `messages[]` are rendered with the model's
+//! detected chat template (chat_template.zig).
 
 const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
 const generator = @import("generator.zig");
+const chat_template = @import("../gguf/chat_template.zig");
 const meter_mod = @import("meter.zig");
 
 pub const Ctx = struct {
@@ -266,7 +267,7 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer) !?R
     // Assemble the prompt: chat messages -> role-labeled text, or the raw
     // `prompt` field for the completions endpoint. Shared by both paths.
     const prompt_text = if (is_chat)
-        try assembleChatPrompt(gpa, parsed)
+        try assembleChatPrompt(ctx, gpa, parsed)
     else
         try gpa.dupe(u8, promptField(parsed));
     defer gpa.free(prompt_text);
@@ -388,12 +389,11 @@ fn streamCompletions(
     wi.flush() catch return;
 }
 
-/// Flatten OpenAI chat `messages[]` into a role-labeled prompt. v1 is a basic
-/// template (a per-model chat template from GGUF metadata is a follow-up); the
-/// resident engine is byte-level, so exact formatting is not load-bearing yet.
-fn assembleChatPrompt(gpa: std.mem.Allocator, parsed: ?std.json.Parsed(std.json.Value)) ![]u8 {
-    var buf = std.ArrayList(u8).empty;
-    errdefer buf.deinit(gpa);
+/// Render OpenAI chat `messages[]` into the model's expected prompt, using the
+/// engine's detected chat format (chat_template.zig).
+fn assembleChatPrompt(ctx: *Ctx, gpa: std.mem.Allocator, parsed: ?std.json.Parsed(std.json.Value)) ![]u8 {
+    var msgs = std.ArrayList(chat_template.Message).empty;
+    defer msgs.deinit(gpa);
     if (parsed) |p| if (p.value == .object) {
         if (p.value.object.get("messages")) |mv| if (mv == .array) {
             for (mv.array.items) |el| {
@@ -406,12 +406,11 @@ fn assembleChatPrompt(gpa: std.mem.Allocator, parsed: ?std.json.Parsed(std.json.
                     .string => |s| s,
                     else => continue, // array/structured content: unsupported in v1
                 };
-                try buf.print(gpa, "{s}: {s}\n", .{ role, content });
+                try msgs.append(gpa, .{ .role = role, .content = content });
             }
         };
     };
-    try buf.appendSlice(gpa, "assistant:");
-    return buf.toOwnedSlice(gpa);
+    return chat_template.render(gpa, ctx.gen.chatFormat(), msgs.items, true);
 }
 
 fn promptField(parsed: ?std.json.Parsed(std.json.Value)) []const u8 {
