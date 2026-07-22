@@ -11,6 +11,7 @@ const Io = std.Io;
 const gguf = @import("gguf.zig");
 const ggml = @import("ggml.zig");
 const tensor = @import("../core/tensor.zig");
+const special = @import("special.zig");
 
 pub const Config = struct {
     dim: usize,
@@ -175,6 +176,7 @@ pub const Tokenizer = struct {
     scores: []const f32,
     types: []const i32,
     lookup: std.StringHashMap(u32),
+    specials: special.Set,
     bos: u32,
     eos: u32,
 
@@ -196,29 +198,57 @@ pub const Tokenizer = struct {
         var lookup = std.StringHashMap(u32).init(gpa);
         errdefer lookup.deinit();
         for (tokens, 0..) |t, i| try lookup.put(t, @intCast(i));
+        var specials = try special.Set.build(gpa, tokens, types);
+        errdefer specials.deinit(gpa);
         return .{
             .tokens = tokens,
             .scores = scores,
             .types = types,
             .lookup = lookup,
+            .specials = specials,
             .bos = @intCast(parsed.getUint("tokenizer.ggml.bos_token_id") orelse 1),
             .eos = @intCast(parsed.getUint("tokenizer.ggml.eos_token_id") orelse 2),
         };
     }
 
     pub fn deinit(self: *Tokenizer, gpa: std.mem.Allocator) void {
-        _ = gpa;
         self.lookup.deinit();
+        self.specials.deinit(gpa);
     }
 
     /// SPM encode: prefix a space, map ' ' -> U+2581, split into UTF-8 chars,
     /// then greedily merge the adjacent pair whose concatenation is the
     /// highest-scoring vocab entry. Unmatched symbols fall back to byte tokens.
     pub fn encode(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, add_bos: bool) ![]u32 {
+        var out = std.ArrayList(u32).empty;
+        errdefer out.deinit(gpa);
+        if (add_bos) try out.append(gpa, self.bos);
+
+        // Split on special tokens (chat-template markers, control tokens),
+        // emitting their ids atomically and SPM-encoding the text between. When
+        // no special appears, this is one segment identical to the old path.
+        var seg_start: usize = 0;
+        var i: usize = 0;
+        while (i < text.len) {
+            if (self.specials.matchAt(text[i..])) |sp| {
+                if (i > seg_start) try self.encodeSegment(gpa, text[seg_start..i], seg_start == 0, &out);
+                try out.append(gpa, sp.id);
+                i += sp.text.len;
+                seg_start = i;
+            } else i += 1;
+        }
+        if (seg_start < text.len) try self.encodeSegment(gpa, text[seg_start..], seg_start == 0, &out);
+        return out.toOwnedSlice(gpa);
+    }
+
+    /// SPM-encode one normal segment into `out`. `add_space_prefix` adds the
+    /// leading dummy space (SPM add_dummy_prefix); applied only to a segment at
+    /// the very start of the input, not to content following a special token.
+    fn encodeSegment(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, add_space_prefix: bool, out: *std.ArrayList(u32)) !void {
         // preprocess: leading space, spaces -> ▁ (e2 96 81)
         var buf = std.ArrayList(u8).empty;
         defer buf.deinit(gpa);
-        try buf.appendSlice(gpa, "\xe2\x96\x81");
+        if (add_space_prefix) try buf.appendSlice(gpa, "\xe2\x96\x81");
         for (text) |ch| {
             if (ch == ' ') {
                 try buf.appendSlice(gpa, "\xe2\x96\x81");
@@ -262,9 +292,6 @@ pub const Tokenizer = struct {
         }
 
         // map symbols to ids (byte fallback for stragglers)
-        var out = std.ArrayList(u32).empty;
-        errdefer out.deinit(gpa);
-        if (add_bos) try out.append(gpa, self.bos);
         for (syms.items) |r| {
             const piece = s[r.start..r.end];
             if (self.lookup.get(piece)) |id| {
@@ -278,7 +305,6 @@ pub const Tokenizer = struct {
                 }
             }
         }
-        return out.toOwnedSlice(gpa);
     }
 
     /// Decode one token into `w`. Byte tokens emit their byte; ▁ becomes space.

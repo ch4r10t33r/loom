@@ -76,10 +76,9 @@ Server-Sent Events (one `data:` chunk per token, then `[DONE]`) over both the
 loom and distributed-GGUF engines. Light nodes delegate the OpenAI surface to
 full nodes (metered reverse proxy). Chat `messages[]` are rendered with the
 model's chat template, auto-detected from the GGUF `tokenizer.chat_template`
-metadata (overridable via `--chat-format`). Text-marker formats (deepseek,
-llama2, mistral) render faithfully; special-token formats (chatml, llama3,
-gemma) render structurally and need special-token-aware tokenization for exact
-ids, a follow-up.
+metadata (overridable via `--chat-format`). Marker tokens (chatml, llama3,
+gemma, control tokens) tokenize atomically to their ids via the special-token
+matcher when the model's vocab defines them.
 
 ## Metering and compensation
 

@@ -169,10 +169,9 @@ curl -sN http://127.0.0.1:8772/v1/chat/completions \
 Chat `messages[]` are rendered with the model's chat template. The format is
 auto-detected from the GGUF `tokenizer.chat_template` metadata (or the arch),
 overridable with `--chat-format {deepseek|chatml|llama2|llama3|gemma|mistral|generic}`.
-Text-marker formats (deepseek, llama2, mistral) render faithfully; special-token
-formats (chatml, llama3, gemma) render structurally but need special-token-aware
-tokenization for exact ids (a follow-up). The validated target, DeepSeek-V2, is
-text-marker and renders faithfully.
+Marker tokens (chatml `<|im_start|>`, llama3 `<|start_header_id|>`, gemma
+`<start_of_turn>`, control tokens) are tokenized atomically to their ids by the
+special-token matcher (`gguf/special.zig`) when the model's vocab defines them.
 
 ### P2P protocol (line-based; one command per line)
 
@@ -590,6 +589,7 @@ src/node/     the daemon: node orchestration, RPC server, model resolver
 | `node/hf.zig` | model resolver: local dir / synthetic / Hugging Face download (local-first) |
 | `node/generator.zig` | generation abstraction over the loom-format engine and the distributed GGUF (deepseek2) engine; both serve paths call it |
 | `gguf/chat_template.zig` | per-model chat-template detection + rendering for OpenAI `messages[]` (deepseek/chatml/llama2/llama3/gemma/mistral/generic) |
+| `gguf/special.zig` | special-token matcher: splices control / user-defined tokens (chat markers) to atomic ids during BPE + SPM encoding |
 | `node/rpc.zig` | JSON-over-TCP inference server (concurrent connections, serialized generate) |
 | `node/openai.zig` | OpenAI-compatible HTTP API: `/v1/chat/completions`, `/v1/completions`, `/v1/models` (shares the engine + meter with `rpc.zig`) |
 | `node/light.zig` | light-node native-RPC delegator (forces client id, round-robin failover) |
