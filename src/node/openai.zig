@@ -27,15 +27,13 @@
 const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
-const engine_mod = @import("../engine/engine.zig");
-const Engine = engine_mod.Engine;
-const tokenizer = @import("../engine/tokenizer.zig");
+const generator = @import("generator.zig");
 const meter_mod = @import("meter.zig");
 
 pub const Ctx = struct {
     gpa: std.mem.Allocator,
     io: Io,
-    engine: *Engine,
+    gen: *generator.Generator,
     addr: []const u8,
     port: u16,
     seed: u64,
@@ -277,49 +275,38 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool) !Response {
         try gpa.dupe(u8, promptField(parsed));
     defer gpa.free(prompt_text);
 
-    const prompt_tok = try tokenizer.encode(gpa, prompt_text);
-    defer gpa.free(prompt_tok);
-
-    // Clamp the generation length to what the client can pay for (mirrors rpc).
-    if (ctx.meter) |m| {
-        const rem = m.remaining(client);
-        const budget = if (rem > prompt_tok.len) rem - prompt_tok.len else 0;
-        max_tokens = @intCast(@min(@as(u64, max_tokens), budget));
-    }
-
-    // Generate under the shared engine mutex (rpc + openai serialize here).
-    var produced = std.ArrayList(usize).empty;
-    defer produced.deinit(gpa);
+    // Generate under the shared engine mutex (rpc + openai serialize here). The
+    // metering budget clamps completion length to the remaining allowance.
+    const budget: ?u64 = if (ctx.meter) |m| m.remaining(client) else null;
     ctx.engine_lock.lockUncancelable(ctx.io);
-    const n = ctx.engine.generate(prompt_tok, max_tokens, temp, seed, &produced) catch |e| {
+    var res = ctx.gen.generate(gpa, ctx.io, prompt_text, max_tokens, temp, seed, budget) catch |e| {
         ctx.engine_lock.unlock(ctx.io);
         return e;
     };
     ctx.engine_lock.unlock(ctx.io);
+    defer res.deinit(gpa);
 
-    // Decode produced token bytes and JSON-escape them for the envelope.
-    const out_bytes = try gpa.alloc(u8, produced.items.len);
-    defer gpa.free(out_bytes);
-    for (produced.items, 0..) |tok, i| out_bytes[i] = tokenizer.decodeByte(tok);
-    const content = try jsonEscapeAlloc(gpa, out_bytes);
+    const content = try jsonEscapeAlloc(gpa, res.text);
     defer gpa.free(content);
 
     // Charge the ledger: prompt tokens processed + tokens generated.
     if (ctx.meter) |m| {
-        _ = try m.charge(client, @intCast(prompt_tok.len + n));
+        _ = try m.charge(client, @intCast(res.prompt_tokens + res.completion_tokens));
     }
 
-    const finish: []const u8 = if (n < max_tokens) "stop" else "length";
+    const finish: []const u8 = if (res.stop) "stop" else "length";
     const id = id_counter.fetchAdd(1, .monotonic) + 1;
+    const pt = res.prompt_tokens;
+    const n = res.completion_tokens;
 
     const body = if (is_chat)
         try std.fmt.allocPrint(gpa,
             \\{{"id":"chatcmpl-loom-{d}","object":"chat.completion","created":0,"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
-        , .{ id, model_id, content, finish, prompt_tok.len, n, prompt_tok.len + n })
+        , .{ id, model_id, content, finish, pt, n, pt + n })
     else
         try std.fmt.allocPrint(gpa,
             \\{{"id":"cmpl-loom-{d}","object":"text_completion","created":0,"model":"{s}","choices":[{{"index":0,"text":"{s}","finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
-        , .{ id, model_id, content, finish, prompt_tok.len, n, prompt_tok.len + n });
+        , .{ id, model_id, content, finish, pt, n, pt + n });
 
     return .{ .status = 200, .body = body };
 }

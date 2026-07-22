@@ -107,11 +107,14 @@ max, not sum), round-robin holder spreading, per-peer fallback, digest-verify
 before disk, fetched shards persisted + advertised (organic heat replication).
 Verified on real DeepSeek-V2-Lite: a 33% store (573/1737 shards) produced the
 correct completion ("Paris."), streaming 641 experts / 3.5 GB from one peer
-with zero failures; token-identical to a full-copy run on the fixture. Still
-todo: holder discovery from the gossip table instead of --peers; measured
+with zero failures; token-identical to a full-copy run on the fixture. The
+distributed engine is now **also served through the node** (`loom node --gguf`
+origin or `--bootstrap` partial store) over both the RPC and OpenAI surfaces via
+a `Generator` abstraction, with the token-loop fetch and eager repair serialized
+on one engine mutex; a partial node's output is byte-identical to a full node's.
+Still todo: holder discovery from the gossip table instead of --peers; measured
 disk-vs-peer ordering once heat replication puts shards in both tiers; RAM
-LRU for beyond-disk-budget caching; serving the distributed engine via node
-RPC.
+LRU for beyond-disk-budget caching.
 
 ### GGUF → inference (✅ first cut implemented)
 
@@ -124,9 +127,9 @@ tokenizer (`deepseek.zig`, `bpe.zig`). Validated on real weights: tinyllamas
 (F32/Q4_0/Q8_0, coherent stories) and **DeepSeek-V2-Lite Q4_K_M** (15.7B MoE —
 correct factual completions on one CPU core). Note: deepseek2 rope is
 NORM-style (adjacent pairs) — DeepSeek's reference interleave-view before
-rotate_half nets out to that; NEOX produces degenerate output. Still todo:
-serve GGUF models through `loom node`'s RPC; batch >1; SIMD kernels;
-IQ-quants.
+rotate_half nets out to that; NEOX produces degenerate output. GGUF models are
+now served through `loom node`'s RPC and OpenAI surfaces (deepseek2 distributed
+path). Still todo: batch >1; SIMD kernels; IQ-quants.
 
 ### Hardware-tailored compute backends (planned)
 
