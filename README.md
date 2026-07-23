@@ -59,9 +59,11 @@ docker compose up --build
 curl -s localhost:8782/v1/completions -d '{"prompt":"the","max_tokens":8}'
 ```
 
-Peers are addressed by IP (connect sites go through `IpAddress.resolve`, so an IP
-always works and a hostname works where the platform resolver cooperates; the
-compose demo pins static IPs to stay independent of container DNS).
+Peers can be addressed by IP **or hostname** — the p2p layer resolves names via a
+minimal DNS client ([`src/p2p/dns.zig`](src/p2p/dns.zig): IP literal, then
+`/etc/hosts`, then a UDP A-query to `/etc/resolv.conf`'s first nameserver), so the
+compose demo addresses peers by Compose service name (`origin`), and Kubernetes
+Service DNS works the same way.
 
 ## 60-second tour
 
@@ -632,6 +634,7 @@ src/node/     the daemon: node orchestration, RPC server, model resolver
 | `p2p/sync.zig` | peer sync client: manifest adoption, root verification, multi-peer range fetch |
 | `p2p/peers.zig` | dynamic peer table shared by gossip/repair/P2P threads |
 | `p2p/gossip.zig` | 3 s gossip loop: announce self, merge peers-of-peers |
+| `p2p/dns.zig` | minimal DNS resolver for peer hostnames (IP literal / /etc/hosts / UDP A-query); Zig std has none |
 | `gguf/gguf.zig` | GGUF v2/v3 parser (metadata incl. tokenizer arrays, tensor table) + fixture writer |
 | `gguf/ggml.zig` | GGML kernels: F32/F16/Q4_0/Q8_0 fused matvec + row dequant |
 | `gguf/llama.zig` | llama-arch engine over mmap'd GGUF: GQA, NORM RoPE, SwiGLU, SPM tokenizer |

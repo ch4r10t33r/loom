@@ -12,6 +12,7 @@ const net = std.Io.net;
 const peers = @import("peers.zig");
 const weights = @import("weights.zig");
 const sync = @import("sync.zig");
+const dns = @import("dns.zig");
 const hashmod = @import("../core/hash.zig");
 const stats = @import("../core/stats.zig");
 const wire = @import("wire.zig");
@@ -32,7 +33,7 @@ fn exchange(ctx: *Ctx, addr_str: []const u8) !void {
     const gpa = ctx.gpa;
     const io = ctx.io;
     const addr = try sync.PeerAddr.parse(addr_str);
-    const ip = try net.IpAddress.resolve(io, addr.host, addr.port);
+    const ip = try dns.resolve(io, addr.host, addr.port);
     const stream = try ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 

@@ -15,6 +15,7 @@ const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
 const sync = @import("../p2p/sync.zig");
+const dns = @import("../p2p/dns.zig");
 
 pub const Options = struct {
     rpc_addr: []const u8,
@@ -125,7 +126,7 @@ fn delegate(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
 
 fn forwardTo(ctx: *Ctx, backend: sync.PeerAddr, request: []const u8) ![]u8 {
     const io = ctx.io;
-    const ip = try net.IpAddress.resolve(io, backend.host, backend.port);
+    const ip = try dns.resolve(io, backend.host, backend.port);
     const stream = try ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
     var rbuf: [1 << 16]u8 = undefined;

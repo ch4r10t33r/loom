@@ -23,6 +23,7 @@ const Io = std.Io;
 const net = std.Io.net;
 const weights = @import("weights.zig");
 const sync = @import("sync.zig");
+const dns = @import("dns.zig");
 const hashmod = @import("../core/hash.zig");
 const stats_mod = @import("../core/stats.zig");
 const wire = @import("wire.zig");
@@ -165,7 +166,7 @@ pub const Source = struct {
     fn fetchFromPeer(self: *Source, addr: sync.PeerAddr, id: usize, buf: []u8) !usize {
         const io = self.io;
         const gpa = self.gpa;
-        const ip = try net.IpAddress.resolve(io, addr.host, addr.port);
+        const ip = try dns.resolve(io, addr.host, addr.port);
         const stream = try ip.connect(io, .{ .mode = .stream });
         defer stream.close(io);
         var rbuf: [1 << 16]u8 = undefined;
