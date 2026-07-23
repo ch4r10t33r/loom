@@ -154,7 +154,7 @@ fn delegate(ctx: *Ctx, req: Request) !Response {
 fn forwardTo(ctx: *Ctx, backend: sync.PeerAddr, req: Request) !Response {
     const io = ctx.io;
     const gpa = ctx.gpa;
-    const ip = try net.IpAddress.parse(backend.host, backend.port);
+    const ip = try net.IpAddress.resolve(io, backend.host, backend.port);
     const stream = try ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
     var rbuf: [1 << 16]u8 = undefined;

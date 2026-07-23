@@ -125,7 +125,7 @@ fn delegate(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
 
 fn forwardTo(ctx: *Ctx, backend: sync.PeerAddr, request: []const u8) ![]u8 {
     const io = ctx.io;
-    const ip = try net.IpAddress.parse(backend.host, backend.port);
+    const ip = try net.IpAddress.resolve(io, backend.host, backend.port);
     const stream = try ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
     var rbuf: [1 << 16]u8 = undefined;

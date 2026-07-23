@@ -32,7 +32,7 @@ fn exchange(ctx: *Ctx, addr_str: []const u8) !void {
     const gpa = ctx.gpa;
     const io = ctx.io;
     const addr = try sync.PeerAddr.parse(addr_str);
-    const ip = try net.IpAddress.parse(addr.host, addr.port);
+    const ip = try net.IpAddress.resolve(io, addr.host, addr.port);
     const stream = try ip.connect(io, .{ .mode = .stream });
     defer stream.close(io);
 

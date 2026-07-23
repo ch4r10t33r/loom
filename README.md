@@ -30,6 +30,39 @@ zig build test                   # unit tests
 zig build run -- <args>          # build + run in one step
 ```
 
+## Docker
+
+A multi-stage [`Dockerfile`](Dockerfile) builds a ReleaseFast binary (Zig 0.16.0
+is fetched by anyzig at build time) into a ~120 MB Debian-slim runtime image.
+
+```sh
+docker build -t loom:dev .
+
+# run a single node (serves the built-in synthetic model)
+docker run --rm -p 8770:8770 -p 8772:8772 loom:dev \
+  node --rpc-addr 0.0.0.0 --openai-port 8772
+curl -s localhost:8772/v1/chat/completions \
+  -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
+```
+
+The image exposes `8770` (RPC), `8771` (P2P), `8772` (OpenAI), runs as a non-root
+user, and persists the model cache in the `/home/loom/.cache/loom` volume.
+
+**Distributed swarm** — [`docker-compose.yml`](docker-compose.yml) brings up a
+two-node swarm (an origin that generates + serves a synthetic deepseek2 GGUF, and
+a partial node that holds ~30% of the experts and fetches the rest from the
+origin at token time), no external model needed:
+
+```sh
+docker compose up --build
+# node2's OpenAI port; a hit_rate < 1 on the RPC response = token-loop peer fetch
+curl -s localhost:8782/v1/completions -d '{"prompt":"the","max_tokens":8}'
+```
+
+Peers are addressed by IP (connect sites go through `IpAddress.resolve`, so an IP
+always works and a hostname works where the platform resolver cooperates; the
+compose demo pins static IPs to stay independent of container DNS).
+
 ## 60-second tour
 
 ```sh

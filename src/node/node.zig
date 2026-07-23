@@ -76,7 +76,7 @@ const HeartbeatCtx = struct {
         const gpa = self.gpa;
         const io = self.io;
         const addr = sync.PeerAddr.parse(addr_str) catch return null;
-        const ip = std.Io.net.IpAddress.parse(addr.host, addr.port) catch return null;
+        const ip = std.Io.net.IpAddress.resolve(io, addr.host, addr.port) catch return null;
         const stream = ip.connect(io, .{ .mode = .stream }) catch return null;
         defer stream.close(io);
         var rbuf: [4096]u8 = undefined;

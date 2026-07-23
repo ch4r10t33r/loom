@@ -165,7 +165,7 @@ pub const Source = struct {
     fn fetchFromPeer(self: *Source, addr: sync.PeerAddr, id: usize, buf: []u8) !usize {
         const io = self.io;
         const gpa = self.gpa;
-        const ip = try net.IpAddress.parse(addr.host, addr.port);
+        const ip = try net.IpAddress.resolve(io, addr.host, addr.port);
         const stream = try ip.connect(io, .{ .mode = .stream });
         defer stream.close(io);
         var rbuf: [1 << 16]u8 = undefined;
