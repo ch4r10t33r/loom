@@ -13,6 +13,7 @@ const Io = std.Io;
 const net = std.Io.net;
 const hashmod = @import("../core/hash.zig");
 const weights = @import("weights.zig");
+const dns = @import("dns.zig");
 
 pub const Result = struct {
     store: weights.Store,
@@ -43,7 +44,7 @@ const Peer = struct {
     wbuf: []u8,
 
     fn connect(gpa: std.mem.Allocator, io: Io, addr: PeerAddr) !*Peer {
-        const address = try net.IpAddress.resolve(io, addr.host, addr.port);
+        const address = try dns.resolve(io, addr.host, addr.port);
         const stream = try address.connect(io, .{ .mode = .stream });
         const p = try gpa.create(Peer);
         errdefer gpa.destroy(p);

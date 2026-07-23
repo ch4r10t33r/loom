@@ -8,6 +8,7 @@ const engine_mod = @import("../engine/engine.zig");
 const Engine = engine_mod.Engine;
 const hf = @import("hf.zig");
 const rpc = @import("rpc.zig");
+const dns = @import("../p2p/dns.zig");
 const openai = @import("openai.zig");
 const generator = @import("generator.zig");
 const deepseek = @import("../gguf/deepseek.zig");
@@ -76,7 +77,7 @@ const HeartbeatCtx = struct {
         const gpa = self.gpa;
         const io = self.io;
         const addr = sync.PeerAddr.parse(addr_str) catch return null;
-        const ip = std.Io.net.IpAddress.resolve(io, addr.host, addr.port) catch return null;
+        const ip = dns.resolve(io, addr.host, addr.port) catch return null;
         const stream = ip.connect(io, .{ .mode = .stream }) catch return null;
         defer stream.close(io);
         var rbuf: [4096]u8 = undefined;
