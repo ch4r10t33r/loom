@@ -693,7 +693,7 @@ fn runDeepseekStore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, dir: []cons
     const temp: f32 = @floatCast(try flagF64(args, "--temp", 0.0));
     const seed = try flagU64(args, "--seed", 42);
 
-    const prompt_toks = try m.encodePrompt(gpa, prompt);
+    const prompt_toks = try m.encodePrompt(gpa, prompt, false);
     defer gpa.free(prompt_toks);
     if (prompt_toks.len == 0) return out.print("empty prompt after tokenization\n", .{});
 
@@ -763,7 +763,7 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
     var st = try eng.State.init(gpa, c);
     defer st.deinit(gpa);
 
-    const prompt_toks = try m.encodePrompt(gpa, prompt);
+    const prompt_toks = try m.encodePrompt(gpa, prompt, false);
     defer gpa.free(prompt_toks);
     if (prompt_toks.len == 0) return out.print("empty prompt after tokenization\n", .{});
 
