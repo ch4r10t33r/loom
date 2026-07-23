@@ -56,6 +56,18 @@ fn contains(h: []const u8, needle: []const u8) bool {
     return std.mem.indexOf(u8, h, needle) != null;
 }
 
+/// True if the format's scaffolding uses special-token markers (chatml, llama3,
+/// gemma) that must be tokenized as their atomic ids. For these, the rendered
+/// prompt is encoded with parse_special=true. Text-marker formats (deepseek,
+/// llama2, mistral, generic) have no special scaffolding, so their prompts are
+/// encoded with parse_special=false and user content cannot inject control ids.
+pub fn usesSpecialMarkers(fmt: Format) bool {
+    return switch (fmt) {
+        .chatml, .llama3, .gemma => true,
+        .deepseek, .llama2, .mistral, .generic => false,
+    };
+}
+
 fn roleIs(m: Message, r: []const u8) bool {
     return std.mem.eql(u8, m.role, r);
 }

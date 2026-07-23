@@ -67,8 +67,8 @@ pub const Model = struct {
 
     tok: Tokenizer,
 
-    pub fn encodePrompt(self: *const Model, gpa: std.mem.Allocator, text: []const u8) ![]u32 {
-        return self.tok.encode(gpa, text, true);
+    pub fn encodePrompt(self: *const Model, gpa: std.mem.Allocator, text: []const u8, parse_special: bool) ![]u32 {
+        return self.tok.encode(gpa, text, true, parse_special);
     }
     pub fn decodeToken(self: *const Model, w: *Io.Writer, id: u32) !void {
         return self.tok.decode(w, id);
@@ -219,14 +219,21 @@ pub const Tokenizer = struct {
     /// SPM encode: prefix a space, map ' ' -> U+2581, split into UTF-8 chars,
     /// then greedily merge the adjacent pair whose concatenation is the
     /// highest-scoring vocab entry. Unmatched symbols fall back to byte tokens.
-    pub fn encode(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, add_bos: bool) ![]u32 {
+    /// `parse_special`: when true, special-token strings are emitted as their
+    /// atomic ids; when false they are SPM-encoded as ordinary text (so
+    /// untrusted input cannot inject a control token).
+    pub fn encode(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, add_bos: bool, parse_special: bool) ![]u32 {
         var out = std.ArrayList(u32).empty;
         errdefer out.deinit(gpa);
         if (add_bos) try out.append(gpa, self.bos);
 
-        // Split on special tokens (chat-template markers, control tokens),
-        // emitting their ids atomically and SPM-encoding the text between. When
-        // no special appears, this is one segment identical to the old path.
+        if (!parse_special) {
+            try self.encodeSegment(gpa, text, true, &out);
+            return out.toOwnedSlice(gpa);
+        }
+
+        // Split on special tokens, emitting their ids atomically and
+        // SPM-encoding the text between.
         var seg_start: usize = 0;
         var i: usize = 0;
         while (i < text.len) {

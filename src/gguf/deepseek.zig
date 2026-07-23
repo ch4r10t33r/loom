@@ -34,10 +34,10 @@ pub const Tok = union(enum) {
     spm: llama.Tokenizer,
     bpe: bpe.Bpe,
 
-    pub fn encode(self: *const Tok, gpa: std.mem.Allocator, text: []const u8, add_bos: bool) ![]u32 {
+    pub fn encode(self: *const Tok, gpa: std.mem.Allocator, text: []const u8, add_bos: bool, parse_special: bool) ![]u32 {
         return switch (self.*) {
-            .spm => |*t| t.encode(gpa, text, add_bos),
-            .bpe => |*t| t.encode(gpa, text, add_bos),
+            .spm => |*t| t.encode(gpa, text, add_bos, parse_special),
+            .bpe => |*t| t.encode(gpa, text, add_bos, parse_special),
         };
     }
     pub fn decode(self: *const Tok, w: *Io.Writer, id: u32) !void {
@@ -158,8 +158,8 @@ pub const Model = struct {
     /// (layer * n_expert + e) -> manifest shard id; built by attachDist.
     expert_shard: []usize = &.{},
 
-    pub fn encodePrompt(self: *const Model, gpa: std.mem.Allocator, text: []const u8) ![]u32 {
-        return self.tok.encode(gpa, text, true);
+    pub fn encodePrompt(self: *const Model, gpa: std.mem.Allocator, text: []const u8, parse_special: bool) ![]u32 {
+        return self.tok.encode(gpa, text, true, parse_special);
     }
     pub fn decodeToken(self: *const Model, w: *Io.Writer, id: u32) !void {
         return self.tok.decode(w, id);

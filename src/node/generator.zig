@@ -65,10 +65,14 @@ pub const Generator = union(enum) {
         seed: u64,
         budget: ?u64,
         sink: ?TokenSink,
+        /// Parse special tokens in `prompt_text` (true only for trusted
+        /// chat-template scaffold; false for raw user prompts, so untrusted
+        /// input cannot inject control tokens). Ignored by the loom byte engine.
+        parse_special: bool,
     ) !Result {
         return switch (self) {
             .loom => |e| genLoom(e, gpa, prompt_text, max_tokens, temp, seed, budget, sink),
-            .gguf => |g| genGguf(g, gpa, io, prompt_text, max_tokens, temp, seed, budget, sink),
+            .gguf => |g| genGguf(g, gpa, io, prompt_text, max_tokens, temp, seed, budget, sink, parse_special),
         };
     }
 
@@ -160,12 +164,13 @@ fn genGguf(
     seed: u64,
     budget: ?u64,
     sink: ?TokenSink,
+    parse_special: bool,
 ) !Result {
     _ = io;
     const m = &g.m;
     const c = m.cfg;
 
-    const toks = try m.encodePrompt(gpa, prompt_text);
+    const toks = try m.encodePrompt(gpa, prompt_text, parse_special);
     defer gpa.free(toks);
     const maxn = clampMax(max_tokens, budget, toks.len);
 

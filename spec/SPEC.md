@@ -78,7 +78,11 @@ full nodes (metered reverse proxy). Chat `messages[]` are rendered with the
 model's chat template, auto-detected from the GGUF `tokenizer.chat_template`
 metadata (overridable via `--chat-format`). Marker tokens (chatml, llama3,
 gemma, control tokens) tokenize atomically to their ids via the special-token
-matcher when the model's vocab defines them.
+matcher when the model's vocab defines them. Special-token parsing is off for raw
+prompts and for text-marker chat formats (deepseek/llama2/mistral), so untrusted
+input cannot inject a control token; it is on only for special-marker chat
+scaffolds (chatml/llama3/gemma), where making message content injection-safe too
+requires segment encoding (follow-up).
 
 ## Metering and compensation
 

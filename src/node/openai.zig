@@ -281,9 +281,14 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer) !?R
         return null;
     }
 
+    // Parse special tokens only for chat formats whose scaffold uses them
+    // (chatml/llama3/gemma); never for a raw completion prompt or a text-marker
+    // chat format, so user content cannot inject control tokens.
+    const parse_special = is_chat and chat_template.usesSpecialMarkers(ctx.gen.chatFormat());
+
     // Generate under the shared engine mutex (rpc + openai serialize here).
     ctx.engine_lock.lockUncancelable(ctx.io);
-    var res = ctx.gen.generate(gpa, ctx.io, prompt_text, max_tokens, temp, seed, budget, null) catch |e| {
+    var res = ctx.gen.generate(gpa, ctx.io, prompt_text, max_tokens, temp, seed, budget, null, parse_special) catch |e| {
         ctx.engine_lock.unlock(ctx.io);
         return e;
     };
@@ -365,8 +370,9 @@ fn streamCompletions(
     var sctx = StreamCtx{ .wi = wi, .gpa = gpa, .id = id, .model = model_id, .is_chat = is_chat };
     const sink = generator.TokenSink{ .ctx = &sctx, .emit = StreamCtx.emit };
 
+    const parse_special = is_chat and chat_template.usesSpecialMarkers(ctx.gen.chatFormat());
     ctx.engine_lock.lockUncancelable(ctx.io);
-    var res = ctx.gen.generate(gpa, ctx.io, prompt_text, max_tokens, temp, seed, budget, sink) catch |e| {
+    var res = ctx.gen.generate(gpa, ctx.io, prompt_text, max_tokens, temp, seed, budget, sink, parse_special) catch |e| {
         ctx.engine_lock.unlock(ctx.io);
         wi.print("data: {{\"error\":{{\"message\":\"{s}\",\"type\":\"server_error\"}}}}\n\ndata: [DONE]\n\n", .{@errorName(e)}) catch {};
         wi.flush() catch {};

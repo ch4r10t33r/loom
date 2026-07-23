@@ -197,13 +197,22 @@ pub const Bpe = struct {
         }
     }
 
-    pub fn encode(self: *const Bpe, gpa: std.mem.Allocator, text: []const u8, add_bos: bool) ![]u32 {
+    /// `parse_special`: when true, special-token strings (chat-template markers,
+    /// control tokens) in `text` are emitted as their atomic ids; when false
+    /// they are encoded as ordinary text (so untrusted input cannot inject a
+    /// control token).
+    pub fn encode(self: *const Bpe, gpa: std.mem.Allocator, text: []const u8, add_bos: bool, parse_special: bool) ![]u32 {
         var out = std.ArrayList(u32).empty;
         errdefer out.deinit(gpa);
         if (add_bos and self.add_bos) try out.append(gpa, self.bos);
 
-        // Split on special tokens (chat-template markers, control tokens),
-        // emitting their ids atomically and BPE-encoding the text between.
+        if (!parse_special) {
+            try self.encodeNormal(gpa, text, &out);
+            return out.toOwnedSlice(gpa);
+        }
+
+        // Split on special tokens, emitting their ids atomically and
+        // BPE-encoding the text between.
         var seg_start: usize = 0;
         var i: usize = 0;
         while (i < text.len) {
