@@ -1,0 +1,63 @@
+# A minimal distributed Loom swarm on one host, for trying the token-loop
+# expert fetch without any external model:
+#
+#   origin  generates a synthetic deepseek2 GGUF, shards it, and serves it as
+#           the bootnode (holds every expert shard).
+#   node2   bootstraps ~30% of the expert shards from the origin, then serves
+#           the same model, fetching the experts it lacks from the origin at
+#           token time.
+#
+#   docker compose up --build
+#   curl -s localhost:8782/v1/completions -d '{"prompt":"the","max_tokens":8}'
+#     (node2's OpenAI port; a hit_rate < 1 on the RPC response = peer fetch)
+#
+# Peers address each other by IP. Connect sites go through IpAddress.resolve, so
+# an IP always works and a resolvable hostname works where the platform resolver
+# cooperates; static IPs keep this demo deterministic and independent of
+# container DNS.
+
+networks:
+  loomnet:
+    ipam:
+      config:
+        - subnet: 172.28.5.0/24
+
+services:
+  origin:
+    build: .
+    image: loom:dev
+    networks:
+      loomnet:
+        ipv4_address: 172.28.5.10
+    entrypoint: ["sh", "-c"]
+    command:
+      - >
+        loom gguf gen /home/loom/model.gguf --arch deepseek2 --seed 1 &&
+        exec loom node --gguf /home/loom/model.gguf
+        --rpc-addr 0.0.0.0 --openai-port 8772
+        --p2p-addr 0.0.0.0 --p2p-port 8771 --advertise 172.28.5.10:8771
+    ports:
+      - "8770:8770"   # rpc
+      - "8772:8772"   # openai
+
+  node2:
+    image: loom:dev
+    depends_on: [origin]
+    networks:
+      loomnet:
+        ipv4_address: 172.28.5.11
+    entrypoint: ["sh", "-c"]
+    # retry the bootstrap until the origin has generated + sharded the model and
+    # is accepting joins (loom node exits 0 if the bootstrap peer isn't ready).
+    command:
+      - >
+        sleep 6;
+        while true; do
+        loom node --bootstrap 172.28.5.10:8771 --hold-fraction 0.3
+        --rpc-addr 0.0.0.0 --openai-port 8772
+        --p2p-addr 0.0.0.0 --p2p-port 8781 --advertise 172.28.5.11:8781;
+        echo 'node2: bootstrap not ready, retrying in 3s'; sleep 3;
+        done
+    ports:
+      - "8780:8770"   # rpc
+      - "8782:8772"   # openai
