@@ -35,6 +35,11 @@ pub const Table = struct {
     mutex: Io.Mutex = .init,
     entries: std.ArrayList(PeerInfo) = .empty,
     self_addr: []const u8, // our own advertised addr — never inserted
+    /// Exact hex length a holdings bitmap must have, i.e. ((nRanges+7)/8)*2.
+    /// Zero means "store not attached yet, do not validate". Announces carry an
+    /// attacker-chosen bitmap whose only bound was MAX_BODY_BYTES, so without
+    /// this a peer could park ~128 MiB of hex per entry (security issue #28).
+    expected_holdings_hex_len: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, io: Io, self_addr: []const u8) Table {
         return .{ .gpa = gpa, .io = io, .self_addr = self_addr };
@@ -53,6 +58,9 @@ pub const Table = struct {
     pub fn merge(self: *Table, addr: []const u8, version_hex: []const u8, holdings_hex: []const u8, committee_id: u32, holdings_seq: u64, now_ns: i128) !bool {
         if (std.mem.eql(u8, addr, self.self_addr)) return false;
         if (version_hex.len != 64) return error.BadVersionHex;
+        // reject a bitmap that is not exactly one bit per shard (issue #28)
+        if (self.expected_holdings_hex_len != 0 and holdings_hex.len != 0 and
+            holdings_hex.len != self.expected_holdings_hex_len) return error.BadHoldingsLength;
 
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
@@ -221,4 +229,16 @@ test "table merges, dedupes, refuses self" {
     }
     try std.testing.expect(members.len == 1);
     try std.testing.expectEqualStrings("127.0.0.1:9001", members[0]);
+}
+
+test "merge rejects a holdings bitmap of the wrong size (issue #28)" {
+    const gpa = std.testing.allocator;
+    var t = Table.init(gpa, undefined, "self:1");
+    defer t.deinit();
+    t.expected_holdings_hex_len = 4; // 2 bytes of bitmap = 16 shards
+    const v = "0" ** 64;
+    // an oversized attacker bitmap is refused instead of being stored
+    try std.testing.expectError(error.BadHoldingsLength, t.merge("peer:1", v, "00" ** 4096, 0, 1, 0));
+    // the correctly sized one is accepted
+    try std.testing.expect(try t.merge("peer:1", v, "ffff", 0, 1, 0));
 }

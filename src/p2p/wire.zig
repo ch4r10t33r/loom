@@ -53,6 +53,10 @@ pub fn encodeFrame(gpa: std.mem.Allocator, ty: MsgType, body: []const u8) ![]u8 
             flags |= FLAG_SNAPPY;
         }
     }
+    // The length field is u32; an oversized payload must be an error, not an
+    // @intCast panic (security issue #28: a poisoned peer table could grow an
+    // AnnounceBatch past 4 GiB and abort the process here).
+    if (payload.len > std.math.maxInt(u32)) return error.FrameTooLarge;
     const out = try gpa.alloc(u8, HEADER_LEN + payload.len);
     out[0] = MAGIC[0];
     out[1] = MAGIC[1];
@@ -321,15 +325,44 @@ pub fn writeFrame(wi: *Io.Writer, frame: []const u8) !void {
 }
 
 /// Reads a `FRAME <len>` header line + body. Caller owns the result.
+/// Read `len` bytes into a fresh buffer, growing it as the bytes actually
+/// arrive (security issue #27). Allocating `len` up front let a peer reserve
+/// the full declared size by sending only the `FRAME <len>` header and then
+/// nothing: 256 connections x 64 MiB = 16 GiB for a few hundred bytes of
+/// traffic. Chunked reads make resident memory track delivered bytes, and the
+/// connection deadline (core/sockopt.zig) bounds how long a stalled transfer
+/// can hold even that.
+fn readBodyChunked(gpa: std.mem.Allocator, ri: *Io.Reader, len: usize) ![]u8 {
+    const CHUNK = 64 * 1024;
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(gpa);
+    try buf.ensureTotalCapacity(gpa, @min(len, CHUNK));
+    var remaining = len;
+    while (remaining > 0) {
+        const n = @min(remaining, CHUNK);
+        const dst = try buf.addManyAsSlice(gpa, n);
+        try ri.readSliceAll(dst);
+        remaining -= n;
+    }
+    return buf.toOwnedSlice(gpa);
+}
+
 pub fn readFrameAlloc(gpa: std.mem.Allocator, ri: *Io.Reader) ![]u8 {
     const line = std.mem.trimEnd(u8, try ri.takeDelimiterInclusive('\n'), "\r\n");
     if (!std.mem.startsWith(u8, line, "FRAME ")) return error.NotAFrame;
     const len = try std.fmt.parseInt(usize, line[6..], 10);
-    if (len < HEADER_LEN or len > 512 * 1024 * 1024) return error.BadFrameLength;
-    const buf = try gpa.alloc(u8, len);
-    errdefer gpa.free(buf);
-    try ri.readSliceAll(buf);
-    return buf;
+    // Same ceiling the server enforces (security issue #27): this client-side
+    // reader used to allow 512 MiB, 8x the server cap, and it runs in up to 64
+    // concurrent prefetch threads.
+    if (len < HEADER_LEN or len > MAX_BODY_BYTES + HEADER_LEN) return error.BadFrameLength;
+    return readBodyChunked(gpa, ri, len);
+}
+
+/// Server-side counterpart: validate the declared length and read it in
+/// bounded chunks. Callers own the returned slice.
+pub fn readFrameBodyAlloc(gpa: std.mem.Allocator, ri: *Io.Reader, len: usize) ![]u8 {
+    if (len < HEADER_LEN or len > MAX_BODY_BYTES + HEADER_LEN) return error.BadFrameLength;
+    return readBodyChunked(gpa, ri, len);
 }
 
 // ---- tests --------------------------------------------------------------------
@@ -442,4 +475,22 @@ test "corrupt frames are rejected" {
     try std.testing.expectError(error.BadMagic, decodeFrame(gpa, &bad));
     var mism = [_]u8{ 'L', 'M', 1, 0, 9, 0, 0, 0 }; // claims 9 body bytes, has 0
     try std.testing.expectError(error.LengthMismatch, decodeFrame(gpa, &mism));
+}
+
+test "readFrameAlloc rejects a length above the server cap (issue #27)" {
+    const gpa = std.testing.allocator;
+    // 512 MiB used to be accepted here while the server capped at 64 MiB
+    var buf: [64]u8 = undefined;
+    const line = try std.fmt.bufPrint(&buf, "FRAME {d}\n", .{MAX_BODY_BYTES + HEADER_LEN + 1});
+    var r: Io.Reader = .fixed(line);
+    try std.testing.expectError(error.BadFrameLength, readFrameAlloc(gpa, &r));
+}
+
+test "readFrameBodyAlloc reads only the bytes delivered (issue #27)" {
+    const gpa = std.testing.allocator;
+    const body = "hello frame body";
+    var r: Io.Reader = .fixed(body);
+    const got = try readFrameBodyAlloc(gpa, &r, body.len);
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings(body, got);
 }

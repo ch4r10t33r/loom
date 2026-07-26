@@ -211,6 +211,14 @@ with per-peer request quotas, so a light node or attacker cannot soak
 expert-serving capacity and starve inference. Not implemented; documented as
 required.
 
+**Frame and announce bounds.** A frame body is read in bounded chunks, so
+resident memory tracks bytes actually delivered rather than the length a peer
+claims; the client-side reader now enforces the same 64 MiB ceiling as the
+server (it previously allowed 512 MiB in up to 64 concurrent prefetch threads).
+An announce whose holdings bitmap is not exactly one bit per shard is rejected
+by the peer table, and an oversized frame payload returns an error rather than
+overflowing the u32 length field.
+
 **Connection deadlines.** Every accepted connection and every outbound peer
 dial carries a deadline enforced by a watchdog that shuts the socket down when
 it expires (30 s serve, 10 s peer). This closes the gap where the connection
