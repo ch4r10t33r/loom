@@ -148,7 +148,17 @@ const Cursor = struct {
     }
 };
 
+/// Max nesting for metadata arrays. An array whose element type is itself an
+/// array recurses, and each level costs only 12 bytes of file, so unbounded
+/// depth is a stack-overflow crash from a malicious GGUF (security issue #29).
+const MAX_ARRAY_DEPTH: u32 = 4;
+
 fn readValue(c: *Cursor, arena: std.mem.Allocator, vtype: u32) !MetaValue {
+    return readValueDepth(c, arena, vtype, 0);
+}
+
+fn readValueDepth(c: *Cursor, arena: std.mem.Allocator, vtype: u32, depth: u32) !MetaValue {
+    if (depth > MAX_ARRAY_DEPTH) return error.ArrayNestingTooDeep;
     return switch (@as(ValueType, @enumFromInt(vtype))) {
         .u8 => .{ .uint = (try c.need(1))[0] },
         .i8 => .{ .int = @as(i8, @bitCast((try c.need(1))[0])) },
@@ -185,7 +195,7 @@ fn readValue(c: *Cursor, arena: std.mem.Allocator, vtype: u32) !MetaValue {
                 else => {
                     // skip contents (recursively handles arrays of any type)
                     var i: u64 = 0;
-                    while (i < count) : (i += 1) _ = try readValue(c, arena, elem_type);
+                    while (i < count) : (i += 1) _ = try readValueDepth(c, arena, elem_type, depth + 1);
                     break :blk .{ .array = .{ .elem_type = elem_type, .count = count } };
                 },
             }
@@ -230,9 +240,17 @@ pub fn parse(gpa: std.mem.Allocator, io: Io, path: []const u8) !Parsed {
     for (tensors) |*t| {
         t.name = try a.dupe(u8, try c.str());
         const n_dims = try c.u32le();
-        if (n_dims > 8) return error.TruncatedGguf;
+        // A 0-dim tensor leaves `dims` empty and every consumer indexes
+        // dims[0]; a 0-length dim makes the element count meaningless
+        // (security issue #29).
+        if (n_dims == 0 or n_dims > 8) return error.BadTensorDims;
         t.dims = try a.alloc(u64, n_dims);
-        for (t.dims) |*d| d.* = try c.u64le();
+        var elems: u64 = 1;
+        for (t.dims) |*d| {
+            d.* = try c.u64le();
+            if (d.* == 0) return error.BadTensorDims;
+            elems = std.math.mul(u64, elems, d.*) catch return error.BadTensorDims;
+        }
         t.ggml_type = try c.u32le();
         t.offset = try c.u64le();
     }
