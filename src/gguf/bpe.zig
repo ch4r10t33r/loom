@@ -59,6 +59,13 @@ pub const Bpe = struct {
             else => return error.NoMerges,
         };
 
+        // token_type is indexed by token id (special.Set.build, decode), so a
+        // shorter array than `tokens` is an OOB read (security issue #29).
+        if (tokens.len == 0 or (types.len != 0 and types.len != tokens.len)) return error.BadTokenizer;
+        const bos_id = parsed.getUint("tokenizer.ggml.bos_token_id") orelse 0;
+        const eos_id = parsed.getUint("tokenizer.ggml.eos_token_id") orelse 0;
+        if (bos_id >= tokens.len or eos_id >= tokens.len) return error.BadTokenizer;
+
         var lookup = std.StringHashMap(u32).init(gpa);
         errdefer lookup.deinit();
         for (tokens, 0..) |t, i| try lookup.put(t, @intCast(i));

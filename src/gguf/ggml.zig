@@ -57,6 +57,46 @@ pub fn tensorBytes(t: Type, ne0: usize, rows: usize) usize {
     return rows * rowBytes(t, ne0);
 }
 
+/// Block size in elements for `t` (1 for unquantized types). A quantized row
+/// length must be a whole number of blocks: `rowBytes` divides, so a ragged
+/// ne0 silently under-counts the bytes a kernel will actually walk.
+pub fn blockElems(t: Type) usize {
+    return switch (t) {
+        .f32, .f16 => 1,
+        .q4_0, .q5_0, .q8_0 => QK_0,
+        .q4_k, .q5_k, .q6_k => QK_K,
+        _ => 1,
+    };
+}
+
+/// Overflow-checked `tensorBytes` for sizes read from an untrusted file
+/// (security issue #29). Also rejects a row length that is not a whole number
+/// of quantization blocks.
+pub fn tensorBytesChecked(t: Type, ne0: usize, rows: usize, ne2: usize) !usize {
+    const blk = blockElems(t);
+    if (blk != 1 and ne0 % blk != 0) return error.BadTensorShape;
+    const per_row = switch (t) {
+        .f32 => try std.math.mul(usize, ne0, 4),
+        .f16 => try std.math.mul(usize, ne0, 2),
+        else => try std.math.mul(usize, ne0 / blk, blockBytes(t)),
+    };
+    const per_slice = try std.math.mul(usize, rows, per_row);
+    return std.math.mul(usize, per_slice, ne2);
+}
+
+/// Bytes per quantization block for `t`.
+pub fn blockBytes(t: Type) usize {
+    return switch (t) {
+        .q4_0 => Q4_0_BLOCK,
+        .q5_0 => Q5_0_BLOCK,
+        .q8_0 => Q8_0_BLOCK,
+        .q4_k => Q4_K_BLOCK,
+        .q5_k => Q5_K_BLOCK,
+        .q6_k => Q6_K_BLOCK,
+        else => 0,
+    };
+}
+
 inline fn f16FromBytes(b: []const u8) f32 {
     const bits = std.mem.readInt(u16, b[0..2], .little);
     return @floatCast(@as(f16, @bitCast(bits)));
@@ -579,4 +619,17 @@ test "f16 matvec and dequantRow" {
     var row: [cols]f32 = undefined;
     dequantRow(.f16, &row, std.mem.sliceAsBytes(&bits), 1, cols);
     try std.testing.expectApproxEqAbs(@as(f32, 0.25), row[0], 1e-3);
+}
+
+test "tensorBytesChecked rejects overflow and ragged quant rows (issue #29)" {
+    // ne0 * 4 must not wrap: 1<<62 f32 elements overflows usize
+    try std.testing.expectError(error.Overflow, tensorBytesChecked(.f32, 1 << 62, 4, 1));
+    // rows * per_row must not wrap
+    try std.testing.expectError(error.Overflow, tensorBytesChecked(.f32, 1 << 40, 1 << 40, 1));
+    // a quantized row must be a whole number of blocks, else rowBytes
+    // under-counts the bytes the kernel actually walks
+    try std.testing.expectError(error.BadTensorShape, tensorBytesChecked(.q4_0, 33, 1, 1));
+    // sane shapes still compute
+    try std.testing.expectEqual(@as(usize, 4 * 16), try tensorBytesChecked(.f32, 16, 1, 1));
+    try std.testing.expectEqual(@as(usize, Q4_0_BLOCK * 2), try tensorBytesChecked(.q4_0, 64, 1, 1));
 }
