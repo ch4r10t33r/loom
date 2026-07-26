@@ -56,6 +56,12 @@ const Conn = struct { ctx: *Ctx, stream: net.Stream };
 const MAX_CONNS: u32 = 128;
 var live_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
+/// Server-side ceiling on what one request may reserve/generate, independent of
+/// the client's balance (security issue #30 / #33): a self-asserted bearer id
+/// can be rotated freely, so the meter alone is not a bound on how long one
+/// request may hold the engine mutex.
+const MAX_RESERVE: u64 = 4096;
+
 /// Monotonic completion-id counter (no time/rand dependency).
 var id_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 
@@ -109,7 +115,8 @@ fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
     const wi = &w.interface;
 
     const req = parseRequest(ctx.gpa, ri) catch {
-        try writeHttp(wi, 400, errorJson(ctx.gpa, "malformed_request", "invalid_request_error", "not_found") catch return);
+        // static body: the allocated variant leaked on every malformed request
+        try writeHttp(wi, 400, "{\"error\":{\"message\":\"malformed_request\",\"type\":\"invalid_request_error\"}}");
         return;
     };
     defer req.deinit(ctx.gpa);
@@ -234,13 +241,9 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer) !?R
     // Identity from the bearer token (SPEC.md: out-of-band, not prompt-forgeable).
     const client: []const u8 = if (req.bearer.len > 0) req.bearer else "anon";
 
-    // Metering gate: refuse an exhausted client before any work.
-    if (ctx.meter) |m| {
-        if (m.remaining(client) == 0) {
-            const b = try errorJson(gpa, "insufficient balance", "insufficient_quota", "payment_required");
-            return .{ .status = 402, .body = b };
-        }
-    }
+    // Metering gate is folded into the reservation below (security issue #30):
+    // checking and charging separately let N concurrent requests each see the
+    // full balance.
 
     // Parse the body once for model / stream / params / prompt.
     var model_id: []const u8 = ctx.model_id;
@@ -279,12 +282,23 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer) !?R
         try gpa.dupe(u8, promptField(parsed));
     defer gpa.free(prompt_text);
 
-    // Metering budget clamps completion length to the remaining allowance.
-    const budget: ?u64 = if (ctx.meter) |m| m.remaining(client) else null;
+    // Reserve the client's allowance up front: this both gates an exhausted
+    // client and debits atomically, and it means an aborted request still pays
+    // for the work already done (settled from actuals below).
+    var reserved: u64 = 0;
+    var budget: ?u64 = null;
+    if (ctx.meter) |m| {
+        reserved = m.reserve(client, MAX_RESERVE) catch 0;
+        if (reserved == 0) {
+            const b = try errorJson(gpa, "insufficient balance", "insufficient_quota", "payment_required");
+            return .{ .status = 402, .body = b };
+        }
+        budget = reserved;
+    }
 
     // Streaming: write the SSE response to the connection and return null.
     if (stream) {
-        streamCompletions(ctx, wi, is_chat, model_id, client, prompt_text, max_tokens, temp, seed, budget);
+        streamCompletions(ctx, wi, is_chat, model_id, client, prompt_text, max_tokens, temp, seed, budget, reserved);
         return null;
     }
 
@@ -297,6 +311,8 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer) !?R
     ctx.engine_lock.lockUncancelable(ctx.io);
     var res = ctx.gen.generate(gpa, ctx.io, prompt_text, max_tokens, temp, seed, budget, null, parse_special) catch |e| {
         ctx.engine_lock.unlock(ctx.io);
+        // failed generation still releases the reservation
+        if (ctx.meter) |m| _ = m.settle(client, reserved, 0);
         return e;
     };
     ctx.engine_lock.unlock(ctx.io);
@@ -305,24 +321,29 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer) !?R
     const content = try jsonEscapeAlloc(gpa, res.text);
     defer gpa.free(content);
 
-    // Charge the ledger: prompt tokens processed + tokens generated.
+    // Settle: keep prompt + completion, refund the rest of the reservation.
     if (ctx.meter) |m| {
-        _ = try m.charge(client, @intCast(res.prompt_tokens + res.completion_tokens));
+        _ = m.settle(client, reserved, @intCast(res.prompt_tokens + res.completion_tokens));
     }
 
     const finish: []const u8 = if (res.stop) "stop" else "length";
     const id = id_counter.fetchAdd(1, .monotonic) + 1;
+    // model_id comes from the request body; unescaped it could inject JSON keys
+    // (a forged usage/total_tokens ahead of the real one desynchronised
+    // light-node accounting) or terminate an SSE event (security issue #30)
+    const model_esc = try jsonEscapeAlloc(gpa, model_id);
+    defer gpa.free(model_esc);
     const pt = res.prompt_tokens;
     const n = res.completion_tokens;
 
     const body = if (is_chat)
         try std.fmt.allocPrint(gpa,
             \\{{"id":"chatcmpl-loom-{d}","object":"chat.completion","created":0,"model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
-        , .{ id, model_id, content, finish, pt, n, pt + n })
+        , .{ id, model_esc, content, finish, pt, n, pt + n })
     else
         try std.fmt.allocPrint(gpa,
             \\{{"id":"cmpl-loom-{d}","object":"text_completion","created":0,"model":"{s}","choices":[{{"index":0,"text":"{s}","finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
-        , .{ id, model_id, content, finish, pt, n, pt + n });
+        , .{ id, model_esc, content, finish, pt, n, pt + n });
 
     return .{ .status = 200, .body = body };
 }
@@ -336,9 +357,14 @@ const StreamCtx = struct {
     id: u64,
     model: []const u8,
     is_chat: bool,
+    /// Tokens actually emitted. A client that disconnects mid-stream makes the
+    /// write fail, which aborts generation — the compute is already spent, so
+    /// this is what gets billed (security issue #30).
+    emitted: u64 = 0,
 
     fn emit(ptr: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *StreamCtx = @ptrCast(@alignCast(ptr));
+        self.emitted += 1;
         const esc = try jsonEscapeAlloc(self.gpa, bytes);
         defer self.gpa.free(esc);
         if (self.is_chat) {
@@ -364,24 +390,33 @@ fn streamCompletions(
     temp: f32,
     seed: u64,
     budget: ?u64,
+    reserved: u64,
 ) void {
     const gpa = ctx.gpa;
     const id = id_counter.fetchAdd(1, .monotonic) + 1;
+    // client-controlled: unescaped it can terminate an SSE event and forge
+    // `data:` frames to the client (security issue #30)
+    const model_esc = jsonEscapeAlloc(gpa, model_id) catch return;
+    defer gpa.free(model_esc);
 
     wi.print("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", .{}) catch return;
     if (is_chat) {
-        wi.print("data: {{\"id\":\"chatcmpl-loom-{d}\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\n", .{ id, model_id }) catch return;
+        wi.print("data: {{\"id\":\"chatcmpl-loom-{d}\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\n", .{ id, model_esc }) catch return;
     }
     wi.flush() catch return;
 
-    var sctx = StreamCtx{ .wi = wi, .gpa = gpa, .id = id, .model = model_id, .is_chat = is_chat };
+    var sctx = StreamCtx{ .wi = wi, .gpa = gpa, .id = id, .model = model_esc, .is_chat = is_chat };
     const sink = generator.TokenSink{ .ctx = &sctx, .emit = StreamCtx.emit };
 
     const parse_special = is_chat and chat_template.usesSpecialMarkers(ctx.gen.chatFormat());
     ctx.engine_lock.lockUncancelable(ctx.io);
-    var res = ctx.gen.generate(gpa, ctx.io, prompt_text, max_tokens, temp, seed, budget, sink, parse_special) catch |e| {
+    var res = ctx.gen.generate(gpa, ctx.io, prompt_text, max_tokens, temp, seed, budget, sink, parse_special) catch {
         ctx.engine_lock.unlock(ctx.io);
-        wi.print("data: {{\"error\":{{\"message\":\"{s}\",\"type\":\"server_error\"}}}}\n\ndata: [DONE]\n\n", .{@errorName(e)}) catch {};
+        // A disconnect aborts generation here. The prefill and every emitted
+        // token were still computed, so bill them rather than letting an
+        // aborted stream be free compute (security issue #30).
+        if (ctx.meter) |m| _ = m.settle(client, reserved, sctx.emitted);
+        wi.print("data: {{\"error\":{{\"message\":\"generation_failed\",\"type\":\"server_error\"}}}}\n\ndata: [DONE]\n\n", .{}) catch {};
         wi.flush() catch {};
         return;
     };
@@ -389,14 +424,14 @@ fn streamCompletions(
     defer res.deinit(gpa);
 
     if (ctx.meter) |m| {
-        _ = m.charge(client, @intCast(res.prompt_tokens + res.completion_tokens)) catch {};
+        _ = m.settle(client, reserved, @intCast(res.prompt_tokens + res.completion_tokens));
     }
 
     const finish: []const u8 = if (res.stop) "stop" else "length";
     if (is_chat) {
-        wi.print("data: {{\"id\":\"chatcmpl-loom-{d}\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}]}}\n\n", .{ id, model_id, finish }) catch return;
+        wi.print("data: {{\"id\":\"chatcmpl-loom-{d}\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"{s}\"}}]}}\n\n", .{ id, model_esc, finish }) catch return;
     } else {
-        wi.print("data: {{\"id\":\"cmpl-loom-{d}\",\"object\":\"text_completion\",\"created\":0,\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"text\":\"\",\"finish_reason\":\"{s}\"}}]}}\n\n", .{ id, model_id, finish }) catch return;
+        wi.print("data: {{\"id\":\"cmpl-loom-{d}\",\"object\":\"text_completion\",\"created\":0,\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"text\":\"\",\"finish_reason\":\"{s}\"}}]}}\n\n", .{ id, model_esc, finish }) catch return;
     }
     wi.print("data: [DONE]\n\n", .{}) catch return;
     wi.flush() catch return;
