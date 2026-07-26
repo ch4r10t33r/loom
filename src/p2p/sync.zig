@@ -14,6 +14,7 @@ const net = std.Io.net;
 const hashmod = @import("../core/hash.zig");
 const weights = @import("weights.zig");
 const dns = @import("dns.zig");
+const sockopt = @import("../core/sockopt.zig");
 
 pub const Result = struct {
     store: weights.Store,
@@ -42,6 +43,7 @@ const Peer = struct {
     w: net.Stream.Writer,
     rbuf: []u8,
     wbuf: []u8,
+    deadline: ?usize = null,
 
     fn connect(gpa: std.mem.Allocator, io: Io, addr: PeerAddr) !*Peer {
         const address = try dns.resolve(io, addr.host, addr.port);
@@ -54,10 +56,12 @@ const Peer = struct {
         p.wbuf = try gpa.alloc(u8, 4096);
         p.r = stream.reader(io, p.rbuf);
         p.w = stream.writer(io, p.wbuf);
+        p.deadline = sockopt.trackPeer(io, stream);
         return p;
     }
 
     fn close(p: *Peer, gpa: std.mem.Allocator) void {
+        sockopt.untrack(p.io, p.deadline); // before close: see sockopt fd-reuse note
         p.stream.close(p.io);
         gpa.free(p.rbuf);
         gpa.free(p.wbuf);

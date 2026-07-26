@@ -9,6 +9,7 @@ const Engine = engine_mod.Engine;
 const hf = @import("hf.zig");
 const rpc = @import("rpc.zig");
 const dns = @import("../p2p/dns.zig");
+const sockopt = @import("../core/sockopt.zig");
 const openai = @import("openai.zig");
 const generator = @import("generator.zig");
 const deepseek = @import("../gguf/deepseek.zig");
@@ -79,6 +80,8 @@ const HeartbeatCtx = struct {
         const addr = sync.PeerAddr.parse(addr_str) catch return null;
         const ip = dns.resolve(io, addr.host, addr.port) catch return null;
         const stream = ip.connect(io, .{ .mode = .stream }) catch return null;
+        const dl = sockopt.trackPeer(io, stream);
+        defer sockopt.untrack(io, dl);
         defer stream.close(io);
         var rbuf: [4096]u8 = undefined;
         var wbuf: [1024]u8 = undefined;
@@ -199,10 +202,6 @@ const RepairCtx = struct {
     /// Candidate holders come from the live gossip table, so repair reaches
     /// peers this node was never explicitly told about.
     table: *peers.Table,
-    /// Shared with the serving path: repair mutates the store (fetching shards)
-    /// and so does the token-loop expert fetch during generation. Serialize both
-    /// on the one engine mutex so their store writes never interleave.
-    engine_lock: *Io.Mutex,
 };
 
 fn repairThread(ctx: *RepairCtx) void {
@@ -214,8 +213,11 @@ fn repairThread(ctx: *RepairCtx) void {
             for (addrs) |a| ctx.gpa.free(a);
             ctx.gpa.free(addrs);
         }
-        ctx.engine_lock.lockUncancelable(ctx.io);
-        defer ctx.engine_lock.unlock(ctx.io);
+        // Security issue #25: never hold the engine mutex across peer I/O. A
+        // peer that accepts and then goes silent would otherwise block every
+        // inference request for as long as it stayed connected. Store mutation
+        // needs no coarse lock: writeRange digest-verifies, writes disjoint
+        // extents, and flips an atomic bit; saveSidecars self-serializes.
         var repaired: usize = 0;
         for (addrs) |addr_str| {
             if (ctx.store.missingCount() == 0) break;
@@ -558,7 +560,6 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             .io = io,
             .store = &store.?,
             .table = &table,
-            .engine_lock = &engine_lock,
         };
         const t = try std.Thread.spawn(.{}, repairThread, .{&repair_ctx});
         t.detach();

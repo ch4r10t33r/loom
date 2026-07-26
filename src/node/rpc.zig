@@ -14,6 +14,7 @@ const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
 const generator = @import("generator.zig");
+const sockopt = @import("../core/sockopt.zig");
 const stats = @import("../core/stats.zig");
 const meter_mod = @import("meter.zig");
 
@@ -48,6 +49,7 @@ var live_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 pub fn serve(ctx: *Ctx) !void {
     var address = try net.IpAddress.parse(ctx.addr, ctx.port);
     var server = try address.listen(ctx.io, .{ .reuse_address = true });
+    sockopt.ensureReaper(ctx.io);
     defer server.deinit(ctx.io);
 
     while (true) {
@@ -81,6 +83,8 @@ fn connThread(conn: *Conn) void {
 
 fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
     defer stream.close(ctx.io);
+    const dl = sockopt.trackServe(ctx.io, stream);
+    defer sockopt.untrack(ctx.io, dl);
     var rbuf: [1 << 16]u8 = undefined;
     var wbuf: [1 << 16]u8 = undefined;
     var r = stream.reader(ctx.io, &rbuf);

@@ -539,6 +539,8 @@ pub const Store = struct {
     /// on heartbeat/gossip so a stale bitmap can never clobber a fresh one —
     /// popcount is NOT monotonic now that verify-failures clear bits (#7 P1).
     seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Guards `saveSidecars` only (see there). Never held across network I/O.
+    sidecar_mutex: Io.Mutex = .init,
 
     pub fn holdingsSeq(self: *Store) u64 {
         return self.seq.load(.monotonic);
@@ -618,7 +620,15 @@ pub const Store = struct {
         _ = self.seq.fetchAdd(1, .monotonic);
     }
 
+    /// Persist the manifest + bitmaps. Self-serializing (security issue #25):
+    /// this is the only store mutation that is NOT safe to run concurrently
+    /// (three whole-file rewrites), so it takes its own lock rather than
+    /// forcing callers to hold a coarse lock across unrelated work. Shard
+    /// writes need no lock: `writeRange` digest-verifies, writes disjoint
+    /// extents, and flips an atomic holdings bit.
     pub fn saveSidecars(self: *Store) !void {
+        self.sidecar_mutex.lockUncancelable(self.io);
+        defer self.sidecar_mutex.unlock(self.io);
         const text = try self.manifest.serialize(self.gpa);
         defer self.gpa.free(text);
         try writeFileIn(self.io, self.dir, "ranges.manifest", text);

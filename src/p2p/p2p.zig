@@ -42,6 +42,7 @@ const peers = @import("peers.zig");
 const stats = @import("../core/stats.zig");
 const bootnode = @import("bootnode.zig");
 const wire = @import("wire.zig");
+const sockopt = @import("../core/sockopt.zig");
 
 pub const Ctx = struct {
     gpa: std.mem.Allocator,
@@ -100,6 +101,7 @@ var live_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 pub fn serve(ctx: *Ctx) !void {
     var address = try net.IpAddress.parse(ctx.addr, ctx.port);
     var server = try address.listen(ctx.io, .{ .reuse_address = true });
+    sockopt.ensureReaper(ctx.io);
     defer server.deinit(ctx.io);
 
     while (true) {
@@ -133,6 +135,8 @@ fn connThread(conn: *Conn) void {
 
 fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
     defer stream.close(ctx.io);
+    const dl = sockopt.trackServe(ctx.io, stream);
+    defer sockopt.untrack(ctx.io, dl);
     // GLM-scale holdings bitmaps make GOSSIP/HOLDINGS lines ~5 KB; size the
     // line buffers well past that
     var rbuf: [1 << 16]u8 = undefined;
