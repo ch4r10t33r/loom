@@ -106,6 +106,13 @@ fn delegate(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
         return error.BadRequest;
     defer parsed.deinit();
     if (parsed.value != .object) return error.BadRequest;
+    // Only inference passes through (security issue #30). Forwarding `method`
+    // verbatim made a light node an anonymous oracle for brute-forcing the full
+    // node's admin token, from behind the proxy's IP and unlogged.
+    if (parsed.value.object.get("method")) |mv| {
+        if (mv != .string or !std.mem.eql(u8, mv.string, "tab")) return error.MethodNotAllowed;
+    }
+    _ = parsed.value.object.orderedRemove("admin_token");
     try parsed.value.object.put(parsed.arena.allocator(), "client", .{ .string = ctx.opts.client_id });
     const fixed = try std.json.Stringify.valueAlloc(gpa, parsed.value, .{});
     defer gpa.free(fixed);

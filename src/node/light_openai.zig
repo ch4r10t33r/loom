@@ -192,6 +192,9 @@ fn forwardTo(ctx: *Ctx, backend: sync.PeerAddr, req: Request) !Response {
             content_length = std.fmt.parseInt(usize, std.mem.trim(u8, headerValue(h), " "), 10) catch 0;
         }
     }
+    // cap the backend's declared length too (security issue #30): the inbound
+    // direction was capped at 8 MB while this one was unbounded
+    if (content_length > (8 << 20)) return error.BodyTooLarge;
     const body = try gpa.alloc(u8, content_length);
     errdefer gpa.free(body);
     if (content_length > 0) try ri.readSliceAll(body);
@@ -201,13 +204,21 @@ fn forwardTo(ctx: *Ctx, backend: sync.PeerAddr, req: Request) !Response {
 /// Tally spend from the response `usage.total_tokens` (the light node's own view
 /// of what it owes across backends), mirroring light.zig's cost tally.
 fn trackSpend(ctx: *Ctx, body: []const u8) void {
-    const key = "\"total_tokens\":";
-    const idx = std.mem.indexOf(u8, body, key) orelse return;
-    var end = idx + key.len;
-    var cost: u64 = 0;
-    while (end < body.len and body[end] >= '0' and body[end] <= '9') : (end += 1) {
-        cost = cost * 10 + (body[end] - '0');
-    }
+    // Parse the JSON rather than scanning for the first `"total_tokens":`
+    // substring (security issue #30): a client-controlled `model` field could
+    // inject a forged usage object ahead of the real one, so the light node
+    // billed itself a number the attacker chose while the full node charged the
+    // real amount.
+    var parsed = std.json.parseFromSlice(std.json.Value, ctx.gpa, body, .{}) catch return;
+    defer parsed.deinit();
+    if (parsed.value != .object) return;
+    const usage = parsed.value.object.get("usage") orelse return;
+    if (usage != .object) return;
+    const tt = usage.object.get("total_tokens") orelse return;
+    const cost: u64 = switch (tt) {
+        .integer => |v| if (v > 0) @intCast(v) else 0,
+        else => 0,
+    };
     if (cost > 0) {
         const total = ctx.spent.fetchAdd(cost, .monotonic) + cost;
         std.debug.print("light-openai: spent {d} tokens this request ({d} total)\n", .{ cost, total });

@@ -44,6 +44,11 @@ const Conn = struct { ctx: *Ctx, stream: net.Stream };
 
 /// Bound concurrent RPC handlers (audit #7 P1 thread-per-accept DoS).
 const MAX_CONNS: u32 = 128;
+
+/// Server-side ceiling on one request's generation, independent of the client's
+/// balance (security issue #30): client ids are self-asserted, so the meter
+/// alone does not bound how long a request holds the engine mutex.
+const MAX_RESERVE: u64 = 4096;
 var live_conns: std.atomic.Value(u32) = std.atomic.Value(u32).init(0);
 
 pub fn serve(ctx: *Ctx) !void {
@@ -172,14 +177,18 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
 
     // metering gate: exhausted clients are refused before any compute; the
     // clamp to remaining allowance happens inside generate via the budget arg.
+    // Reserve atomically (security issue #30): the old check-then-charge let N
+    // concurrent requests for one client each see the full balance.
+    var reserved: u64 = 0;
     var budget: ?u64 = null;
     if (ctx.meter) |m| {
-        if (m.remaining(client) == 0) {
+        reserved = m.reserve(client, MAX_RESERVE) catch 0;
+        if (reserved == 0) {
             try wi.print("{{\"ok\":false,\"error\":\"payment_required\",\"balance\":0}}\n", .{});
             try wi.flush();
             return;
         }
-        budget = m.remaining(client);
+        budget = reserved;
     }
 
     ctx.engine_lock.lockUncancelable(ctx.io);
@@ -187,6 +196,7 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
     // raw user prompt: do not parse special tokens (no injection of control ids)
     var res = ctx.gen.generate(gpa, ctx.io, prompt_str, max_tokens, temp, seed, budget, null, false) catch |e| {
         ctx.engine_lock.unlock(ctx.io);
+        if (ctx.meter) |m| _ = m.settle(client, reserved, 0);
         return e;
     };
     const t1 = stats.nowNs(ctx.io);
@@ -206,8 +216,9 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
     }
     try wi.print("],\"tok_per_s\":{d:.2},\"hit_rate\":{d:.4}", .{ tok_s, hit_rate });
     if (ctx.meter) |m| {
-        // cost = prompt tokens processed + tokens generated
-        const ch = try m.charge(client, @intCast(res.prompt_tokens + res.completion_tokens));
+        // cost = prompt tokens processed + tokens generated; the rest of the
+        // reservation is refunded
+        const ch = m.settle(client, reserved, @intCast(res.prompt_tokens + res.completion_tokens));
         try wi.print(",\"cost\":{d},\"balance\":{d}", .{ ch.cost, ch.balance });
     }
     try wi.print("}}\n", .{});
