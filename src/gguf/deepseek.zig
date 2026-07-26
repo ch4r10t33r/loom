@@ -62,6 +62,12 @@ pub const Tok = union(enum) {
 
 pub const GatingFunc = enum(u32) { softmax = 1, sigmoid = 2 };
 
+/// Caps for config values that index fixed-size stack buffers in `step`
+/// (security issue #29). `n_used` slices `sel_buf`/`ids_buf` and `dim` slices
+/// `acc_buf`; without these an oversized metadata value smashes the stack.
+pub const MAX_SELECTED: usize = 64;
+pub const MAX_DIM: usize = 8192;
+
 pub const Config = struct {
     dim: usize,
     n_layers: usize,
@@ -103,10 +109,16 @@ pub const Tensor = struct {
     ne1: usize, // rows (output dim)
     ne2: usize, // experts (3D tensors), else 1
 
-    /// Byte slice of expert `e` in a 3D tensor.
-    pub fn expert(self: Tensor, e: usize) Tensor {
+    /// Byte slice of expert `e` in a 3D tensor. `e` comes from the router,
+    /// bounded by the config's expert count, while `ne2` comes from the file:
+    /// a file declaring fewer experts than the config would slice past the
+    /// mapping (security issue #29), so bound it here.
+    pub fn expert(self: Tensor, e: usize) !Tensor {
+        if (e >= self.ne2) return error.ExpertOutOfRange;
         const per = self.ne1 * ggml.rowBytes(self.ty, self.ne0);
-        return .{ .ty = self.ty, .data = self.data[e * per ..][0..per], .ne0 = self.ne0, .ne1 = self.ne1, .ne2 = 1 };
+        const start = e * per;
+        if (start + per > self.data.len) return error.ExpertOutOfRange;
+        return .{ .ty = self.ty, .data = self.data[start..][0..per], .ne0 = self.ne0, .ne1 = self.ne1, .ne2 = 1 };
     }
 };
 
@@ -181,23 +193,75 @@ pub const Model = struct {
         self.parsed.deinit();
     }
 
+    /// Resolve a tensor by name, validating every size against the file with
+    /// overflow-checked arithmetic (security issue #29). Unchecked, a malicious
+    /// GGUF could wrap `ne0*4` or `start+bytes` to a small value, pass the
+    /// bounds test, and have kernels walk far past the mapping.
     fn resolve(self: *const Model, name: []const u8) !Tensor {
         const t = self.parsed.findTensor(name) orelse return error.MissingTensor;
         if (!ggml.Type.supported(t.ggml_type)) return error.UnsupportedTensorType;
         const ty: ggml.Type = @enumFromInt(t.ggml_type);
-        const ne0: usize = @intCast(t.dims[0]);
-        const ne1: usize = if (t.dims.len > 1) @intCast(t.dims[1]) else 1;
-        const ne2: usize = if (t.dims.len > 2) @intCast(t.dims[2]) else 1;
-        const bytes = ggml.tensorBytes(ty, ne0, ne1) * ne2;
-        const start: usize = @intCast(self.parsed.data_offset + t.offset);
-        if (start + bytes > self.mm.memory.len) return error.TruncatedGguf;
-        return .{ .ty = ty, .data = self.mm.memory[start .. start + bytes], .ne0 = ne0, .ne1 = ne1, .ne2 = ne2 };
+        if (t.dims.len == 0) return error.BadTensorShape;
+        const ne0: usize = std.math.cast(usize, t.dims[0]) orelse return error.BadTensorShape;
+        const ne1: usize = if (t.dims.len > 1) std.math.cast(usize, t.dims[1]) orelse return error.BadTensorShape else 1;
+        const ne2: usize = if (t.dims.len > 2) std.math.cast(usize, t.dims[2]) orelse return error.BadTensorShape else 1;
+        const bytes = ggml.tensorBytesChecked(ty, ne0, ne1, ne2) catch return error.BadTensorShape;
+        const off = std.math.add(u64, self.parsed.data_offset, t.offset) catch return error.TruncatedGguf;
+        const start = std.math.cast(usize, off) orelse return error.TruncatedGguf;
+        const end = std.math.add(usize, start, bytes) catch return error.TruncatedGguf;
+        if (end > self.mm.memory.len) return error.TruncatedGguf;
+        return .{ .ty = ty, .data = self.mm.memory[start..end], .ne0 = ne0, .ne1 = ne1, .ne2 = ne2 };
+    }
+
+    /// Assert a resolved tensor has exactly the shape the config implies.
+    /// Without this the kernels trust the file's dims and the config
+    /// independently: e.g. a `[dim, 1<<20]` q_a weight against an 8-float
+    /// destination is a heap overflow write (security issue #29).
+    /// Assert a tensor really is F32. `asF32` reinterprets the mapped bytes as
+    /// floats behind a debug assert, which is a no-op in ReleaseFast: a norm
+    /// weight declared as q8_0 would otherwise be reinterpreted (security
+    /// issue #29). Alignment is checked too, since the data offset is
+    /// file-controlled and `general.alignment` may legally be 1 or 2.
+    fn expectF32(t: Tensor, name: []const u8) !void {
+        if (t.ty != .f32) {
+            std.debug.print("gguf: tensor {s} must be f32, got {s}\n", .{ name, @tagName(t.ty) });
+            return error.BadTensorType;
+        }
+        if (@intFromPtr(t.data.ptr) % @alignOf(f32) != 0) return error.BadTensorAlignment;
+        if (t.data.len % @sizeOf(f32) != 0) return error.BadTensorType;
+    }
+
+    fn expectShape(t: Tensor, ne0: usize, ne1: usize, name: []const u8) !void {
+        if (t.ne0 != ne0 or t.ne1 != ne1) {
+            std.debug.print("gguf: tensor {s} has shape [{d},{d}], config implies [{d},{d}]\n", .{ name, t.ne0, t.ne1, ne0, ne1 });
+            return error.BadTensorShape;
+        }
     }
 
     fn resolveOpt(self: *const Model, name: []const u8) ?Tensor {
         return self.resolve(name) catch null;
     }
 };
+
+/// Reject metadata that would divide by zero, overflow a size computation, or
+/// index past a fixed-size buffer (security issue #29). Everything here comes
+/// from an untrusted file: a peer-supplied GGUF or a Hugging Face download.
+fn validateConfig(cfg: Config) !void {
+    if (cfg.dim == 0 or cfg.n_heads == 0 or cfg.n_layers == 0) return error.BadConfig;
+    if (cfg.dim > MAX_DIM) return error.BadConfig; // acc_buf in step()
+    if (cfg.n_used > MAX_SELECTED) return error.BadConfig; // sel_buf/ids_buf
+    if (cfg.n_expert != 0 and cfg.n_used > cfg.n_expert) return error.BadConfig;
+    if (cfg.n_dense_layers > cfg.n_layers) return error.BadConfig;
+    if (cfg.kv_lora_rank == 0 or cfg.v_head_dim == 0) return error.BadConfig;
+    if (cfg.rope_dim == 0 or cfg.nope_dim == 0) return error.BadConfig;
+    if (cfg.ctx_len == 0) return error.BadConfig;
+    // KV cache is n_layers * ctx_len * kv_lora_rank floats; keep the product
+    // representable so State.init cannot wrap to a small allocation.
+    const kv = std.math.mul(usize, cfg.n_layers, cfg.ctx_len) catch return error.BadConfig;
+    _ = std.math.mul(usize, kv, cfg.kv_lora_rank) catch return error.BadConfig;
+    const kr = std.math.mul(usize, cfg.n_layers, cfg.ctx_len) catch return error.BadConfig;
+    _ = std.math.mul(usize, kr, cfg.rope_dim) catch return error.BadConfig;
+}
 
 pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
     var parsed = try gguf.parse(gpa, io, path);
@@ -253,6 +317,7 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
     if (cfg.n_layers > cfg.n_dense_layers and (cfg.n_expert == 0 or cfg.n_used == 0 or cfg.moe_ffn == 0))
         return error.BadConfig;
     if (cfg.n_expert > 512) return error.BadConfig;
+    try validateConfig(cfg);
 
     // YaRN: DeepSeek applies the mscale to the attention softmax scale (the
     // in-rope mscale is cancelled by attn_factor = 1/(1 + 0.1 ln(1/freq_scale)),
@@ -286,6 +351,7 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
     };
     model.token_embd = try model.resolve("token_embd.weight");
     model.output_norm = try model.resolve("output_norm.weight");
+    try Model.expectF32(model.output_norm, "output_norm.weight");
     model.output = model.resolveOpt("output.weight") orelse model.token_embd;
     model.cfg.vocab = model.token_embd.ne1;
 
@@ -300,22 +366,34 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
         };
         l.is_moe = i >= cfg.n_dense_layers;
         l.attn_norm = try model.resolve(N.f(&nb, i, "attn_norm.weight"));
+        try Model.expectF32(l.attn_norm, "attn_norm.weight");
         if (cfg.q_lora_rank > 0) {
             l.attn_q = null;
             l.attn_q_a = try model.resolve(N.f(&nb, i, "attn_q_a.weight"));
+            // st.q_a is q_lora_rank floats: a larger ne1 here is a heap
+            // overflow write in mv() (security issue #29)
+            try Model.expectShape(l.attn_q_a.?, cfg.dim, cfg.q_lora_rank, "attn_q_a");
             l.attn_q_a_norm = try model.resolve(N.f(&nb, i, "attn_q_a_norm.weight"));
+            try Model.expectF32(l.attn_q_a_norm.?, "attn_q_a_norm.weight");
             l.attn_q_b = try model.resolve(N.f(&nb, i, "attn_q_b.weight"));
+            try Model.expectShape(l.attn_q_b.?, cfg.q_lora_rank, cfg.n_heads * cfg.keyDim(), "attn_q_b");
         } else {
             l.attn_q = try model.resolve(N.f(&nb, i, "attn_q.weight"));
+            try Model.expectShape(l.attn_q.?, cfg.dim, cfg.n_heads * cfg.keyDim(), "attn_q");
             l.attn_q_a = null;
             l.attn_q_a_norm = null;
             l.attn_q_b = null;
         }
         l.attn_kv_a_mqa = try model.resolve(N.f(&nb, i, "attn_kv_a_mqa.weight"));
+        try Model.expectShape(l.attn_kv_a_mqa, cfg.dim, cfg.kv_lora_rank + cfg.rope_dim, "attn_kv_a_mqa");
         l.attn_kv_a_norm = try model.resolve(N.f(&nb, i, "attn_kv_a_norm.weight"));
+        try Model.expectF32(l.attn_kv_a_norm, "attn_kv_a_norm.weight");
         l.attn_kv_b = try model.resolve(N.f(&nb, i, "attn_kv_b.weight"));
+        try Model.expectShape(l.attn_kv_b, cfg.kv_lora_rank, cfg.n_heads * (cfg.nope_dim + cfg.v_head_dim), "attn_kv_b");
         l.attn_output = try model.resolve(N.f(&nb, i, "attn_output.weight"));
+        try Model.expectShape(l.attn_output, cfg.n_heads * cfg.v_head_dim, cfg.dim, "attn_output");
         l.ffn_norm = try model.resolve(N.f(&nb, i, "ffn_norm.weight"));
+        try Model.expectF32(l.ffn_norm, "ffn_norm.weight");
         if (!l.is_moe) {
             l.ffn_gate = try model.resolve(N.f(&nb, i, "ffn_gate.weight"));
             l.ffn_up = try model.resolve(N.f(&nb, i, "ffn_up.weight"));
@@ -334,6 +412,7 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
             l.ffn_down = null;
             l.ffn_gate_inp = try model.resolve(N.f(&nb, i, "ffn_gate_inp.weight"));
             l.exp_probs_b = model.resolveOpt(N.f(&nb, i, "exp_probs_b.bias"));
+            if (l.exp_probs_b) |b| try Model.expectF32(b, "exp_probs_b.bias");
             l.ffn_gate_exps = try model.resolve(N.f(&nb, i, "ffn_gate_exps.weight"));
             l.ffn_up_exps = try model.resolve(N.f(&nb, i, "ffn_up_exps.weight"));
             l.ffn_down_exps = try model.resolve(N.f(&nb, i, "ffn_down_exps.weight"));
@@ -582,6 +661,10 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     const vd = cfg.v_head_dim;
     const scale = cfg.attn_scale;
 
+    // A token id indexes token_embd rows directly. Ids come from the
+    // tokenizer, whose ceiling is an independent metadata array, so bound it
+    // here rather than trusting the two to agree (security issue #29).
+    if (token >= cfg.vocab) return error.TokenOutOfRange;
     ggml.dequantRow(m.token_embd.ty, st.x, m.token_embd.data, token, cfg.dim);
 
     for (m.layers, 0..) |l, li| {
@@ -683,9 +766,9 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
                 } else {
                     denseFFN(
                         st,
-                        l.ffn_gate_exps.?.expert(s.expert),
-                        l.ffn_up_exps.?.expert(s.expert),
-                        l.ffn_down_exps.?.expert(s.expert),
+                        try l.ffn_gate_exps.?.expert(s.expert),
+                        try l.ffn_up_exps.?.expert(s.expert),
+                        try l.ffn_down_exps.?.expert(s.expert),
                     );
                 }
                 for (acc, st.ffn_out) |*a, v| a.* += s.gate * v;

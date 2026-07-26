@@ -85,16 +85,45 @@ pub const Model = struct {
         self.parsed.deinit();
     }
 
+    /// Resolve a tensor by name, validating every size against the file with
+    /// overflow-checked arithmetic (security issue #29). Unchecked, a malicious
+    /// GGUF could wrap `ne0*4` or `start+bytes` to a small value, pass the
+    /// bounds test, and have kernels walk far past the mapping.
     fn resolve(self: *const Model, name: []const u8) !Tensor {
         const t = self.parsed.findTensor(name) orelse return error.MissingTensor;
         if (!ggml.Type.supported(t.ggml_type)) return error.UnsupportedTensorType;
         const ty: ggml.Type = @enumFromInt(t.ggml_type);
-        const ne0: usize = @intCast(t.dims[0]);
-        const ne1: usize = if (t.dims.len > 1) @intCast(t.dims[1]) else 1;
-        const bytes = ggml.tensorBytes(ty, ne0, ne1);
-        const start: usize = @intCast(self.parsed.data_offset + t.offset);
-        if (start + bytes > self.mm.memory.len) return error.TruncatedGguf;
-        return .{ .ty = ty, .data = self.mm.memory[start .. start + bytes], .ne0 = ne0, .ne1 = ne1 };
+        if (t.dims.len == 0) return error.BadTensorShape;
+        const ne0: usize = std.math.cast(usize, t.dims[0]) orelse return error.BadTensorShape;
+        const ne1: usize = if (t.dims.len > 1) std.math.cast(usize, t.dims[1]) orelse return error.BadTensorShape else 1;
+        const ne2: usize = if (t.dims.len > 2) std.math.cast(usize, t.dims[2]) orelse return error.BadTensorShape else 1;
+        const bytes = ggml.tensorBytesChecked(ty, ne0, ne1, ne2) catch return error.BadTensorShape;
+        const off = std.math.add(u64, self.parsed.data_offset, t.offset) catch return error.TruncatedGguf;
+        const start = std.math.cast(usize, off) orelse return error.TruncatedGguf;
+        const end = std.math.add(usize, start, bytes) catch return error.TruncatedGguf;
+        if (end > self.mm.memory.len) return error.TruncatedGguf;
+        if (ne2 != 1) return error.BadTensorShape; // llama tensors are 2D
+        return .{ .ty = ty, .data = self.mm.memory[start..end], .ne0 = ne0, .ne1 = ne1 };
+    }
+
+    /// Assert a resolved tensor has exactly the shape the config implies.
+    /// Without this the kernels trust the file's dims and the config
+    /// independently: e.g. a `[dim, 1<<20]` q_a weight against an 8-float
+    /// destination is a heap overflow write (security issue #29).
+    fn expectF32(t: Tensor, name: []const u8) !void {
+        if (t.ty != .f32) {
+            std.debug.print("gguf: tensor {s} must be f32, got {s}\n", .{ name, @tagName(t.ty) });
+            return error.BadTensorType;
+        }
+        if (@intFromPtr(t.data.ptr) % @alignOf(f32) != 0) return error.BadTensorAlignment;
+        if (t.data.len % @sizeOf(f32) != 0) return error.BadTensorType;
+    }
+
+    fn expectShape(t: Tensor, ne0: usize, ne1: usize, name: []const u8) !void {
+        if (t.ne0 != ne0 or t.ne1 != ne1) {
+            std.debug.print("gguf: tensor {s} has shape [{d},{d}], config implies [{d},{d}]\n", .{ name, t.ne0, t.ne1, ne0, ne1 });
+            return error.BadTensorShape;
+        }
     }
 };
 
@@ -115,6 +144,10 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
 
     const dim: usize = @intCast(parsed.getUint("llama.embedding_length") orelse return error.BadConfig);
     const n_heads: usize = @intCast(parsed.getUint("llama.attention.head_count") orelse return error.BadConfig);
+    // `head_dim` divides by n_heads, and Config.headDim/kvDim do it again on
+    // every forward pass: a metadata head_count of 0 is a guaranteed crash
+    // (security issue #29).
+    if (dim == 0 or n_heads == 0 or dim % n_heads != 0) return error.BadConfig;
     const head_dim = dim / n_heads;
     const cfg = Config{
         .dim = dim,
@@ -128,6 +161,12 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
         .rope_base = @floatCast(parsed.getFloat("llama.rope.freq_base") orelse 10000.0),
         .eps = @floatCast(parsed.getFloat("llama.attention.layer_norm_rms_epsilon") orelse 1e-5),
     };
+
+    if (cfg.n_layers == 0 or cfg.ctx_len == 0 or cfg.ffn == 0) return error.BadConfig;
+    if (cfg.n_kv_heads == 0 or cfg.n_heads % cfg.n_kv_heads != 0) return error.BadConfig;
+    // scores/kv allocations multiply these; keep the products representable
+    const kv = std.math.mul(usize, cfg.n_layers, cfg.ctx_len) catch return error.BadConfig;
+    _ = std.math.mul(usize, kv, cfg.kvDim()) catch return error.BadConfig;
 
     var model = Model{
         .gpa = gpa,
@@ -147,6 +186,7 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
     model.output_norm = try model.resolve("output_norm.weight");
     model.output = model.resolve("output.weight") catch model.token_embd; // tied embeddings
     model.cfg.vocab = model.token_embd.ne1;
+    if (model.cfg.vocab == 0) return error.BadConfig;
 
     const layers = try gpa.alloc(LayerT, cfg.n_layers);
     errdefer gpa.free(layers);
@@ -162,8 +202,24 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
             const name = try std.fmt.bufPrint(&namebuf, "blk.{d}.{s}.weight", .{ i, pair[0] });
             pair[1].* = try model.resolve(name);
         }
+        // The kernels already require these shapes (mv asserts out.len==rows,
+        // x.len==cols); assert them here so a hostile file fails loudly at load
+        // instead of walking past a buffer in ReleaseFast (security issue #29).
+        const hd = cfg.headDim();
+        try Model.expectShape(l.attn_norm, cfg.dim, 1, "attn_norm");
+        try Model.expectF32(l.attn_norm, "attn_norm");
+        try Model.expectShape(l.attn_q, cfg.dim, cfg.n_heads * hd, "attn_q");
+        try Model.expectShape(l.attn_k, cfg.dim, cfg.kvDim(), "attn_k");
+        try Model.expectShape(l.attn_v, cfg.dim, cfg.kvDim(), "attn_v");
+        try Model.expectShape(l.attn_output, cfg.n_heads * hd, cfg.dim, "attn_output");
+        try Model.expectShape(l.ffn_norm, cfg.dim, 1, "ffn_norm");
+        try Model.expectF32(l.ffn_norm, "ffn_norm");
+        try Model.expectShape(l.ffn_gate, cfg.dim, cfg.ffn, "ffn_gate");
+        try Model.expectShape(l.ffn_up, cfg.dim, cfg.ffn, "ffn_up");
+        try Model.expectShape(l.ffn_down, cfg.ffn, cfg.dim, "ffn_down");
     }
     model.layers = layers;
+    try Model.expectF32(model.output_norm, "output_norm");
 
     model.tok = try Tokenizer.init(gpa, &model.parsed);
     return model;
@@ -195,6 +251,17 @@ pub const Tokenizer = struct {
             .array_i32 => |a| a,
             else => return error.NoTokenizer,
         };
+        // `scores` and `types` are indexed by a token id derived from `tokens`
+        // (encode does `self.scores[id]`), so unequal lengths are an OOB read
+        // from a malicious GGUF (security issue #29).
+        if (scores.len != tokens.len or types.len != tokens.len) return error.BadTokenizer;
+        if (tokens.len == 0) return error.BadTokenizer;
+        // bos/eos are metadata and get emitted into the token stream, which
+        // indexes token_embd rows; keep them inside the vocab.
+        const bos_id = parsed.getUint("tokenizer.ggml.bos_token_id") orelse 1;
+        const eos_id = parsed.getUint("tokenizer.ggml.eos_token_id") orelse 2;
+        if (bos_id >= tokens.len or eos_id >= tokens.len) return error.BadTokenizer;
+
         var lookup = std.StringHashMap(u32).init(gpa);
         errdefer lookup.deinit();
         for (tokens, 0..) |t, i| try lookup.put(t, @intCast(i));
@@ -206,8 +273,8 @@ pub const Tokenizer = struct {
             .types = types,
             .lookup = lookup,
             .specials = specials,
-            .bos = @intCast(parsed.getUint("tokenizer.ggml.bos_token_id") orelse 1),
-            .eos = @intCast(parsed.getUint("tokenizer.ggml.eos_token_id") orelse 2),
+            .bos = std.math.cast(u32, bos_id) orelse return error.BadTokenizer,
+            .eos = std.math.cast(u32, eos_id) orelse return error.BadTokenizer,
         };
     }
 
@@ -421,6 +488,10 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     const q_per_kv = cfg.n_heads / cfg.n_kv_heads;
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
 
+    // A token id indexes token_embd rows directly. Ids come from the
+    // tokenizer, whose ceiling is an independent metadata array, so bound it
+    // here rather than trusting the two to agree (security issue #29).
+    if (token >= cfg.vocab) return error.TokenOutOfRange;
     ggml.dequantRow(m.token_embd.ty, st.x, m.token_embd.data, token, cfg.dim);
 
     for (m.layers, 0..) |l, li| {

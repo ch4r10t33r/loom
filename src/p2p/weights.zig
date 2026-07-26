@@ -126,6 +126,13 @@ pub fn parseManifestBytes(gpa: std.mem.Allocator, bytes: []const u8) !Manifest {
     const n_resident = try std.fmt.parseInt(usize, try headerField(it.next() orelse return error.BadManifest, "resident"), 10);
     const n = try std.fmt.parseInt(usize, try headerField(it.next() orelse return error.BadManifest, "shards"), 10);
     if (n == 0 or n > (1 << 26)) return error.BadManifest;
+    // A declared shard count is honoured before any shard line is read, so a
+    // ~200-byte manifest claiming 67M shards would allocate 2.3 GB and then
+    // fail (security issue #29). Every shard line is at least
+    // "<64 hex digest> <offset>:<len>\n" = 68 bytes, so bound n by what the
+    // payload could possibly contain.
+    const MIN_SHARD_LINE = 68;
+    if (n > bytes.len / MIN_SHARD_LINE + 1) return error.BadManifest;
 
     const digests = try gpa.alloc(hashmod.Digest, n);
     errdefer gpa.free(digests);
