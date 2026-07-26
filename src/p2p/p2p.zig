@@ -218,10 +218,10 @@ fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer) !void
         try wi.writeAll(data);
     } else if (std.mem.startsWith(u8, line, "FRAME ")) {
         const len = std.fmt.parseInt(usize, line[6..], 10) catch return wi.print("ERR bad_frame\n", .{});
-        if (len < wire.HEADER_LEN or len > wire.MAX_BODY_BYTES + wire.HEADER_LEN) return wi.print("ERR bad_frame\n", .{});
-        const raw = try ctx.gpa.alloc(u8, len);
+        // read the body in chunks so memory tracks bytes actually delivered
+        // (security issue #27), not the length a peer merely claims
+        const raw = wire.readFrameBodyAlloc(ctx.gpa, ri, len) catch return wi.print("ERR bad_frame\n", .{});
         defer ctx.gpa.free(raw);
-        try ri.readSliceAll(raw);
         try handleFrame(ctx, raw, wi);
     } else if (std.mem.startsWith(u8, line, "JOIN ")) {
         const reg = ctx.boot orelse return wi.print("ERR no_bootnode\n", .{});

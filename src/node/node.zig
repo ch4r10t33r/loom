@@ -416,6 +416,9 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         committee_members.len, @divTrunc(HEARTBEAT_INTERVAL_NS, std.time.ns_per_s),
     });
     if (store) |*st| {
+        // Now that the shard count is known, announces carrying a holdings
+        // bitmap of any other size are rejected (security issue #28).
+        table.expected_holdings_hex_len = ((st.manifest.nRanges() + 7) / 8) * 2;
         try out.print("  weights    version={s}\n", .{hashmod.toHex(st.manifest.version)});
         try out.print("  shards     mode={s} total={d} (resident={d}, expert={d}) held={d} ({d:.1}%)\n", .{
             @tagName(st.manifest.mode),
