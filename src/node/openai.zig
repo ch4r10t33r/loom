@@ -26,6 +26,7 @@ const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
 const generator = @import("generator.zig");
+const sockopt = @import("../core/sockopt.zig");
 const chat_template = @import("../gguf/chat_template.zig");
 const meter_mod = @import("meter.zig");
 
@@ -61,6 +62,7 @@ var id_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
 pub fn serve(ctx: *Ctx) !void {
     var address = try net.IpAddress.parse(ctx.addr, ctx.port);
     var server = try address.listen(ctx.io, .{ .reuse_address = true });
+    sockopt.ensureReaper(ctx.io);
     defer server.deinit(ctx.io);
 
     while (true) {
@@ -97,6 +99,8 @@ fn connThread(conn: *Conn) void {
 /// body. Sufficient for the OpenAI request shape; keep-alive is a later concern.
 fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
     defer stream.close(ctx.io);
+    const dl = sockopt.trackServe(ctx.io, stream);
+    defer sockopt.untrack(ctx.io, dl);
     var rbuf: [1 << 16]u8 = undefined;
     var wbuf: [1 << 16]u8 = undefined;
     var r = stream.reader(ctx.io, &rbuf);
@@ -113,7 +117,7 @@ fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
     // A streaming handler writes the SSE response to `wi` itself and returns
     // null; otherwise we get a buffered Response to write here.
     if (try route(ctx, req, wi)) |resp| {
-        defer ctx.gpa.free(resp.body);
+        defer if (resp.owned) ctx.gpa.free(resp.body);
         try writeHttp(wi, resp.status, resp.body);
     }
 }
@@ -192,7 +196,10 @@ fn headerValue(h: []const u8) []const u8 {
 
 // ---- routing ---------------------------------------------------------------
 
-const Response = struct { status: u16, body: []u8 };
+/// `owned` distinguishes an allocated body from a static one (security issue
+/// #23): `fallback()` returns a string literal, and freeing that is an invalid
+/// free whose effect depends on the allocator.
+const Response = struct { status: u16, body: []u8, owned: bool = true };
 
 /// Returns a buffered Response to write, or null if the handler already wrote
 /// the response to `wi` (streaming).
@@ -462,7 +469,11 @@ fn ok(gpa: std.mem.Allocator, comptime json: []const u8) !Response {
 
 /// Last-resort body when even allocation fails; static, never freed via gpa.
 fn fallback() Response {
-    return .{ .status = 500, .body = @constCast("{\"error\":{\"message\":\"internal\",\"type\":\"server_error\"}}") };
+    return .{
+        .status = 500,
+        .body = @constCast("{\"error\":{\"message\":\"internal\",\"type\":\"server_error\"}}"),
+        .owned = false, // static storage: never freed
+    };
 }
 
 fn errorJson(gpa: std.mem.Allocator, msg: []const u8, ty: []const u8, code: []const u8) ![]u8 {

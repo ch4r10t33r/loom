@@ -24,6 +24,7 @@ const net = std.Io.net;
 const weights = @import("weights.zig");
 const sync = @import("sync.zig");
 const dns = @import("dns.zig");
+const sockopt = @import("../core/sockopt.zig");
 const hashmod = @import("../core/hash.zig");
 const stats_mod = @import("../core/stats.zig");
 const wire = @import("wire.zig");
@@ -168,6 +169,8 @@ pub const Source = struct {
         const gpa = self.gpa;
         const ip = try dns.resolve(io, addr.host, addr.port);
         const stream = try ip.connect(io, .{ .mode = .stream });
+        const dl = sockopt.trackPeer(io, stream);
+        defer sockopt.untrack(io, dl);
         defer stream.close(io);
         var rbuf: [1 << 16]u8 = undefined;
         var wbuf: [1024]u8 = undefined;

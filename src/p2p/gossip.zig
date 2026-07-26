@@ -13,6 +13,7 @@ const peers = @import("peers.zig");
 const weights = @import("weights.zig");
 const sync = @import("sync.zig");
 const dns = @import("dns.zig");
+const sockopt = @import("../core/sockopt.zig");
 const hashmod = @import("../core/hash.zig");
 const stats = @import("../core/stats.zig");
 const wire = @import("wire.zig");
@@ -35,6 +36,8 @@ fn exchange(ctx: *Ctx, addr_str: []const u8) !void {
     const addr = try sync.PeerAddr.parse(addr_str);
     const ip = try dns.resolve(io, addr.host, addr.port);
     const stream = try ip.connect(io, .{ .mode = .stream });
+    const dl = sockopt.trackPeer(io, stream);
+    defer sockopt.untrack(io, dl);
     defer stream.close(io);
 
     var rbuf: [1 << 16]u8 = undefined;

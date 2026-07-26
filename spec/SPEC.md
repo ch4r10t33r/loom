@@ -211,6 +211,17 @@ with per-peer request quotas, so a light node or attacker cannot soak
 expert-serving capacity and starve inference. Not implemented; documented as
 required.
 
+**Connection deadlines.** Every accepted connection and every outbound peer
+dial carries a deadline enforced by a watchdog that shuts the socket down when
+it expires (30 s serve, 10 s peer). This closes the gap where the connection
+semaphore below was the only bound: without a deadline, idle connections held
+every handler slot permanently. Two platform limits are documented in
+`src/core/sockopt.zig`: `SO_RCVTIMEO` is unusable (the Threaded Io backend
+panics on `EAGAIN`), and `ConnectOptions.timeout` is unimplemented, so the TCP
+handshake itself still falls back to the OS timeout. The eager-repair loop no
+longer holds the engine mutex across peer I/O, so a silent peer cannot stall
+inference.
+
 **Peer-table bounds and mesh authenticity.** The peer table is now bounded
 (`MAX_PEERS`, coldest-`last_seen` eviction on overflow) and holdings updates carry
 a monotonic sequence so a stale or replayed bitmap cannot clobber a fresh one

@@ -12,7 +12,7 @@ const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
 
-const QUERY_TIMEOUT = Io.Timeout{ .duration = .{ .raw = .{ .nanoseconds = 2 * std.time.ns_per_s }, .clock = .awake } };
+const QUERY_TIMEOUT_NS: i96 = 2 * std.time.ns_per_s;
 
 pub fn resolve(io: Io, host: []const u8, port: u16) !net.IpAddress {
     // 1. IP literal (no lookup).
@@ -79,36 +79,106 @@ fn firstNameserver(io: Io, out: []u8) ?[]const u8 {
     return null;
 }
 
+/// Process-wide CSPRNG for DNS transaction ids. Zig 0.16 exposes no
+/// `std.crypto.random` / `posix.getrandom`, so seed ChaCha from `/dev/urandom`
+/// once; if that is unreadable, fall back to clock + address entropy (weaker,
+/// but the source-address and question-echo checks are the primary defenses).
+var rng_mutex: Io.Mutex = .init;
+var rng: ?std.Random.DefaultCsprng = null;
+
+fn randomBytes(io: Io, out: []u8) void {
+    rng_mutex.lockUncancelable(io);
+    defer rng_mutex.unlock(io);
+    if (rng == null) {
+        const n = std.Random.DefaultCsprng.secret_seed_length;
+        var seed: [n]u8 = undefined;
+        var got: usize = 0;
+        if (Io.Dir.cwd().openFile(io, "/dev/urandom", .{})) |f| {
+            defer f.close(io);
+            got = f.readPositional(io, &[_][]u8{seed[0..]}, 0) catch 0;
+        } else |_| {}
+        if (got < n) {
+            // fallback: clock + a stack address (ASLR) mixed by hashing
+            var mix: [24]u8 = undefined;
+            std.mem.writeInt(i128, mix[0..16], Io.Clock.Timestamp.now(io, .awake).raw.toNanoseconds(), .little);
+            std.mem.writeInt(u64, mix[16..24], @intFromPtr(&seed), .little);
+            std.crypto.hash.sha2.Sha256.hash(&mix, &seed, .{});
+        }
+        rng = std.Random.DefaultCsprng.init(seed);
+    }
+    rng.?.random().bytes(out);
+}
+
 fn queryDns(io: Io, host: []const u8) ![4]u8 {
     var nsbuf: [64]u8 = undefined;
     const ns = firstNameserver(io, &nsbuf) orelse return error.NoNameserver;
     const ns_addr = net.IpAddress.parse(ns, 53) catch return error.NoNameserver;
 
     var q: [512]u8 = undefined;
-    const qlen = try buildQuery(&q, host);
+    // Random transaction id per query (security issue #26): a constant id makes
+    // off-path blind spoofing a matter of guessing only the source port.
+    var txid: [2]u8 = undefined;
+    randomBytes(io, &txid);
+    const qlen = try buildQuery(&q, host, txid);
 
     var any = net.IpAddress.parse("0.0.0.0", 0) catch unreachable;
     var sock = any.bind(io, .{ .mode = .dgram, .protocol = .udp }) catch return error.ResolveFailed;
     defer sock.close(io);
 
     sock.send(io, &ns_addr, q[0..qlen]) catch return error.ResolveFailed;
+
+    // Accept only a datagram that (a) came from the nameserver we asked,
+    // (b) echoes our transaction id, (c) is a response, and (d) echoes the
+    // exact question we sent. Anything else is discarded and we keep waiting
+    // until the deadline, so one forged packet cannot pre-empt the real answer.
+    const deadline = Io.Timeout{ .deadline = Io.Clock.Timestamp.fromNow(io, .{
+        .raw = .{ .nanoseconds = QUERY_TIMEOUT_NS },
+        .clock = .awake,
+    }) };
     var rbuf: [512]u8 = undefined;
-    const msg = sock.receiveTimeout(io, rbuf[0..], QUERY_TIMEOUT) catch return error.ResolveTimeout;
-    return parseAnswer(msg.data);
+    var tries: usize = 0;
+    while (tries < 8) : (tries += 1) {
+        const msg = sock.receiveTimeout(io, rbuf[0..], deadline) catch return error.ResolveTimeout;
+        if (!sameAddr(msg.from, ns_addr)) continue; // not from our resolver
+        const r = msg.data;
+        if (r.len < qlen) continue;
+        if (r[0] != txid[0] or r[1] != txid[1]) continue; // wrong transaction
+        if (r[2] & 0x80 == 0) continue; // not a response (QR)
+        if (be16(r[4], r[5]) != 1) continue; // qdcount must be our 1 question
+        if (!std.mem.eql(u8, r[12..qlen], q[12..qlen])) continue; // question echo
+        return parseAnswer(r);
+    }
+    return error.ResolveTimeout;
+}
+
+/// Compare two addresses (family + bytes + port). Used to reject responses from
+/// anyone other than the nameserver we queried.
+fn sameAddr(a: net.IpAddress, b: net.IpAddress) bool {
+    return switch (a) {
+        .ip4 => |x| switch (b) {
+            .ip4 => |y| std.mem.eql(u8, &x.bytes, &y.bytes) and x.port == y.port,
+            else => false,
+        },
+        .ip6 => |x| switch (b) {
+            .ip6 => |y| std.mem.eql(u8, &x.bytes, &y.bytes) and x.port == y.port,
+            else => false,
+        },
+    };
 }
 
 fn be16(hi: u8, lo: u8) u16 {
     return (@as(u16, hi) << 8) | lo;
 }
 
-fn buildQuery(buf: []u8, host: []const u8) !usize {
+fn buildQuery(buf: []u8, host: []const u8, txid: [2]u8) !usize {
     if (buf.len < 12 + host.len + 6) return error.NameTooLong;
     // header: id, flags(RD), qdcount=1, an/ns/ar=0
-    @memcpy(buf[0..12], &[_]u8{ 0x13, 0x37, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
+    @memcpy(buf[0..12], &[_]u8{ txid[0], txid[1], 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0 });
     var pos: usize = 12;
     var labels = std.mem.splitScalar(u8, host, '.');
     while (labels.next()) |label| {
-        if (label.len == 0 or label.len > 63) continue;
+        if (label.len > 63) return error.NameTooLong;
+        if (label.len == 0) continue;
         buf[pos] = @intCast(label.len);
         pos += 1;
         @memcpy(buf[pos..][0..label.len], label);
@@ -167,7 +237,7 @@ fn parseAnswer(resp: []const u8) ![4]u8 {
 
 test "buildQuery encodes labels + A/IN question" {
     var buf: [64]u8 = undefined;
-    const n = try buildQuery(&buf, "origin");
+    const n = try buildQuery(&buf, "origin", .{ 0x13, 0x37 });
     // header(12) + [6]"origin"(7) + root(1) + qtype/qclass(4) = 24
     try std.testing.expectEqual(@as(usize, 24), n);
     try std.testing.expectEqual(@as(u8, 6), buf[12]); // label length
