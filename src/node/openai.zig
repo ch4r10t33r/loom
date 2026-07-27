@@ -29,6 +29,10 @@ const generator = @import("generator.zig");
 const sockopt = @import("../core/sockopt.zig");
 const chat_template = @import("../gguf/chat_template.zig");
 const meter_mod = @import("meter.zig");
+const peers_mod = @import("../p2p/peers.zig");
+
+/// The bundled chat UI, compiled into the binary.
+const chat_html = @embedFile("ui.html");
 
 pub const Ctx = struct {
     gpa: std.mem.Allocator,
@@ -48,6 +52,19 @@ pub const Ctx = struct {
     /// Per-client ledger. When set, the bearer token is the client id; usage is
     /// charged here (TODO in the skeleton).
     meter: ?*meter_mod.Meter = null,
+    /// Serve the bundled chat UI at `GET /`. Set on the second listener the
+    /// node runs for `--ui-port`; the API listener leaves it off so the API
+    /// surface stays pure JSON.
+    serve_ui: bool = false,
+    /// The node's live peer table, read for `/health` so the UI header can show
+    /// the peer count. Null when this process has no p2p layer (a light node,
+    /// or `--p2p-port 0`).
+    peers: ?*peers_mod.Table = null,
+    /// True when the served weights are one of loom's random-weight fixtures.
+    /// Reported by `/health` so the UI can say so: a fixture answers with
+    /// meaningless text by construction, and without a warning that reads as a
+    /// broken model rather than as a model that was never trained.
+    synthetic: bool = false,
 };
 
 const Conn = struct { ctx: *Ctx, stream: net.Stream };
@@ -116,7 +133,7 @@ fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
 
     const req = parseRequest(ctx.gpa, ri) catch {
         // static body: the allocated variant leaked on every malformed request
-        try writeHttp(wi, 400, "{\"error\":{\"message\":\"malformed_request\",\"type\":\"invalid_request_error\"}}");
+        try writeHttp(wi, 400, "{\"error\":{\"message\":\"malformed_request\",\"type\":\"invalid_request_error\"}}", .json);
         return;
     };
     defer req.deinit(ctx.gpa);
@@ -125,7 +142,7 @@ fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
     // null; otherwise we get a buffered Response to write here.
     if (try route(ctx, req, wi)) |resp| {
         defer if (resp.owned) ctx.gpa.free(resp.body);
-        try writeHttp(wi, resp.status, resp.body);
+        try writeHttp(wi, resp.status, resp.body, resp.content_type);
     }
 }
 
@@ -206,7 +223,19 @@ fn headerValue(h: []const u8) []const u8 {
 /// `owned` distinguishes an allocated body from a static one (security issue
 /// #23): `fallback()` returns a string literal, and freeing that is an invalid
 /// free whose effect depends on the allocator.
-const Response = struct { status: u16, body: []u8, owned: bool = true };
+const ContentType = enum {
+    json,
+    html,
+
+    fn mime(self: ContentType) []const u8 {
+        return switch (self) {
+            .json => "application/json",
+            .html => "text/html; charset=utf-8",
+        };
+    }
+};
+
+const Response = struct { status: u16, body: []u8, owned: bool = true, content_type: ContentType = .json };
 
 /// Returns a buffered Response to write, or null if the handler already wrote
 /// the response to `wi` (streaming).
@@ -214,8 +243,13 @@ fn route(ctx: *Ctx, req: Request, wi: *Io.Writer) !?Response {
     const gpa = ctx.gpa;
     const path = stripQuery(req.path);
 
+    if (ctx.serve_ui and eql(req.method, "GET") and (eql(path, "/") or eql(path, "/index.html"))) {
+        // Static, embedded at compile time: the binary stays self-contained,
+        // which is the point of shipping one executable.
+        return .{ .status = 200, .body = @constCast(chat_html), .owned = false, .content_type = .html };
+    }
     if (eql(req.method, "GET") and eql(path, "/health")) {
-        return ok(gpa, "{\"status\":\"ok\"}") catch fallback();
+        return handleHealth(ctx) catch fallback();
     }
     if (eql(req.method, "GET") and eql(path, "/v1/models")) {
         return handleModels(ctx) catch fallback();
@@ -226,6 +260,20 @@ fn route(ctx: *Ctx, req: Request, wi: *Io.Writer) !?Response {
 
     const b = errorJson(gpa, "unknown route", "invalid_request_error", "not_found") catch return fallback();
     return .{ .status = 404, .body = b };
+}
+
+/// Liveness plus the two numbers worth watching from the UI header: how many
+/// peers are reachable, and what fraction of expert reads were served locally.
+fn handleHealth(ctx: *Ctx) !Response {
+    const n_peers: usize = if (ctx.peers) |p| p.count() else 0;
+    const model_esc = try jsonEscapeAlloc(ctx.gpa, ctx.model_id);
+    defer ctx.gpa.free(model_esc);
+    const body = try std.fmt.allocPrint(
+        ctx.gpa,
+        "{{\"status\":\"ok\",\"model\":\"{s}\",\"peers\":{d},\"hit_rate\":{d:.4},\"synthetic\":{}}}",
+        .{ model_esc, n_peers, ctx.gen.hitRate(), ctx.synthetic },
+    );
+    return .{ .status = 200, .body = body };
 }
 
 fn handleModels(ctx: *Ctx) !Response {
@@ -517,7 +565,7 @@ fn errorJson(gpa: std.mem.Allocator, msg: []const u8, ty: []const u8, code: []co
     , .{ msg, ty, code });
 }
 
-fn writeHttp(wi: *Io.Writer, status: u16, body: []const u8) !void {
+fn writeHttp(wi: *Io.Writer, status: u16, body: []const u8, ct: ContentType) !void {
     const reason = switch (status) {
         200 => "OK",
         400 => "Bad Request",
@@ -529,7 +577,7 @@ fn writeHttp(wi: *Io.Writer, status: u16, body: []const u8) !void {
         else => "OK",
     };
     try wi.print("HTTP/1.1 {d} {s}\r\n", .{ status, reason });
-    try wi.print("Content-Type: application/json\r\n", .{});
+    try wi.print("Content-Type: {s}\r\n", .{ct.mime()});
     try wi.print("Content-Length: {d}\r\n", .{body.len});
     try wi.print("Access-Control-Allow-Origin: *\r\n", .{});
     try wi.print("Connection: close\r\n\r\n", .{});

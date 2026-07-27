@@ -16,6 +16,7 @@ const deepseek = @import("../gguf/deepseek.zig");
 const llama = @import("../gguf/llama.zig");
 const gguf_mod = @import("../gguf/gguf.zig");
 const banner = @import("../core/banner.zig");
+const status_mod = @import("status.zig");
 const chat_template = @import("../gguf/chat_template.zig");
 const expert_fetch = @import("../p2p/expert_fetch.zig");
 const p2p = @import("../p2p/p2p.zig");
@@ -38,6 +39,9 @@ pub const Options = struct {
     rpc_port: u16,
     openai_addr: []const u8, // OpenAI-compatible HTTP API bind addr
     openai_port: u16, // 0 = OpenAI surface disabled (SPEC.md client API)
+    ui_addr: []const u8 = "127.0.0.1", // bundled chat UI bind addr
+    ui_port: u16 = 8555, // 0 = UI disabled
+    status_secs: u32 = 30, // periodic console status; 0 = off
     p2p_addr: []const u8,
     p2p_port: u16,
     ram_bytes: u64,
@@ -530,6 +534,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     // serializes here.
     var engine_lock: Io.Mutex = .init;
 
+    // The status thread writes to the same `out` as the main thread and the
+    // event logs; interleaved prints from two threads would corrupt lines.
+    var out_lock: Io.Mutex = .init;
+
     // Choose what serves inference. Default: the loom-format engine. If an
     // expert-sharded GGUF store is attached and its resident bundle is complete,
     // serve the distributed GGUF (deepseek2) engine with token-loop peer fetch.
@@ -539,6 +547,14 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     var committee_peers = std.ArrayList(sync.PeerAddr).empty;
     defer committee_peers.deinit(gpa);
     var serve_gguf = false;
+    // `--model` names the loom-format checkpoint. When an expert-sharded GGUF
+    // takes over the serve path, that spec is no longer what answers requests,
+    // and echoing it in /v1/models and the UI header is simply wrong.
+    var served_model_id: []const u8 = opts.model;
+    // `hf.resolve` reports how the loom-format checkpoint was obtained; a
+    // generated one has random weights. The GGUF path re-decides this below
+    // from the file's own metadata.
+    var synthetic = std.mem.eql(u8, resolved.source, "synthetic");
     if (store) |*st| {
         if (st.manifest.mode == .expert) {
             for (committee_members) |m| {
@@ -581,6 +597,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                             chat_template.detect(gguf_gen.m.chatTemplate(), arch_name);
                         gen = .{ .gguf = &gguf_gen };
                         serve_gguf = true;
+                        served_model_id = if (opts.gguf_path) |gp| std.fs.path.basename(gp) else arch_name;
+                        // `loom gguf gen` stamps its fixtures "loom <arch> fixture".
+                        const gname = gguf_gen.m.generalName() orelse "";
+                        synthetic = std.mem.startsWith(u8, gname, "loom ") and std.mem.endsWith(u8, gname, "fixture");
                         try out.print("  serving    distributed GGUF ({s}): ctx={d} chat={s}\n", .{
                             arch_name, gguf_gen.m.ctxLen(), @tagName(gguf_gen.chat_format),
                         });
@@ -599,9 +619,43 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             }
         }
     }
+
+    // Local-only fallback: a dense (non-MoE) model has no routed experts, so it
+    // shards into fixed ranges and cannot be served *distributed*. It can still
+    // be served — it is a complete model file sitting right there. Without this,
+    // pointing --gguf at an ordinary model silently answered from the synthetic
+    // loom checkpoint instead, which looks like a broken model rather than an
+    // unsupported topology.
+    var local_gguf = false;
+    if (!serve_gguf) {
+        if (opts.gguf_path) |gp| {
+            if (loadGgufEngine(gpa, io, gp)) |mdl| {
+                gguf_gen = .{ .m = mdl, .src = null, .ctx_cap = opts.ctx_cap };
+                gguf_gen.m.setCtxLen(@min(gguf_gen.m.ctxLen(), opts.ctx_cap));
+                const arch_name = gguf_gen.m.archName();
+                gguf_gen.chat_format = if (opts.chat_format) |cf|
+                    chat_template.parse(cf) orelse chat_template.detect(gguf_gen.m.chatTemplate(), arch_name)
+                else
+                    chat_template.detect(gguf_gen.m.chatTemplate(), arch_name);
+                gen = .{ .gguf = &gguf_gen };
+                local_gguf = true;
+                served_model_id = std.fs.path.basename(gp);
+                const gname = gguf_gen.m.generalName() orelse "";
+                synthetic = std.mem.startsWith(u8, gname, "loom ") and std.mem.endsWith(u8, gname, "fixture");
+                try out.print("  serving    local GGUF ({s}): ctx={d} chat={s}  (not expert-sharded: no distributed fetch)\n", .{
+                    arch_name, gguf_gen.m.ctxLen(), @tagName(gguf_gen.chat_format),
+                });
+            } else |e| {
+                try out.print("  gguf serve disabled: model load failed ({s}); serving loom engine\n", .{@errorName(e)});
+            }
+        }
+    }
+
     defer if (serve_gguf) {
         gguf_gen.m.deinit();
         gguf_src.deinit();
+    } else if (local_gguf) {
+        gguf_gen.m.deinit();
     };
     try out.flush();
 
@@ -631,11 +685,59 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             .addr = opts.openai_addr,
             .port = opts.openai_port,
             .seed = opts.seed,
-            .model_id = opts.model,
+            .model_id = served_model_id,
             .engine_lock = &engine_lock,
             .meter = &meter,
+            .synthetic = synthetic,
         };
+        openai_ctx.peers = &table;
         const t = try std.Thread.spawn(.{}, openaiThread, .{&openai_ctx});
+        t.detach();
+    }
+
+    // Bundled chat UI. A second listener rather than a route on the API port,
+    // so the JSON API can stay bound to one interface while the UI stays on
+    // loopback (or the reverse). It reuses the same HTTP implementation and
+    // the same generator, so the page is same-origin with the API it calls and
+    // there is no CORS story and no host to configure in the page.
+    var ui_ctx: openai.Ctx = undefined;
+    if (opts.ui_port != 0) {
+        ui_ctx = .{
+            .gpa = gpa,
+            .io = io,
+            .gen = &gen,
+            .addr = opts.ui_addr,
+            .port = opts.ui_port,
+            .seed = opts.seed,
+            .model_id = served_model_id,
+            .engine_lock = &engine_lock,
+            .meter = &meter,
+            .serve_ui = true,
+            .peers = &table,
+            .synthetic = synthetic,
+        };
+        const t = try std.Thread.spawn(.{}, openaiThread, .{&ui_ctx});
+        t.detach();
+        try out.print("  chat ui    http://{s}:{d}\n", .{ opts.ui_addr, opts.ui_port });
+        try out.flush();
+    }
+
+    // Periodic console status: membership and holdings move without any
+    // request arriving, so an event-only log makes a churning node look idle.
+    var status_ctx: status_mod.Reporter = undefined;
+    if (opts.status_secs != 0) {
+        status_ctx = .{
+            .io = io,
+            .out = out,
+            .out_lock = &out_lock,
+            .table = &table,
+            .store = if (store) |*st| st else null,
+            .gen = &gen,
+            .committee = committee_members.len,
+            .interval_ns = @as(u64, opts.status_secs) * std.time.ns_per_s,
+            .start_ns = stats.nowNs(io),
+        };
+        const t = try std.Thread.spawn(.{}, status_mod.thread, .{&status_ctx});
         t.detach();
     }
 
