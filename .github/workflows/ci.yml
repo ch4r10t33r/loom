@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# a new push to a PR cancels the previous run
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Keep in step with the Dockerfile. anyzig resolves the exact Zig version
+  # pinned in build.zig.zon (0.16.0), so CI and the image build with the same
+  # compiler. The checksum matters for the same reason it does in the
+  # Dockerfile: the version is a mutable git tag (security issue #33).
+  ANYZIG_VERSION: v2026_03_26
+  ANYZIG_SHA256: f9d5a09fbd7c019eecef1a397613ce5baec22872a1c3eb5ab4b1132e917c3d71
+  ZIG: "0.16.0"
+
+jobs:
+  zig:
+    name: fmt, build, tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Zig itself is large and version-pinned, so cache it across runs.
+      - name: Cache Zig toolchain + package cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-${{ env.ZIG }}-${{ runner.os }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: zig-${{ env.ZIG }}-${{ runner.os }}-
+
+      - name: Install anyzig (checksum-verified)
+        run: |
+          set -eux
+          curl -fsSL -o /tmp/anyzig.tar.gz \
+            "https://github.com/marler8997/anyzig/releases/download/${ANYZIG_VERSION}/anyzig-x86_64-linux.tar.gz"
+          echo "${ANYZIG_SHA256}  /tmp/anyzig.tar.gz" | sha256sum -c -
+          sudo tar -xz -C /usr/local/bin -f /tmp/anyzig.tar.gz
+          sudo chmod +x /usr/local/bin/zig
+          zig "${ZIG}" version
+
+      - name: Format check
+        run: zig "${ZIG}" fmt --check src/ build.zig
+
+      - name: Build
+        run: zig "${ZIG}" build
+
+      - name: Unit tests
+        run: zig "${ZIG}" build test --summary all
+
+  docker:
+    name: image build + smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t loom:ci .
+
+      # Building is not enough: the image has previously built fine while the
+      # node failed at runtime (e.g. the cache dir was root-owned and the
+      # non-root user could not write it). Prove it actually serves.
+      - name: Smoke test the image
+        run: |
+          set -eux
+          docker run -d --name loom-ci \
+            -p 127.0.0.1:8770:8770 -p 127.0.0.1:8772:8772 \
+            loom:ci node --rpc-addr 0.0.0.0 --openai-port 8772 --ram-gb 1
+          # wait for the synthetic model to generate and the listeners to bind
+          for i in $(seq 1 30); do
+            if curl -fsS --max-time 2 http://127.0.0.1:8772/health >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          curl -fsS --max-time 5 http://127.0.0.1:8772/health
+          # a real completion through the OpenAI surface
+          curl -fsS --max-time 60 http://127.0.0.1:8772/v1/completions \
+            -d '{"prompt":"hi","max_tokens":4}' | tee /tmp/out.json
+          grep -q '"total_tokens"' /tmp/out.json
+          # and through the native RPC (python rather than nc: the -q/-w flags
+          # differ between the netcat variants runners ship)
+          python3 - <<'EOF'
+          import socket, json, sys
+          s = socket.create_connection(("127.0.0.1", 8770), timeout=60)
+          s.sendall(json.dumps({"prompt": "hi", "max_tokens": 4}).encode() + b"\n")
+          resp = s.recv(4096).decode()
+          print("rpc:", resp[:120])
+          sys.exit(0 if '"ok":true' in resp else 1)
+          EOF
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs loom-ci || true
+
+      - name: Clean up
+        if: always()
+        run: docker rm -f loom-ci || true

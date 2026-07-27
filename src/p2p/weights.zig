@@ -178,7 +178,6 @@ pub fn parseManifestBytes(gpa: std.mem.Allocator, bytes: []const u8) !Manifest {
     };
 }
 
-
 /// Version id = Merkle root over per-shard *layout-committing* leaves plus a
 /// header leaf binding global fields. Binding extents/file_size/n_resident/mode
 /// into the root means a peer cannot serve digests that verify while pointing
@@ -868,7 +867,6 @@ test "manifest serialize/parse roundtrip with multi-extent shards" {
     try std.testing.expect(hashmod.eql(p.version, version));
 }
 
-
 test "expert manifest partitions the whole file: no gaps, no overlaps (issue #4.14)" {
     const gpa = std.testing.allocator;
     var threaded: std.Io.Threaded = .init(gpa, .{});
@@ -911,7 +909,6 @@ test "expert manifest partitions the whole file: no gaps, no overlaps (issue #4.
     try std.testing.expectEqual(m.file_size, total);
 }
 
-
 test "malicious manifest extents rejected on parse (audit #5 P0-1)" {
     const gpa = std.testing.allocator;
     var digests = [_]hashmod.Digest{ hashmod.hashBlock("a"), hashmod.hashBlock("b") };
@@ -923,8 +920,14 @@ test "malicious manifest extents rejected on parse (audit #5 P0-1)" {
     var starts = [_]u32{ 0, 1, 2 };
     const version = try computeVersion(gpa, .expert, 100, 1, &digests, &extents, &starts);
     const m = Manifest{
-        .mode = .expert, .version = version, .file_size = 100, .range_size = 0,
-        .n_resident = 1, .digests = &digests, .extents = &extents, .extent_start = &starts,
+        .mode = .expert,
+        .version = version,
+        .file_size = 100,
+        .range_size = 0,
+        .n_resident = 1,
+        .digests = &digests,
+        .extents = &extents,
+        .extent_start = &starts,
     };
     const text = try m.serialize(gpa);
     defer gpa.free(text);

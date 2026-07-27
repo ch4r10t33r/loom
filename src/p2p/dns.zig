@@ -251,8 +251,8 @@ test "parseAnswer extracts A record past a compressed name" {
     // question: "a" A IN ; answer: ptr(0xC00C) A IN ttl rdlen=4 1.2.3.4
     const resp = [_]u8{
         0x13, 0x37, 0x81, 0x80, 0, 1, 0, 1, 0, 0, 0, 0, // header
-        1,    'a',  0,    0,    1, 0, 1, // question: label "a", A, IN
-        0xC0, 0x0C, 0,    1,    0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4, // answer
+        1, 'a', 0, 0, 1, 0, 1, // question: label "a", A, IN
+        0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4, // answer
     };
     try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, &(try parseAnswer(&resp)));
 }

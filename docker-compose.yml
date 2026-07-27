@@ -11,6 +11,12 @@
 #   curl -s localhost:8782/v1/completions -d '{"prompt":"the","max_tokens":8}'
 #     (node2's OpenAI port; a hit_rate < 1 on the RPC response = peer fetch)
 #
+# Ports are published to 127.0.0.1 only (security issue #33). The RPC and
+# OpenAI surfaces have no TLS and no authentication (see spec/SPEC.md
+# "Transport security"), so a bare "8770:8770" would expose an unauthenticated
+# inference endpoint on every host interface. Do not widen these without
+# putting an authenticating reverse proxy in front.
+#
 # Peers address each other by Compose service name ("origin"): the p2p layer
 # resolves hostnames via src/p2p/dns.zig.
 
@@ -26,8 +32,15 @@ services:
         --rpc-addr 0.0.0.0 --openai-port 8772
         --p2p-addr 0.0.0.0 --p2p-port 8771 --advertise origin:8771
     ports:
-      - "8770:8770"   # rpc
-      - "8772:8772"   # openai
+      - "127.0.0.1:8770:8770"   # rpc
+      - "127.0.0.1:8772:8772"   # openai
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    mem_limit: 4g
+
 
   node2:
     image: loom:dev
@@ -45,5 +58,12 @@ services:
         echo 'node2: bootstrap not ready, retrying in 3s'; sleep 3;
         done
     ports:
-      - "8780:8770"   # rpc
-      - "8782:8772"   # openai
+      - "127.0.0.1:8780:8770"   # rpc
+      - "127.0.0.1:8782:8772"   # openai
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    pids_limit: 512
+    mem_limit: 4g
+
