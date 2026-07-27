@@ -118,6 +118,7 @@ fn usage(out: *Io.Writer) !void {
         \\            [--gguf FILE | --bootstrap HOST:PORT]
         \\            [--peers H:P,H:P,...] [--hold-fraction F] [--range-mb M]
         \\            [--advertise HOST:PORT] [--r-target N] [--free-quota TOKENS] [--admin-token TOK]
+        \\            [--ui-addr A] [--ui-port P] [--status-secs N]
         \\  loom light [--full-nodes H:P[,...]] [--openai-port P --openai-full-nodes H:P[,...]]
         \\             [--rpc-addr A] [--rpc-port P] [--openai-addr A] [--client-id ID]
         \\  loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2|llama|qwen2moe|qwen3moe|glm4moe]
@@ -387,6 +388,9 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .hold_fraction = @floatCast(std.math.clamp(hold_fraction, 0.0, 1.0)),
         .range_bytes = @intFromFloat(range_mb * @as(f64, MB)),
         .ctx_cap = try flagUsize(args, "--ctx", 4096),
+        .ui_addr = flagStr(args, "--ui-addr") orelse "127.0.0.1",
+        .ui_port = try flagU16(args, "--ui-port", @intCast(try envU64(env, "UI_PORT", 8555))),
+        .status_secs = @intCast(try flagUsize(args, "--status-secs", 30)),
         .chat_format = flagStr(args, "--chat-format"),
     });
 }

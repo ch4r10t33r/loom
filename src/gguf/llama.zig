@@ -189,6 +189,12 @@ pub const Model = struct {
     pub fn eosToken(self: *const Model) u32 {
         return self.tok.eosId();
     }
+    /// The GGUF `general.name` string, if present. Used to recognise loom's
+    /// own random-weight fixtures, which are stamped "loom <arch> fixture".
+    pub fn generalName(self: *const Model) ?[]const u8 {
+        return self.parsed.getString("general.name");
+    }
+
     /// The GGUF `tokenizer.chat_template` string, if the model carries one.
     pub fn chatTemplate(self: *const Model) ?[]const u8 {
         return self.parsed.getString("tokenizer.chat_template");
