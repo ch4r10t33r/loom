@@ -15,6 +15,7 @@ const generator = @import("generator.zig");
 const deepseek = @import("../gguf/deepseek.zig");
 const llama = @import("../gguf/llama.zig");
 const gguf_mod = @import("../gguf/gguf.zig");
+const banner = @import("../core/banner.zig");
 const chat_template = @import("../gguf/chat_template.zig");
 const expert_fetch = @import("../p2p/expert_fetch.zig");
 const p2p = @import("../p2p/p2p.zig");
@@ -286,6 +287,8 @@ fn attachGgufDist(m: *generator.GgufModel, gpa: std.mem.Allocator, src: *expert_
 }
 
 pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void {
+    try banner.print(out, "node");
+
     const resolved = hf.resolve(gpa, io, opts.model, opts.cache_root) catch |e| {
         try out.print("model resolve failed ({s}): {s}\n", .{ opts.model, @errorName(e) });
         return;
