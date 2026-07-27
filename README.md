@@ -24,7 +24,7 @@ One binary, `loom`, provides:
 | [`loom node`](#loom-node--run-an-inference--weight-sharing-node) | the daemon: load a model, serve inference over RPC, share/sync/repair GGUF weight ranges over P2P with gossip discovery |
 | [`loom run`](#loom-run--one-shot-local-inference) | one-shot local inference against a loom checkpoint (no servers) |
 | [`loom gen`](#loom-gen--generate-a-synthetic-checkpoint) / [`loom info`](#loom-info--inspect--verify-a-checkpoint) | create / inspect+verify loom-format checkpoints |
-| [`loom gguf`](#loom-gguf--gguf-tools-gen--info--shard--run) | GGUF tools: make a fixture, inspect a file, **shard by expert**, run llama/deepseek2 models |
+| [`loom gguf`](#loom-gguf--gguf-tools-gen--info--shard--run) | GGUF tools: make a fixture, inspect a file, **shard by expert**, run deepseek2/llama/qwen/glm models |
 | [`loom light`](#loom-light--delegating-light-node) | **light node**: no weights/engine; delegates the native RPC and/or OpenAI API to full nodes, metered by them |
 | [`loom iobench`](#loom-iobench--disk-profiler) | disk profiler for the random-read pattern the engine issues |
 
@@ -100,7 +100,7 @@ Service DNS works the same way.
 loom node                                   # zero-config: generates a tiny model, serves RPC :8770 / P2P :8771
 printf '{"prompt":"hello","max_tokens":16}\n' | nc -w 3 127.0.0.1 8770
 
-# run a real llama-architecture GGUF model (download any small GGUF first)
+# run a real GGUF model (download any small GGUF first)
 curl -LO https://huggingface.co/ggml-org/models/resolve/main/tinyllamas/stories15M-q4_0.gguf
 loom gguf run stories15M-q4_0.gguf --prompt "Once upon a time"
 ```
@@ -417,16 +417,26 @@ loom info /tmp/ckpt
 ### `loom gguf gen` — synthetic GGUF fixture
 
 ```
-loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2]
+loom gguf gen <file> [--seed N] [--data-mb M] [--arch A]
 ```
 
 Writes a small valid GGUF v3 file. Default (`demo`): metadata + two f32 tensors
 of deterministic data — a distribution payload, **not** a runnable model.
-`--arch deepseek2`: a structurally faithful tiny **deepseek2** model (MLA with
-q-LoRA, 1 dense + 2 MoE layers, sigmoid gating + selection bias + shared
-expert, byte-fallback SPM vocab) with random weights — runnable with
-`loom gguf run`, used to validate the deepseek2 engine without a multi-GB
-download.
+
+`--arch deepseek2|llama|qwen2moe|qwen3moe|glm4moe` writes a structurally
+faithful tiny model of that architecture with random weights — runnable with
+`loom gguf run` and shardable by expert, so the engines and the whole
+distribution path can be validated without a multi-GB download. Each fixture
+carries exactly the optional pieces the real architecture has, so together they
+cover every branch of the shared engine:
+
+| `--arch` | What it exercises |
+|---|---|
+| `deepseek2` | MLA with q-LoRA, 1 dense + 2 MoE layers, sigmoid gating, selection bias, shared expert |
+| `llama` | Mixtral shape: softmax routing, no bias, no Q/K norm, no shared expert, NORM RoPE |
+| `qwen2moe` | QKV biases, sigmoid-**gated** shared expert, and the one arch that does *not* renormalize gates |
+| `qwen3moe` | Q/K norm, and a head_dim that is deliberately not `dim / n_heads` |
+| `glm4moe` | QKV biases, Q/K norm, sigmoid routing with selection bias, plain shared expert, `post_attention_norm` in place of `ffn_norm`, a leading dense layer, partial RoPE, and a trailing NextN block the forward pass must skip |
 
 ### `loom gguf info` — inspect any GGUF
 
@@ -466,7 +476,7 @@ For GLM 5.2 this yields the planned 19,200 expert shards (~19 MB each) + a
 ~10 GB resident bundle. `--hold-fraction` applies to *expert* shards only —
 resident shards are always in every node's want-set.
 
-### `loom gguf run` — run a llama-architecture GGUF model
+### `loom gguf run` — run a GGUF model
 
 ```
 loom gguf run <file.gguf> [--prompt STR] [--max-tokens N] [--temp T] [--seed S] [--ctx N]
@@ -479,20 +489,49 @@ loom gguf run <file.gguf> [--prompt STR] [--max-tokens N] [--temp T] [--seed S] 
 | `--temp T` | `0` (greedy) |
 | `--seed S` | `42` |
 
-Real inference over the mmap'd file, dispatched on `general.architecture`:
+Real inference over the mmap'd file, dispatched on `general.architecture`.
+Two engines:
 
-- **`llama`** — GQA attention, NORM-style RoPE, SwiGLU.
-- **`deepseek2`** (DeepSeek V2/V3, Kimi K2, GLM-class MoE) — MLA attention
-  (q-LoRA, compressed-KV latent cache, decoupled NORM-rope head), MoE FFN
-  (sigmoid/softmax gating, noaux_tc selection bias, top-k with renormalized
-  scaled gates, shared experts, leading dense layers), YaRN context-extension
-  scaling, and the gpt2-style **byte-level BPE tokenizer** from GGUF merges.
+- **`deepseek2`** (DeepSeek V2/V3, Kimi K2) — MLA attention (q-LoRA,
+  compressed-KV latent cache, decoupled NORM-rope head), MoE FFN, YaRN
+  context-extension scaling.
   **Validated on real weights**: DeepSeek-V2-Lite Q4_K_M (15.7B MoE, 27 MLA
   layers, 64 experts) produces correct factual completions ("The capital of
   France is Paris.") on one CPU core.
+- **`llama` / `qwen2moe` / `qwen3moe` / `glm4moe`** — one shared GQA engine.
+  These differ only in optional pieces bolted onto the same skeleton, so the
+  engine detects them from the tensors the file contains rather than from a
+  table of per-architecture beliefs: QKV biases, per-head Q/K RMSNorm before
+  RoPE, a dense or mixture-of-experts FFN, a shared expert that may be
+  sigmoid-gated, leading dense layers, a post-attention norm standing in for
+  `ffn_norm`, and trailing MTP/NextN blocks that are skipped. The one fact
+  pinned per architecture is the RoPE style — adjacent-pair NORM for `llama`,
+  split-half NEOX for the rest — because getting it wrong produces fluent but
+  wrong output rather than an error.
 
-GGML tensor types: **F32 / F16 / Q4_0 / Q5_0 / Q8_0 / Q4_K / Q5_K / Q6_K**
-(fused matvec on the raw mmap'd bytes — no wholesale dequantization).
+MoE routing is shared by both engines (`src/gguf/moe.zig`): sigmoid or softmax
+gating, noaux_tc selection bias, top-k with optionally renormalized and scaled
+gates, shared experts.
+
+GGML tensor types — every quantization llama.cpp ships except the ternary TQ
+types and NVFP4:
+
+| Family | Types |
+|---|---|
+| float | `F32`, `F16` |
+| legacy | `Q4_0`, `Q5_0`, `Q8_0` |
+| K-quants | `Q4_K`, `Q5_K`, `Q6_K` |
+| IQ (codebook) | `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS` |
+| microscaling | `MXFP4` |
+
+Affine types (float/legacy/K) use a fused matvec on the raw mmap'd bytes, with
+no wholesale dequantization. The IQ and MXFP4 types are *codebook* quants —
+a block stores an index into a static grid table rather than a value to scale —
+so they decode through `src/gguf/iq.zig` against tables transcribed from
+llama.cpp. Because a wrong table entry there would silently corrupt weights
+instead of failing, all ten decoders are checked **bit-for-bit against
+llama.cpp's own `dequantize_row_*` output** on golden vectors
+(`src/gguf/iq_vectors.zig`).
 Tokenizers: SentencePiece (score-merge, byte fallback) and byte-level BPE
 (merge ranks, gpt2 byte table), selected by `tokenizer.ggml.model`. Output
 streams as it generates. `--ctx N` (default 4096) caps the KV allocation for
@@ -645,7 +684,7 @@ docs/         roadmap and planning documents
 src/main.zig  CLI entry point
 src/core/     primitives: hashing/Merkle, tensor math, int4 quant, stats, iobench
 src/engine/   the loom-format MoE engine (MLA, router, expert cache, checkpoints)
-src/gguf/     GGUF plane: parser, GGML kernels, llama + deepseek2 engines, BPE
+src/gguf/     GGUF plane: parser, GGML + IQ kernels, MLA + GQA engines, shared MoE routing, BPE
 src/p2p/      distribution: wire frames, gossip, committees, sync, token-loop fetch
 src/node/     the daemon: node orchestration, RPC server, model resolver
 ```
@@ -664,7 +703,7 @@ src/node/     the daemon: node orchestration, RPC server, model resolver
 | `engine/forward.zig` / `engine/engine.zig` | forward step wiring; engine lifecycle, RAM-budget → cache sizing |
 | `node/node.zig` | `loom node` orchestration: model → engine → RPC/P2P/gossip/repair |
 | `node/hf.zig` | model resolver: local dir / synthetic / Hugging Face download (local-first) |
-| `node/generator.zig` | generation abstraction over the loom-format engine and the distributed GGUF (deepseek2) engine; both serve paths call it |
+| `node/generator.zig` | generation abstraction over the loom-format engine and the distributed GGUF engines (MLA and GQA); both serve paths call it |
 | `gguf/chat_template.zig` | per-model chat-template detection + rendering for OpenAI `messages[]` (deepseek/chatml/llama2/llama3/gemma/mistral/generic) |
 | `gguf/special.zig` | special-token matcher: splices control / user-defined tokens (chat markers) to atomic ids during BPE + SPM encoding |
 | `node/rpc.zig` | JSON-over-TCP inference server (concurrent connections, serialized generate) |

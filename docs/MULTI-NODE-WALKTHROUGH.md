@@ -8,26 +8,36 @@ actual run.
 
 ## Which models work
 
-Two hard constraints, and both bite:
+**Architecture.** Every MoE architecture below serves distributed — a partial
+node fetches the experts it lacks from peers inside the token loop:
 
-**1. Architecture must be `deepseek2`.** That is the only engine wired into the
-distributed serving path. Loom also runs `llama`, but only single-node — a
-llama model will shard and distribute perfectly, yet a partial node cannot
-*serve* it (it silently falls back to the loom-format `--model` engine).
-
-This rules out most MoE GGUFs you will find:
-
-| Model | GGUF arch | Works? |
+| Model | GGUF arch | Engine |
 |---|---|---|
-| DeepSeek-V2 / V2-Lite / Coder-V2-Lite | `deepseek2` | **yes** |
-| Mixtral 8x7B | `llama` | shards, but no distributed serving |
-| Qwen1.5/3 MoE | `qwen2moe` / `qwen3moe` | not supported |
-| GLM-4.5 MoE | `glm4moe` | not supported |
+| DeepSeek-V2 / V2-Lite / Coder-V2-Lite | `deepseek2` | MLA |
+| Mixtral 8x7B / 8x22B | `llama` | GQA |
+| Qwen1.5-MoE | `qwen2moe` | GQA |
+| Qwen3-MoE | `qwen3moe` | GQA |
+| GLM-4.5 / 4.6 MoE | `glm4moe` | GQA |
 
-**2. Quantization must be one Loom implements:** `F32`, `F16`, `Q4_0`, `Q5_0`,
-`Q8_0`, `Q4_K`, `Q5_K`, `Q6_K`. **IQ-quants are not supported** (`IQ2_M`,
-`IQ3_XXS`, …), and most modern GGUF repos publish mostly IQ variants — check
-before downloading.
+A dense (non-MoE) model of a supported architecture runs single-node, but has
+no routed experts to distribute, so it shards into fixed-size ranges rather
+than per-expert ones.
+
+**Quantization** must be one Loom implements. That is now every quantization
+llama.cpp ships except the ternary TQ types:
+
+| Family | Types |
+|---|---|
+| float | `F32`, `F16` |
+| legacy | `Q4_0`, `Q5_0`, `Q8_0` |
+| K-quants | `Q4_K`, `Q5_K`, `Q6_K` |
+| IQ (codebook) | `IQ1_S`, `IQ1_M`, `IQ2_XXS`, `IQ2_XS`, `IQ2_S`, `IQ3_XXS`, `IQ3_S`, `IQ4_NL`, `IQ4_XS` |
+| microscaling | `MXFP4` |
+
+Not supported: `Q2_K`, `Q3_K`, `Q4_1`, `Q5_1`, `TQ1_0`, `TQ2_0`, `NVFP4`.
+`loom gguf info` reports the tensor types in a file, and sharding fails with
+`UnsupportedTensorType` before any inference if one is missing — so you find
+out at plan time, not mid-token.
 
 ### Recommended model
 
@@ -86,8 +96,9 @@ curl -L -o /tmp/dsc-v2-lite.gguf \
 ./zig-out/bin/loom gguf info /tmp/dsc-v2-lite.gguf | head -20
 ```
 
-Check `general.architecture = "deepseek2"`. If it says anything else, stop —
-the rest of this walkthrough will not work.
+Check `general.architecture` against the table above, and check the tensor
+types too. If the architecture is unsupported, `gguf run` says so and lists
+what it does support.
 
 ## Step 3 — look at the expert-aligned shard plan
 
@@ -137,6 +148,9 @@ serving    distributed GGUF (deepseek2): … chat=deepseek
 
 `mode=expert` is the one to check — that is expert-aligned sharding. If it says
 `mode=fixed`, the model is not MoE.
+
+The architecture in the `serving` line is read from the file, not assumed: it
+will say `deepseek2`, `llama`, `qwen2moe`, `qwen3moe` or `glm4moe`.
 
 ## Step 6 — start a partial node
 
@@ -280,7 +294,7 @@ byte-identical with the original.
 | `mode=fixed`, not `expert` | The model is dense, not MoE. |
 | `gguf serve disabled: …` in the banner | The store is not expert-sharded, or its resident bundle is incomplete. The node falls back to the loom-format engine and serves that instead. |
 | First request takes minutes | Expected on a cold partial node: every miss is a synchronous peer fetch. It warms as shards persist. |
-| `UnsupportedTensorType` | An IQ-quant. Use Q4_K/Q5_K/Q6_K/Q8_0. |
+| `UnsupportedTensorType` | A quantization Loom does not implement (`Q2_K`, `Q3_K`, `Q4_1`, `Q5_1`, `TQ*`, `NVFP4`). See the table above for what is supported. |
 
 ## Doing it with containers instead
 

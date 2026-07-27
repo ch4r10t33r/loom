@@ -201,17 +201,37 @@ rest and in flight, and the local forward pass) from a control plane (membership
 gossip, repair, metering). Two inference engines share a common set of
 quantized-matmul kernels.
 
-- The **llama** engine (grouped-query attention, rotary embeddings, SwiGLU),
-  validated against the tinyllamas reference models at F32, Q4_0, and Q8_0.
-- The **deepseek2** engine, covering the Kimi/DeepSeek/GLM family: MLA attention,
-  sparse MoE routing with sigmoid/softmax gating and shared experts, YaRN context
-  extension [11], and a byte-level BPE tokenizer read from GGUF metadata.
-  Validated on real DeepSeek-V2-Lite weights (Q4_K_M).
+- The **MLA** engine (`deepseek2`), covering the DeepSeek/Kimi family: MLA
+  attention, YaRN context extension [11], and a byte-level BPE tokenizer read
+  from GGUF metadata. Validated on real DeepSeek-V2-Lite weights (Q4_K_M).
+- The **GQA** engine, covering `llama` (including Mixtral), `qwen2moe`,
+  `qwen3moe` and `glm4moe` in one forward pass. These architectures differ only
+  in optional pieces over a shared skeleton, so the engine detects them from the
+  tensors a file contains rather than from per-architecture assumptions: QKV
+  biases, per-head Q/K normalization, dense or mixture-of-experts FFN, an
+  optionally sigmoid-gated shared expert, leading dense layers, a
+  post-attention norm in place of `ffn_norm`, and trailing MTP blocks that are
+  skipped. Only the rotary-embedding style is pinned per architecture, because
+  an incorrect choice yields fluent but wrong output rather than an error. The
+  dense llama path is validated against the tinyllamas reference models at F32,
+  Q4_0 and Q8_0.
 
-Weights remain in their GGML quantized formats
-(F32/F16/Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K) in a read-only memory map. Each matmul is
-a fused kernel over the raw bytes, so no tensor is dequantized wholesale. The
-source layout appears in [Appendix B](#appendix-b-source-layout).
+Both engines share one router (sigmoid or softmax gating, selection bias,
+top-k with optionally renormalized and scaled gates, shared experts), so a new
+architecture requires an attention variant rather than a new engine. The
+distribution plane was never architecture-specific: expert sharding keys on the
+GGUF tensor-naming convention that every mixture-of-experts conversion follows.
+
+Weights remain in their GGML quantized formats in a read-only memory map, and
+each matmul is a fused kernel over the raw bytes, so no tensor is dequantized
+wholesale. Two families are supported. *Affine* formats
+(F32/F16/Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K) reconstruct a value arithmetically.
+*Codebook* formats (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
+IQ4_NL, IQ4_XS, and MXFP4) instead store an index into a static grid table, so
+a transcription error in that table would silently corrupt weights rather than
+fail; every codebook decoder is therefore checked bit-for-bit against the
+reference implementation's output on stored vectors. The source layout appears
+in [Appendix B](#appendix-b-source-layout).
 
 ---
 
@@ -567,6 +587,9 @@ the spec governs the p2p protocol and the roadmap governs status.
 | 2026-07-22 | Per-model chat templates (`src/gguf/chat_template.zig`): detect the format from GGUF `tokenizer.chat_template` (or arch), render `messages[]` per format (deepseek/chatml/llama2/llama3/gemma/mistral/generic), `--chat-format` override. Format detection plus built-in renderers, not a Jinja engine | Real chat models need their own prompt format. DeepSeek-V2 (the validated target) is faithful |
 | 2026-07-22 | Special-token-aware tokenization (`src/gguf/special.zig`): both BPE and SPM splice control (type 3) / user-defined (type 4) tokens to atomic ids, longest-match with a first-byte filter, splitting the input before normal encoding | Chat markers (chatml/llama3/gemma) and control tokens tokenize exactly instead of being split. No change when no special appears (no regression). Caveats: parse_special always on (injection); SPM dummy-prefix on the first segment only |
 | 2026-07-24 | Parse-special injection hardening: `parse_special` threaded through the tokenizer chain; off for raw prompts and text-marker chat formats (deepseek/llama2/mistral), on only for special-marker scaffolds (chatml/llama3/gemma) | Untrusted input can no longer inject a control token on the raw-prompt or RPC path, nor via text-marker chat content (the validated DeepSeek-V2 target is fully safe). Segment-encoding content for special-marker formats is the remaining follow-up |
+| 2026-07-27 | Codebook quantizations implemented (`src/gguf/iq.zig`): IQ1_S/M, IQ2_XXS/XS/S, IQ3_XXS/S, IQ4_NL/XS and MXFP4, with grid and sign tables transcribed mechanically from llama.cpp (`src/gguf/iq_tables.zig`) | Most modern GGUF repositories publish mostly IQ variants, so the affine-only kernel set excluded the majority of available checkpoints. MXFP4 additionally covers microscaling checkpoints. Verified bit-for-bit against llama.cpp's own `dequantize_row_*` on stored vectors (`src/gguf/iq_vectors.zig`), because a wrong codebook entry corrupts weights silently instead of failing |
+| 2026-07-27 | MoE routing extracted to `src/gguf/moe.zig` and shared by both engines, including the expert-to-shard binding used for distributed fetch | The routing was never DeepSeek-specific: upstream funnels every MoE architecture through one routing function differing in four knobs (gating function, selection bias, gate renormalization, constant scale). Sharing it means a new architecture needs an attention variant, not a new engine |
+| 2026-07-27 | The llama engine generalized into one GQA engine covering `llama` (Mixtral), `qwen2moe`, `qwen3moe` and `glm4moe`; optional features detected from the file's tensors, with only the RoPE style pinned per architecture | Distributed serving previously required `deepseek2`, even though sharding, sync and repair were already architecture-agnostic — a Mixtral store distributed correctly but could not be served. Feature detection follows the checkpoint rather than a table of beliefs about each architecture, which is also what makes the qwen3 explicit `head_dim` and the glm4 NextN skip fall out naturally. Verified end to end: for all five architectures a node holding roughly 30% of shards serves with hit rate below 1 and produces output token-identical to a full-copy origin |
 
 ---
 
@@ -579,7 +602,7 @@ whitepaper/    this document
 src/main.zig   CLI entry
 src/core/      hashing/Merkle, tensor math, int4 quant, stats, iobench
 src/engine/    loom-format MoE engine (MLA, router, expert cache, checkpoints)
-src/gguf/      GGUF parser, GGML kernels, llama and deepseek2 engines, BPE
+src/gguf/      GGUF parser, GGML + codebook kernels, MLA and GQA engines, shared MoE routing, BPE
 src/p2p/       distribution: wire frames, gossip, committees, sync, token-loop fetch
 src/node/      daemon: node orchestration, RPC, model resolver, light node, metering
 ```

@@ -49,6 +49,11 @@ pub fn detect(template: ?[]const u8, arch: []const u8) Format {
         if (contains(t, "Assistant:") or contains(t, "\u{ff5c}Assistant\u{ff5c}")) return .deepseek;
     }
     if (std.mem.eql(u8, arch, "deepseek2")) return .deepseek;
+    // Qwen MoE and GLM-4.5 MoE both use ChatML markers. Only reached when the
+    // file carries no chat_template at all — the template string above is the
+    // authority when present.
+    if (std.mem.eql(u8, arch, "qwen2moe") or std.mem.eql(u8, arch, "qwen3moe") or
+        std.mem.eql(u8, arch, "glm4moe")) return .chatml;
     return .generic;
 }
 
@@ -145,7 +150,15 @@ test "detect from markers and arch" {
     try std.testing.expectEqual(Format.mistral, detect("...[INST]...", "llama"));
     try std.testing.expectEqual(Format.llama2, detect("...[INST]...<<SYS>>...", "llama"));
     try std.testing.expectEqual(Format.deepseek, detect(null, "deepseek2"));
+    // Qwen/GLM MoE default to ChatML when the file carries no template
+    try std.testing.expectEqual(Format.chatml, detect(null, "qwen2moe"));
+    try std.testing.expectEqual(Format.chatml, detect(null, "qwen3moe"));
+    try std.testing.expectEqual(Format.chatml, detect(null, "glm4moe"));
+    // Mixtral is arch "llama" and ships a mistral-style template
     try std.testing.expectEqual(Format.generic, detect(null, "llama"));
+    try std.testing.expectEqual(Format.mistral, detect("{{ '[INST] ' }}", "llama"));
+    // an explicit template always beats the arch fallback
+    try std.testing.expectEqual(Format.llama3, detect("<|start_header_id|>", "qwen3moe"));
 }
 
 test "deepseek render single user turn" {
