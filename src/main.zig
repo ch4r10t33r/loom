@@ -7,6 +7,7 @@
 //!   run <dir> [opts]                     generate tokens, log tok/s + hit-rate
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 pub const model = @import("engine/model.zig");
@@ -79,15 +80,32 @@ pub fn main(init: std.process.Init) !void {
         try cmdGguf(gpa, io, out, args);
     } else if (std.mem.eql(u8, cmd, "light")) {
         try cmdLight(gpa, io, out, args);
+    } else if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-V")) {
+        try cmdVersion(out);
     } else {
         try out.print("unknown command: {s}\n\n", .{cmd});
         try usage(out);
     }
 }
 
+/// Report what this binary is. Release builds are cross-compiled and
+/// downloaded, so the target triple matters as much as the version: it is the
+/// first thing to check when a binary misbehaves on unexpected hardware.
+fn cmdVersion(out: *Io.Writer) !void {
+    const info = @import("build_info");
+    try out.print("loom {s} ({s})\n", .{ info.version, info.commit });
+    try out.print("  target   {s}-{s}-{s}\n", .{
+        @tagName(builtin.cpu.arch), @tagName(builtin.os.tag), @tagName(builtin.abi),
+    });
+    try out.print("  zig      {s}\n", .{builtin.zig_version_string});
+    try out.print("  mode     {s}\n", .{@tagName(builtin.mode)});
+}
+
 fn usage(out: *Io.Writer) !void {
+    const info = @import("build_info");
+    try out.print("loom {s} — distributed expert cache for large MoE inference\n\n", .{info.version});
     try out.print(
-        \\loom v0 — single-node expert-streaming MoE inference
+        \\usage:
         \\
         \\usage:
         \\  loom node [--model SPEC] [--rpc-addr A] [--rpc-port P]
@@ -109,6 +127,7 @@ fn usage(out: *Io.Writer) !void {
         \\  loom iobench <file> [--threads N] [--block-mb M] [--reads R]
         \\  loom run <dir> [--prompt STR] [--max-tokens N] [--ram-gb X]
         \\                 [--pin-gb Y] [--temp T] [--seed S] [--stats FILE] [--no-verify]
+        \\  loom version
         \\
         \\--model SPEC: <local dir> | tiny | [hf:]org/repo[@rev]   (default: tiny)
         \\env overrides: MODEL, RAM_BUDGET_GB, PIN_GB, MAX_TOKENS, TEMP, SEED, STATS

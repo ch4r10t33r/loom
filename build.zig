@@ -1,10 +1,21 @@
 const std = @import("std");
 
+/// Single source of truth for the release version: build.zig.zon. Baked into
+/// the binary so a downloaded executable can report exactly what it is.
+const version = @import("build.zig.zon").version;
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
     const snappy = b.dependency("zig_snappy", .{ .target = target, .optimize = optimize });
+
+    // `-Dcommit=<sha>` from CI; "unknown" for a plain local build, which is
+    // itself useful information when someone reports a bug.
+    const commit = b.option([]const u8, "commit", "Git commit the build came from") orelse "unknown";
+    const build_info = b.addOptions();
+    build_info.addOption([]const u8, "version", version);
+    build_info.addOption([]const u8, "commit", commit);
 
     const exe = b.addExecutable(.{
         .name = "loom",
@@ -14,6 +25,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "snappyz", .module = snappy.module("snappyz") },
+                .{ .name = "build_info", .module = build_info.createModule() },
             },
         }),
     });
@@ -34,6 +46,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "snappyz", .module = snappy.module("snappyz") },
+                .{ .name = "build_info", .module = build_info.createModule() },
             },
         }),
     });
