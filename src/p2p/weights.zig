@@ -467,14 +467,47 @@ pub const Holdings = struct {
     /// The bootstrap want-set: resident shards [0, n_resident) are always
     /// wanted; each expert shard independently with probability `fraction`.
     /// Overlap across nodes with different seeds provides emergent redundancy.
+    /// Choose this node's want-set: all resident shards, plus a random subset of
+    /// the expert shards sized by `fraction`.
+    ///
+    /// The count is exact — `round(fraction * expert_shards)` — and only *which*
+    /// shards get picked is random. An earlier version flipped an independent
+    /// coin per shard, which makes the count binomial: with 5 shards and
+    /// `--hold-fraction 0.4` that returned 0, 1, or 2 depending on the seed, and
+    /// on the default seed it returned 0, i.e. a node holding nothing. At
+    /// GLM scale (~19k shards) the binomial concentrates and nobody notices, but
+    /// the flag should mean what it says at any size.
     pub fn initWanted(gpa: std.mem.Allocator, n: usize, n_resident: usize, fraction: f32, seed: u64) !Holdings {
         var h = try initEmpty(gpa, n);
         var i: usize = 0;
-        while (i < n_resident) : (i += 1) h.set(i);
+        while (i < n_resident) : (i += 1) h.set(i); // resident bundle is mandatory
+        const pool = n - n_resident;
+        if (pool == 0) return h;
+
+        const frac = std.math.clamp(fraction, 0.0, 1.0);
+        var want: usize = @intFromFloat(@round(@as(f64, @floatFromInt(pool)) * @as(f64, frac)));
+        // asking for a non-zero fraction should never yield an empty node
+        if (want == 0 and frac > 0) want = 1;
+        if (want > pool) want = pool;
+        if (want == pool) {
+            while (i < n) : (i += 1) h.set(i);
+            return h;
+        }
+
+        // partial Fisher-Yates over the expert-shard indices: exact count,
+        // uniformly chosen, seeded so a restart re-picks the same set
+        const idx = try gpa.alloc(usize, pool);
+        defer gpa.free(idx);
+        for (idx, 0..) |*v, k| v.* = n_resident + k;
         var prng = std.Random.DefaultPrng.init(seed);
         const rnd = prng.random();
-        while (i < n) : (i += 1) {
-            if (rnd.float(f32) < fraction) h.set(i);
+        var k: usize = 0;
+        while (k < want) : (k += 1) {
+            const j = k + rnd.uintLessThan(usize, pool - k);
+            const tmp = idx[k];
+            idx[k] = idx[j];
+            idx[j] = tmp;
+            h.set(idx[k]);
         }
         return h;
     }
@@ -947,4 +980,34 @@ test "malicious manifest extents rejected on parse (audit #5 P0-1)" {
     const bad = try std.mem.replaceOwned(u8, gpa, t2, "0:64", "0:60");
     defer gpa.free(bad);
     try std.testing.expectError(error.ManifestNotAPartition, parseManifestBytes(gpa, bad));
+}
+
+test "initWanted picks an exact count, not a binomial draw" {
+    const gpa = std.testing.allocator;
+    // 5 shards, no resident, 40% -> exactly 2, for EVERY seed
+    for ([_]u64{ 1, 2, 3, 42, 99, 12345 }) |seed| {
+        var h = try Holdings.initWanted(gpa, 5, 0, 0.4, seed);
+        defer h.deinit(gpa);
+        try std.testing.expectEqual(@as(usize, 2), h.count());
+    }
+    // resident shards are always wanted, and count toward neither the pool nor
+    // the fraction
+    var h2 = try Holdings.initWanted(gpa, 10, 4, 0.5, 7); // 4 resident + 3 of 6
+    defer h2.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 7), h2.count());
+    var r: usize = 0;
+    while (r < 4) : (r += 1) try std.testing.expect(h2.has(r));
+
+    // a non-zero fraction must never yield an empty node
+    var h3 = try Holdings.initWanted(gpa, 100, 0, 0.001, 42);
+    defer h3.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 1), h3.count());
+
+    // the extremes
+    var h4 = try Holdings.initWanted(gpa, 8, 0, 1.0, 42);
+    defer h4.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 8), h4.count());
+    var h5 = try Holdings.initWanted(gpa, 8, 0, 0.0, 42);
+    defer h5.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), h5.count());
 }
