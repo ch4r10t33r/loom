@@ -13,6 +13,8 @@ const sockopt = @import("../core/sockopt.zig");
 const openai = @import("openai.zig");
 const generator = @import("generator.zig");
 const deepseek = @import("../gguf/deepseek.zig");
+const llama = @import("../gguf/llama.zig");
+const gguf_mod = @import("../gguf/gguf.zig");
 const chat_template = @import("../gguf/chat_template.zig");
 const expert_fetch = @import("../p2p/expert_fetch.zig");
 const p2p = @import("../p2p/p2p.zig");
@@ -257,6 +259,30 @@ fn p2pThread(ctx: *p2p.Ctx) void {
 
 fn openaiThread(ctx: *openai.Ctx) void {
     openai.serve(ctx) catch |e| fatal("openai server failed: {s}\n", .{@errorName(e)});
+}
+
+/// Load a GGUF through whichever engine its `general.architecture` selects.
+/// deepseek2 is MLA; everything else supported is GQA (llama.zig).
+fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8) !generator.GgufModel {
+    var peek = try gguf_mod.parse(gpa, io, path);
+    const arch_src = peek.getString("general.architecture") orelse "?";
+    var arch_buf: [64]u8 = undefined;
+    const n = @min(arch_src.len, arch_buf.len);
+    @memcpy(arch_buf[0..n], arch_src[0..n]);
+    peek.deinit();
+    const arch = arch_buf[0..n];
+
+    if (std.mem.eql(u8, arch, "deepseek2")) {
+        return .{ .deepseek = try deepseek.load(gpa, io, path) };
+    }
+    return .{ .gqa = try llama.load(gpa, io, path) };
+}
+
+fn attachGgufDist(m: *generator.GgufModel, gpa: std.mem.Allocator, src: *expert_fetch.Source) !void {
+    switch (m.*) {
+        .deepseek => |*d| try deepseek.attachDist(d, gpa, src),
+        .gqa => |*g| try llama.attachDist(g, gpa, src),
+    }
 }
 
 pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void {
@@ -538,18 +564,22 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                 else
                     try std.fmt.allocPrint(gpa, "{s}/model.gguf", .{st.dir});
                 defer gpa.free(mpath);
-                if (deepseek.load(gpa, io, mpath)) |mdl| {
+                // Pick the engine from the file's own architecture: MLA
+                // (deepseek2) or the GQA family (llama/Mixtral, qwen2moe,
+                // qwen3moe, glm4moe). Both attach to the same expert source.
+                if (loadGgufEngine(gpa, io, mpath)) |mdl| {
                     gguf_gen = .{ .m = mdl, .src = &gguf_src, .ctx_cap = opts.ctx_cap };
-                    gguf_gen.m.cfg.ctx_len = @min(gguf_gen.m.cfg.ctx_len, opts.ctx_cap);
-                    if (deepseek.attachDist(&gguf_gen.m, gpa, &gguf_src)) |_| {
+                    gguf_gen.m.setCtxLen(@min(gguf_gen.m.ctxLen(), opts.ctx_cap));
+                    const arch_name = gguf_gen.m.archName();
+                    if (attachGgufDist(&gguf_gen.m, gpa, &gguf_src)) |_| {
                         gguf_gen.chat_format = if (opts.chat_format) |cf|
-                            chat_template.parse(cf) orelse chat_template.detect(gguf_gen.m.chatTemplate(), "deepseek2")
+                            chat_template.parse(cf) orelse chat_template.detect(gguf_gen.m.chatTemplate(), arch_name)
                         else
-                            chat_template.detect(gguf_gen.m.chatTemplate(), "deepseek2");
+                            chat_template.detect(gguf_gen.m.chatTemplate(), arch_name);
                         gen = .{ .gguf = &gguf_gen };
                         serve_gguf = true;
-                        try out.print("  serving    distributed GGUF (deepseek2): dim={d} layers={d} vocab={d} ctx={d} chat={s}\n", .{
-                            gguf_gen.m.cfg.dim, gguf_gen.m.cfg.n_layers, gguf_gen.m.cfg.vocab, gguf_gen.m.cfg.ctx_len, @tagName(gguf_gen.chat_format),
+                        try out.print("  serving    distributed GGUF ({s}): ctx={d} chat={s}\n", .{
+                            arch_name, gguf_gen.m.ctxLen(), @tagName(gguf_gen.chat_format),
                         });
                     } else |e| {
                         try out.print("  gguf serve disabled: attach failed ({s})\n", .{@errorName(e)});

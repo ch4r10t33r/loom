@@ -99,7 +99,7 @@ fn usage(out: *Io.Writer) !void {
         \\            [--advertise HOST:PORT] [--r-target N] [--free-quota TOKENS] [--admin-token TOK]
         \\  loom light [--full-nodes H:P[,...]] [--openai-port P --openai-full-nodes H:P[,...]]
         \\             [--rpc-addr A] [--rpc-port P] [--openai-addr A] [--client-id ID]
-        \\  loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2]
+        \\  loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2|llama|qwen2moe|qwen3moe|glm4moe]
         \\  loom gguf info <file> [--range-mb M]
         \\  loom gguf shard <file>
         \\  loom gguf run <file.gguf | store-dir> [--prompt STR] [--max-tokens N] [--temp T]
@@ -473,6 +473,10 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
             try out.print("writing synthetic deepseek2 GGUF (MLA + MoE, random weights) -> {s}\n", .{path});
             try out.flush();
             try gguf.writeDeepseekFixture(gpa, io, path, seed);
+        } else if (llama.archFor(arch) != null) {
+            try out.print("writing synthetic {s} GGUF (GQA + MoE, random weights) -> {s}\n", .{ arch, path });
+            try out.flush();
+            try gguf.writeMoeFixture(gpa, io, path, seed, arch);
         } else {
             const data_mb = try flagUsize(args, "--data-mb", 8);
             try out.print("writing synthetic GGUF ({d} MB tensor data) -> {s}\n", .{ data_mb, path });
@@ -578,7 +582,7 @@ fn cmdGgufRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8,
         const mp = std.fmt.bufPrint(&pbuf, "{s}/ranges.manifest", .{path}) catch null;
         if (mp != null) {
             if (Io.Dir.cwd().access(io, mp.?, .{})) |_| {
-                return runDeepseekStore(gpa, io, out, path, args);
+                return runStore(gpa, io, out, path, args);
             } else |_| {}
         }
     }
@@ -594,18 +598,23 @@ fn cmdGgufRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8,
     @memcpy(@constCast(arch), arch_src[0..arch.len]);
     peek.deinit();
 
-    if (std.mem.eql(u8, arch, "llama")) {
-        return runEngine(llama, gpa, io, out, path, args);
-    } else if (std.mem.eql(u8, arch, "deepseek2")) {
+    if (std.mem.eql(u8, arch, "deepseek2")) {
         return runEngine(deepseek, gpa, io, out, path, args);
     }
-    try out.print("unsupported architecture: {s} (supported: llama, deepseek2)\n", .{arch});
+    if (llama.archFor(arch) != null) {
+        return runEngine(llama, gpa, io, out, path, args);
+    }
+    try out.print("unsupported architecture: {s} (supported: deepseek2", .{arch});
+    for (llama.arches) |a| try out.print(", {s}", .{a.name});
+    try out.print(")\n", .{});
 }
 
-/// Run a deepseek2 model from a *partial* expert-sharded store: held shards
-/// come from the local sparse file, missing ones are fetched from --peers in
-/// the token loop (digest-verified, persisted — issue #3).
-fn runDeepseekStore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, dir: []const u8, args: [][]const u8) !void {
+/// Run a MoE model from a *partial* expert-sharded store: held shards come
+/// from the local sparse file, missing ones are fetched from --peers in the
+/// token loop (digest-verified, persisted — issue #3). The engine is chosen
+/// from the store's own model file, so this works for deepseek2 (MLA) and the
+/// GQA family alike.
+fn runStore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, dir: []const u8, args: [][]const u8) !void {
     var store = weights.openDir(gpa, io, dir) catch |e| {
         return out.print("store open failed: {s}\n", .{@errorName(e)});
     };
@@ -663,17 +672,37 @@ fn runDeepseekStore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, dir: []cons
 
     const mpath = try std.fmt.allocPrint(gpa, "{s}/model.gguf", .{dir});
     defer gpa.free(mpath);
-    var m = deepseek.load(gpa, io, mpath) catch |e| {
+    var peek = gguf.parse(gpa, io, mpath) catch |e| {
+        return out.print("load failed: {s}\n", .{@errorName(e)});
+    };
+    const is_mla = std.mem.eql(u8, peek.getString("general.architecture") orelse "?", "deepseek2");
+    peek.deinit();
+    if (is_mla) return runStoreWith(deepseek, gpa, io, out, &store, &src, mpath, args);
+    return runStoreWith(llama, gpa, io, out, &store, &src, mpath, args);
+}
+
+/// The distributed-store generation loop, instantiated per engine module.
+fn runStoreWith(
+    comptime E: type,
+    gpa: std.mem.Allocator,
+    io: Io,
+    out: *Io.Writer,
+    store: *weights.Store,
+    src: *expert_fetch.Source,
+    mpath: []const u8,
+    args: [][]const u8,
+) !void {
+    var m = E.load(gpa, io, mpath) catch |e| {
         return out.print("load failed: {s}\n", .{@errorName(e)});
     };
     defer m.deinit();
-    deepseek.attachDist(&m, gpa, &src) catch |e| {
+    E.attachDist(&m, gpa, src) catch |e| {
         return out.print("attach failed: {s}\n", .{@errorName(e)});
     };
 
     const held_before = store.holdings.count();
     try out.print("distributed store: shards={d} held={d} ({d} resident + experts) peers={d}\n", .{
-        store.manifest.nRanges(), held_before, store.manifest.n_resident, peer_list.items.len,
+        store.manifest.nRanges(), held_before, store.manifest.n_resident, src.peers.len,
     });
 
     const ctx_cap = try flagUsize(args, "--ctx", 4096);
@@ -684,7 +713,7 @@ fn runDeepseekStore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, dir: []cons
     });
     try out.flush();
 
-    var st = try deepseek.State.init(gpa, c);
+    var st = try E.State.init(gpa, c);
     defer st.deinit(gpa);
 
     const prompt = flagStr(args, "--prompt") orelse "Once upon a time";
@@ -706,7 +735,7 @@ fn runDeepseekStore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, dir: []cons
     try out.print("output: ", .{});
     for (prompt_toks) |tok| {
         if (pos >= c.ctx_len) return out.print("\nprompt exceeds context\n", .{});
-        try deepseek.step(&m, &st, tok, pos);
+        try E.step(&m, &st, tok, pos);
         try m.decodeToken(out, tok);
         pos += 1;
     }
@@ -718,7 +747,7 @@ fn runDeepseekStore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, dir: []cons
         if (last == m.eosToken()) break;
         try m.decodeToken(out, last);
         try out.flush();
-        try deepseek.step(&m, &st, last, pos);
+        try E.step(&m, &st, last, pos);
         pos += 1;
         last = @intCast(sampler.sample(sample_scratch, st.logits, temp, rnd));
     }

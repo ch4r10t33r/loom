@@ -223,7 +223,7 @@ and whether the stored root matches the recomputed one.
 Tools for GGUF files — the format real models ship in.
 
 ```
-loom gguf gen   <file> [--seed N] [--data-mb M] [--arch deepseek2]
+loom gguf gen   <file> [--seed N] [--data-mb M] [--arch A]
 loom gguf info  <file> [--range-mb M]
 loom gguf shard <file>
 loom gguf run   <file.gguf | store-dir> [--prompt STR] [--max-tokens N]
@@ -235,7 +235,7 @@ loom gguf run   <file.gguf | store-dir> [--prompt STR] [--max-tokens N]
 
 | Flag | Default | What it does |
 |---|---|---|
-| `--arch A` | `demo` | Architecture to emit. `deepseek2` produces a real MLA + MoE structure (the Kimi/DeepSeek/GLM family shape) and is what the expert-sharding and distribution tests use. |
+| `--arch A` | `demo` | Architecture to emit. `deepseek2` produces an MLA + MoE structure (the DeepSeek/Kimi family shape). `llama`, `qwen2moe`, `qwen3moe` and `glm4moe` produce GQA + MoE structures, each with exactly the optional pieces that architecture really has, so the fixtures exercise every branch of the shared engine. Anything else emits the plain `demo` tensor blob. These are what the expert-sharding and distribution tests run against, no multi-GB download needed. |
 | `--seed N` | `42` | Weight seed. |
 | `--data-mb M` | `8` | Approximate payload size, for the non-deepseek2 fixture. |
 
@@ -257,10 +257,12 @@ automatically.
 
 ### `gguf run` — run a GGUF model
 
-Runs a `.gguf` file directly, dispatching on `general.architecture` (`llama` or
-`deepseek2`). Point it at a **store directory** instead and it runs
-*distributed*: held shards come from the local sparse file and missing experts
-are fetched from peers inside the token loop.
+Runs a `.gguf` file directly, dispatching on `general.architecture`:
+`deepseek2` uses the MLA engine, and `llama` (including Mixtral), `qwen2moe`,
+`qwen3moe` and `glm4moe` use the shared GQA engine. Point it at a **store
+directory** instead and it runs *distributed*: held shards come from the local
+sparse file and missing experts are fetched from peers inside the token loop.
+The store's own model file selects the engine, so both families distribute.
 
 | Flag | Default | What it does |
 |---|---|---|

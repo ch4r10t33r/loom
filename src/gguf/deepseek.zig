@@ -25,47 +25,18 @@ const gguf = @import("gguf.zig");
 const ggml = @import("ggml.zig");
 const tensor = @import("../core/tensor.zig");
 const llama = @import("llama.zig");
-const bpe = @import("bpe.zig");
+const tokmod = @import("tok.zig");
+const moe = @import("moe.zig");
 const expert_fetch = @import("../p2p/expert_fetch.zig");
 
-/// Real DeepSeek/Kimi GGUFs ship a gpt2-style BPE tokenizer; fixtures (and
-/// some conversions) use SPM. Selected by `tokenizer.ggml.model`.
-pub const Tok = union(enum) {
-    spm: llama.Tokenizer,
-    bpe: bpe.Bpe,
+/// The file's tokenizer (SPM or gpt2-BPE); see tok.zig.
+pub const Tok = tokmod.Tok;
 
-    pub fn encode(self: *const Tok, gpa: std.mem.Allocator, text: []const u8, add_bos: bool, parse_special: bool) ![]u32 {
-        return switch (self.*) {
-            .spm => |*t| t.encode(gpa, text, add_bos, parse_special),
-            .bpe => |*t| t.encode(gpa, text, add_bos, parse_special),
-        };
-    }
-    pub fn decode(self: *const Tok, w: *Io.Writer, id: u32) !void {
-        return switch (self.*) {
-            .spm => |*t| t.decode(w, id),
-            .bpe => |*t| t.decode(w, id),
-        };
-    }
-    pub fn eosId(self: *const Tok) u32 {
-        return switch (self.*) {
-            .spm => |*t| t.eos,
-            .bpe => |*t| t.eos,
-        };
-    }
-    pub fn deinit(self: *Tok, gpa: std.mem.Allocator) void {
-        switch (self.*) {
-            .spm => |*t| t.deinit(gpa),
-            .bpe => |*t| t.deinit(gpa),
-        }
-    }
-};
+pub const GatingFunc = moe.GatingFunc;
 
-pub const GatingFunc = enum(u32) { softmax = 1, sigmoid = 2 };
-
-/// Caps for config values that index fixed-size stack buffers in `step`
-/// (security issue #29). `n_used` slices `sel_buf`/`ids_buf` and `dim` slices
-/// `acc_buf`; without these an oversized metadata value smashes the stack.
-pub const MAX_SELECTED: usize = 64;
+/// Cap on `dim`, which slices `acc_buf` in step() (security issue #29).
+/// The expert-count caps live in moe.zig alongside the router that uses them.
+pub const MAX_SELECTED: usize = moe.MAX_SELECTED;
 pub const MAX_DIM: usize = 8192;
 
 pub const Config = struct {
@@ -99,6 +70,16 @@ pub const Config = struct {
 
     pub fn keyDim(self: Config) usize {
         return self.nope_dim + self.rope_dim;
+    }
+
+    pub fn routeCfg(self: Config) moe.RouteCfg {
+        return .{
+            .n_expert = self.n_expert,
+            .n_used = self.n_used,
+            .gating = self.gating,
+            .weights_norm = self.weights_norm,
+            .weights_scale = self.weights_scale,
+        };
     }
 };
 
@@ -250,6 +231,7 @@ fn validateConfig(cfg: Config) !void {
     if (cfg.dim == 0 or cfg.n_heads == 0 or cfg.n_layers == 0) return error.BadConfig;
     if (cfg.dim > MAX_DIM) return error.BadConfig; // acc_buf in step()
     if (cfg.n_used > MAX_SELECTED) return error.BadConfig; // sel_buf/ids_buf
+    if (cfg.n_expert > moe.MAX_EXPERTS) return error.BadConfig; // route() score buffers
     if (cfg.n_expert != 0 and cfg.n_used > cfg.n_expert) return error.BadConfig;
     if (cfg.n_dense_layers > cfg.n_layers) return error.BadConfig;
     if (cfg.kv_lora_rank == 0 or cfg.v_head_dim == 0) return error.BadConfig;
@@ -429,11 +411,7 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
     }
     model.layers = layers;
 
-    const tok_model = model.parsed.getString("tokenizer.ggml.model") orelse "llama";
-    model.tok = if (std.mem.eql(u8, tok_model, "gpt2"))
-        .{ .bpe = try bpe.Bpe.init(gpa, &model.parsed) }
-    else
-        .{ .spm = try llama.Tokenizer.init(gpa, &model.parsed) };
+    model.tok = try Tok.init(gpa, &model.parsed);
     return model;
 }
 
@@ -441,34 +419,17 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
 /// manifest shard by matching the gate slice's file offset against the shard's
 /// first extent — no reliance on shard ordering conventions.
 pub fn attachDist(m: *Model, gpa: std.mem.Allocator, src: *expert_fetch.Source) !void {
-    const mani = &src.store.manifest;
-    if (mani.mode != .expert) return error.NotExpertManifest;
-
-    var by_off = std.AutoHashMap(u64, usize).init(gpa);
-    defer by_off.deinit();
-    var i: usize = mani.n_resident;
-    while (i < mani.nRanges()) : (i += 1) {
-        try by_off.put(mani.shardExtents(i)[0].offset, i);
-    }
-
-    const map = try gpa.alloc(usize, m.cfg.n_layers * m.cfg.n_expert);
-    errdefer gpa.free(map);
-    @memset(map, std.math.maxInt(usize));
-
-    var nb: [128]u8 = undefined;
-    for (m.layers, 0..) |l, li| {
-        if (!l.is_moe) continue;
-        const name = try std.fmt.bufPrint(&nb, "blk.{d}.ffn_gate_exps.weight", .{li});
-        const t = m.parsed.findTensor(name) orelse return error.MissingTensor;
-        const ty: ggml.Type = @enumFromInt(t.ggml_type);
-        const per: u64 = @intCast(t.dims[1] * ggml.rowBytes(ty, @intCast(t.dims[0])));
-        var e: usize = 0;
-        while (e < m.cfg.n_expert) : (e += 1) {
-            const off = m.parsed.data_offset + t.offset + per * e;
-            map[li * m.cfg.n_expert + e] = by_off.get(off) orelse return error.ShardMapMismatch;
-        }
-    }
-    m.expert_shard = map;
+    const is_moe = try gpa.alloc(bool, m.cfg.n_layers);
+    defer gpa.free(is_moe);
+    for (m.layers, 0..) |l, i| is_moe[i] = l.is_moe;
+    m.expert_shard = try moe.buildExpertShardMap(
+        gpa,
+        &m.parsed,
+        &src.store.manifest,
+        m.cfg.n_layers,
+        m.cfg.n_expert,
+        is_moe,
+    );
     m.dist = src;
 }
 
@@ -603,52 +564,7 @@ fn denseFFN(st: *State, gate_w: Tensor, up_w: Tensor, down_w: Tensor) void {
     mv(down_w, st.ffn_out, st.act[0..f]);
 }
 
-const Selected = struct { expert: usize, gate: f32 };
-
-/// deepseek2 routing: gating func over router logits; selection may add a bias
-/// (noaux_tc) that does NOT affect the returned gate weights; top-k gates are
-/// optionally renormalized, then scaled.
-fn route(cfg: Config, router_logits: []const f32, bias: ?[]const f32, sel: []Selected) void {
-    var scores_buf: [512]f32 = undefined;
-    const scores = scores_buf[0..cfg.n_expert];
-    switch (cfg.gating) {
-        .sigmoid => for (router_logits, 0..) |l, i| {
-            scores[i] = tensor.sigmoid(l);
-        },
-        .softmax => {
-            @memcpy(scores, router_logits);
-            tensor.softmax(scores);
-        },
-    }
-    var choice_buf: [512]f32 = undefined;
-    const choice = choice_buf[0..cfg.n_expert];
-    @memcpy(choice, scores);
-    if (bias) |b| for (choice, b) |*c, bv| {
-        c.* += bv;
-    };
-
-    var used = [_]bool{false} ** 512;
-    for (sel) |*s| {
-        var best: usize = 0;
-        var best_v: f32 = -std.math.inf(f32);
-        for (choice, 0..) |c, e| {
-            if (!used[e] and c > best_v) {
-                best_v = c;
-                best = e;
-            }
-        }
-        used[best] = true;
-        s.* = .{ .expert = best, .gate = scores[best] };
-    }
-    if (cfg.weights_norm) {
-        var sum: f32 = 0;
-        for (sel) |s| sum += s.gate;
-        if (sum > 0) for (sel) |*s| {
-            s.gate /= sum;
-        };
-    }
-    for (sel) |*s| s.gate *= cfg.weights_scale;
-}
+const Selected = moe.Selected;
 
 /// One token step; logits land in st.logits. Errors only when a distributed
 /// expert shard has no reachable holder (fail loud, not silently degraded).
@@ -733,10 +649,10 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             tensor.add(st.x, st.ffn_out);
         } else {
             mv(l.ffn_gate_inp.?, st.router[0..cfg.n_expert], st.normed);
-            var sel_buf: [64]Selected = undefined;
+            var sel_buf: [moe.MAX_SELECTED]Selected = undefined;
             const sel = sel_buf[0..cfg.n_used];
             const bias: ?[]const f32 = if (l.exp_probs_b) |b| asF32(b) else null;
-            route(cfg, st.router[0..cfg.n_expert], bias, sel);
+            moe.route(cfg.routeCfg(), st.router[0..cfg.n_expert], bias, sel);
 
             var acc_buf: [8192]f32 = undefined;
             const acc = acc_buf[0..cfg.dim];
@@ -744,7 +660,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             if (m.dist) |src| {
                 // warm the missing shards in parallel: per-layer miss latency
                 // becomes max(fetch), not sum(fetch)
-                var ids_buf: [64]usize = undefined;
+                var ids_buf: [moe.MAX_SELECTED]usize = undefined;
                 for (sel, 0..) |s, k| ids_buf[k] = m.expert_shard[li * cfg.n_expert + s.expert];
                 src.prefetch(ids_buf[0..sel.len]);
             }
@@ -817,7 +733,7 @@ test "route: sigmoid gating with selection bias picks by biased score, gates fro
     const logits = [_]f32{ 2.0, 1.5, 0.0, -0.5 };
     const bias = [_]f32{ 0, 0, 10, 10 };
     var sel: [2]Selected = undefined;
-    route(cfg, &logits, &bias, &sel);
+    moe.route(cfg.routeCfg(), &logits, &bias, &sel);
     for (sel) |s| try std.testing.expect(s.expert == 2 or s.expert == 3);
     // gates renormalized over raw sigmoid scores of the selected pair
     var sum: f32 = 0;
@@ -826,6 +742,6 @@ test "route: sigmoid gating with selection bias picks by biased score, gates fro
 
     // without bias, raw scores pick 0,1
     var sel2: [2]Selected = undefined;
-    route(cfg, &logits, null, &sel2);
+    moe.route(cfg.routeCfg(), &logits, null, &sel2);
     for (sel2) |s| try std.testing.expect(s.expert == 0 or s.expert == 1);
 }

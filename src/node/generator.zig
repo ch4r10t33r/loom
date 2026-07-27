@@ -16,6 +16,7 @@ const Engine = engine_mod.Engine;
 const tokenizer = @import("../engine/tokenizer.zig");
 const sampler = @import("../engine/sampler.zig");
 const deepseek = @import("../gguf/deepseek.zig");
+const llama = @import("../gguf/llama.zig");
 const chat_template = @import("../gguf/chat_template.zig");
 const expert_fetch = @import("../p2p/expert_fetch.zig");
 
@@ -40,10 +41,46 @@ pub const TokenSink = struct {
     emit: *const fn (ctx: *anyopaque, bytes: []const u8) anyerror!void,
 };
 
-/// Distributed GGUF (deepseek2) generator: the model plus its token-loop expert
-/// fetch source. A fresh `State` (KV cache) is built per request.
+/// The loaded GGUF model, by engine. deepseek2 is MLA (deepseek.zig); every
+/// other supported architecture is GQA (llama.zig). Both expose the same
+/// Model/State/step shape, so the generation loop below is written once and
+/// instantiated for each.
+pub const GgufModel = union(enum) {
+    deepseek: deepseek.Model,
+    gqa: llama.Model,
+
+    pub fn deinit(self: *GgufModel) void {
+        switch (self.*) {
+            inline else => |*m| m.deinit(),
+        }
+    }
+    pub fn ctxLen(self: *const GgufModel) usize {
+        return switch (self.*) {
+            inline else => |*m| m.cfg.ctx_len,
+        };
+    }
+    pub fn setCtxLen(self: *GgufModel, n: usize) void {
+        switch (self.*) {
+            inline else => |*m| m.cfg.ctx_len = n,
+        }
+    }
+    pub fn archName(self: *const GgufModel) []const u8 {
+        return switch (self.*) {
+            .deepseek => "deepseek2",
+            .gqa => |*m| m.cfg.arch.name,
+        };
+    }
+    pub fn chatTemplate(self: *const GgufModel) ?[]const u8 {
+        return switch (self.*) {
+            inline else => |*m| m.chatTemplate(),
+        };
+    }
+};
+
+/// Distributed GGUF generator: the model plus its token-loop expert fetch
+/// source. A fresh `State` (KV cache) is built per request.
 pub const GgufGen = struct {
-    m: deepseek.Model,
+    m: GgufModel,
     src: *expert_fetch.Source,
     ctx_cap: usize,
     chat_format: chat_template.Format = .generic,
@@ -167,14 +204,33 @@ fn genGguf(
     parse_special: bool,
 ) !Result {
     _ = io;
-    const m = &g.m;
+    return switch (g.m) {
+        .deepseek => |*m| genGgufInner(deepseek, m, gpa, prompt_text, max_tokens, temp, seed, budget, sink, parse_special),
+        .gqa => |*m| genGgufInner(llama, m, gpa, prompt_text, max_tokens, temp, seed, budget, sink, parse_special),
+    };
+}
+
+/// The GGUF generation loop, instantiated per engine. `E` is an engine module
+/// exposing Model, State and step — deepseek.zig or llama.zig.
+fn genGgufInner(
+    comptime E: type,
+    m: *E.Model,
+    gpa: std.mem.Allocator,
+    prompt_text: []const u8,
+    max_tokens: usize,
+    temp: f32,
+    seed: u64,
+    budget: ?u64,
+    sink: ?TokenSink,
+    parse_special: bool,
+) !Result {
     const c = m.cfg;
 
     const toks = try m.encodePrompt(gpa, prompt_text, parse_special);
     defer gpa.free(toks);
     const maxn = clampMax(max_tokens, budget, toks.len);
 
-    var st = try deepseek.State.init(gpa, c);
+    var st = try E.State.init(gpa, c);
     defer st.deinit(gpa);
     const scratch = try gpa.alloc(f32, c.vocab);
     defer gpa.free(scratch);
@@ -185,7 +241,7 @@ fn genGguf(
     var pos: usize = 0;
     for (toks) |t| {
         if (pos >= c.ctx_len) break;
-        try deepseek.step(m, &st, t, pos);
+        try E.step(m, &st, t, pos);
         pos += 1;
     }
 
@@ -203,7 +259,7 @@ fn genGguf(
             const before = aw.writer.buffered().len;
             try m.decodeToken(&aw.writer, last);
             if (sink) |s| try s.emit(s.ctx, aw.writer.buffered()[before..]);
-            try deepseek.step(m, &st, last, pos);
+            try E.step(m, &st, last, pos);
             pos += 1;
             last = @intCast(sampler.sample(scratch, st.logits, temp, rnd));
         }
