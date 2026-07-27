@@ -54,8 +54,11 @@ jobs:
         run: zig "${ZIG}" build test --summary all
 
   docker:
-    name: image build + smoke test
+    name: image build, smoke test, publish on main
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write   # push to ghcr.io on main
     steps:
       - uses: actions/checkout@v4
 
@@ -91,6 +94,28 @@ jobs:
           print("rpc:", resp[:120])
           sys.exit(0 if '"ok":true' in resp else 1)
           EOF
+
+      # Publish the image that just passed the smoke test rather than
+      # rebuilding: what ships is exactly what was tested. Only on a push to
+      # main, so PRs (including from forks, which have no package write token)
+      # never publish.
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push to ghcr.io
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -eux
+          # registry paths must be lowercase
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/${owner}/loom"
+          # :latest for convenience, :<sha> so a deploy can be pinned and rolled back
+          docker tag loom:ci "${image}:latest"
+          docker tag loom:ci "${image}:${GITHUB_SHA}"
+          docker push "${image}:latest"
+          docker push "${image}:${GITHUB_SHA}"
+          echo "published ${image}:latest and ${image}:${GITHUB_SHA}"
 
       - name: Container logs on failure
         if: failure()

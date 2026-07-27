@@ -37,6 +37,17 @@ zig build run -- <args>          # build + run in one step
 A multi-stage [`Dockerfile`](Dockerfile) builds a ReleaseFast binary (Zig 0.16.0
 is fetched by anyzig at build time) into a ~120 MB Debian-slim runtime image.
 
+A prebuilt image is published to the GitHub Container Registry on every push to
+`main`, tagged `latest` and with the commit SHA (pin the SHA for anything you
+need to reproduce or roll back):
+
+```sh
+docker pull ghcr.io/ch4r10t33r/loom:latest
+```
+
+Only images that pass the CI smoke test are published, and the image pushed is
+the one that was tested, not a rebuild. To build locally instead:
+
 ```sh
 docker build -t loom:dev .
 
