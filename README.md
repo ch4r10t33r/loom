@@ -11,6 +11,10 @@ nodes as content-addressed byte ranges of a GGUF file (v1, in progress — see
 
 One binary, `loom`, provides:
 
+> **Full CLI reference: [`docs/CLI.md`](docs/CLI.md)** — every command and every
+> flag, with defaults, env overrides, and when you would change them. The
+> sections below are a tour; that document is the detail.
+
 | Command | Purpose |
 |---|---|
 | [`loom node`](#loom-node--run-an-inference--weight-sharing-node) | the daemon: load a model, serve inference over RPC, share/sync/repair GGUF weight ranges over P2P with gossip discovery |
@@ -100,6 +104,8 @@ loom gguf run stories15M-q4_0.gguf --prompt "Once upon a time"
 ---
 
 ## `loom node` — run an inference + weight-sharing node
+
+*Every flag for this command: [docs/CLI.md](docs/CLI.md#loom-node).*
 
 ```
 loom node [--model SPEC] [--rpc-addr A] [--rpc-port P] [--openai-addr A] [--openai-port P]
@@ -284,6 +290,8 @@ on real machines this isn't needed.)
 
 ## `loom run` — one-shot local inference
 
+*Every flag for this command: [docs/CLI.md](docs/CLI.md#loom-run).*
+
 ```
 loom run <dir> [--prompt STR] [--max-tokens N] [--ram-gb X] [--pin-gb Y]
                [--temp T] [--seed S] [--stats FILE] [--no-verify]
@@ -318,6 +326,8 @@ histogram (rank, expert id, count, cumulative coverage, cumulative pin bytes).
 ---
 
 ## `loom light` — delegating light node
+
+*Every flag for this command: [docs/CLI.md](docs/CLI.md#loom-light).*
 
 ```
 loom light [--full-nodes H:RPC_PORT[,...]] [--openai-port P --openai-full-nodes H:OPENAI_PORT[,...]]
@@ -357,6 +367,8 @@ curl -s http://127.0.0.1:9000/v1/chat/completions \
 
 ## `loom gen` — generate a synthetic checkpoint
 
+*Every flag for this command: [docs/CLI.md](docs/CLI.md#loom-gen).*
+
 ```
 loom gen <dir> [--glm] [--seed N]
 ```
@@ -376,6 +388,8 @@ loom gen /tmp/ckpt --seed 7
 
 ## `loom info` — inspect & verify a checkpoint
 
+*Every flag for this command: [docs/CLI.md](docs/CLI.md#loom-info).*
+
 ```
 loom info <dir>
 ```
@@ -393,6 +407,8 @@ loom info /tmp/ckpt
 ---
 
 ## `loom gguf` — GGUF tools (`gen` / `info` / `shard` / `run`)
+
+*Every flag for this command: [docs/CLI.md](docs/CLI.md#loom-gguf).*
 
 ### `loom gguf gen` — synthetic GGUF fixture
 
@@ -592,6 +608,8 @@ serving-throughput architecture — batch and pin), and on 1 GbE the win is
 *fitting the model at all*, not speed (see CLAUDE.md's bandwidth table).
 
 ## `loom iobench` — disk profiler
+
+*Every flag for this command: [docs/CLI.md](docs/CLI.md#loom-iobench).*
 
 ```
 loom iobench <file> [--threads N] [--block-mb M] [--reads R]
