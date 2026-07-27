@@ -335,6 +335,10 @@ loom 0.1.0 (1e35bba...)
   mode     ReleaseFast
 ```
 
+`loom node` and `loom light` print the same identity as a banner at startup,
+in short form, so a long-running daemon's logs record which build produced
+them.
+
 The commit is stamped at build time via `-Dcommit=<sha>`; a plain local build
 reports `unknown`, which is itself worth knowing. `mode Debug` explains a
 roughly 10x slowdown, and the target triple is the first thing to check when a

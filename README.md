@@ -48,6 +48,20 @@ on any distro.
 
 Windows is not built yet.
 
+One line, which detects your platform, verifies the download against the
+release checksums, and installs to `/usr/local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/ch4r10t33r/loom/main/install.sh | sh
+```
+
+It takes `--version vX.Y.Z` and `--dir PATH`, or the same as `LOOM_VERSION` and
+`LOOM_INSTALL_DIR`. On Windows it stops with an explanation and points at WSL2,
+where the Linux build works. While the repository is private it needs a
+`GITHUB_TOKEN`, or a signed-in `gh`.
+
+By hand instead:
+
 ```sh
 VER=v0.1.0; PLAT=aarch64-macos       # pick yours from the table
 curl -fsSL -O https://github.com/ch4r10t33r/loom/releases/download/$VER/loom-$VER-$PLAT.tar.gz
