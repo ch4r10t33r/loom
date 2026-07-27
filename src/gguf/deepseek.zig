@@ -522,9 +522,9 @@ pub const State = struct {
 
     pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
         inline for (.{
-            self.x,     self.normed,   self.q_a,      self.q,       self.kv_a,
-            self.k_nope, self.v_t,     self.head_out, self.proj_out, self.gate,
-            self.up,    self.act,      self.ffn_out,  self.router,  self.scores,
+            self.x,      self.normed,     self.q_a,          self.q,        self.kv_a,
+            self.k_nope, self.v_t,        self.head_out,     self.proj_out, self.gate,
+            self.up,     self.act,        self.ffn_out,      self.router,   self.scores,
             self.logits, self.c_kv_cache, self.k_rope_cache,
         }) |sl| gpa.free(sl);
     }
@@ -787,12 +787,31 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
 
 test "route: sigmoid gating with selection bias picks by biased score, gates from raw" {
     const cfg = Config{
-        .dim = 8, .n_layers = 1, .n_dense_layers = 0, .n_heads = 1, .q_lora_rank = 0,
-        .kv_lora_rank = 4, .rope_dim = 2, .nope_dim = 2, .v_head_dim = 2, .ffn = 8,
-        .moe_ffn = 8, .n_expert = 4, .n_used = 2, .n_shared = 0, .gating = .sigmoid,
-        .weights_norm = true, .weights_scale = 1.0, .vocab = 8, .ctx_len = 8,
-        .rope_base = 10000, .eps = 1e-6, .yarn_factor = 0, .yarn_orig_ctx = 0,
-        .yarn_log_mul = 0, .attn_scale = 1.0,
+        .dim = 8,
+        .n_layers = 1,
+        .n_dense_layers = 0,
+        .n_heads = 1,
+        .q_lora_rank = 0,
+        .kv_lora_rank = 4,
+        .rope_dim = 2,
+        .nope_dim = 2,
+        .v_head_dim = 2,
+        .ffn = 8,
+        .moe_ffn = 8,
+        .n_expert = 4,
+        .n_used = 2,
+        .n_shared = 0,
+        .gating = .sigmoid,
+        .weights_norm = true,
+        .weights_scale = 1.0,
+        .vocab = 8,
+        .ctx_len = 8,
+        .rope_base = 10000,
+        .eps = 1e-6,
+        .yarn_factor = 0,
+        .yarn_orig_ctx = 0,
+        .yarn_log_mul = 0,
+        .attn_scale = 1.0,
     };
     // raw logits favor experts 0,1; bias flips selection to 2,3
     const logits = [_]f32{ 2.0, 1.5, 0.0, -0.5 };

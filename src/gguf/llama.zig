@@ -193,10 +193,10 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
     var namebuf: [128]u8 = undefined;
     for (layers, 0..) |*l, i| {
         inline for (.{
-            .{ "attn_norm", &l.attn_norm },   .{ "attn_q", &l.attn_q },
-            .{ "attn_k", &l.attn_k },         .{ "attn_v", &l.attn_v },
+            .{ "attn_norm", &l.attn_norm },     .{ "attn_q", &l.attn_q },
+            .{ "attn_k", &l.attn_k },           .{ "attn_v", &l.attn_v },
             .{ "attn_output", &l.attn_output }, .{ "ffn_norm", &l.ffn_norm },
-            .{ "ffn_gate", &l.ffn_gate },     .{ "ffn_up", &l.ffn_up },
+            .{ "ffn_gate", &l.ffn_gate },       .{ "ffn_up", &l.ffn_up },
             .{ "ffn_down", &l.ffn_down },
         }) |pair| {
             const name = try std.fmt.bufPrint(&namebuf, "blk.{d}.{s}.weight", .{ i, pair[0] });
@@ -452,9 +452,9 @@ pub const State = struct {
 
     pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
         inline for (.{
-            self.x,        self.normed, self.q,       self.k,      self.v,
-            self.attn_out, self.proj_out, self.gate,  self.up,     self.act,
-            self.ffn_out,  self.scores, self.logits,  self.k_cache, self.v_cache,
+            self.x,        self.normed,   self.q,      self.k,       self.v,
+            self.attn_out, self.proj_out, self.gate,   self.up,      self.act,
+            self.ffn_out,  self.scores,   self.logits, self.k_cache, self.v_cache,
         }) |sl| gpa.free(sl);
     }
 };
@@ -508,8 +508,8 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
 
         // append to cache
         const cache_base = (li * cfg.ctx_len + pos) * kvd;
-        @memcpy(st.k_cache[cache_base ..][0..kvd], st.k);
-        @memcpy(st.v_cache[cache_base ..][0..kvd], st.v);
+        @memcpy(st.k_cache[cache_base..][0..kvd], st.k);
+        @memcpy(st.v_cache[cache_base..][0..kvd], st.v);
 
         // per-head attention over positions 0..=pos
         const seq = pos + 1;
