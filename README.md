@@ -13,7 +13,11 @@ One binary, `loom`, provides:
 
 > **Walkthrough — shard a real MoE model across a swarm:
 > [`docs/MULTI-NODE-WALKTHROUGH.md`](docs/MULTI-NODE-WALKTHROUGH.md)** — which
-> models work, how to shard them, and how to run several nodes.
+> models work, how to shard them, and how to run several nodes on one host.
+>
+> **Two physical machines:
+> [`docs/TWO-MACHINE-TEST.md`](docs/TWO-MACHINE-TEST.md)** — measure your link
+> first, then run a real cross-machine swarm and get honest tok/s numbers.
 >
 > **Full CLI reference: [`docs/CLI.md`](docs/CLI.md)** — every command and every
 > flag, with defaults, env overrides, and when you would change them. The
