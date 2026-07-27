@@ -12,6 +12,7 @@ const Io = std.Io;
 
 pub const model = @import("engine/model.zig");
 pub const hash = @import("core/hash.zig");
+const banner = @import("core/banner.zig");
 pub const quant = @import("core/quant.zig");
 pub const tensor = @import("core/tensor.zig");
 pub const checkpoint = @import("engine/checkpoint.zig");
@@ -93,6 +94,8 @@ pub fn main(init: std.process.Init) !void {
 /// first thing to check when a binary misbehaves on unexpected hardware.
 fn cmdVersion(out: *Io.Writer) !void {
     const info = @import("build_info");
+    // Full hash here, unlike the boot banner's short form: this is the command
+    // you run to paste into a bug report.
     try out.print("loom {s} ({s})\n", .{ info.version, info.commit });
     try out.print("  target   {s}-{s}-{s}\n", .{
         @tagName(builtin.cpu.arch), @tagName(builtin.os.tag), @tagName(builtin.abi),
@@ -414,6 +417,8 @@ fn lightOpenaiThread(ctx: *light_openai.Ctx) void {
 }
 
 fn cmdLight(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) !void {
+    try banner.print(out, "light");
+
     const rpc_addr = flagStr(args, "--rpc-addr") orelse "127.0.0.1";
     const rpc_port = try flagU16(args, "--rpc-port", 8768);
     const openai_addr = flagStr(args, "--openai-addr") orelse rpc_addr;
