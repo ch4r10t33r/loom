@@ -1,0 +1,177 @@
+name: Release
+
+# Tag-driven: `git tag v0.1.0 && git push origin v0.1.0` builds and publishes.
+# workflow_dispatch builds the same artifacts without publishing, so the
+# release path can be exercised before a tag is cut — a release is the one
+# thing you cannot quietly retry.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  ANYZIG_VERSION: v2026_03_26
+  ZIG: "0.16.0"
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Zig cross-compiles all four from either host. They are split
+          # across two runners anyway so each native binary gets smoke-tested
+          # on the OS it claims to support, rather than only being linked.
+          - { target: x86_64-linux-musl,  runner: ubuntu-latest, asset: x86_64-linux,  anyzig: x86_64-linux,   sha: f9d5a09fbd7c019eecef1a397613ce5baec22872a1c3eb5ab4b1132e917c3d71, native: true }
+          - { target: aarch64-linux-musl, runner: ubuntu-latest, asset: aarch64-linux, anyzig: x86_64-linux,   sha: f9d5a09fbd7c019eecef1a397613ce5baec22872a1c3eb5ab4b1132e917c3d71, native: false }
+          - { target: aarch64-macos,      runner: macos-latest,  asset: aarch64-macos, anyzig: aarch64-macos,  sha: c7d0d77dd5f21e44d67b09717b60435bc7b90b81873f543040f0bc4dd8622109, native: true }
+          - { target: x86_64-macos,       runner: macos-latest,  asset: x86_64-macos,  anyzig: aarch64-macos,  sha: c7d0d77dd5f21e44d67b09717b60435bc7b90b81873f543040f0bc4dd8622109, native: false }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # anyzig resolves the exact Zig version pinned in build.zig.zon, so
+      # every artifact is built by the same compiler. The checksum matters for
+      # the same reason it does in the Dockerfile: the version is a mutable
+      # git tag (security issue #33).
+      - name: Install anyzig (checksum-verified)
+        run: |
+          set -eux
+          curl -fsSL -o /tmp/anyzig.tar.gz \
+            "https://github.com/marler8997/anyzig/releases/download/${ANYZIG_VERSION}/anyzig-${{ matrix.anyzig }}.tar.gz"
+          echo "${{ matrix.sha }}  /tmp/anyzig.tar.gz" | shasum -a 256 -c -
+          sudo tar -xz -C /usr/local/bin -f /tmp/anyzig.tar.gz
+          sudo chmod +x /usr/local/bin/zig
+          zig "${ZIG}" version
+
+      - name: Build
+        run: |
+          set -eux
+          zig "${ZIG}" build \
+            -Doptimize=ReleaseFast \
+            -Dtarget=${{ matrix.target }} \
+            -Dcommit="${GITHUB_SHA}" \
+            -p out
+
+      # Linking is not evidence that it runs. Where the artifact matches the
+      # runner, actually execute it.
+      - name: Smoke test
+        if: matrix.native
+        run: |
+          set -eux
+          ./out/bin/loom version
+          ./out/bin/loom version | grep -q "${GITHUB_SHA}"
+          # generate a synthetic MoE model, shard it, and serve one completion
+          ./out/bin/loom gguf gen /tmp/smoke.gguf --arch qwen3moe --seed 1
+          ./out/bin/loom gguf shard /tmp/smoke.gguf | grep -q "mode=expert\|expert-aligned"
+          ./out/bin/loom gguf run /tmp/smoke.gguf --prompt hi --max-tokens 4 | grep -q "output:"
+
+      - name: Package
+        id: pkg
+        shell: bash
+        run: |
+          set -eux
+          # tags give v0.1.0; a manual run has no tag, so label it by commit
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then VER="${GITHUB_REF_NAME}"; else VER="dev-${GITHUB_SHA::7}"; fi
+          NAME="loom-${VER}-${{ matrix.asset }}"
+          mkdir -p "dist/${NAME}"
+          cp out/bin/loom "dist/${NAME}/"
+          cp README.md "dist/${NAME}/"
+          tar -C dist -czf "${NAME}.tar.gz" "${NAME}"
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.name }}.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    # Only a tag publishes. A manual run stops after building, so the whole
+    # path can be rehearsed without creating a release.
+    if: github.ref_type == 'tag'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          set -eux
+          cd artifacts
+          ls -l
+          sha256sum *.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      # `gh` is preinstalled on the runner, so the release is cut without a
+      # third-party action holding a write token. Install instructions are
+      # written here (they are identical every release); --generate-notes
+      # appends the commit/PR changelog after them, so nothing has to be
+      # hand-maintained and go stale.
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          V="${GITHUB_REF_NAME}"
+          cat > /tmp/notes.md <<EOF
+          Prebuilt \`loom\` binaries. No runtime dependencies: the Linux builds are
+          statically linked against musl, so they run on any glibc or musl distro.
+
+          | platform | asset |
+          |---|---|
+          | macOS, Apple silicon | \`loom-${V}-aarch64-macos.tar.gz\` |
+          | macOS, Intel | \`loom-${V}-x86_64-macos.tar.gz\` |
+          | Linux, x86-64 | \`loom-${V}-x86_64-linux.tar.gz\` |
+          | Linux, arm64 | \`loom-${V}-aarch64-linux.tar.gz\` |
+
+          Windows is not built yet.
+
+          ### Install
+
+          \`\`\`sh
+          # pick the asset for your platform, e.g. macOS on Apple silicon
+          curl -fsSL -o loom.tar.gz \\
+            https://github.com/${GITHUB_REPOSITORY}/releases/download/${V}/loom-${V}-aarch64-macos.tar.gz
+          tar -xzf loom.tar.gz
+          sudo mv loom-${V}-aarch64-macos/loom /usr/local/bin/
+          loom version
+          \`\`\`
+
+          Verify the download against \`SHA256SUMS\` first:
+
+          \`\`\`sh
+          curl -fsSLO https://github.com/${GITHUB_REPOSITORY}/releases/download/${V}/SHA256SUMS
+          shasum -a 256 -c SHA256SUMS --ignore-missing
+          \`\`\`
+
+          On macOS, Gatekeeper will quarantine an unsigned downloaded binary. Clear it with
+          \`xattr -d com.apple.quarantine /usr/local/bin/loom\`, or right-click and Open once.
+
+          ### Where to start
+
+          - [Two-machine test](https://github.com/${GITHUB_REPOSITORY}/blob/${V}/docs/TWO-MACHINE-TEST.md) — run a real cross-machine swarm
+          - [Single-host walkthrough](https://github.com/${GITHUB_REPOSITORY}/blob/${V}/docs/MULTI-NODE-WALKTHROUGH.md)
+          - [CLI reference](https://github.com/${GITHUB_REPOSITORY}/blob/${V}/docs/CLI.md)
+          EOF
+          sed -i 's/^          //' /tmp/notes.md
+          gh release create "${V}" \
+            --title "loom ${V}" \
+            --notes-file /tmp/notes.md \
+            --generate-notes \
+            --verify-tag \
+            artifacts/*.tar.gz artifacts/SHA256SUMS

@@ -32,7 +32,43 @@ One binary, `loom`, provides:
 | [`loom light`](#loom-light--delegating-light-node) | **light node**: no weights/engine; delegates the native RPC and/or OpenAI API to full nodes, metered by them |
 | [`loom iobench`](#loom-iobench--disk-profiler) | disk profiler for the random-read pattern the engine issues |
 
-## Build
+## Install
+
+Prebuilt binaries are attached to each
+[release](https://github.com/ch4r10t33r/loom/releases). No runtime
+dependencies — the Linux builds are statically linked against musl, so they run
+on any distro.
+
+| platform | asset suffix |
+|---|---|
+| macOS, Apple silicon | `aarch64-macos` |
+| macOS, Intel | `x86_64-macos` |
+| Linux, x86-64 | `x86_64-linux` |
+| Linux, arm64 | `aarch64-linux` |
+
+Windows is not built yet.
+
+```sh
+VER=v0.1.0; PLAT=aarch64-macos       # pick yours from the table
+curl -fsSL -O https://github.com/ch4r10t33r/loom/releases/download/$VER/loom-$VER-$PLAT.tar.gz
+curl -fsSL -O https://github.com/ch4r10t33r/loom/releases/download/$VER/SHA256SUMS
+shasum -a 256 -c SHA256SUMS --ignore-missing
+tar -xzf loom-$VER-$PLAT.tar.gz
+sudo mv loom-$VER-$PLAT/loom /usr/local/bin/
+loom version
+```
+
+`loom version` reports the version, the commit it was built from, and its
+target triple — worth quoting in any bug report.
+
+On macOS, Gatekeeper quarantines unsigned downloads. Clear it with
+`xattr -d com.apple.quarantine /usr/local/bin/loom`, or right-click and Open
+once. The binaries are not code-signed or notarized.
+
+Docker images are published to `ghcr.io/ch4r10t33r/loom:latest` on every push
+to `main`.
+
+## Build from source
 
 Targets **Zig 0.16.0** (pinned in `build.zig.zon`; [anyzig](https://github.com/marler8997/anyzig)
 resolves it automatically).
@@ -43,6 +79,15 @@ zig build -Doptimize=ReleaseFast # ~10x faster inference
 zig build test                   # unit tests
 zig build run -- <args>          # build + run in one step
 ```
+
+Cross-compiling is a flag, since Zig ships every target:
+
+```sh
+zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -p out
+```
+
+Releases are cut by pushing a tag (`v0.1.0`), which builds all four targets and
+publishes them; see [`.github/workflows/release.yml`](.github/workflows/release.yml).
 
 ## Docker
 
