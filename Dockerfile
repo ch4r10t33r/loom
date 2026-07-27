@@ -48,7 +48,8 @@ COPY src ./src
 
 # `zig 0.16.0` triggers anyzig to fetch Zig 0.16.0; the build then fetches the
 # snappy dependency (git+https) and compiles.
-RUN zig 0.16.0 build -Doptimize=ReleaseFast
+ARG COMMIT=unknown
+RUN zig 0.16.0 build -Doptimize=ReleaseFast -Dcommit="$COMMIT"
 
 # ---- runtime: minimal image with just the binary ----
 FROM debian@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime

@@ -316,3 +316,26 @@ Only these are read, and a flag always wins:
 - [README](../README.md) — overview, quick start, protocol examples
 - [spec/SPEC.md](../spec/SPEC.md) — the p2p layer: roles, committees, wire messages, trust model
 - [docs/ROADMAP.md](ROADMAP.md) — status and what is planned
+
+---
+
+## `loom version`
+
+```
+loom version        # also: --version, -V
+```
+
+Prints the release version, the git commit the binary was built from, its
+target triple, the Zig version that compiled it, and the optimization mode:
+
+```
+loom 0.1.0 (1e35bba...)
+  target   aarch64-macos-none
+  zig      0.16.0
+  mode     ReleaseFast
+```
+
+The commit is stamped at build time via `-Dcommit=<sha>`; a plain local build
+reports `unknown`, which is itself worth knowing. `mode Debug` explains a
+roughly 10x slowdown, and the target triple is the first thing to check when a
+downloaded binary misbehaves on unexpected hardware.
