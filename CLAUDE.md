@@ -160,6 +160,17 @@ change set: update the affected section AND append a dated row to
 never delete). Where documents disagree: spec/SPEC.md governs the p2p layer,
 docs/ROADMAP.md governs status, the whitepaper governs intent.
 
+**Regenerate the PDF in the same change set**, always:
+
+```sh
+./whitepaper/build.sh
+```
+
+`WHITEPAPER.pdf` is committed and is what actually gets sent to readers, so a
+stale one is worse than none: it is a document that looks current while
+describing an older design, and nothing fails to warn you. CI rejects a commit
+that touches `WHITEPAPER.md` without also touching `WHITEPAPER.pdf`.
+
 ## Open questions / risks
 - **Slow fabric kills the network tier.** On ≤25 GbE the win is capacity/dedup, not speed. Size expectations to measured bandwidth.
 - **colibri is a PoC.** Re-validate on real weights; treat as reference, not production.
