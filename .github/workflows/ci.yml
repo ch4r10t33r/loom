@@ -20,6 +20,33 @@ env:
   ZIG: "0.16.0"
 
 jobs:
+  # The PDF is a committed build artifact of the Markdown, so nothing breaks
+  # when it goes stale -- it just quietly starts describing an older design to
+  # anyone who is sent it. This has happened once. Make forgetting impossible.
+  whitepaper:
+    name: whitepaper pdf is in step
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: PDF regenerated alongside the Markdown
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -eu
+          changed=$(git diff --name-only "$BASE" "$HEAD")
+          md=$(printf '%s\n' "$changed" | grep -cx 'whitepaper/WHITEPAPER.md'  || true)
+          pdf=$(printf '%s\n' "$changed" | grep -cx 'whitepaper/WHITEPAPER.pdf' || true)
+          if [ "$md" -gt 0 ] && [ "$pdf" -eq 0 ]; then
+            echo "::error file=whitepaper/WHITEPAPER.md::WHITEPAPER.md changed but WHITEPAPER.pdf did not. Run ./whitepaper/build.sh and commit the result."
+            exit 1
+          fi
+          echo "ok (md=$md pdf=$pdf)"
+
   zig:
     name: fmt, build, tests
     runs-on: ubuntu-latest
