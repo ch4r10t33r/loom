@@ -1,35 +1,106 @@
-//! Llama-architecture inference over a GGUF file — the engine that runs what
-//! the distribution plane ships. Standard llama: RMSNorm, GQA attention with
-//! NORM-style RoPE (adjacent-pair rotation), SwiGLU FFN, tied-or-separate
-//! output head, and the SentencePiece tokenizer embedded in GGUF metadata.
+//! GQA-attention inference over a GGUF file — the engine behind every
+//! architecture loom runs except deepseek2 (whose MLA lives in deepseek.zig).
 //!
-//! Weights stay in their GGML format (F32/F16/Q4_0/Q8_0) in a read-only memory
-//! map; every matmul is a fused kernel over the raw bytes (ggml.zig).
+//! One forward pass covers llama (including Mixtral), qwen2moe, qwen3moe and
+//! glm4moe, because in llama.cpp these differ only in optional pieces bolted
+//! onto the same skeleton: RMSNorm, GQA attention, RoPE, SwiGLU FFN,
+//! tied-or-separate output head. The variable parts are
+//!
+//!   - RoPE style (adjacent-pair NORM vs split-half NEOX), and how much of
+//!     each head is rotated,
+//!   - QKV biases, and per-head Q/K RMSNorm before RoPE,
+//!   - whether the FFN is dense or a mixture of experts, with or without a
+//!     shared expert, and whether that shared expert is sigmoid-gated,
+//!   - a post-attention norm standing in for ffn_norm.
+//!
+//! Everything except the RoPE style is detected from the tensors the file
+//! actually contains, so the engine follows the checkpoint rather than a
+//! table of beliefs about each architecture.
+//!
+//! Weights stay in their GGML format in a read-only memory map; every matmul
+//! is a fused kernel over the raw bytes (ggml.zig). Routed experts can instead
+//! come from the distribution plane — see attachDist.
 
 const std = @import("std");
 const Io = std.Io;
 const gguf = @import("gguf.zig");
 const ggml = @import("ggml.zig");
 const tensor = @import("../core/tensor.zig");
-const special = @import("special.zig");
+const spm = @import("spm.zig");
+const moe = @import("moe.zig");
+const expert_fetch = @import("../p2p/expert_fetch.zig");
+
+/// Re-exported: the SPM tokenizer moved to spm.zig so every engine can share
+/// it without an import cycle.
+pub const Tokenizer = spm.Tokenizer;
+
+/// The file's tokenizer (SPM or gpt2-BPE); see tok.zig.
+pub const Tok = @import("tok.zig").Tok;
+
+/// The GQA-attention architectures this engine covers. Each is a set of
+/// optional features over the same skeleton, so they share one forward pass
+/// rather than one file each. The only hard per-arch fact is the RoPE style;
+/// everything else (QKV bias, Q/K norm, MoE, shared experts, leading dense
+/// layers, a post-attention norm standing in for ffn_norm) is detected from
+/// the tensors the file actually contains.
+///
+/// Verified against llama.cpp's `llama_model_rope_type` and the per-model
+/// graph builders in `src/models/`.
+pub const Arch = struct {
+    name: []const u8, // also the metadata key prefix
+    rope: RopeStyle,
+};
+
+pub const RopeStyle = enum { norm, neox };
+
+pub const arches = [_]Arch{
+    .{ .name = "llama", .rope = .norm }, // includes Mixtral (MoE llama)
+    .{ .name = "qwen2moe", .rope = .neox },
+    .{ .name = "qwen3moe", .rope = .neox },
+    .{ .name = "glm4moe", .rope = .neox },
+};
+
+pub fn archFor(name: []const u8) ?Arch {
+    for (arches) |a| {
+        if (std.mem.eql(u8, a.name, name)) return a;
+    }
+    return null;
+}
 
 pub const Config = struct {
+    arch: Arch,
     dim: usize,
-    n_layers: usize,
+    head_dim: usize, // may differ from dim/n_heads (qwen3 sets key_length)
+    n_layers: usize, // excludes trailing MTP/NextN blocks
+    n_dense_layers: usize, // leading layers with a plain FFN
     n_heads: usize,
     n_kv_heads: usize,
     ffn: usize,
+    moe_ffn: usize, // per-routed-expert hidden size
+    shexp_ffn: usize, // shared-expert hidden size (total across n_shared)
+    n_expert: usize,
+    n_used: usize,
+    n_shared: usize,
+    route: moe.RouteCfg,
     vocab: usize,
     ctx_len: usize,
-    rope_dim: usize,
+    rope_dim: usize, // may be < head_dim (glm4moe rotates a prefix)
     rope_base: f32,
     eps: f32,
 
     pub fn headDim(self: Config) usize {
-        return self.dim / self.n_heads;
+        return self.head_dim;
     }
     pub fn kvDim(self: Config) usize {
-        return self.n_kv_heads * self.headDim();
+        return self.n_kv_heads * self.head_dim;
+    }
+    pub fn qDim(self: Config) usize {
+        return self.n_heads * self.head_dim;
+    }
+    /// Widest FFN intermediate any layer needs, which is what State sizes its
+    /// gate/up/act buffers to.
+    pub fn maxFfn(self: Config) usize {
+        return @max(self.ffn, @max(self.moe_ffn, self.shexp_ffn));
     }
 };
 
@@ -38,6 +109,19 @@ pub const Tensor = struct {
     data: []const u8,
     ne0: usize, // row length (input dim)
     ne1: usize, // rows (output dim)
+    ne2: usize = 1, // experts, for the stacked 3D *_exps tensors
+
+    /// Byte slice of expert `e` in a 3D tensor. `e` comes from the router and
+    /// is bounded by the config's expert count, while `ne2` comes from the
+    /// file: a file declaring fewer experts than the config would slice past
+    /// the mapping (security issue #29), so bound it here too.
+    pub fn expert(self: Tensor, e: usize) !Tensor {
+        if (e >= self.ne2) return error.ExpertOutOfRange;
+        const per = self.ne1 * ggml.rowBytes(self.ty, self.ne0);
+        const start = e * per;
+        if (start + per > self.data.len) return error.ExpertOutOfRange;
+        return .{ .ty = self.ty, .data = self.data[start..][0..per], .ne0 = self.ne0, .ne1 = self.ne1, .ne2 = 1 };
+    }
 };
 
 const LayerT = struct {
@@ -46,10 +130,32 @@ const LayerT = struct {
     attn_k: Tensor,
     attn_v: Tensor,
     attn_output: Tensor,
+    // optional attention extras, present or absent per architecture
+    attn_q_bias: ?Tensor,
+    attn_k_bias: ?Tensor,
+    attn_v_bias: ?Tensor,
+    attn_q_norm: ?Tensor, // per-head RMSNorm applied before RoPE
+    attn_k_norm: ?Tensor,
+    /// The norm before the FFN. glm4moe names it `post_attention_norm` and
+    /// ships no `ffn_norm`; functionally they are the same slot.
     ffn_norm: Tensor,
-    ffn_gate: Tensor,
-    ffn_up: Tensor,
-    ffn_down: Tensor,
+    // dense FFN (leading layers, or a non-MoE model)
+    ffn_gate: ?Tensor,
+    ffn_up: ?Tensor,
+    ffn_down: ?Tensor,
+    // MoE
+    ffn_gate_inp: ?Tensor,
+    exp_probs_b: ?Tensor, // selection bias (noaux_tc)
+    ffn_gate_exps: ?Tensor,
+    ffn_up_exps: ?Tensor,
+    ffn_down_exps: ?Tensor,
+    ffn_gate_shexp: ?Tensor,
+    ffn_up_shexp: ?Tensor,
+    ffn_down_shexp: ?Tensor,
+    /// qwen2moe gates its shared expert by sigmoid(w . x); the others add the
+    /// shared expert output unweighted.
+    ffn_gate_inp_shexp: ?Tensor,
+    is_moe: bool,
 };
 
 pub const Model = struct {
@@ -65,7 +171,14 @@ pub const Model = struct {
     output: Tensor, // == token_embd when tied
     layers: []LayerT,
 
-    tok: Tokenizer,
+    tok: Tok,
+
+    /// Distributed expert source (issue #3): when set, routed-expert weights
+    /// come through Source.get() — local tier or peer fetch — instead of the
+    /// (possibly sparse) memory map.
+    dist: ?*expert_fetch.Source = null,
+    /// (layer * n_expert + e) -> manifest shard id; built by attachDist.
+    expert_shard: []usize = &.{},
 
     pub fn encodePrompt(self: *const Model, gpa: std.mem.Allocator, text: []const u8, parse_special: bool) ![]u32 {
         return self.tok.encode(gpa, text, true, parse_special);
@@ -74,10 +187,15 @@ pub const Model = struct {
         return self.tok.decode(w, id);
     }
     pub fn eosToken(self: *const Model) u32 {
-        return self.tok.eos;
+        return self.tok.eosId();
+    }
+    /// The GGUF `tokenizer.chat_template` string, if the model carries one.
+    pub fn chatTemplate(self: *const Model) ?[]const u8 {
+        return self.parsed.getString("tokenizer.chat_template");
     }
 
     pub fn deinit(self: *Model) void {
+        if (self.expert_shard.len > 0) self.gpa.free(self.expert_shard);
         self.tok.deinit(self.gpa);
         self.gpa.free(self.layers);
         self.mm.destroy(self.io);
@@ -102,14 +220,18 @@ pub const Model = struct {
         const start = std.math.cast(usize, off) orelse return error.TruncatedGguf;
         const end = std.math.add(usize, start, bytes) catch return error.TruncatedGguf;
         if (end > self.mm.memory.len) return error.TruncatedGguf;
-        if (ne2 != 1) return error.BadTensorShape; // llama tensors are 2D
-        return .{ .ty = ty, .data = self.mm.memory[start..end], .ne0 = ne0, .ne1 = ne1 };
+        return .{ .ty = ty, .data = self.mm.memory[start..end], .ne0 = ne0, .ne1 = ne1, .ne2 = ne2 };
     }
 
-    /// Assert a resolved tensor has exactly the shape the config implies.
-    /// Without this the kernels trust the file's dims and the config
-    /// independently: e.g. a `[dim, 1<<20]` q_a weight against an 8-float
-    /// destination is a heap overflow write (security issue #29).
+    fn resolveOpt(self: *const Model, name: []const u8) ?Tensor {
+        return self.resolve(name) catch null;
+    }
+
+    /// Assert a tensor really is F32. `tensorAsF32` reinterprets the mapped
+    /// bytes as floats behind a debug assert, which is a no-op in ReleaseFast:
+    /// a norm weight declared as q8_0 would otherwise be reinterpreted
+    /// (security issue #29). Alignment is checked too, since the data offset is
+    /// file-controlled and `general.alignment` may legally be 1 or 2.
     fn expectF32(t: Tensor, name: []const u8) !void {
         if (t.ty != .f32) {
             std.debug.print("gguf: tensor {s} must be f32, got {s}\n", .{ name, @tagName(t.ty) });
@@ -119,20 +241,55 @@ pub const Model = struct {
         if (t.data.len % @sizeOf(f32) != 0) return error.BadTensorType;
     }
 
+    /// Assert a resolved tensor has exactly the shape the config implies.
+    /// Without this the kernels trust the file's dims and the config
+    /// independently: e.g. a `[dim, 1<<20]` q weight against a smaller
+    /// destination is a heap overflow write (security issue #29).
     fn expectShape(t: Tensor, ne0: usize, ne1: usize, name: []const u8) !void {
         if (t.ne0 != ne0 or t.ne1 != ne1) {
             std.debug.print("gguf: tensor {s} has shape [{d},{d}], config implies [{d},{d}]\n", .{ name, t.ne0, t.ne1, ne0, ne1 });
             return error.BadTensorShape;
         }
     }
+
+    /// Same, for the stacked 3D expert tensors.
+    fn expectExpertShape(t: Tensor, ne0: usize, ne1: usize, ne2: usize, name: []const u8) !void {
+        if (t.ne0 != ne0 or t.ne1 != ne1 or t.ne2 != ne2) {
+            std.debug.print("gguf: tensor {s} has shape [{d},{d},{d}], config implies [{d},{d},{d}]\n", .{ name, t.ne0, t.ne1, t.ne2, ne0, ne1, ne2 });
+            return error.BadTensorShape;
+        }
+    }
 };
+
+/// Reject metadata that would divide by zero, overflow a size computation, or
+/// index past a fixed-size buffer (security issue #29). Everything here comes
+/// from an untrusted file: a peer-supplied GGUF or a Hugging Face download.
+fn validateConfig(cfg: Config) !void {
+    if (cfg.dim == 0 or cfg.n_heads == 0 or cfg.n_layers == 0) return error.BadConfig;
+    if (cfg.head_dim == 0 or cfg.ctx_len == 0) return error.BadConfig;
+    if (cfg.n_kv_heads == 0 or cfg.n_heads % cfg.n_kv_heads != 0) return error.BadConfig;
+    if (cfg.rope_dim > cfg.head_dim) return error.BadConfig;
+    if (cfg.n_dense_layers > cfg.n_layers) return error.BadConfig;
+    if (cfg.n_used > moe.MAX_SELECTED) return error.BadConfig; // sel_buf/ids_buf
+    if (cfg.n_expert > moe.MAX_EXPERTS) return error.BadConfig; // route() score buffers
+    if (cfg.n_expert != 0 and cfg.n_used > cfg.n_expert) return error.BadConfig;
+    // a model with MoE layers must declare a usable expert configuration
+    if (cfg.n_layers > cfg.n_dense_layers and cfg.n_expert != 0) {
+        if (cfg.n_used == 0 or cfg.moe_ffn == 0) return error.BadConfig;
+    }
+    if (cfg.n_expert == 0 and cfg.ffn == 0) return error.BadConfig;
+    // scores/kv allocations multiply these; keep the products representable
+    const kv = std.math.mul(usize, cfg.n_layers, cfg.ctx_len) catch return error.BadConfig;
+    _ = std.math.mul(usize, kv, cfg.kvDim()) catch return error.BadConfig;
+    _ = std.math.mul(usize, cfg.n_layers, cfg.n_expert) catch return error.BadConfig;
+}
 
 pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
     var parsed = try gguf.parse(gpa, io, path);
     errdefer parsed.deinit();
 
-    const arch = parsed.getString("general.architecture") orelse return error.NoArchitecture;
-    if (!std.mem.eql(u8, arch, "llama")) return error.UnsupportedArchitecture;
+    const arch_name = parsed.getString("general.architecture") orelse return error.NoArchitecture;
+    const arch = archFor(arch_name) orelse return error.UnsupportedArchitecture;
 
     const file = try Io.Dir.cwd().openFile(io, path, .{});
     errdefer file.close(io);
@@ -142,31 +299,62 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
     });
     errdefer mm.destroy(io);
 
-    const dim: usize = @intCast(parsed.getUint("llama.embedding_length") orelse return error.BadConfig);
-    const n_heads: usize = @intCast(parsed.getUint("llama.attention.head_count") orelse return error.BadConfig);
-    // `head_dim` divides by n_heads, and Config.headDim/kvDim do it again on
-    // every forward pass: a metadata head_count of 0 is a guaranteed crash
-    // (security issue #29).
-    if (dim == 0 or n_heads == 0 or dim % n_heads != 0) return error.BadConfig;
-    const head_dim = dim / n_heads;
-    const cfg = Config{
-        .dim = dim,
-        .n_layers = @intCast(parsed.getUint("llama.block_count") orelse return error.BadConfig),
-        .n_heads = n_heads,
-        .n_kv_heads = @intCast(parsed.getUint("llama.attention.head_count_kv") orelse n_heads),
-        .ffn = @intCast(parsed.getUint("llama.feed_forward_length") orelse return error.BadConfig),
-        .vocab = 0, // fixed up below from token_embd
-        .ctx_len = @intCast(parsed.getUint("llama.context_length") orelse 2048),
-        .rope_dim = @intCast(parsed.getUint("llama.rope.dimension_count") orelse head_dim),
-        .rope_base = @floatCast(parsed.getFloat("llama.rope.freq_base") orelse 10000.0),
-        .eps = @floatCast(parsed.getFloat("llama.attention.layer_norm_rms_epsilon") orelse 1e-5),
+    var kb: [128]u8 = undefined;
+    const K = struct {
+        fn f(buf: []u8, a: []const u8, comptime s: []const u8) []const u8 {
+            return std.fmt.bufPrint(buf, "{s}." ++ s, .{a}) catch unreachable;
+        }
     };
 
-    if (cfg.n_layers == 0 or cfg.ctx_len == 0 or cfg.ffn == 0) return error.BadConfig;
-    if (cfg.n_kv_heads == 0 or cfg.n_heads % cfg.n_kv_heads != 0) return error.BadConfig;
-    // scores/kv allocations multiply these; keep the products representable
-    const kv = std.math.mul(usize, cfg.n_layers, cfg.ctx_len) catch return error.BadConfig;
-    _ = std.math.mul(usize, kv, cfg.kvDim()) catch return error.BadConfig;
+    const dim: usize = @intCast(parsed.getUint(K.f(&kb, arch_name, "embedding_length")) orelse return error.BadConfig);
+    const n_heads: usize = @intCast(parsed.getUint(K.f(&kb, arch_name, "attention.head_count")) orelse return error.BadConfig);
+    if (dim == 0 or n_heads == 0) return error.BadConfig;
+    // qwen3 sets an explicit head_dim that is *not* dim/n_heads; fall back to
+    // the classic division only when the file stays silent.
+    const head_dim: usize = @intCast(parsed.getUint(K.f(&kb, arch_name, "attention.key_length")) orelse blk: {
+        if (dim % n_heads != 0) return error.BadConfig;
+        break :blk dim / n_heads;
+    });
+
+    // glm4moe ships its MTP/NextN blocks as ordinary trailing layers that the
+    // forward pass must not run. Their tensors stay in the file (and so stay
+    // shardable), we simply stop before them.
+    const block_count: usize = @intCast(parsed.getUint(K.f(&kb, arch_name, "block_count")) orelse return error.BadConfig);
+    const nextn: usize = @intCast(parsed.getUint(K.f(&kb, arch_name, "nextn_predict_layers")) orelse 0);
+    if (nextn >= block_count) return error.BadConfig;
+
+    const n_expert: usize = @intCast(parsed.getUint(K.f(&kb, arch_name, "expert_count")) orelse 0);
+    const n_used: usize = @intCast(parsed.getUint(K.f(&kb, arch_name, "expert_used_count")) orelse 0);
+
+    var cfg = Config{
+        .arch = arch,
+        .dim = dim,
+        .head_dim = head_dim,
+        .n_layers = block_count - nextn,
+        .n_dense_layers = @intCast(parsed.getUint(K.f(&kb, arch_name, "leading_dense_block_count")) orelse 0),
+        .n_heads = n_heads,
+        .n_kv_heads = @intCast(parsed.getUint(K.f(&kb, arch_name, "attention.head_count_kv")) orelse n_heads),
+        .ffn = @intCast(parsed.getUint(K.f(&kb, arch_name, "feed_forward_length")) orelse 0),
+        .moe_ffn = @intCast(parsed.getUint(K.f(&kb, arch_name, "expert_feed_forward_length")) orelse 0),
+        .shexp_ffn = @intCast(parsed.getUint(K.f(&kb, arch_name, "expert_shared_feed_forward_length")) orelse 0),
+        .n_expert = n_expert,
+        .n_used = n_used,
+        .n_shared = @intCast(parsed.getUint(K.f(&kb, arch_name, "expert_shared_count")) orelse 0),
+        .route = moe.routeCfgFromMeta(&parsed, arch_name, n_expert, n_used),
+        .vocab = 0, // fixed up below from token_embd
+        .ctx_len = @intCast(parsed.getUint(K.f(&kb, arch_name, "context_length")) orelse 2048),
+        .rope_dim = @intCast(parsed.getUint(K.f(&kb, arch_name, "rope.dimension_count")) orelse head_dim),
+        .rope_base = @floatCast(parsed.getFloat(K.f(&kb, arch_name, "rope.freq_base")) orelse 10000.0),
+        .eps = @floatCast(parsed.getFloat(K.f(&kb, arch_name, "attention.layer_norm_rms_epsilon")) orelse 1e-5),
+    };
+    // llama.cpp's fallback when a MoE file omits the per-expert FFN size
+    if (cfg.n_expert > 0 and cfg.moe_ffn == 0 and cfg.n_used > 0) cfg.moe_ffn = cfg.ffn / cfg.n_used;
+    // qwen2moe's shared expert defaults to the dense FFN width; the others
+    // size theirs as n_shared whole routed experts.
+    if (cfg.shexp_ffn == 0) {
+        cfg.shexp_ffn = if (std.mem.eql(u8, arch_name, "qwen2moe")) cfg.ffn else cfg.n_shared * cfg.moe_ffn;
+    }
+    try validateConfig(cfg);
 
     var model = Model{
         .gpa = gpa,
@@ -184,228 +372,144 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
 
     model.token_embd = try model.resolve("token_embd.weight");
     model.output_norm = try model.resolve("output_norm.weight");
-    model.output = model.resolve("output.weight") catch model.token_embd; // tied embeddings
+    try Model.expectF32(model.output_norm, "output_norm");
+    model.output = model.resolveOpt("output.weight") orelse model.token_embd; // tied embeddings
     model.cfg.vocab = model.token_embd.ne1;
     if (model.cfg.vocab == 0) return error.BadConfig;
+    cfg = model.cfg;
 
     const layers = try gpa.alloc(LayerT, cfg.n_layers);
     errdefer gpa.free(layers);
-    var namebuf: [128]u8 = undefined;
-    for (layers, 0..) |*l, i| {
-        inline for (.{
-            .{ "attn_norm", &l.attn_norm },     .{ "attn_q", &l.attn_q },
-            .{ "attn_k", &l.attn_k },           .{ "attn_v", &l.attn_v },
-            .{ "attn_output", &l.attn_output }, .{ "ffn_norm", &l.ffn_norm },
-            .{ "ffn_gate", &l.ffn_gate },       .{ "ffn_up", &l.ffn_up },
-            .{ "ffn_down", &l.ffn_down },
-        }) |pair| {
-            const name = try std.fmt.bufPrint(&namebuf, "blk.{d}.{s}.weight", .{ i, pair[0] });
-            pair[1].* = try model.resolve(name);
+    var nb: [128]u8 = undefined;
+    const N = struct {
+        fn f(buf: []u8, li: usize, comptime s: []const u8) []const u8 {
+            return std.fmt.bufPrint(buf, "blk.{d}." ++ s, .{li}) catch unreachable;
         }
-        // The kernels already require these shapes (mv asserts out.len==rows,
-        // x.len==cols); assert them here so a hostile file fails loudly at load
-        // instead of walking past a buffer in ReleaseFast (security issue #29).
-        const hd = cfg.headDim();
-        try Model.expectShape(l.attn_norm, cfg.dim, 1, "attn_norm");
+    };
+    const hd = cfg.head_dim;
+    for (layers, 0..) |*l, i| {
+        l.attn_norm = try model.resolve(N.f(&nb, i, "attn_norm.weight"));
         try Model.expectF32(l.attn_norm, "attn_norm");
-        try Model.expectShape(l.attn_q, cfg.dim, cfg.n_heads * hd, "attn_q");
+        try Model.expectShape(l.attn_norm, cfg.dim, 1, "attn_norm");
+        l.attn_q = try model.resolve(N.f(&nb, i, "attn_q.weight"));
+        l.attn_k = try model.resolve(N.f(&nb, i, "attn_k.weight"));
+        l.attn_v = try model.resolve(N.f(&nb, i, "attn_v.weight"));
+        l.attn_output = try model.resolve(N.f(&nb, i, "attn_output.weight"));
+        try Model.expectShape(l.attn_q, cfg.dim, cfg.qDim(), "attn_q");
         try Model.expectShape(l.attn_k, cfg.dim, cfg.kvDim(), "attn_k");
         try Model.expectShape(l.attn_v, cfg.dim, cfg.kvDim(), "attn_v");
-        try Model.expectShape(l.attn_output, cfg.n_heads * hd, cfg.dim, "attn_output");
-        try Model.expectShape(l.ffn_norm, cfg.dim, 1, "ffn_norm");
+        try Model.expectShape(l.attn_output, cfg.qDim(), cfg.dim, "attn_output");
+
+        // qwen2moe and glm4moe carry QKV biases; llama and qwen3moe do not.
+        // Detect rather than tabulate: the file is the authority.
+        l.attn_q_bias = model.resolveOpt(N.f(&nb, i, "attn_q.bias"));
+        l.attn_k_bias = model.resolveOpt(N.f(&nb, i, "attn_k.bias"));
+        l.attn_v_bias = model.resolveOpt(N.f(&nb, i, "attn_v.bias"));
+        if (l.attn_q_bias) |b| {
+            try Model.expectF32(b, "attn_q.bias");
+            try Model.expectShape(b, cfg.qDim(), 1, "attn_q.bias");
+        }
+        if (l.attn_k_bias) |b| {
+            try Model.expectF32(b, "attn_k.bias");
+            try Model.expectShape(b, cfg.kvDim(), 1, "attn_k.bias");
+        }
+        if (l.attn_v_bias) |b| {
+            try Model.expectF32(b, "attn_v.bias");
+            try Model.expectShape(b, cfg.kvDim(), 1, "attn_v.bias");
+        }
+
+        // qwen3moe always has Q/K norms; glm4moe has them only on the 355B
+        // variant. Both are per-head RMSNorm over head_dim.
+        l.attn_q_norm = model.resolveOpt(N.f(&nb, i, "attn_q_norm.weight"));
+        l.attn_k_norm = model.resolveOpt(N.f(&nb, i, "attn_k_norm.weight"));
+        if (l.attn_q_norm) |n| {
+            try Model.expectF32(n, "attn_q_norm");
+            try Model.expectShape(n, hd, 1, "attn_q_norm");
+        }
+        if (l.attn_k_norm) |n| {
+            try Model.expectF32(n, "attn_k_norm");
+            try Model.expectShape(n, hd, 1, "attn_k_norm");
+        }
+
+        // glm4moe has no ffn_norm; its post_attention_norm sits in the same
+        // place in the graph, so accept either name.
+        l.ffn_norm = model.resolveOpt(N.f(&nb, i, "ffn_norm.weight")) orelse
+            try model.resolve(N.f(&nb, i, "post_attention_norm.weight"));
         try Model.expectF32(l.ffn_norm, "ffn_norm");
-        try Model.expectShape(l.ffn_gate, cfg.dim, cfg.ffn, "ffn_gate");
-        try Model.expectShape(l.ffn_up, cfg.dim, cfg.ffn, "ffn_up");
-        try Model.expectShape(l.ffn_down, cfg.ffn, cfg.dim, "ffn_down");
+        try Model.expectShape(l.ffn_norm, cfg.dim, 1, "ffn_norm");
+
+        l.is_moe = cfg.n_expert > 0 and i >= cfg.n_dense_layers;
+        l.ffn_gate = null;
+        l.ffn_up = null;
+        l.ffn_down = null;
+        l.ffn_gate_inp = null;
+        l.exp_probs_b = null;
+        l.ffn_gate_exps = null;
+        l.ffn_up_exps = null;
+        l.ffn_down_exps = null;
+        l.ffn_gate_shexp = null;
+        l.ffn_up_shexp = null;
+        l.ffn_down_shexp = null;
+        l.ffn_gate_inp_shexp = null;
+
+        if (!l.is_moe) {
+            l.ffn_gate = try model.resolve(N.f(&nb, i, "ffn_gate.weight"));
+            l.ffn_up = try model.resolve(N.f(&nb, i, "ffn_up.weight"));
+            l.ffn_down = try model.resolve(N.f(&nb, i, "ffn_down.weight"));
+            try Model.expectShape(l.ffn_gate.?, cfg.dim, cfg.ffn, "ffn_gate");
+            try Model.expectShape(l.ffn_up.?, cfg.dim, cfg.ffn, "ffn_up");
+            try Model.expectShape(l.ffn_down.?, cfg.ffn, cfg.dim, "ffn_down");
+        } else {
+            l.ffn_gate_inp = try model.resolve(N.f(&nb, i, "ffn_gate_inp.weight"));
+            try Model.expectShape(l.ffn_gate_inp.?, cfg.dim, cfg.n_expert, "ffn_gate_inp");
+            l.exp_probs_b = model.resolveOpt(N.f(&nb, i, "exp_probs_b.bias"));
+            if (l.exp_probs_b) |b| {
+                try Model.expectF32(b, "exp_probs_b.bias");
+                try Model.expectShape(b, cfg.n_expert, 1, "exp_probs_b.bias");
+            }
+            l.ffn_gate_exps = try model.resolve(N.f(&nb, i, "ffn_gate_exps.weight"));
+            l.ffn_up_exps = try model.resolve(N.f(&nb, i, "ffn_up_exps.weight"));
+            l.ffn_down_exps = try model.resolve(N.f(&nb, i, "ffn_down_exps.weight"));
+            try Model.expectExpertShape(l.ffn_gate_exps.?, cfg.dim, cfg.moe_ffn, cfg.n_expert, "ffn_gate_exps");
+            try Model.expectExpertShape(l.ffn_up_exps.?, cfg.dim, cfg.moe_ffn, cfg.n_expert, "ffn_up_exps");
+            try Model.expectExpertShape(l.ffn_down_exps.?, cfg.moe_ffn, cfg.dim, cfg.n_expert, "ffn_down_exps");
+
+            // Shared expert: qwen2moe always has one, glm4moe has one when
+            // expert_shared_count > 0, qwen3moe and Mixtral have none.
+            l.ffn_gate_shexp = model.resolveOpt(N.f(&nb, i, "ffn_gate_shexp.weight"));
+            if (l.ffn_gate_shexp) |g| {
+                l.ffn_up_shexp = try model.resolve(N.f(&nb, i, "ffn_up_shexp.weight"));
+                l.ffn_down_shexp = try model.resolve(N.f(&nb, i, "ffn_down_shexp.weight"));
+                try Model.expectShape(g, cfg.dim, cfg.shexp_ffn, "ffn_gate_shexp");
+                try Model.expectShape(l.ffn_up_shexp.?, cfg.dim, cfg.shexp_ffn, "ffn_up_shexp");
+                try Model.expectShape(l.ffn_down_shexp.?, cfg.shexp_ffn, cfg.dim, "ffn_down_shexp");
+                l.ffn_gate_inp_shexp = model.resolveOpt(N.f(&nb, i, "ffn_gate_inp_shexp.weight"));
+                if (l.ffn_gate_inp_shexp) |s| try Model.expectShape(s, cfg.dim, 1, "ffn_gate_inp_shexp");
+            }
+        }
     }
     model.layers = layers;
-    try Model.expectF32(model.output_norm, "output_norm");
 
-    model.tok = try Tokenizer.init(gpa, &model.parsed);
+    model.tok = try Tok.init(gpa, &model.parsed);
     return model;
 }
 
-// ---- SentencePiece tokenizer (from GGUF metadata) ---------------------------
-
-pub const Tokenizer = struct {
-    tokens: []const []const u8, // arena-owned by Parsed
-    scores: []const f32,
-    types: []const i32,
-    lookup: std.StringHashMap(u32),
-    specials: special.Set,
-    bos: u32,
-    eos: u32,
-
-    const BYTE_TYPE: i32 = 6;
-
-    pub fn init(gpa: std.mem.Allocator, parsed: *const gguf.Parsed) !Tokenizer {
-        const tokens = switch (parsed.findMeta("tokenizer.ggml.tokens") orelse return error.NoTokenizer) {
-            .array_str => |a| a,
-            else => return error.NoTokenizer,
-        };
-        const scores = switch (parsed.findMeta("tokenizer.ggml.scores") orelse return error.NoTokenizer) {
-            .array_f32 => |a| a,
-            else => return error.NoTokenizer,
-        };
-        const types = switch (parsed.findMeta("tokenizer.ggml.token_type") orelse return error.NoTokenizer) {
-            .array_i32 => |a| a,
-            else => return error.NoTokenizer,
-        };
-        // `scores` and `types` are indexed by a token id derived from `tokens`
-        // (encode does `self.scores[id]`), so unequal lengths are an OOB read
-        // from a malicious GGUF (security issue #29).
-        if (scores.len != tokens.len or types.len != tokens.len) return error.BadTokenizer;
-        if (tokens.len == 0) return error.BadTokenizer;
-        // bos/eos are metadata and get emitted into the token stream, which
-        // indexes token_embd rows; keep them inside the vocab.
-        const bos_id = parsed.getUint("tokenizer.ggml.bos_token_id") orelse 1;
-        const eos_id = parsed.getUint("tokenizer.ggml.eos_token_id") orelse 2;
-        if (bos_id >= tokens.len or eos_id >= tokens.len) return error.BadTokenizer;
-
-        var lookup = std.StringHashMap(u32).init(gpa);
-        errdefer lookup.deinit();
-        for (tokens, 0..) |t, i| try lookup.put(t, @intCast(i));
-        var specials = try special.Set.build(gpa, tokens, types);
-        errdefer specials.deinit(gpa);
-        return .{
-            .tokens = tokens,
-            .scores = scores,
-            .types = types,
-            .lookup = lookup,
-            .specials = specials,
-            .bos = std.math.cast(u32, bos_id) orelse return error.BadTokenizer,
-            .eos = std.math.cast(u32, eos_id) orelse return error.BadTokenizer,
-        };
-    }
-
-    pub fn deinit(self: *Tokenizer, gpa: std.mem.Allocator) void {
-        self.lookup.deinit();
-        self.specials.deinit(gpa);
-    }
-
-    /// SPM encode: prefix a space, map ' ' -> U+2581, split into UTF-8 chars,
-    /// then greedily merge the adjacent pair whose concatenation is the
-    /// highest-scoring vocab entry. Unmatched symbols fall back to byte tokens.
-    /// `parse_special`: when true, special-token strings are emitted as their
-    /// atomic ids; when false they are SPM-encoded as ordinary text (so
-    /// untrusted input cannot inject a control token).
-    pub fn encode(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, add_bos: bool, parse_special: bool) ![]u32 {
-        var out = std.ArrayList(u32).empty;
-        errdefer out.deinit(gpa);
-        if (add_bos) try out.append(gpa, self.bos);
-
-        if (!parse_special) {
-            try self.encodeSegment(gpa, text, true, &out);
-            return out.toOwnedSlice(gpa);
-        }
-
-        // Split on special tokens, emitting their ids atomically and
-        // SPM-encoding the text between.
-        var seg_start: usize = 0;
-        var i: usize = 0;
-        while (i < text.len) {
-            if (self.specials.matchAt(text[i..])) |sp| {
-                if (i > seg_start) try self.encodeSegment(gpa, text[seg_start..i], seg_start == 0, &out);
-                try out.append(gpa, sp.id);
-                i += sp.text.len;
-                seg_start = i;
-            } else i += 1;
-        }
-        if (seg_start < text.len) try self.encodeSegment(gpa, text[seg_start..], seg_start == 0, &out);
-        return out.toOwnedSlice(gpa);
-    }
-
-    /// SPM-encode one normal segment into `out`. `add_space_prefix` adds the
-    /// leading dummy space (SPM add_dummy_prefix); applied only to a segment at
-    /// the very start of the input, not to content following a special token.
-    fn encodeSegment(self: *const Tokenizer, gpa: std.mem.Allocator, text: []const u8, add_space_prefix: bool, out: *std.ArrayList(u32)) !void {
-        // preprocess: leading space, spaces -> ▁ (e2 96 81)
-        var buf = std.ArrayList(u8).empty;
-        defer buf.deinit(gpa);
-        if (add_space_prefix) try buf.appendSlice(gpa, "\xe2\x96\x81");
-        for (text) |ch| {
-            if (ch == ' ') {
-                try buf.appendSlice(gpa, "\xe2\x96\x81");
-            } else {
-                try buf.append(gpa, ch);
-            }
-        }
-        const s = buf.items;
-
-        // symbols as (start,end) ranges over s, initially one UTF-8 char each
-        const Range = struct { start: usize, end: usize };
-        var syms = std.ArrayList(Range).empty;
-        defer syms.deinit(gpa);
-        {
-            var i: usize = 0;
-            while (i < s.len) {
-                const l = std.unicode.utf8ByteSequenceLength(s[i]) catch 1;
-                const end = @min(i + l, s.len);
-                try syms.append(gpa, .{ .start = i, .end = end });
-                i = end;
-            }
-        }
-
-        // greedy best-pair merging by vocab score
-        while (true) {
-            var best_score: f32 = -std.math.inf(f32);
-            var best_i: ?usize = null;
-            var i: usize = 0;
-            while (i + 1 < syms.items.len) : (i += 1) {
-                const merged = s[syms.items[i].start..syms.items[i + 1].end];
-                if (self.lookup.get(merged)) |id| {
-                    if (self.scores[id] > best_score) {
-                        best_score = self.scores[id];
-                        best_i = i;
-                    }
-                }
-            }
-            const bi = best_i orelse break;
-            syms.items[bi].end = syms.items[bi + 1].end;
-            _ = syms.orderedRemove(bi + 1);
-        }
-
-        // map symbols to ids (byte fallback for stragglers)
-        for (syms.items) |r| {
-            const piece = s[r.start..r.end];
-            if (self.lookup.get(piece)) |id| {
-                try out.append(gpa, id);
-            } else {
-                for (piece) |byte| {
-                    var namebuf: [8]u8 = undefined;
-                    const bname = std.fmt.bufPrint(&namebuf, "<0x{X:0>2}>", .{byte}) catch unreachable;
-                    if (self.lookup.get(bname)) |id| try out.append(gpa, id);
-                    // no byte token in vocab: drop the byte
-                }
-            }
-        }
-    }
-
-    /// Decode one token into `w`. Byte tokens emit their byte; ▁ becomes space.
-    pub fn decode(self: *const Tokenizer, w: *Io.Writer, id: u32) !void {
-        if (id >= self.tokens.len) return;
-        const piece = self.tokens[id];
-        if (id < self.types.len and self.types[id] == BYTE_TYPE) {
-            // "<0xXX>"
-            if (piece.len == 6) {
-                const byte = std.fmt.parseInt(u8, piece[3..5], 16) catch return;
-                try w.writeAll(&.{byte});
-            }
-            return;
-        }
-        var i: usize = 0;
-        while (i < piece.len) {
-            if (i + 3 <= piece.len and std.mem.eql(u8, piece[i .. i + 3], "\xe2\x96\x81")) {
-                try w.writeAll(" ");
-                i += 3;
-            } else {
-                try w.writeAll(piece[i .. i + 1]);
-                i += 1;
-            }
-        }
-    }
-};
-
+/// Attach a distributed expert source: routed-expert reads become
+/// Source.get() calls (local shard or peer fetch) instead of memory-map reads.
+pub fn attachDist(m: *Model, gpa: std.mem.Allocator, src: *expert_fetch.Source) !void {
+    const is_moe = try gpa.alloc(bool, m.cfg.n_layers);
+    defer gpa.free(is_moe);
+    for (m.layers, 0..) |l, i| is_moe[i] = l.is_moe;
+    m.expert_shard = try moe.buildExpertShardMap(
+        gpa,
+        &m.parsed,
+        &src.store.manifest,
+        m.cfg.n_layers,
+        m.cfg.n_expert,
+        is_moe,
+    );
+    m.dist = src;
+}
 // ---- forward pass ------------------------------------------------------------
 
 pub const State = struct {
@@ -413,7 +517,7 @@ pub const State = struct {
     // activations
     x: []f32,
     normed: []f32,
-    q: []f32,
+    q: []f32, // n_heads * head_dim (not necessarily dim)
     k: []f32,
     v: []f32,
     attn_out: []f32,
@@ -422,6 +526,8 @@ pub const State = struct {
     up: []f32,
     act: []f32,
     ffn_out: []f32,
+    moe_acc: []f32,
+    router: []f32,
     scores: []f32,
     logits: []f32,
     // kv cache: [n_layers][ctx][kv_dim]
@@ -430,19 +536,22 @@ pub const State = struct {
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config) !State {
         const kvd = cfg.kvDim();
+        const ffn_max = cfg.maxFfn();
         return .{
             .cfg = cfg,
             .x = try gpa.alloc(f32, cfg.dim),
             .normed = try gpa.alloc(f32, cfg.dim),
-            .q = try gpa.alloc(f32, cfg.dim),
+            .q = try gpa.alloc(f32, cfg.qDim()),
             .k = try gpa.alloc(f32, kvd),
             .v = try gpa.alloc(f32, kvd),
-            .attn_out = try gpa.alloc(f32, cfg.dim),
+            .attn_out = try gpa.alloc(f32, cfg.qDim()),
             .proj_out = try gpa.alloc(f32, cfg.dim),
-            .gate = try gpa.alloc(f32, cfg.ffn),
-            .up = try gpa.alloc(f32, cfg.ffn),
-            .act = try gpa.alloc(f32, cfg.ffn),
+            .gate = try gpa.alloc(f32, ffn_max),
+            .up = try gpa.alloc(f32, ffn_max),
+            .act = try gpa.alloc(f32, ffn_max),
             .ffn_out = try gpa.alloc(f32, cfg.dim),
+            .moe_acc = try gpa.alloc(f32, cfg.dim),
+            .router = try gpa.alloc(f32, @max(cfg.n_expert, 1)),
             .scores = try gpa.alloc(f32, cfg.ctx_len),
             .logits = try gpa.alloc(f32, cfg.vocab),
             .k_cache = try gpa.alloc(f32, cfg.n_layers * cfg.ctx_len * kvd),
@@ -452,9 +561,10 @@ pub const State = struct {
 
     pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
         inline for (.{
-            self.x,        self.normed,   self.q,      self.k,       self.v,
-            self.attn_out, self.proj_out, self.gate,   self.up,      self.act,
-            self.ffn_out,  self.scores,   self.logits, self.k_cache, self.v_cache,
+            self.x,        self.normed,   self.q,      self.k,      self.v,
+            self.attn_out, self.gate,     self.up,     self.act,    self.ffn_out,
+            self.moe_acc,  self.router,   self.scores, self.logits, self.k_cache,
+            self.v_cache,  self.proj_out,
         }) |sl| gpa.free(sl);
     }
 };
@@ -463,27 +573,90 @@ fn mv(t: Tensor, out: []f32, x: []const f32) void {
     ggml.matvec(t.ty, out, t.data, x, t.ne1, t.ne0);
 }
 
-/// NORM-style RoPE: rotate adjacent pairs (2i, 2i+1) of the first rope_dim
-/// dims of each head; freq_i = base^(-2i/rope_dim).
+/// Norm weights are always f32 in practice; view the raw bytes as f32.
+fn tensorAsF32(t: Tensor) []const f32 {
+    std.debug.assert(t.ty == .f32);
+    return @alignCast(std.mem.bytesAsSlice(f32, t.data));
+}
+
+/// theta for rotation index `i` (0, 2, 4, ...) of a rope_dim-wide rotation.
+inline fn ropeTheta(i: usize, rope_dim: usize, pos: usize, base: f32) struct { c: f32, s: f32 } {
+    const exponent = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(rope_dim));
+    const freq = std.math.pow(f32, base, -exponent);
+    const angle = @as(f32, @floatFromInt(pos)) * freq;
+    return .{ .c = @cos(angle), .s = @sin(angle) };
+}
+
+/// NORM-style RoPE: rotate *adjacent* pairs (2i, 2i+1) of the first rope_dim
+/// dims. Used by llama (and deepseek2).
 fn ropeNorm(vec: []f32, rope_dim: usize, pos: usize, base: f32) void {
     var i: usize = 0;
     while (i + 1 < rope_dim) : (i += 2) {
-        const exponent = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(rope_dim));
-        const freq = std.math.pow(f32, base, -exponent);
-        const angle = @as(f32, @floatFromInt(pos)) * freq;
-        const c = @cos(angle);
-        const sn = @sin(angle);
+        const t = ropeTheta(i, rope_dim, pos, base);
         const a = vec[i];
         const b = vec[i + 1];
-        vec[i] = a * c - b * sn;
-        vec[i + 1] = a * sn + b * c;
+        vec[i] = a * t.c - b * t.s;
+        vec[i + 1] = a * t.s + b * t.c;
     }
 }
 
-/// One token step; logits land in `st.logits`.
+/// NEOX-style RoPE: rotate *split-half* pairs (i, i + rope_dim/2). Used by
+/// qwen2moe, qwen3moe and glm4moe. Same theta progression as NORM, different
+/// pairing — swapping the two produces fluent-looking but wrong output, which
+/// is why the style is pinned per architecture rather than guessed.
+fn ropeNeox(vec: []f32, rope_dim: usize, pos: usize, base: f32) void {
+    const half = rope_dim / 2;
+    var i: usize = 0;
+    while (i < half) : (i += 1) {
+        const t = ropeTheta(2 * i, rope_dim, pos, base);
+        const a = vec[i];
+        const b = vec[i + half];
+        vec[i] = a * t.c - b * t.s;
+        vec[i + half] = a * t.s + b * t.c;
+    }
+}
+
+inline fn ropeApply(style: RopeStyle, vec: []f32, rope_dim: usize, pos: usize, base: f32) void {
+    switch (style) {
+        .norm => ropeNorm(vec, rope_dim, pos, base),
+        .neox => ropeNeox(vec, rope_dim, pos, base),
+    }
+}
+
+fn addBias(dst: []f32, b: ?Tensor) void {
+    const t = b orelse return;
+    for (dst, tensorAsF32(t)) |*d, bv| d.* += bv;
+}
+
+/// Per-head RMSNorm over head_dim, applied to q/k before RoPE (qwen3moe
+/// always; glm4moe on variants that ship the weights).
+fn headNorm(vec: []f32, w: ?Tensor, n_heads: usize, hd: usize, eps: f32) void {
+    const t = w orelse return;
+    const g = tensorAsF32(t);
+    var h: usize = 0;
+    while (h < n_heads) : (h += 1) {
+        const head = vec[h * hd ..][0..hd];
+        var ss: f32 = 0;
+        for (head) |v| ss += v * v;
+        const inv = 1.0 / @sqrt(ss / @as(f32, @floatFromInt(hd)) + eps);
+        for (head, g) |*v, gv| v.* = v.* * inv * gv;
+    }
+}
+
+/// SwiGLU FFN into st.ffn_out over an intermediate width taken from `gate_w`.
+fn denseFFN(st: *State, gate_w: Tensor, up_w: Tensor, down_w: Tensor) void {
+    const n = gate_w.ne1;
+    mv(gate_w, st.gate[0..n], st.normed);
+    mv(up_w, st.up[0..n], st.normed);
+    tensor.swiglu(st.act[0..n], st.gate[0..n], st.up[0..n]);
+    mv(down_w, st.ffn_out, st.act[0..n]);
+}
+
+/// One token step; logits land in `st.logits`. Errors only when a distributed
+/// expert shard has no reachable holder (fail loud, not silently degraded).
 pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     const cfg = m.cfg;
-    const hd = cfg.headDim();
+    const hd = cfg.head_dim;
     const kvd = cfg.kvDim();
     const q_per_kv = cfg.n_heads / cfg.n_kv_heads;
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
@@ -495,16 +668,23 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     ggml.dequantRow(m.token_embd.ty, st.x, m.token_embd.data, token, cfg.dim);
 
     for (m.layers, 0..) |l, li| {
-        // attention
+        // ---- attention ----
         tensor.rmsnorm(st.normed, st.x, tensorAsF32(l.attn_norm), cfg.eps);
         mv(l.attn_q, st.q, st.normed);
         mv(l.attn_k, st.k, st.normed);
         mv(l.attn_v, st.v, st.normed);
+        addBias(st.q, l.attn_q_bias);
+        addBias(st.k, l.attn_k_bias);
+        addBias(st.v, l.attn_v_bias);
+
+        // Q/K norm comes *before* RoPE (llama.cpp build_norm then rope_ext).
+        headNorm(st.q, l.attn_q_norm, cfg.n_heads, hd, cfg.eps);
+        headNorm(st.k, l.attn_k_norm, cfg.n_kv_heads, hd, cfg.eps);
 
         var h: usize = 0;
-        while (h < cfg.n_heads) : (h += 1) ropeNorm(st.q[h * hd ..][0..hd], cfg.rope_dim, pos, cfg.rope_base);
+        while (h < cfg.n_heads) : (h += 1) ropeApply(cfg.arch.rope, st.q[h * hd ..][0..hd], cfg.rope_dim, pos, cfg.rope_base);
         h = 0;
-        while (h < cfg.n_kv_heads) : (h += 1) ropeNorm(st.k[h * hd ..][0..hd], cfg.rope_dim, pos, cfg.rope_base);
+        while (h < cfg.n_kv_heads) : (h += 1) ropeApply(cfg.arch.rope, st.k[h * hd ..][0..hd], cfg.rope_dim, pos, cfg.rope_base);
 
         // append to cache
         const cache_base = (li * cfg.ctx_len + pos) * kvd;
@@ -537,21 +717,212 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
         mv(l.attn_output, st.proj_out, st.attn_out);
         tensor.add(st.x, st.proj_out);
 
-        // FFN
+        // ---- FFN ----
         tensor.rmsnorm(st.normed, st.x, tensorAsF32(l.ffn_norm), cfg.eps);
-        mv(l.ffn_gate, st.gate, st.normed);
-        mv(l.ffn_up, st.up, st.normed);
-        tensor.swiglu(st.act, st.gate, st.up);
-        mv(l.ffn_down, st.ffn_out, st.act);
-        tensor.add(st.x, st.ffn_out);
+        if (!l.is_moe) {
+            denseFFN(st, l.ffn_gate.?, l.ffn_up.?, l.ffn_down.?);
+            tensor.add(st.x, st.ffn_out);
+            continue;
+        }
+
+        mv(l.ffn_gate_inp.?, st.router[0..cfg.n_expert], st.normed);
+        var sel_buf: [moe.MAX_SELECTED]moe.Selected = undefined;
+        const sel = sel_buf[0..cfg.n_used];
+        const bias: ?[]const f32 = if (l.exp_probs_b) |b| tensorAsF32(b) else null;
+        moe.route(cfg.route, st.router[0..cfg.n_expert], bias, sel);
+
+        const acc = st.moe_acc;
+        @memset(acc, 0);
+        if (m.dist) |src| {
+            // warm the missing shards in parallel: per-layer miss latency
+            // becomes max(fetch), not sum(fetch)
+            var ids_buf: [moe.MAX_SELECTED]usize = undefined;
+            for (sel, 0..) |s, k| ids_buf[k] = m.expert_shard[li * cfg.n_expert + s.expert];
+            src.prefetch(ids_buf[0..sel.len]);
+        }
+        for (sel) |s| {
+            if (m.dist) |src| {
+                // One shard carries this expert's [gate, up, down] slices
+                // back to back, in that order (p2p/weights.zig).
+                const blk = try src.get(m.expert_shard[li * cfg.n_expert + s.expert]);
+                const gt = l.ffn_gate_exps.?;
+                const ut = l.ffn_up_exps.?;
+                const dt = l.ffn_down_exps.?;
+                const gl = gt.ne1 * ggml.rowBytes(gt.ty, gt.ne0);
+                const ul = ut.ne1 * ggml.rowBytes(ut.ty, ut.ne0);
+                const dl = dt.ne1 * ggml.rowBytes(dt.ty, dt.ne0);
+                denseFFN(
+                    st,
+                    .{ .ty = gt.ty, .data = blk[0..gl], .ne0 = gt.ne0, .ne1 = gt.ne1 },
+                    .{ .ty = ut.ty, .data = blk[gl..][0..ul], .ne0 = ut.ne0, .ne1 = ut.ne1 },
+                    .{ .ty = dt.ty, .data = blk[gl + ul ..][0..dl], .ne0 = dt.ne0, .ne1 = dt.ne1 },
+                );
+            } else {
+                denseFFN(
+                    st,
+                    try l.ffn_gate_exps.?.expert(s.expert),
+                    try l.ffn_up_exps.?.expert(s.expert),
+                    try l.ffn_down_exps.?.expert(s.expert),
+                );
+            }
+            for (acc, st.ffn_out) |*a, v| a.* += s.gate * v;
+        }
+        if (l.ffn_gate_shexp) |gs| {
+            denseFFN(st, gs, l.ffn_up_shexp.?, l.ffn_down_shexp.?);
+            if (l.ffn_gate_inp_shexp) |sg| {
+                // qwen2moe scales the shared expert by sigmoid(w . x). The
+                // others add it unweighted.
+                var logit: [1]f32 = undefined;
+                mv(sg, &logit, st.normed);
+                const g = tensor.sigmoid(logit[0]);
+                for (acc, st.ffn_out) |*a, v| a.* += g * v;
+            } else {
+                tensor.add(acc, st.ffn_out);
+            }
+        }
+        tensor.add(st.x, acc);
     }
 
     tensor.rmsnorm(st.normed, st.x, tensorAsF32(m.output_norm), cfg.eps);
     mv(m.output, st.logits, st.normed);
 }
 
-/// Norm weights are always f32 in practice; view the raw bytes as f32.
-fn tensorAsF32(t: Tensor) []const f32 {
-    std.debug.assert(t.ty == .f32);
-    return @alignCast(std.mem.bytesAsSlice(f32, t.data));
+// ---- tests -------------------------------------------------------------------
+
+test "NEOX and NORM rope rotate different pairs" {
+    // The two styles share a theta progression and differ only in pairing.
+    // Mixing them up yields plausible-looking but wrong attention, so pin the
+    // distinction rather than trusting the name.
+    var a = [_]f32{ 1, 2, 3, 4 };
+    var b = a;
+    ropeNorm(&a, 4, 1, 10000.0);
+    ropeNeox(&b, 4, 1, 10000.0);
+    try std.testing.expect(!std.mem.eql(u8, std.mem.sliceAsBytes(&a), std.mem.sliceAsBytes(&b)));
+
+    // NORM mixes lanes (0,1) and (2,3); NEOX mixes (0,2) and (1,3). With
+    // theta_0 = 0 the first pair is identity under both.
+    var c = [_]f32{ 1, 2, 3, 4 };
+    ropeNorm(&c, 4, 0, 10000.0);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, &c);
+}
+
+test "partial rope leaves the tail of a head untouched" {
+    // glm4moe rotates only the first rope_dim of each head.
+    var v = [_]f32{ 1, 1, 1, 1, 7, 7, 7, 7 };
+    ropeNeox(v[0..4], 4, 3, 10000.0);
+    try std.testing.expectEqualSlices(f32, &.{ 7, 7, 7, 7 }, v[4..8]);
+    try std.testing.expect(v[0] != 1);
+}
+
+test "head norm normalizes each head independently" {
+    const gpa = std.testing.allocator;
+    const w = try gpa.alloc(f32, 2);
+    defer gpa.free(w);
+    @memset(w, 1.0);
+    const t = Tensor{ .ty = .f32, .data = std.mem.sliceAsBytes(w), .ne0 = 2, .ne1 = 1 };
+    // two heads of width 2, wildly different magnitudes
+    var v = [_]f32{ 3, 4, 300, 400 };
+    headNorm(&v, t, 2, 2, 0.0);
+    // after per-head RMS norm both heads have the same shape
+    try std.testing.expectApproxEqAbs(v[0], v[2], 1e-4);
+    try std.testing.expectApproxEqAbs(v[1], v[3], 1e-4);
+    // and RMS of each head is 1
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), @sqrt((v[0] * v[0] + v[1] * v[1]) / 2.0), 1e-4);
+}
+
+test "absent optional tensors are no-ops" {
+    var v = [_]f32{ 1, 2, 3, 4 };
+    addBias(&v, null);
+    headNorm(&v, null, 2, 2, 1e-5);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, &v);
+}
+
+test "every supported arch resolves and pins its rope style" {
+    try std.testing.expectEqual(RopeStyle.norm, archFor("llama").?.rope);
+    try std.testing.expectEqual(RopeStyle.neox, archFor("qwen2moe").?.rope);
+    try std.testing.expectEqual(RopeStyle.neox, archFor("qwen3moe").?.rope);
+    try std.testing.expectEqual(RopeStyle.neox, archFor("glm4moe").?.rope);
+    try std.testing.expect(archFor("deepseek2") == null); // MLA, handled by deepseek.zig
+    try std.testing.expect(archFor("mamba") == null);
+}
+
+test "each supported architecture loads with the features it actually declares" {
+    // Round-trips the synthetic fixtures through the real loader, so a
+    // regression in feature detection (a missing bias, a Q/K norm that stops
+    // being found, an off-by-one on the NextN skip) fails here rather than
+    // silently degrading output on a real model.
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gguf_mod = @import("gguf.zig");
+
+    const Case = struct {
+        arch: []const u8,
+        qkv_bias: bool,
+        qk_norm: bool,
+        shexp: bool,
+        shexp_gate: bool,
+        n_dense: usize,
+        rope: RopeStyle,
+        head_dim: usize,
+        n_layers: usize, // after skipping trailing NextN blocks
+    };
+    const cases = [_]Case{
+        .{ .arch = "llama", .qkv_bias = false, .qk_norm = false, .shexp = false, .shexp_gate = false, .n_dense = 0, .rope = .norm, .head_dim = 16, .n_layers = 3 },
+        .{ .arch = "qwen2moe", .qkv_bias = true, .qk_norm = false, .shexp = true, .shexp_gate = true, .n_dense = 0, .rope = .neox, .head_dim = 16, .n_layers = 3 },
+        .{ .arch = "qwen3moe", .qkv_bias = false, .qk_norm = true, .shexp = false, .shexp_gate = false, .n_dense = 0, .rope = .neox, .head_dim = 24, .n_layers = 3 },
+        .{ .arch = "glm4moe", .qkv_bias = true, .qk_norm = true, .shexp = true, .shexp_gate = false, .n_dense = 1, .rope = .neox, .head_dim = 16, .n_layers = 3 },
+    };
+
+    for (cases) |c| {
+        var pbuf: [128]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pbuf, "test-arch-{s}.gguf", .{c.arch});
+        defer Io.Dir.cwd().deleteFile(io, path) catch {};
+        try gguf_mod.writeMoeFixture(gpa, io, path, 7, c.arch);
+
+        var m = try load(gpa, io, path);
+        defer m.deinit();
+
+        try std.testing.expectEqual(c.rope, m.cfg.arch.rope);
+        try std.testing.expectEqual(c.head_dim, m.cfg.head_dim);
+        // qwen3's head_dim deliberately is *not* dim/n_heads; that is the
+        // whole point of reading attention.key_length.
+        if (std.mem.eql(u8, c.arch, "qwen3moe")) {
+            try std.testing.expect(m.cfg.head_dim != m.cfg.dim / m.cfg.n_heads);
+        }
+        // NextN/MTP blocks are present in the file but must not be run
+        try std.testing.expectEqual(c.n_layers, m.layers.len);
+        try std.testing.expectEqual(c.n_dense, m.cfg.n_dense_layers);
+
+        const last = m.layers[m.layers.len - 1];
+        try std.testing.expectEqual(c.qkv_bias, last.attn_q_bias != null);
+        try std.testing.expectEqual(c.qkv_bias, last.attn_v_bias != null);
+        try std.testing.expectEqual(c.qk_norm, last.attn_q_norm != null);
+        try std.testing.expectEqual(c.qk_norm, last.attn_k_norm != null);
+        try std.testing.expectEqual(c.shexp, last.ffn_gate_shexp != null);
+        try std.testing.expectEqual(c.shexp_gate, last.ffn_gate_inp_shexp != null);
+        try std.testing.expect(last.is_moe);
+        // leading dense layers keep a plain FFN and no router
+        if (c.n_dense > 0) {
+            try std.testing.expect(!m.layers[0].is_moe);
+            try std.testing.expect(m.layers[0].ffn_gate != null);
+            try std.testing.expect(m.layers[0].ffn_gate_inp == null);
+        }
+        // glm4moe alone routes with sigmoid and a selection bias
+        const is_glm = std.mem.eql(u8, c.arch, "glm4moe");
+        try std.testing.expectEqual(
+            if (is_glm) moe.GatingFunc.sigmoid else moe.GatingFunc.softmax,
+            m.cfg.route.gating,
+        );
+        try std.testing.expectEqual(is_glm, last.exp_probs_b != null);
+        // qwen2moe is the only one that does not renormalize its gates
+        try std.testing.expectEqual(!std.mem.eql(u8, c.arch, "qwen2moe"), m.cfg.route.weights_norm);
+
+        // and it actually runs a token
+        var st = try State.init(gpa, m.cfg);
+        defer st.deinit(gpa);
+        try step(&m, &st, 1, 0);
+        for (st.logits) |v| try std.testing.expect(!std.math.isNan(v));
+    }
 }

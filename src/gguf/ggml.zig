@@ -1,12 +1,22 @@
 //! GGML tensor formats — the quantizations GGUF files actually ship.
 //!
-//! Supported: F32, F16, Q4_0 (18-byte blocks: f16 scale + 32 nibbles),
-//! Q8_0 (34-byte blocks: f16 scale + 32 int8). Each gets a fused
-//! matvec over the raw tensor bytes so weights are never dequantized
-//! wholesale. Note these differ from loom's own q4 expert format
-//! (quant.zig, f32 scales): here we implement GGML's layouts exactly.
+//! Two families, decoded differently:
+//!
+//!   *affine*    F32, F16, Q4_0, Q5_0, Q8_0, Q4_K, Q5_K, Q6_K. A value is
+//!               reconstructed arithmetically (`scale * q + min`), so the
+//!               kernel is a mask, a shift and a multiply-add. Implemented
+//!               here.
+//!   *codebook*  the IQ quants and MXFP4. A block stores an index into a
+//!               static grid table plus packed signs; values come out of a
+//!               lookup. Implemented in iq.zig against tables transcribed
+//!               from llama.cpp (iq_tables.zig).
+//!
+//! Each type gets a fused matvec over the raw tensor bytes so weights are
+//! never dequantized wholesale. Note these differ from loom's own q4 expert
+//! format (quant.zig, f32 scales): here we implement GGML's layouts exactly.
 
 const std = @import("std");
+const iq = @import("iq.zig");
 
 pub const Type = enum(u32) {
     f32 = 0,
@@ -17,12 +27,49 @@ pub const Type = enum(u32) {
     q4_k = 12,
     q5_k = 13,
     q6_k = 14,
+    iq2_xxs = 16,
+    iq2_xs = 17,
+    iq3_xxs = 18,
+    iq1_s = 19,
+    iq4_nl = 20,
+    iq3_s = 21,
+    iq2_s = 22,
+    iq4_xs = 23,
+    iq1_m = 29,
+    mxfp4 = 39,
     _,
 
     pub fn supported(t: u32) bool {
         return switch (@as(Type, @enumFromInt(t))) {
-            .f32, .f16, .q4_0, .q5_0, .q8_0, .q4_k, .q5_k, .q6_k => true,
+            .f32,
+            .f16,
+            .q4_0,
+            .q5_0,
+            .q8_0,
+            .q4_k,
+            .q5_k,
+            .q6_k,
+            .iq2_xxs,
+            .iq2_xs,
+            .iq3_xxs,
+            .iq1_s,
+            .iq4_nl,
+            .iq3_s,
+            .iq2_s,
+            .iq4_xs,
+            .iq1_m,
+            .mxfp4,
+            => true,
             _ => false,
+        };
+    }
+
+    /// True for the codebook (IQ / MXFP4) family, which decodes through
+    /// iq.zig rather than an affine formula.
+    pub fn isCodebook(self: Type) bool {
+        return switch (self) {
+            .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq4_nl, .iq3_s, .iq2_s, .iq4_xs, .iq1_m, .mxfp4 => true,
+            else => false,
         };
     }
 };
@@ -49,7 +96,7 @@ pub fn rowBytes(t: Type, n: usize) usize {
         .q4_k => (n / QK_K) * Q4_K_BLOCK,
         .q5_k => (n / QK_K) * Q5_K_BLOCK,
         .q6_k => (n / QK_K) * Q6_K_BLOCK,
-        _ => unreachable,
+        else => (n / blockElems(t)) * blockBytes(t), // codebook types
     };
 }
 
@@ -65,6 +112,9 @@ pub fn blockElems(t: Type) usize {
         .f32, .f16 => 1,
         .q4_0, .q5_0, .q8_0 => QK_0,
         .q4_k, .q5_k, .q6_k => QK_K,
+        // codebook types: iq4_nl and mxfp4 are 32-wide, the rest are 256-wide
+        .iq4_nl, .mxfp4 => iq.QK_NL,
+        .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => iq.QK_K,
         _ => 1,
     };
 }
@@ -93,6 +143,16 @@ pub fn blockBytes(t: Type) usize {
         .q4_k => Q4_K_BLOCK,
         .q5_k => Q5_K_BLOCK,
         .q6_k => Q6_K_BLOCK,
+        .iq2_xxs => iq.IQ2_XXS_BLOCK,
+        .iq2_xs => iq.IQ2_XS_BLOCK,
+        .iq2_s => iq.IQ2_S_BLOCK,
+        .iq3_xxs => iq.IQ3_XXS_BLOCK,
+        .iq3_s => iq.IQ3_S_BLOCK,
+        .iq1_s => iq.IQ1_S_BLOCK,
+        .iq1_m => iq.IQ1_M_BLOCK,
+        .iq4_xs => iq.IQ4_XS_BLOCK,
+        .iq4_nl => iq.IQ4_NL_BLOCK,
+        .mxfp4 => iq.MXFP4_BLOCK,
         else => 0,
     };
 }
@@ -113,7 +173,60 @@ pub fn matvec(t: Type, out: []f32, data: []const u8, x: []const f32, rows: usize
         .q5_0 => matvecQ50(out, data, x, rows, cols),
         .q8_0 => matvecQ80(out, data, x, rows, cols),
         .q4_k, .q5_k, .q6_k => matvecK(t, out, data, x, rows, cols),
-        _ => unreachable,
+        else => matvecCodebook(t, out, data, x, rows, cols),
+    }
+}
+
+/// Decode one codebook block into the front of `vals`, returning how many
+/// lanes it wrote (32 for iq4_nl/mxfp4, 256 for the rest).
+fn dequantBlockCodebook(t: Type, block: []const u8, vals: *[QK_K]f32) usize {
+    switch (t) {
+        .iq2_xxs => iq.dequantBlockIq2XXS(block, vals),
+        .iq2_xs => iq.dequantBlockIq2XS(block, vals),
+        .iq2_s => iq.dequantBlockIq2S(block, vals),
+        .iq3_xxs => iq.dequantBlockIq3XXS(block, vals),
+        .iq3_s => iq.dequantBlockIq3S(block, vals),
+        .iq1_s => iq.dequantBlockIq1S(block, vals),
+        .iq1_m => iq.dequantBlockIq1M(block, vals),
+        .iq4_xs => iq.dequantBlockIq4XS(block, vals),
+        .iq4_nl => {
+            iq.dequantBlockIq4NL(block, vals[0..iq.QK_NL]);
+            return iq.QK_NL;
+        },
+        .mxfp4 => {
+            iq.dequantBlockMxfp4(block, vals[0..iq.QK_NL]);
+            return iq.QK_NL;
+        },
+        // `supported()` gates every type that reaches a kernel, and resolve()
+        // rejects the rest at load; an unknown tag here is a loom bug.
+        else => unreachable,
+    }
+    return QK_K;
+}
+
+/// Codebook matvec: decode one block at a time through the grid tables and dot
+/// it, same shape as matvecK. Slower per byte than the affine kernels (a table
+/// lookup per lane rather than a shift), which is the price of the format.
+fn matvecCodebook(t: Type, out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
+    const blk = blockElems(t);
+    const bs = blockBytes(t);
+    std.debug.assert(cols % blk == 0);
+    const blocks_per_row = cols / blk;
+    const rb = blocks_per_row * bs;
+    var vals: [QK_K]f32 = undefined;
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        const row = data[r * rb ..][0..rb];
+        var acc: f32 = 0;
+        var b: usize = 0;
+        while (b < blocks_per_row) : (b += 1) {
+            const n = dequantBlockCodebook(t, row[b * bs ..][0..bs], &vals);
+            const xb = x[b * blk ..][0..blk];
+            var partial: f32 = 0;
+            for (vals[0..n], xb) |v, xv| partial += v * xv;
+            acc += partial;
+        }
+        out[r] = acc;
     }
 }
 
@@ -468,7 +581,19 @@ pub fn dequantRow(t: Type, out: []f32, data: []const u8, r: usize, cols: usize) 
                 }
             }
         },
-        _ => unreachable,
+        else => {
+            // codebook types: decode block by block into `out`
+            const blk = blockElems(t);
+            const bs = blockBytes(t);
+            const rb = rowBytes(t, cols);
+            const row = data[r * rb ..][0..rb];
+            var vals: [QK_K]f32 = undefined;
+            var b: usize = 0;
+            while (b * blk < cols) : (b += 1) {
+                const n = dequantBlockCodebook(t, row[b * bs ..][0..bs], &vals);
+                @memcpy(out[b * blk ..][0..n], vals[0..n]);
+            }
+        },
     }
 }
 
