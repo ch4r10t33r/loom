@@ -511,10 +511,24 @@ pub const Holdings = struct {
     pub fn toHex(self: *const Holdings, gpa: std.mem.Allocator) ![]u8 {
         const out = try gpa.alloc(u8, self.bits.len * 2);
         const hex = "0123456789abcdef";
-        for (self.bits, 0..) |b, i| {
+        // atomic per byte: other threads RMW these bits concurrently, and
+        // mixing plain loads with atomic RMWs on one location is a data race
+        // (security issue #31)
+        for (self.bits, 0..) |*bp, i| {
+            const b = @atomicLoad(u8, bp, .monotonic);
             out[i * 2] = hex[b >> 4];
             out[i * 2 + 1] = hex[b & 0xf];
         }
+        return out;
+    }
+
+    /// Consistent copy of the bitmap for advertising or hashing. Reading
+    /// `bits` directly races the atomic RMWs done by set/clear, which yields a
+    /// torn bitmap and a digest that does not match what was advertised
+    /// (security issue #31). Caller owns the result.
+    pub fn snapshotAlloc(self: *const Holdings, gpa: std.mem.Allocator) ![]u8 {
+        const out = try gpa.alloc(u8, self.bits.len);
+        for (self.bits, 0..) |*bp, i| out[i] = @atomicLoad(u8, bp, .monotonic);
         return out;
     }
 

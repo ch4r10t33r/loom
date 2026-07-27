@@ -324,7 +324,17 @@ pub fn selfHeartbeat(ctx: *Ctx) wire.Heartbeat {
     if (ctx.store) |st| {
         hb.manifest_version = st.manifest.version;
         hb.holdings_seq = st.holdingsSeq(); // truly monotonic (audit #7 P1)
-        hb.holdings_digest = hashmod.hashBlock(st.holdings.bits);
+        // hash a consistent snapshot, not a bitmap being mutated underneath
+        // (security issue #31): otherwise the advertised digest can describe a
+        // state that never existed
+        var buf: [4096]u8 = undefined;
+        if (st.holdings.bits.len <= buf.len) {
+            for (st.holdings.bits, 0..) |*bp, i| buf[i] = @atomicLoad(u8, bp, .monotonic);
+            hb.holdings_digest = hashmod.hashBlock(buf[0..st.holdings.bits.len]);
+        } else if (st.holdings.snapshotAlloc(ctx.gpa)) |snap| {
+            defer ctx.gpa.free(snap);
+            hb.holdings_digest = hashmod.hashBlock(snap);
+        } else |_| {}
     }
     return hb;
 }
@@ -361,11 +371,14 @@ fn sendAnnounceBatch(ctx: *Ctx, wi: *Io.Writer) !void {
 
     // self entry
     {
+        var self_snap: ?[]u8 = null;
+        defer if (self_snap) |sp| gpa.free(sp);
         var self_ann = wire.Announce{ .committee_id = ctx.committee_id, .addr = ctx.advertise };
         if (ctx.store) |st| {
             self_ann.manifest_version = st.manifest.version;
             self_ann.holdings_seq = @intCast(st.holdings.count());
-            self_ann.holdings_bitmap = st.holdings.bits;
+            self_snap = try st.holdings.snapshotAlloc(gpa);
+            self_ann.holdings_bitmap = self_snap.?;
         }
         try bodies.append(gpa, try self_ann.encodeBody(gpa));
     }
