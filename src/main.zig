@@ -528,8 +528,7 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
 
     if (std.mem.eql(u8, sub, "shard")) {
         var m = weights.buildExpertManifest(gpa, io, path) catch |e| switch (e) {
-            error.NoExpertTensors => return out.print(
-                "no 3D expert tensors found — not a MoE GGUF (fixed-size ranges apply instead)\n", .{}),
+            error.NoExpertTensors => return out.print("no 3D expert tensors found — not a MoE GGUF (fixed-size ranges apply instead)\n", .{}),
             else => return out.print("shard failed: {s}\n", .{@errorName(e)}),
         };
         defer m.deinit(gpa);
@@ -730,7 +729,9 @@ fn runDeepseekStore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, dir: []cons
         prompt_toks.len, produced, secs, @as(f64, @floatFromInt(prompt_toks.len + produced)) / secs,
     });
     try out.print("expert tiers: local={d} peer_fetched={d} ({d:.1} MB, avg {d:.1} ms/fetch) failures={d}\n", .{
-        fs.local, fs.fetched, @as(f64, @floatFromInt(fs.fetch_bytes)) / @as(f64, MB),
+        fs.local,
+        fs.fetched,
+        @as(f64, @floatFromInt(fs.fetch_bytes)) / @as(f64, MB),
         if (fs.fetched > 0) @as(f64, @floatFromInt(fs.fetch_ns)) / @as(f64, @floatFromInt(fs.fetched)) / 1e6 else 0,
         fs.fetch_failures,
     });

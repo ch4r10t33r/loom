@@ -1,5 +1,7 @@
 # Loom — distributed expert cache & weight-sharing node for large MoE inference
 
+[![CI](https://github.com/ch4r10t33r/loom/actions/workflows/ci.yml/badge.svg)](https://github.com/ch4r10t33r/loom/actions/workflows/ci.yml)
+
 Loom is a research prototype (Zig, no runtime dependencies) exploring the design
 in [`CLAUDE.md`](CLAUDE.md): for a huge Mixture-of-Experts model like GLM-5.2,
 keep **compute node-local** and make the **weights** the thing that moves —
@@ -38,15 +40,22 @@ is fetched by anyzig at build time) into a ~120 MB Debian-slim runtime image.
 ```sh
 docker build -t loom:dev .
 
-# run a single node (serves the built-in synthetic model)
-docker run --rm -p 8770:8770 -p 8772:8772 loom:dev \
+# run a single node (serves the built-in synthetic model).
+# Ports are published to 127.0.0.1: the RPC and OpenAI surfaces have no TLS and
+# no authentication, so do not expose them on a routable interface without an
+# authenticating proxy in front.
+docker run --rm -p 127.0.0.1:8770:8770 -p 127.0.0.1:8772:8772 loom:dev \
   node --rpc-addr 0.0.0.0 --openai-port 8772
 curl -s localhost:8772/v1/chat/completions \
   -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":16}'
 ```
 
 The image exposes `8770` (RPC), `8771` (P2P), `8772` (OpenAI), runs as a non-root
-user, and persists the model cache in the `/home/loom/.cache/loom` volume.
+user, and persists the model cache in the `/home/loom/.cache/loom` volume. The
+base image is pinned by digest and the build verifies the compiler tarball's
+SHA-256, so neither a moved tag nor a swapped release asset can change what is
+built. The compose demo additionally drops all capabilities, sets
+`no-new-privileges`, and caps memory/PIDs.
 
 **Distributed swarm** — [`docker-compose.yml`](docker-compose.yml) brings up a
 two-node swarm (an origin that generates + serves a synthetic deepseek2 GGUF, and

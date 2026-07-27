@@ -179,8 +179,8 @@ fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer) !void
         const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
         const m = &store.manifest;
         try wi.print("MANIFEST version={s} size={d} ranges={d} range_size={d} mode={s} resident={d}\n", .{
-            hashmod.toHex(m.version), m.file_size, m.nRanges(), m.range_size,
-            @tagName(m.mode),          m.n_resident,
+            hashmod.toHex(m.version), m.file_size,  m.nRanges(), m.range_size,
+            @tagName(m.mode),         m.n_resident,
         });
     } else if (std.mem.eql(u8, line, "MANIFESTFILE")) {
         const store = ctx.store orelse return wi.print("ERR no_store\n", .{});

@@ -230,6 +230,5 @@ test "download refuses a non-https URL (redirect-downgrade guard, issue #32)" {
     const io = threaded.io();
     var client = std.http.Client{ .allocator = gpa, .io = io };
     defer client.deinit();
-    try std.testing.expectError(error.InsecureRedirect,
-        downloadFile(gpa, io, &client, "http://huggingface.co/x/y", "/tmp/dl-nope.bin"));
+    try std.testing.expectError(error.InsecureRedirect, downloadFile(gpa, io, &client, "http://huggingface.co/x/y", "/tmp/dl-nope.bin"));
 }

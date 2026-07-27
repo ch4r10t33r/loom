@@ -5,11 +5,19 @@
 # runtime image carries only the compiled binary.
 
 # ---- builder: fetch Zig 0.16.0 via anyzig, compile a ReleaseFast binary ----
-FROM debian:bookworm-slim AS builder
+# Base pinned by digest, not tag (security issue #33): a tag is mutable, so
+# an unpinned base silently changes what is built and shipped.
+# debian:bookworm-slim as of 2026-07-27. Re-pin when refreshing for CVEs.
+FROM debian@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS builder
 
 # set by BuildKit: "amd64" | "arm64"
 ARG TARGETARCH
 ARG ANYZIG_VERSION=v2026_03_26
+# Checksums of the release assets (security issue #33). ANYZIG_VERSION is a git
+# tag, which is mutable: without verification a moved tag or a replaced asset
+# silently swaps the compiler that builds the shipped binary.
+ARG ANYZIG_SHA256_x86_64=f9d5a09fbd7c019eecef1a397613ce5baec22872a1c3eb5ab4b1132e917c3d71
+ARG ANYZIG_SHA256_aarch64=1963afb44ca0705768cba7346fc649b5b56879c5c6ab91303bc8808604ab3a3c
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl git xz-utils \
@@ -22,8 +30,15 @@ RUN set -eux; \
         arm64) azarch=aarch64 ;; \
         *) echo "unsupported TARGETARCH: ${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    curl -fsSL "https://github.com/marler8997/anyzig/releases/download/${ANYZIG_VERSION}/anyzig-${azarch}-linux.tar.gz" \
-        | tar -xz -C /usr/local/bin; \
+    case "${azarch}" in \
+        x86_64)  want="${ANYZIG_SHA256_x86_64}" ;; \
+        aarch64) want="${ANYZIG_SHA256_aarch64}" ;; \
+    esac; \
+    curl -fsSL -o /tmp/anyzig.tar.gz \
+        "https://github.com/marler8997/anyzig/releases/download/${ANYZIG_VERSION}/anyzig-${azarch}-linux.tar.gz"; \
+    echo "${want}  /tmp/anyzig.tar.gz" | sha256sum -c -; \
+    tar -xz -C /usr/local/bin -f /tmp/anyzig.tar.gz; \
+    rm -f /tmp/anyzig.tar.gz; \
     chmod +x /usr/local/bin/zig
 
 WORKDIR /src
@@ -36,7 +51,7 @@ COPY src ./src
 RUN zig 0.16.0 build -Doptimize=ReleaseFast
 
 # ---- runtime: minimal image with just the binary ----
-FROM debian:bookworm-slim AS runtime
+FROM debian@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime
 
 # ca-certificates: the node downloads models from Hugging Face over HTTPS.
 # Pre-create the cache dir owned by `loom` so the anonymous volume inherits its
