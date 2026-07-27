@@ -47,10 +47,15 @@ fn exchange(ctx: *Ctx, addr_str: []const u8) !void {
 
     // self announce (SPEC.md Announce container)
     var ann = wire.Announce{ .committee_id = ctx.committee_id, .addr = ctx.advertise };
+    // atomic snapshot: reading `bits` directly races the repair/fetch threads'
+    // RMWs and advertises a torn bitmap (security issue #31)
+    var snap: ?[]u8 = null;
+    defer if (snap) |sp| gpa.free(sp);
     if (ctx.store) |st| {
         ann.manifest_version = st.manifest.version;
         ann.holdings_seq = st.holdingsSeq();
-        ann.holdings_bitmap = st.holdings.bits;
+        snap = try st.holdings.snapshotAlloc(gpa);
+        ann.holdings_bitmap = snap.?;
     }
     const body = try ann.encodeBody(gpa);
     defer gpa.free(body);

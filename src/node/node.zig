@@ -234,12 +234,29 @@ fn repairThread(ctx: *RepairCtx) void {
     }
 }
 
+/// Terminate the process instead of unwinding `run`'s stack frame.
+///
+/// Security issue #31: the gossip, heartbeat, repair and OpenAI loops are
+/// detached and hold pointers into that frame (`&meter`, `&table`, `&store.?`,
+/// `&gguf_src`, and their own contexts). Returning from `run` fires its defer
+/// chain — `meter.deinit()`, `gguf_src.deinit()`, `committee_peers.deinit()` —
+/// while those threads are still running, which is a use-after-free.
+///
+/// Every exit from `run` after the threads start is a failed listener, i.e.
+/// fatal for a daemon. Exiting the process makes that explicit and removes the
+/// whole teardown-race class, rather than trying to sequence a shutdown that
+/// nothing else needs.
+fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
+    std.debug.print(fmt, args);
+    std.process.exit(1);
+}
+
 fn p2pThread(ctx: *p2p.Ctx) void {
-    p2p.serve(ctx) catch |e| std.debug.print("p2p: {s}\n", .{@errorName(e)});
+    p2p.serve(ctx) catch |e| fatal("p2p server failed: {s}\n", .{@errorName(e)});
 }
 
 fn openaiThread(ctx: *openai.Ctx) void {
-    openai.serve(ctx) catch |e| std.debug.print("openai: {s}\n", .{@errorName(e)});
+    openai.serve(ctx) catch |e| fatal("openai server failed: {s}\n", .{@errorName(e)});
 }
 
 pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void {
@@ -601,7 +618,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .engine_lock = &engine_lock,
     };
     rpc.serve(&rpc_ctx) catch |e| {
-        try out.print("rpc server error: {s}\n", .{@errorName(e)});
-        return;
+        // Do not return: the loops above are detached and still hold pointers
+        // into this frame (security issue #31).
+        out.print("rpc server error: {s}\n", .{@errorName(e)}) catch {};
+        out.flush() catch {};
+        fatal("node: shutting down\n", .{});
     };
 }
