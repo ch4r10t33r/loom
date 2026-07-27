@@ -310,6 +310,9 @@ To use a real model there, mount it and point `--gguf` at the mounted path.
 
 ## See also
 
+- [TWO-MACHINE-TEST.md](TWO-MACHINE-TEST.md) — the same thing across two real
+  machines: measuring your link first, firewall and `--advertise` setup, and
+  what throughput to expect on 1 / 2.5 / 10 GbE
 - [docs/CLI.md](CLI.md) — every flag in detail
 - [spec/SPEC.md](../spec/SPEC.md) — committees, wire protocol, trust model
 - [README](../README.md) — overview
