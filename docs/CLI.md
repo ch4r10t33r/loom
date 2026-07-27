@@ -52,6 +52,7 @@ synthetic model and serves it on `127.0.0.1:8770`.
 ```
 loom node [--model SPEC] [--rpc-addr A] [--rpc-port P]
           [--openai-addr A] [--openai-port P] [--ctx N] [--chat-format F]
+          [--ui-addr A] [--ui-port P] [--status-secs N]
           [--p2p-addr A] [--p2p-port P] [--ram-gb X] [--pin-gb Y]
           [--seed S] [--stats FILE] [--no-verify]
           [--gguf FILE | --bootstrap HOST:PORT]
@@ -91,6 +92,9 @@ The startup banner tells you which one you got.
 | Flag | Default | What it does |
 |---|---|---|
 | `--rpc-addr A` / `--rpc-port P` | `127.0.0.1` / `8770` | The line-delimited JSON inference RPC. Bind `0.0.0.0` to accept remote clients — but see the warning below. |
+| `--ui-port P` | `8555` | Port for the **bundled chat UI**, a single page compiled into the binary. Open `http://127.0.0.1:8555` to talk to this node: streaming replies, temperature and max-token controls, per-response decode speed and time-to-first-token, and a header showing the live peer count and local-hit rate. It runs on its own listener but shares the HTTP implementation and the generator with the API, so the page is same-origin with the endpoint it calls — no CORS, nothing to configure. `0` disables it. |
+| `--ui-addr A` | `127.0.0.1` | Bind address for the chat UI. Leave it on loopback unless an authenticating proxy sits in front: like the API, it has no TLS and no auth. |
+| `--status-secs N` | `30` | Interval for the periodic console status line (peers, committee size, shards held, local-hit rate, uptime). Membership and holdings change without any request arriving, so an event-only log makes a churning node look idle. `0` disables it. |
 | `--openai-addr A` / `--openai-port P` | `<rpc-addr>` / `0` (**off**) | The OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`). Off until you set a port. Serves the same engine and the same ledger as the RPC; client identity comes from `Authorization: Bearer`. |
 | `--p2p-addr A` / `--p2p-port P` | `0.0.0.0` / `8771` | Where the P2P protocol listens: shard serving, gossip, heartbeats, and bootnode `JOIN`. |
 | `--advertise HOST:PORT` | `127.0.0.1:<p2p-port>` | The address this node tells peers to dial it on. **Set this whenever peers are on other machines** — the default only works on one box. Accepts an IP or a hostname (Compose service names and Kubernetes Service DNS both work). |

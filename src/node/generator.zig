@@ -75,13 +75,22 @@ pub const GgufModel = union(enum) {
             inline else => |*m| m.chatTemplate(),
         };
     }
+    pub fn generalName(self: *const GgufModel) ?[]const u8 {
+        return switch (self.*) {
+            inline else => |*m| m.generalName(),
+        };
+    }
 };
 
 /// Distributed GGUF generator: the model plus its token-loop expert fetch
 /// source. A fresh `State` (KV cache) is built per request.
 pub const GgufGen = struct {
     m: GgufModel,
-    src: *expert_fetch.Source,
+    /// The distributed expert source, or null when this GGUF is served
+    /// locally (a dense model has no routed experts to fetch, so there is no
+    /// source to attach). Optional rather than undefined: hitRate() reads it
+    /// on every request, and an undefined pointer there is a wild read.
+    src: ?*expert_fetch.Source = null,
     ctx_cap: usize,
     chat_format: chat_template.Format = .generic,
 };
@@ -128,7 +137,10 @@ pub const Generator = union(enum) {
         return switch (self) {
             .loom => |e| e.cache.stats.hitRate(),
             .gguf => |g| blk: {
-                const s = g.src.stats;
+                // A locally served GGUF has no fetch tier, so "fraction served
+                // locally" is 1 by construction rather than unknown.
+                const src = g.src orelse break :blk 1.0;
+                const s = src.stats;
                 const tot = s.local + s.fetched;
                 break :blk if (tot == 0) 0 else @as(f64, @floatFromInt(s.local)) / @as(f64, @floatFromInt(tot));
             },
