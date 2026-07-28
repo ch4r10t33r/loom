@@ -125,6 +125,7 @@ fn usage(out: *Io.Writer) !void {
         \\  loom light [--full-nodes H:P[,...]] [--openai-port P --openai-full-nodes H:P[,...]]
         \\             [--rpc-addr A] [--rpc-port P] [--openai-addr A] [--client-id ID]
         \\  loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2|llama|qwen2moe|qwen3moe|glm4moe]
+        \\  loom gguf check <file | https://...>
         \\  loom gguf info <file> [--range-mb M]
         \\  loom gguf shard <file>
         \\  loom gguf run <file.gguf | store-dir> [--prompt STR] [--max-tokens N] [--temp T]
@@ -521,6 +522,10 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
         return;
     }
 
+    if (std.mem.eql(u8, sub, "check")) {
+        return @import("gguf/check.zig").run(gpa, io, out, path);
+    }
+
     if (std.mem.eql(u8, sub, "info")) {
         var parsed = gguf.parse(gpa, io, path) catch |e| {
             return out.print("parse failed: {s}\n", .{@errorName(e)});
@@ -606,7 +611,7 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
         return;
     }
 
-    try out.print("gguf: unknown subcommand {s} (want gen|info|shard|run)\n", .{sub});
+    try out.print("gguf: unknown subcommand {s} (want gen|check|info|shard|run)\n", .{sub});
 }
 
 fn cmdGgufRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8, args: [][]const u8) !void {
