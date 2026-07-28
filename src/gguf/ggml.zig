@@ -445,7 +445,12 @@ pub fn matmul(t: Type, out: []f32, data: []const u8, xs: []const f32, n: usize, 
     if (n == 0) return;
     if (n == 1) return matvec(t, out, data, xs, rows, cols);
 
-    // Types without a batched kernel still work, just without the saving.
+    // Which types have a *batched* kernel, which is a narrower set than the
+    // ones with an int8-activation matvec: adding a type to the single-vector
+    // path does not give it a matmul kernel. Claiming otherwise reaches an
+    // `unreachable` in matmulRows -- caught by a Debug test here, but silent
+    // memory corruption in ReleaseFast, where unreachable is undefined
+    // behaviour rather than a panic.
     const batched = switch (t) {
         .q4_k, .q6_k, .q8_0 => true,
         else => false,
@@ -651,14 +656,14 @@ fn dispatch(t: Type, out: []f32, data: []const u8, x: []const f32, rows: usize, 
     switch (t) {
         .f32 => matvecF32(out, data, x, rows, cols),
         .f16 => matvecF16(out, data, x, rows, cols),
-        .q4_0 => matvecQ40(out, data, x, rows, cols),
+        .q4_0 => matvecQ40Int(out, data, x, rows, cols),
         .q4_1 => matvecQ41(out, data, x, rows, cols),
         .q5_0 => matvecQ50(out, data, x, rows, cols),
         .q5_1 => matvecQ51(out, data, x, rows, cols),
         .q8_0 => matvecQ80Int(out, data, x, rows, cols),
         .q4_k => matvecQ4KInt(out, data, x, rows, cols),
         .q6_k => matvecQ6KInt(out, data, x, rows, cols),
-        .q5_k => matvecK(t, out, data, x, rows, cols),
+        .q5_k => matvecQ5KInt(out, data, x, rows, cols),
         else => matvecCodebook(t, out, data, x, rows, cols),
     }
 }
@@ -836,7 +841,7 @@ fn matvecQ4KInt(out: []f32, data: []const u8, x: []const f32, rows: usize, cols:
 /// reference.
 pub fn usesInt8Activations(t: Type) bool {
     return switch (t) {
-        .q4_k, .q6_k, .q8_0 => true,
+        .q4_k, .q5_k, .q6_k, .q4_0, .q8_0 => true,
         else => false,
     };
 }
@@ -902,6 +907,83 @@ fn matvecQ6KInt(out: []f32, data: []const u8, x: []const f32, rows: usize, cols:
                         s1 * (@as(f32, @floatFromInt(dot_hi)) - 32.0 * @as(f32, @floatFromInt(sum_hi))));
                 }
             }
+        }
+        out[r] = acc;
+    }
+}
+
+
+/// Q5_K against int8 activations. Identical in shape to Q4_K, except the
+/// quantized value carries a fifth bit from `qh`, so q runs 0..31 instead of
+/// 0..15 and the per-sub-block high-bit mask advances by two each pair.
+fn matvecQ5KInt(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
+    const qx = quantizeX(x);
+    const blocks_per_row = cols / QK_K;
+    const rb = blocks_per_row * Q5_K_BLOCK;
+    for (0..rows) |r| {
+        const row = data[r * rb ..][0..rb];
+        var acc: f32 = 0;
+        for (0..blocks_per_row) |b| {
+            const block = row[b * Q5_K_BLOCK ..][0..Q5_K_BLOCK];
+            const d = f16FromBytes(block[0..2]);
+            const dmin = f16FromBytes(block[2..4]);
+            const scales: *const [12]u8 = block[4..16];
+            const qh = block[16..][0 .. QK_K / 8];
+            const qs = block[16 + QK_K / 8 ..][0 .. QK_K / 2];
+            for (0..QK_K / QK_0) |j| {
+                var sc: u8 = undefined;
+                var mn: u8 = undefined;
+                scaleMinK4(j, scales, &sc, &mn);
+                // The dequant kernel walks 64 values per iteration with hb1/hb2
+                // advancing two bits each time; sub-block j therefore uses bit
+                // (j % 2) + 2*(j / 2) of every qh byte.
+                const bit: u3 = @intCast(j % 2 + 2 * (j / 2) % 8);
+                const mask: u8 = @as(u8, 1) << bit;
+                const src = qs[(j / 2) * QK_0 ..][0..QK_0];
+                const hv: @Vector(QK_0, u8) = qh[0..QK_0].*;
+                const nib = nib32(src, j % 2 == 1);
+                const hi: @Vector(QK_0, i16) = @select(
+                    i16,
+                    (hv & @as(@Vector(QK_0, u8), @splat(mask))) != @as(@Vector(QK_0, u8), @splat(0)),
+                    @as(@Vector(QK_0, i16), @splat(16)),
+                    @as(@Vector(QK_0, i16), @splat(0)),
+                );
+                const xb = &qx[b * (QK_K / QK_0) + j];
+                const dot = dotW32(nib + hi, &xb.q);
+                acc += xb.d * (d * @as(f32, @floatFromInt(sc)) * @as(f32, @floatFromInt(dot)) -
+                    dmin * @as(f32, @floatFromInt(mn)) * @as(f32, @floatFromInt(xb.sum)));
+            }
+        }
+        out[r] = acc;
+    }
+}
+
+/// Q4_0 against int8 activations: one f16 scale per 32 values and a fixed -8
+/// offset, so the offset factors out as `-8 * sum(xq)` and never touches a
+/// lane.
+fn matvecQ40Int(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
+    const qx = quantizeX(x);
+    const blocks_per_row = cols / QK_0;
+    const rb = blocks_per_row * Q4_0_BLOCK;
+    for (0..rows) |r| {
+        const row = data[r * rb ..][0..rb];
+        var acc: f32 = 0;
+        for (0..blocks_per_row) |b| {
+            const block = row[b * Q4_0_BLOCK ..][0..Q4_0_BLOCK];
+            const d = f16FromBytes(block[0..2]);
+            const qs = block[2..][0 .. QK_0 / 2];
+            // Q4_0 packs lane i in the low nibble and lane i+16 in the high
+            // nibble of byte i, so the two halves are gathered separately.
+            const xb = &qx[b];
+            var dot: i32 = 0;
+            var sum: i32 = 0;
+            for (0..QK_0 / 2) |i| {
+                const lo: i32 = qs[i] & 0x0F;
+                const hi: i32 = qs[i] >> 4;
+                dot += lo * @as(i32, xb.q[i]) + hi * @as(i32, xb.q[i + QK_0 / 2]);
+                sum += @as(i32, xb.q[i]) + @as(i32, xb.q[i + QK_0 / 2]);
+            }
+            acc += d * xb.d * @as(f32, @floatFromInt(dot - 8 * sum));
         }
         out[r] = acc;
     }
@@ -1663,7 +1745,7 @@ test "parallel matvec produces bit-identical results to inline" {
     // Exact kernels only: row-splitting must be bit-identical, but the
     // int8-activation kernels quantize `x` once per matvec call, so their
     // output legitimately depends on how rows are grouped.
-    for ([_]Type{ .q5_k, .q4_0, .q5_0, .f32 }) |t| {
+    for ([_]Type{ .q5_0, .q6_k, .iq4_xs, .f32 }) |t| {
         const data = try gpa.alloc(u8, tensorBytes(t, cols, rows));
         defer gpa.free(data);
         rnd.bytes(data);
