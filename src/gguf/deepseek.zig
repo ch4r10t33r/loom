@@ -23,6 +23,7 @@ const std = @import("std");
 const Io = std.Io;
 const gguf = @import("gguf.zig");
 const ggml = @import("ggml.zig");
+const backend = @import("../compute/backend.zig");
 const tensor = @import("../core/tensor.zig");
 const llama = @import("llama.zig");
 const tokmod = @import("tok.zig");
@@ -498,7 +499,7 @@ pub const State = struct {
 };
 
 fn mv(t: Tensor, out: []f32, x: []const f32) void {
-    ggml.matvec(t.ty, out, t.data, x, t.ne1, t.ne0);
+    backend.matvec(t.ty, out, t.data, x, t.ne1, t.ne0);
 }
 
 /// NORM adjacent-pair rope, with YaRN frequency correction when enabled: each
@@ -566,7 +567,7 @@ fn denseFFN(st: *State, gate_w: Tensor, up_w: Tensor, down_w: Tensor) void {
     const f = gate_w.ne1;
     mv(gate_w, st.gate[0..f], st.normed);
     mv(up_w, st.up[0..f], st.normed);
-    tensor.swiglu(st.act[0..f], st.gate[0..f], st.up[0..f]);
+    backend.swiglu(st.act[0..f], st.gate[0..f], st.up[0..f]);
     mv(down_w, st.ffn_out, st.act[0..f]);
 }
 
@@ -587,15 +588,15 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     // tokenizer, whose ceiling is an independent metadata array, so bound it
     // here rather than trusting the two to agree (security issue #29).
     if (token >= cfg.vocab) return error.TokenOutOfRange;
-    ggml.dequantRow(m.token_embd.ty, st.x, m.token_embd.data, token, cfg.dim);
+    backend.dequantRow(m.token_embd.ty, st.x, m.token_embd.data, token, cfg.dim);
 
     for (m.layers, 0..) |l, li| {
         // ---- MLA attention ----
-        tensor.rmsnorm(st.normed, st.x, asF32(l.attn_norm), cfg.eps);
+        backend.rmsnorm(st.normed, st.x, asF32(l.attn_norm), cfg.eps);
 
         if (cfg.q_lora_rank > 0) {
             mv(l.attn_q_a.?, st.q_a, st.normed);
-            tensor.rmsnorm(st.q_a, st.q_a, asF32(l.attn_q_a_norm.?), cfg.eps);
+            backend.rmsnorm(st.q_a, st.q_a, asF32(l.attn_q_a_norm.?), cfg.eps);
             mv(l.attn_q_b.?, st.q, st.q_a);
         } else {
             mv(l.attn_q.?, st.q, st.normed);
@@ -603,7 +604,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
 
         mv(l.attn_kv_a_mqa, st.kv_a, st.normed);
         const c_kv = st.c_kv_cache[(li * cfg.ctx_len + pos) * kvr ..][0..kvr];
-        tensor.rmsnorm(c_kv, st.kv_a[0..kvr], asF32(l.attn_kv_a_norm), cfg.eps);
+        backend.rmsnorm(c_kv, st.kv_a[0..kvr], asF32(l.attn_kv_a_norm), cfg.eps);
         const k_rope = st.k_rope_cache[(li * cfg.ctx_len + pos) * rope ..][0..rope];
         @memcpy(k_rope, st.kv_a[kvr .. kvr + rope]);
         ropeApply(cfg, k_rope, pos);
@@ -626,29 +627,29 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             var t_i: usize = 0;
             while (t_i < seq) : (t_i += 1) {
                 const c_t = st.c_kv_cache[(li * cfg.ctx_len + t_i) * kvr ..][0..kvr];
-                ggml.matvec(l.attn_kv_b.ty, st.k_nope, k_rows, c_t, nope, kvr);
+                backend.matvec(l.attn_kv_b.ty, st.k_nope, k_rows, c_t, nope, kvr);
                 const kr_t = st.k_rope_cache[(li * cfg.ctx_len + t_i) * rope ..][0..rope];
-                st.scores[t_i] = (ggml.dotF32(q_nope, st.k_nope) + ggml.dotF32(q_rope, kr_t)) * scale;
+                st.scores[t_i] = (backend.dotF32(q_nope, st.k_nope) + backend.dotF32(q_rope, kr_t)) * scale;
             }
-            tensor.softmax(st.scores[0..seq]);
+            backend.softmax(st.scores[0..seq]);
 
             const oh = st.head_out[h * vd ..][0..vd];
             @memset(oh, 0);
             t_i = 0;
             while (t_i < seq) : (t_i += 1) {
                 const c_t = st.c_kv_cache[(li * cfg.ctx_len + t_i) * kvr ..][0..kvr];
-                ggml.matvec(l.attn_kv_b.ty, st.v_t, v_rows, c_t, vd, kvr);
-                ggml.axpy(oh, st.v_t, st.scores[t_i]);
+                backend.matvec(l.attn_kv_b.ty, st.v_t, v_rows, c_t, vd, kvr);
+                backend.axpy(oh, st.v_t, st.scores[t_i]);
             }
         }
         mv(l.attn_output, st.proj_out, st.head_out);
-        tensor.add(st.x, st.proj_out);
+        backend.add(st.x, st.proj_out);
 
         // ---- FFN ----
-        tensor.rmsnorm(st.normed, st.x, asF32(l.ffn_norm), cfg.eps);
+        backend.rmsnorm(st.normed, st.x, asF32(l.ffn_norm), cfg.eps);
         if (!l.is_moe) {
             denseFFN(st, l.ffn_gate.?, l.ffn_up.?, l.ffn_down.?);
-            tensor.add(st.x, st.ffn_out);
+            backend.add(st.x, st.ffn_out);
         } else {
             mv(l.ffn_gate_inp.?, st.router[0..cfg.n_expert], st.normed);
             var sel_buf: [moe.MAX_SELECTED]Selected = undefined;
@@ -693,13 +694,13 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             }
             if (l.ffn_gate_shexp) |gs| {
                 denseFFN(st, gs, l.ffn_up_shexp.?, l.ffn_down_shexp.?);
-                tensor.add(acc, st.ffn_out);
+                backend.add(acc, st.ffn_out);
             }
-            tensor.add(st.x, acc);
+            backend.add(st.x, acc);
         }
     }
 
-    tensor.rmsnorm(st.normed, st.x, asF32(m.output_norm), cfg.eps);
+    backend.rmsnorm(st.normed, st.x, asF32(m.output_norm), cfg.eps);
     mv(m.output, st.logits, st.normed);
 }
 
