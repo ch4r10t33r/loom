@@ -35,6 +35,12 @@ const dmmv_q4k_src = @embedFile("../shaders/metal/dmmv_q4k.metal");
 /// work: norm and router projections stay on the CPU.
 const MIN_GPU_ROWS = 512;
 
+/// Apple GPUs execute in 32-lane SIMD groups; the kernel assigns one per row.
+const SIMD_W = 32;
+/// SIMD groups per threadgroup. Four gives 128 threads, enough to keep the
+/// scheduler fed without pushing register pressure.
+const SIMDGROUPS_PER_GROUP = 4;
+
 const Ctx = struct {
     dev: mtl.Device,
     q4k: mtl.Pipeline,
@@ -121,17 +127,16 @@ pub fn matvec(t: ggml.Type, out: []f32, data: []const u8, x: []const f32, rows: 
 
     @memcpy(cx.scratch_x.slice(f32)[0..x.len], x);
     const dims = Dims{ .rows = @intCast(rows), .cols = @intCast(cols) };
-    // One thread per row; the grid is the row count and Metal splits it into
-    // groups. dispatchThreads handles a ragged last group, so `rows` need not
-    // be a multiple of the group size.
-    const group = @min(cx.q4k.maxThreads(), 64);
+    // One SIMD group (32 lanes) per row. The threadgroup holds several of
+    // them, so the grid is rows*32 threads.
+    const group = SIMD_W * SIMDGROUPS_PER_GROUP;
     const cb = cx.dev.commandBuffer();
     cb.dispatch(
         cx.q4k,
         &.{ w.buf, cx.scratch_x, cx.scratch_out },
         &.{ w.off, 0, 0 },
         std.mem.asBytes(&dims),
-        rows,
+        rows * SIMD_W,
         group,
     );
     cb.commitAndWait();
@@ -194,4 +199,89 @@ test "metal q4_k matvec agrees with the exact cpu reference" {
             return e;
         };
     }
+}
+
+test "metal dispatch cost breakdown" {
+    // Where does the time actually go? Claiming "submission latency dominates"
+    // is worth nothing without the number, so measure three things:
+    //   1. a commit-and-wait round trip per dispatch (what the code does now)
+    //   2. many dispatches in one command buffer, committed once
+    //   3. the kernel's own execution time, inferred from 2
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const cols = 2048;
+    const rows = 5632; // a real ffn_up shape
+
+    // 8 threads, not 1: the CPU comparison has to be the CPU path as it
+    // actually ships, or the GPU looks good for the wrong reason.
+    parallelBegin(8);
+    defer parallelEnd();
+    const cx = &(ctx orelse return error.SkipZigTest);
+
+    var prng = std.Random.DefaultPrng.init(1);
+    const rnd = prng.random();
+    const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, cols, rows));
+    defer gpa.free(data);
+    rnd.bytes(data);
+    for (0..data.len / 2) |i| data[i * 2 + 1] &= 0xFB;
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rnd.float(f32) - 0.5;
+    @memcpy(cx.scratch_x.slice(f32)[0..cols], x);
+
+    const w = wrapFor(cx, data).?;
+    const dims = Dims{ .rows = @intCast(rows), .cols = @intCast(cols) };
+    const group = @min(cx.q4k.maxThreads(), 64);
+    const N = 50;
+
+    var t: std.Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+    const now = struct {
+        fn f(i: std.Io) i128 {
+            return std.Io.Clock.Timestamp.now(i, .awake).raw.toNanoseconds();
+        }
+    }.f;
+
+    // 1. one commit+wait per dispatch
+    const t0 = now(io);
+    for (0..N) |_| {
+        const cb = cx.dev.commandBuffer();
+        cb.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), rows, group);
+        cb.commitAndWait();
+    }
+    const per_sync = @divTrunc(now(io) - t0, N);
+
+    // 2. N dispatches, one commit
+    const t1 = now(io);
+    {
+        const cb = cx.dev.commandBuffer();
+        for (0..N) |_| {
+            cb.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), rows, group);
+        }
+        cb.commitAndWait();
+    }
+    const per_batched = @divTrunc(now(io) - t1, N);
+
+    // 3. the CPU kernel, for scale
+    const out = try gpa.alloc(f32, rows);
+    defer gpa.free(out);
+    const t2 = now(io);
+    for (0..N) |_| cpu.matvec(.q4_k, out, data, x, rows, cols);
+    const per_cpu = @divTrunc(now(io) - t2, N);
+
+    const ms = struct {
+        fn f(ns: i128) f64 {
+            return @as(f64, @floatFromInt(ns)) / 1e6;
+        }
+    }.f;
+    std.debug.print(
+        \\
+        \\  one matvec, 2048x5632 Q4_K:
+        \\    GPU, commit+wait each   {d:6.3} ms   <- what the code does now
+        \\    GPU, batched in one cb  {d:6.3} ms   <- kernel + amortized submit
+        \\    submission overhead     {d:6.3} ms   <- the difference
+        \\    CPU, 8 threads          {d:6.3} ms   <- what it is beating
+        \\
+    , .{ ms(per_sync), ms(per_batched), ms(per_sync - per_batched), ms(per_cpu) });
 }
