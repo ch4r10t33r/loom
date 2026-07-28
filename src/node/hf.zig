@@ -140,7 +140,28 @@ fn downloadRepo(gpa: std.mem.Allocator, io: Io, repo: []const u8, rev: []const u
 /// would hand an on-path attacker the weights. The body is written to a
 /// `.part` file and renamed only on success, so an interrupted transfer never
 /// leaves a file that looks complete.
+/// Fetch only the first `max_bytes` of `url` into `dest_path`.
+///
+/// A GGUF's entire structure -- architecture, shapes, tokenizer, and every
+/// tensor's type -- lives in its header, which is the first megabyte or two of
+/// a file that may be tens of gigabytes. `loom gguf check` uses this to answer
+/// "will this model load?" from a range request instead of a download (issue
+/// #51).
+///
+/// Shares downloadFile's redirect handling and its https-on-every-hop rule;
+/// the only differences are the Range header and the byte cap.
+pub fn downloadHead(gpa: std.mem.Allocator, io: Io, url: []const u8, dest_path: []const u8, max_bytes: u64) !void {
+    var client = std.http.Client{ .allocator = gpa, .io = io };
+    defer client.deinit();
+    return downloadInner(gpa, io, &client, url, dest_path, max_bytes);
+}
+
 fn downloadFile(gpa: std.mem.Allocator, io: Io, client: *std.http.Client, url: []const u8, dest_path: []const u8) !void {
+    return downloadInner(gpa, io, client, url, dest_path, 0);
+}
+
+/// `range_bytes` of 0 means the whole file; otherwise fetch only that prefix.
+fn downloadInner(gpa: std.mem.Allocator, io: Io, client: *std.http.Client, url: []const u8, dest_path: []const u8, range_bytes: u64) !void {
     const part_path = try std.fmt.allocPrint(gpa, "{s}.part", .{dest_path});
     defer gpa.free(part_path);
 
@@ -164,7 +185,12 @@ fn downloadFile(gpa: std.mem.Allocator, io: Io, client: *std.http.Client, url: [
         // handing an on-path attacker the weights (security issue #32).
         if (!std.mem.eql(u8, uri.scheme, "https")) return error.InsecureRedirect;
 
-        var req = try client.request(.GET, uri, .{ .redirect_behavior = .unhandled });
+        var range_buf: [64]u8 = undefined;
+        const extra: []const std.http.Header = if (range_bytes > 0) &.{.{
+            .name = "Range",
+            .value = std.fmt.bufPrint(&range_buf, "bytes=0-{d}", .{range_bytes - 1}) catch unreachable,
+        }} else &.{};
+        var req = try client.request(.GET, uri, .{ .redirect_behavior = .unhandled, .extra_headers = extra });
         defer req.deinit();
         try req.sendBodiless();
         var redirect_buf: [8192]u8 = undefined;
@@ -186,7 +212,10 @@ fn downloadFile(gpa: std.mem.Allocator, io: Io, client: *std.http.Client, url: [
             uri = uri.resolveInPlace(loc.len, &aux) catch return error.InvalidUrl;
             continue;
         }
-        if (status != .ok) return error.HttpDownloadFailed;
+        // 206 Partial Content is the success case for a ranged request; a
+        // server that ignores Range answers 200 and the byte cap below still
+        // stops the transfer.
+        if (status != .ok and !(range_bytes > 0 and status == .partial_content)) return error.HttpDownloadFailed;
         if (resp.head.content_length) |len| {
             if (len > MAX_FILE_BYTES) return error.DownloadTooLarge;
         }
@@ -198,6 +227,9 @@ fn downloadFile(gpa: std.mem.Allocator, io: Io, client: *std.http.Client, url: [
         // Content-Length (security issue #32).
         var total: u64 = 0;
         var idle: usize = 0;
+        // A server may ignore Range and answer 200 with the whole file; the cap
+        // is what actually stops a 9 GB transfer, not the header.
+        const cap: u64 = if (range_bytes > 0) range_bytes else MAX_FILE_BYTES;
         while (true) {
             // NOTE: a zero return is normal here (std's own streamRemaining
             // loops until EndOfStream and never treats 0 as the end); only
@@ -214,6 +246,7 @@ fn downloadFile(gpa: std.mem.Allocator, io: Io, client: *std.http.Client, url: [
             }
             idle = 0;
             total += n;
+            if (total >= cap) break;
             if (total > MAX_FILE_BYTES) return error.DownloadTooLarge;
         }
         try fw.interface.flush();

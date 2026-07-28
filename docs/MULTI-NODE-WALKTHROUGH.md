@@ -96,6 +96,17 @@ curl -L -o /tmp/dsc-v2-lite.gguf \
 ./zig-out/bin/loom gguf info /tmp/dsc-v2-lite.gguf | head -20
 ```
 
+```sh
+./zig-out/bin/loom gguf check /tmp/dsc-v2-lite.gguf
+```
+
+`gguf check` answers this in one line, and it takes a URL — so you can check a
+model *before* downloading it:
+
+```sh
+loom gguf check https://huggingface.co/.../model.gguf
+```
+
 Check `general.architecture` against the table above, and check the tensor
 types too. If the architecture is unsupported, `gguf run` says so and lists
 what it does support.
