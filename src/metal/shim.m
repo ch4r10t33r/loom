@@ -107,6 +107,45 @@ void loom_mtl_encode(loom_mtl_cmdbuf cb, loom_mtl_pipeline p,
   threadsPerThreadgroup:MTLSizeMake(group_x, 1, 1)];
     [enc endEncoding];
 }
+loom_mtl_encoder loom_mtl_encoder_begin(loom_mtl_cmdbuf cb) {
+    id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>)cb;
+    // Concurrent dispatch type: without it Metal serializes every dispatch in
+    // the encoder even when they are independent, which is most of what this
+    // change is trying to avoid. Ordering where it matters comes from the
+    // explicit barriers below.
+    id<MTLComputeCommandEncoder> enc =
+        [buf computeCommandEncoderWithDispatchType:MTLDispatchTypeConcurrent];
+    return (__bridge_retained void *)enc;
+}
+
+void loom_mtl_encoder_dispatch(loom_mtl_encoder e, loom_mtl_pipeline p,
+                               const loom_mtl_buffer *buffers, const size_t *offsets,
+                               size_t n_buffers, const void *constants,
+                               size_t constants_len, size_t grid_x, size_t group_x) {
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)e;
+    id<MTLComputePipelineState> pso = (__bridge id<MTLComputePipelineState>)p;
+    [enc setComputePipelineState:pso];
+    for (size_t i = 0; i < n_buffers; i++) {
+        [enc setBuffer:(__bridge id<MTLBuffer>)buffers[i] offset:offsets[i] atIndex:i];
+    }
+    if (constants && constants_len) {
+        [enc setBytes:constants length:constants_len atIndex:n_buffers];
+    }
+    [enc dispatchThreads:MTLSizeMake(grid_x, 1, 1)
+  threadsPerThreadgroup:MTLSizeMake(group_x, 1, 1)];
+}
+
+void loom_mtl_encoder_barrier(loom_mtl_encoder e) {
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)e;
+    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+}
+
+void loom_mtl_encoder_end(loom_mtl_encoder e) {
+    id<MTLComputeCommandEncoder> enc = (__bridge id<MTLComputeCommandEncoder>)e;
+    [enc endEncoding];
+    CFRelease(e);
+}
+
 void loom_mtl_cmdbuf_commit_wait(loom_mtl_cmdbuf cb) {
     id<MTLCommandBuffer> buf = (__bridge id<MTLCommandBuffer>)cb;
     [buf commit];

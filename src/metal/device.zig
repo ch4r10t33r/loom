@@ -150,10 +150,57 @@ pub const CommandBuffer = struct {
         );
     }
 
+    /// Open one encoder for several dispatches. Each `dispatch` call above
+    /// opens its own encoder, and an encoder boundary is a full pipeline
+    /// drain; a block of six dispatches pays six of them.
+    pub fn encoder(self: CommandBuffer) Encoder {
+        return .{ .handle = c.loom_mtl_encoder_begin(self.handle).? };
+    }
+
     /// Submit and block. Batching many dispatches into one command buffer
     /// before committing is what keeps submission overhead off the per-op
     /// path; a commit per matvec would dominate.
     pub fn commitAndWait(self: CommandBuffer) void {
         c.loom_mtl_cmdbuf_commit_wait(self.handle);
+    }
+};
+
+pub const Encoder = struct {
+    handle: c.loom_mtl_encoder,
+
+    pub fn dispatch(
+        self: Encoder,
+        p: Pipeline,
+        buffers: []const Buffer,
+        offsets: []const usize,
+        constants: ?[]const u8,
+        grid: usize,
+        group: usize,
+    ) void {
+        std.debug.assert(buffers.len == offsets.len and buffers.len <= 8);
+        var handles: [8]c.loom_mtl_buffer = undefined;
+        for (buffers, 0..) |b, i| handles[i] = b.handle;
+        c.loom_mtl_encoder_dispatch(
+            self.handle,
+            p.handle,
+            &handles,
+            offsets.ptr,
+            buffers.len,
+            if (constants) |k| k.ptr else null,
+            if (constants) |k| k.len else 0,
+            grid,
+            group,
+        );
+    }
+
+    /// Order the dispatches issued so far before those issued after. Needed
+    /// only where a dispatch reads what a previous one wrote — the encoder is
+    /// opened in concurrent mode, so independent dispatches overlap.
+    pub fn barrier(self: Encoder) void {
+        c.loom_mtl_encoder_barrier(self.handle);
+    }
+
+    pub fn end(self: Encoder) void {
+        c.loom_mtl_encoder_end(self.handle);
     }
 };
