@@ -407,8 +407,10 @@ fn dispatch(t: Type, out: []f32, data: []const u8, x: []const f32, rows: usize, 
         .q4_1 => matvecQ41(out, data, x, rows, cols),
         .q5_0 => matvecQ50(out, data, x, rows, cols),
         .q5_1 => matvecQ51(out, data, x, rows, cols),
-        .q8_0 => matvecQ80(out, data, x, rows, cols),
-        .q4_k, .q5_k, .q6_k => matvecK(t, out, data, x, rows, cols),
+        .q8_0 => matvecQ80Int(out, data, x, rows, cols),
+        .q4_k => matvecQ4KInt(out, data, x, rows, cols),
+        .q6_k => matvecQ6KInt(out, data, x, rows, cols),
+        .q5_k => matvecK(t, out, data, x, rows, cols),
         else => matvecCodebook(t, out, data, x, rows, cols),
     }
 }
@@ -458,6 +460,221 @@ fn matvecCodebook(t: Type, out: []f32, data: []const u8, x: []const f32, rows: u
         while (b < blocks_per_row) : (b += 1) {
             const n = dequantBlockCodebook(t, row[b * bs ..][0..bs], &vals);
             acc += dotF32(vals[0..n], x[b * blk ..][0..blk]);
+        }
+        out[r] = acc;
+    }
+}
+
+// ---- int8 activation path (issue #11 follow-up) ------------------------------
+//
+// The dequantize-then-dot shape spent most of its time in the dequantize.
+// Measured single-threaded on a 2048x5632 tensor, Apple M5, before and after:
+//
+//     type   before              after     of which dequant, before
+//     q4_k   1.90 ms  3.4 GB/s   1.12 ms   76%
+//     q6_k   1.48 ms  6.4 GB/s   1.18 ms   92%
+//     q8_0   3.50 ms  3.5 GB/s   0.36 ms   79%
+//     f32    0.75 ms 61.7 GB/s   (unchanged: already bandwidth-bound)
+//
+// f32 nearly saturates memory bandwidth; the quantized kernels sat an order of
+// magnitude below it, building a 256-float scratch buffer per block and
+// pushing it through L1 only to read it straight back.
+//
+// The fix is the one llama.cpp uses: quantize the *activation* vector to int8
+// once per matvec, then dot it against the packed weights as integers. The
+// weights are never widened to f32, the scratch buffer disappears, and integer
+// lanes are four times as wide as f32 lanes on the same register.
+//
+// This is an approximation the f32 path did not make: the activation carries
+// ~0.4% per-element error. Over a 2048-long dot those errors are independent
+// and largely cancel, and it is what every production CPU inference engine
+// does, but it does mean results are no longer bit-identical to the dequant
+// path -- so `matvec` is checked against `dequantRow` within a tolerance, not
+// exactly.
+
+/// One 32-value block of int8-quantized activations: `x[i] ~= d * q[i]`.
+const XBlock = struct {
+    d: f32,
+    /// Sum of the quantized lanes, needed by the affine formats whose value is
+    /// `scale*q + min`: the min term becomes `min * d * sum(q)`.
+    sum: i32,
+    q: [QK_0]i8,
+};
+
+/// Scratch for the quantized activation. One matvec's worth, reused across
+/// rows: quantizing is O(cols) while the matvec is O(rows*cols), so it happens
+/// once per call rather than once per row.
+const MAX_QX_BLOCKS = 1024; // 32k activation elements
+threadlocal var qx_buf: [MAX_QX_BLOCKS]XBlock = undefined;
+
+/// Quantize `x` into `qx_buf`, returning the populated slice. Symmetric
+/// round-to-nearest against the block's absolute maximum, matching Q8_0.
+fn quantizeX(x: []const f32) []const XBlock {
+    const nb = x.len / QK_0;
+    std.debug.assert(nb <= MAX_QX_BLOCKS);
+    for (0..nb) |b| {
+        const src = x[b * QK_0 ..][0..QK_0];
+        var amax: f32 = 0;
+        for (src) |v| amax = @max(amax, @abs(v));
+        const d = amax / 127.0;
+        const inv: f32 = if (d != 0) 1.0 / d else 0;
+        var sum: i32 = 0;
+        for (src, 0..) |v, i| {
+            const q: i8 = @intFromFloat(@round(v * inv));
+            qx_buf[b].q[i] = q;
+            sum += q;
+        }
+        qx_buf[b].d = d;
+        qx_buf[b].sum = sum;
+    }
+    return qx_buf[0..nb];
+}
+
+/// Integer dot of 32 already-unpacked weights against 32 int8 activations.
+inline fn dotW32(w: @Vector(QK_0, i16), q: *const [QK_0]i8) i32 {
+    const X: @Vector(QK_0, i16) = @as(@Vector(QK_0, i8), q.*);
+    return @reduce(.Add, @as(@Vector(QK_0, i32), w * X));
+}
+
+/// Unpack 32 nibbles straight from packed bytes into i16 lanes. Going through
+/// a scratch [32]u8 first cost more than the dot itself: this is the whole
+/// point of the int8 path, so it must not reintroduce a per-lane loop.
+inline fn nib32(src: *const [QK_0]u8, high: bool) @Vector(QK_0, i16) {
+    const v: @Vector(QK_0, u8) = src.*;
+    const n = if (high) v >> @as(@Vector(QK_0, u3), @splat(4)) else v & @as(@Vector(QK_0, u8), @splat(0x0F));
+    return n;
+}
+
+/// Q4_K against int8 activations.
+///
+/// A super-block is eight 32-wide sub-blocks, each with its own 6-bit scale
+/// and min, so the value is `d*sc*q - dmin*m`. Summed over a sub-block that
+/// separates into `d*sc*dx*dot(q,xq) - dmin*m*dx*sum(xq)` -- one integer dot
+/// and one already-computed lane sum, then two scalar multiply-adds.
+fn matvecQ4KInt(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
+    const qx = quantizeX(x);
+    const blocks_per_row = cols / QK_K;
+    const rb = blocks_per_row * Q4_K_BLOCK;
+    for (0..rows) |r| {
+        const row = data[r * rb ..][0..rb];
+        var acc: f32 = 0;
+        for (0..blocks_per_row) |b| {
+            const block = row[b * Q4_K_BLOCK ..][0..Q4_K_BLOCK];
+            const d = f16FromBytes(block[0..2]);
+            const dmin = f16FromBytes(block[2..4]);
+            const scales: *const [12]u8 = block[4..16];
+            const qs = block[16..][0 .. QK_K / 2];
+            // sub-block j covers activation block b*8 + j
+            for (0..QK_K / QK_0) |j| {
+                var sc: u8 = undefined;
+                var mn: u8 = undefined;
+                scaleMinK4(j, scales, &sc, &mn);
+                // 32 weights of sub-block j: low nibbles of one 32-byte half
+                // for even j, high nibbles for odd j (the layout pairs them).
+                const half = j / 2;
+                const w = nib32(qs[half * QK_0 ..][0..QK_0], j % 2 == 1);
+                const xb = &qx[b * (QK_K / QK_0) + j];
+                const dot = dotW32(w, &xb.q);
+                acc += xb.d * (d * @as(f32, @floatFromInt(sc)) * @as(f32, @floatFromInt(dot)) -
+                    dmin * @as(f32, @floatFromInt(mn)) * @as(f32, @floatFromInt(xb.sum)));
+            }
+        }
+        out[r] = acc;
+    }
+}
+
+/// True for the kernels that quantize the activation vector to int8, and are
+/// therefore approximate rather than exact against the dequantize-then-dot
+/// reference.
+pub fn usesInt8Activations(t: Type) bool {
+    return switch (t) {
+        .q4_k, .q6_k, .q8_0 => true,
+        else => false,
+    };
+}
+
+/// Q6_K against int8 activations.
+///
+/// Sixteen 16-wide sub-blocks per super-block, each with a signed 8-bit scale;
+/// the value is `d*sc*(q-32)` with q a 6-bit unsigned built from a nibble of
+/// `ql` plus two bits of `qh`. Over a sub-block that separates into
+/// `d*sc*dx*(dot(q,xq) - 32*sum(xq))`, so the -32 bias never touches a lane.
+fn matvecQ6KInt(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
+    const qx = quantizeX(x);
+    const blocks_per_row = cols / QK_K;
+    const rb = blocks_per_row * Q6_K_BLOCK;
+    const m0f: @Vector(QK_0, u8) = @splat(0x0F);
+    const m3: @Vector(QK_0, u8) = @splat(3);
+    for (0..rows) |r| {
+        const row = data[r * rb ..][0..rb];
+        var acc: f32 = 0;
+        for (0..blocks_per_row) |b| {
+            const block = row[b * Q6_K_BLOCK ..][0..Q6_K_BLOCK];
+            const ql_all = block[0 .. QK_K / 2];
+            const qh_all = block[QK_K / 2 ..][0 .. QK_K / 4];
+            const sc_all = block[QK_K / 2 + QK_K / 4 ..][0 .. QK_K / 16];
+            const d = f16FromBytes(block[QK_K / 2 + QK_K / 4 + QK_K / 16 ..][0..2]);
+
+            // Two 128-value halves, each producing four 32-wide runs.
+            for (0..2) |n| {
+                const ql = ql_all[n * 64 ..][0..64];
+                const qh = qh_all[n * 32 ..][0..32];
+                const sc = sc_all[n * 8 ..][0..8];
+                const a: @Vector(QK_0, u8) = ql[0..QK_0].*;
+                const bb: @Vector(QK_0, u8) = ql[32..64].*;
+                const h: @Vector(QK_0, u8) = qh[0..QK_0].*;
+                const sh4: @Vector(QK_0, u3) = @splat(4);
+                const sh2: @Vector(QK_0, u3) = @splat(2);
+                const sh6: @Vector(QK_0, u3) = @splat(6);
+                const w: [4]@Vector(QK_0, i16) = .{
+                    @as(@Vector(QK_0, u8), (a & m0f) | ((h & m3) << sh4)),
+                    @as(@Vector(QK_0, u8), (bb & m0f) | (((h >> sh2) & m3) << sh4)),
+                    @as(@Vector(QK_0, u8), (a >> sh4) | (((h >> sh4) & m3) << sh4)),
+                    @as(@Vector(QK_0, u8), (bb >> sh4) | (((h >> sh6) & m3) << sh4)),
+                };
+                for (0..4) |k| {
+                    const xb = &qx[b * 8 + n * 4 + k];
+                    const X: @Vector(QK_0, i16) = @as(@Vector(QK_0, i8), xb.q);
+                    // A 32-wide run spans two 16-value scale groups, so the
+                    // dot and the -32 bias term both split at lane 16. Folding
+                    // them under one scale is wrong and silently degrades
+                    // every Q6_K tensor.
+                    const wv = w[k];
+                    const lo_w: @Vector(16, i16) = std.simd.extract(wv, 0, 16);
+                    const hi_w: @Vector(16, i16) = std.simd.extract(wv, 16, 16);
+                    const lo_x: @Vector(16, i16) = std.simd.extract(X, 0, 16);
+                    const hi_x: @Vector(16, i16) = std.simd.extract(X, 16, 16);
+                    const dot_lo = @reduce(.Add, @as(@Vector(16, i32), lo_w * lo_x));
+                    const dot_hi = @reduce(.Add, @as(@Vector(16, i32), hi_w * hi_x));
+                    const sum_lo = @reduce(.Add, @as(@Vector(16, i32), lo_x));
+                    const sum_hi = @reduce(.Add, @as(@Vector(16, i32), hi_x));
+                    const s0 = i8f(sc[k * 2]);
+                    const s1 = i8f(sc[k * 2 + 1]);
+                    acc += d * xb.d * (s0 * (@as(f32, @floatFromInt(dot_lo)) - 32.0 * @as(f32, @floatFromInt(sum_lo))) +
+                        s1 * (@as(f32, @floatFromInt(dot_hi)) - 32.0 * @as(f32, @floatFromInt(sum_hi))));
+                }
+            }
+        }
+        out[r] = acc;
+    }
+}
+
+/// Q8_0 against int8 activations: both sides are already int8, so this is a
+/// straight integer dot with two scales.
+fn matvecQ80Int(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
+    const qx = quantizeX(x);
+    const blocks_per_row = cols / QK_0;
+    const rb = blocks_per_row * Q8_0_BLOCK;
+    for (0..rows) |r| {
+        const row = data[r * rb ..][0..rb];
+        var acc: f32 = 0;
+        for (0..blocks_per_row) |b| {
+            const block = row[b * Q8_0_BLOCK ..][0..Q8_0_BLOCK];
+            const d = f16FromBytes(block[0..2]);
+            const W: @Vector(QK_0, i16) = @as(@Vector(QK_0, i8), @bitCast(block[2..][0..QK_0].*));
+            const X: @Vector(QK_0, i16) = @as(@Vector(QK_0, i8), qx[b].q);
+            const dot = @reduce(.Add, @as(@Vector(QK_0, i32), W * X));
+            acc += d * qx[b].d * @as(f32, @floatFromInt(dot));
         }
         out[r] = acc;
     }
@@ -1150,9 +1367,28 @@ test "matvec agrees with dequantRow for every supported type" {
         for (0..rows) |r| {
             dequantRow(t, row, data, r, cols);
             var want: f32 = 0;
-            for (row, x) |w, xv| want += w * xv;
-            // f32 accumulation in a different order, so compare relatively
-            const tol = @max(@abs(want), @abs(got[r])) * 1e-4 + 1e-3;
+            var mass: f32 = 0; // sum |w*x|, the size of the terms being summed
+            for (row, x) |w, xv| {
+                want += w * xv;
+                mass += @abs(w * xv);
+            }
+            // Two different tolerances, for two different reasons.
+            //
+            // Exact kernels differ from this reference only by summation
+            // order, so they get a tight relative bound.
+            //
+            // The int8-activation kernels quantize x to 8 bits, which is a
+            // real approximation of about 0.4% per element. Bounding that
+            // against the *result* would be wrong: a dot of random terms
+            // cancels almost completely, so the result can be orders of
+            // magnitude smaller than the terms and any per-term error looks
+            // enormous next to it. The honest bound is against the mass of
+            // the terms actually summed. Real activations (post-RMSNorm,
+            // same sign structure) cancel far less than this random case.
+            const tol = if (usesInt8Activations(t))
+                mass * 0.01
+            else
+                @max(@abs(want), @abs(got[r])) * 1e-4 + 1e-3;
             std.testing.expectApproxEqAbs(want, got[r], tol) catch |e| {
                 std.debug.print("{s} row {d}: matvec {d} vs dequant-dot {d}\n", .{ @tagName(t), r, got[r], want });
                 return e;
@@ -1176,7 +1412,10 @@ test "parallel matvec produces bit-identical results to inline" {
     defer gpa.free(x);
     for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 4.0;
 
-    for ([_]Type{ .q4_k, .q6_k, .q4_0, .f32 }) |t| {
+    // Exact kernels only: row-splitting must be bit-identical, but the
+    // int8-activation kernels quantize `x` once per matvec call, so their
+    // output legitimately depends on how rows are grouped.
+    for ([_]Type{ .q5_k, .q4_0, .q5_0, .f32 }) |t| {
         const data = try gpa.alloc(u8, tensorBytes(t, cols, rows));
         defer gpa.free(data);
         rnd.bytes(data);
