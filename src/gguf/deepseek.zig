@@ -628,10 +628,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
                 const c_t = st.c_kv_cache[(li * cfg.ctx_len + t_i) * kvr ..][0..kvr];
                 ggml.matvec(l.attn_kv_b.ty, st.k_nope, k_rows, c_t, nope, kvr);
                 const kr_t = st.k_rope_cache[(li * cfg.ctx_len + t_i) * rope ..][0..rope];
-                var dot: f32 = 0;
-                for (q_nope, st.k_nope) |a, b| dot += a * b;
-                for (q_rope, kr_t) |a, b| dot += a * b;
-                st.scores[t_i] = dot * scale;
+                st.scores[t_i] = (ggml.dotF32(q_nope, st.k_nope) + ggml.dotF32(q_rope, kr_t)) * scale;
             }
             tensor.softmax(st.scores[0..seq]);
 
@@ -641,8 +638,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             while (t_i < seq) : (t_i += 1) {
                 const c_t = st.c_kv_cache[(li * cfg.ctx_len + t_i) * kvr ..][0..kvr];
                 ggml.matvec(l.attn_kv_b.ty, st.v_t, v_rows, c_t, vd, kvr);
-                const w = st.scores[t_i];
-                for (oh, st.v_t) |*o, vv| o.* += w * vv;
+                ggml.axpy(oh, st.v_t, st.scores[t_i]);
             }
         }
         mv(l.attn_output, st.proj_out, st.head_out);
