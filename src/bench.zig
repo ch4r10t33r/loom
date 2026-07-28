@@ -101,6 +101,13 @@ const Result = struct {
 pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) !void {
     const json = hasFlag(args, "--json");
     const strict = hasFlag(args, "--check");
+    // Mirrors the node/run flags, so a CI runner's thread count can be
+    // reproduced locally: the invariants behave differently at one thread.
+    for (args, 0..) |a, i| {
+        if (std.mem.eql(u8, a, "--threads") and i + 1 < args.len) {
+            generator.kernel_threads = std.fmt.parseInt(usize, args[i + 1], 10) catch 0;
+        }
+    }
     if (hasFlag(args, "--pool")) return poolOverhead(gpa, io, out);
 
     var results = std.ArrayList(Result).empty;
@@ -174,7 +181,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
         const Ctx = struct { data: []const u8, xs: []const f32, outs: []f32, n: usize };
         const c = Ctx{ .data = data, .xs = xs, .outs = outs, .n = n };
         backend.parallelBegin(generator.threads());
-        const pair = medianRatio(io, 11, c, struct {
+        const pair = medianRatio(io, 21, c, struct {
             fn f(cc: Ctx) void {
                 backend.matmul(.q4_k, cc.outs, cc.data, cc.xs, cc.n, ROWS, COLS);
             }
@@ -196,7 +203,18 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
 
         // ---- invariants ----
         var failures: usize = 0;
-        try check(out, json, &failures, "batching beats unbatched", pair.ratio < 0.95, "ratio {d:.2} ({d:.3} ms vs {d:.3} ms)", .{ pair.ratio, batched, serial });
+        // Threshold 0.98, not 0.95. The margin batching wins by is
+        // machine-dependent: 0.70 on eight cores here, but only 0.96 on a
+        // single-core CI runner, where the batched path's larger working set
+        // costs back most of what the shared weight unpack saves. A 0.95 gate
+        // passed locally and failed on the runner.
+        //
+        // 0.98 still catches the failure this exists for. When batching is not
+        // wired into a path, `matmul` falls through to calling `matvec` n
+        // times -- which is *literally the other side of this comparison* --
+        // so the ratio is 1.00, not 0.96. The gate distinguishes "batching is
+        // less effective on this machine" from "batching is not happening".
+        try check(out, json, &failures, "batching beats unbatched", pair.ratio < 0.98, "ratio {d:.2} ({d:.3} ms vs {d:.3} ms)", .{ pair.ratio, batched, serial });
 
         // Only meaningful for the CPU backend: a GPU backend does not use the
         // CPU worker pool for the kernels it owns, so the comparison would be

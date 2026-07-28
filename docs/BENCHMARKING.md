@@ -24,6 +24,18 @@ host, idle, on mains power. A shared CI runner has none of those properties.
 Those survive a noisy runner, so CI gates on them and merely reports the
 timings.
 
+They still need a threshold chosen for the *worst* environment they run in,
+not the best. "Batching beats unbatched" is a ratio of 0.70 on eight cores
+here and 0.96 on a single-core CI runner, where the batched path's larger
+working set costs back most of what the shared weight unpack saves. A gate set
+from the local number failed on the runner.
+
+The threshold that works is 0.98, and it still catches what the invariant
+exists for: when batching is not wired into a path, `matmul` falls through to
+calling `matvec` n times, which is literally the other side of the
+comparison — so the ratio is 1.00, not 0.96. The gate separates "batching is
+less effective on this machine" from "batching is not happening".
+
 This is not theoretical. The two performance bugs found in this codebase were
 both *batched prefill wired into only one of the two prefill paths* — the
 first measurement round showed no improvement at all, twice, and the cause was
