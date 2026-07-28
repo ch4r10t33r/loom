@@ -223,8 +223,8 @@ distribution plane was never architecture-specific: expert sharding keys on the
 GGUF tensor-naming convention that every mixture-of-experts conversion follows.
 
 Weights remain in their GGML quantized formats in a read-only memory map, and
-each matmul is a fused kernel over the raw bytes, so no tensor is dequantized
-wholesale. Two families are supported. *Affine* formats
+each matmul is a fused, vectorized kernel over the raw bytes, distributed
+across a worker pool by row, so no tensor is dequantized wholesale. Two families are supported. *Affine* formats
 (F32/F16/Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K) reconstruct a value arithmetically.
 *Codebook* formats (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S,
 IQ4_NL, IQ4_XS, and MXFP4) instead store an index into a static grid table, so
@@ -593,6 +593,8 @@ the spec governs the p2p protocol and the roadmap governs status.
 | 2026-07-28 | A node serves a GGUF locally when it is not expert-sharded, instead of falling back to the synthetic checkpoint | A dense model has no routed experts, so it shards into fixed ranges and cannot be served *distributed* — but it is a complete model file, and answering from an unrelated synthetic checkpoint reads as a broken model rather than as an unsupported topology |
 | 2026-07-28 | A chat UI is compiled into the binary and served on its own listener (`--ui-port`, default 8555), sharing the HTTP implementation and generator with the OpenAI API; plus a periodic console status line (`--status-secs`) | Nothing in the system reported its own state: exercising a node meant hand-writing HTTP, and membership and holdings move with no request arriving, so an event-only log made a churning node look idle. Serving the page same-origin with the API removes any CORS or host configuration. The UI separates decode speed from time-to-first-token, because on a partial node the first token also pays for the prefill's expert fetches |
 | 2026-07-28 | `/health` reports whether the served weights are one of loom's random-weight fixtures, and the UI says so | A fixture answers with meaningless text by construction; unlabelled, that is indistinguishable from a broken model and was the first thing a new user saw |
+| 2026-07-28 | Q4_1 and Q5_1 implemented, completing every non-ternary GGML type | Three Q5_1 tensors out of 377 blocked an entire 8.9 GB checkpoint. llama.cpp quant *mixes* fold a handful of legacy types into otherwise K-quant files, so one missing format costs a whole model |
+| 2026-07-28 | SIMD kernels via `@Vector` plus row-parallel matvec over a worker pool (issue #11) | Inference ran at roughly 1% of the machine's memory bandwidth on one of ten cores: the limit was scalar single-threaded code, not the absence of a GPU. Measured 23.6x on a 10-core M5 (1.1 -> 26.0 tok/s, TinyLlama 1.1B Q4_K_M). Row-splitting is exact rather than approximate, since each output row is an independent dot product with no reassociation, so results stay bit-identical to the serial path and the tests assert it. The pool is scoped to a generation because Zig 0.16 moved condition variables under `Io`, which the kernels deliberately do not depend on, so parked workers would otherwise spin |
 
 ---
 

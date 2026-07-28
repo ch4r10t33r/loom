@@ -36,6 +36,7 @@ pub const sync = @import("p2p/sync.zig");
 pub const peers = @import("p2p/peers.zig");
 pub const gossip = @import("p2p/gossip.zig");
 pub const ggml = @import("gguf/ggml.zig");
+const generator = @import("node/generator.zig");
 pub const llama = @import("gguf/llama.zig");
 pub const deepseek = @import("gguf/deepseek.zig");
 pub const expert_fetch = @import("p2p/expert_fetch.zig");
@@ -118,14 +119,14 @@ fn usage(out: *Io.Writer) !void {
         \\            [--gguf FILE | --bootstrap HOST:PORT]
         \\            [--peers H:P,H:P,...] [--hold-fraction F] [--range-mb M]
         \\            [--advertise HOST:PORT] [--r-target N] [--free-quota TOKENS] [--admin-token TOK]
-        \\            [--ui-addr A] [--ui-port P] [--status-secs N]
+        \\            [--ui-addr A] [--ui-port P] [--status-secs N] [--threads N]
         \\  loom light [--full-nodes H:P[,...]] [--openai-port P --openai-full-nodes H:P[,...]]
         \\             [--rpc-addr A] [--rpc-port P] [--openai-addr A] [--client-id ID]
         \\  loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2|llama|qwen2moe|qwen3moe|glm4moe]
         \\  loom gguf info <file> [--range-mb M]
         \\  loom gguf shard <file>
         \\  loom gguf run <file.gguf | store-dir> [--prompt STR] [--max-tokens N] [--temp T]
-        \\                [--seed S] [--ctx N] [--committee H:P,...] [--peers H:P,...]
+        \\                [--seed S] [--ctx N] [--threads N] [--committee H:P,...] [--peers H:P,...]
         \\  loom gen <dir> [--glm] [--seed N]
         \\  loom info <dir>
         \\  loom iobench <file> [--threads N] [--block-mb M] [--reads R]
@@ -391,6 +392,7 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .ui_addr = flagStr(args, "--ui-addr") orelse "127.0.0.1",
         .ui_port = try flagU16(args, "--ui-port", @intCast(try envU64(env, "UI_PORT", 8555))),
         .status_secs = @intCast(try flagUsize(args, "--status-secs", 30)),
+        .kernel_threads = try flagUsize(args, "--threads", 0),
         .chat_format = flagStr(args, "--chat-format"),
     });
 }
@@ -734,12 +736,16 @@ fn runStoreWith(
     });
 
     const ctx_cap = try flagUsize(args, "--ctx", 4096);
+    generator.kernel_threads = try flagUsize(args, "--threads", 0);
     m.cfg.ctx_len = @min(m.cfg.ctx_len, ctx_cap);
     const c = m.cfg;
     try out.print("gguf: dim={d} layers={d} heads={d} vocab={d} ctx={d}\n", .{
         c.dim, c.n_layers, c.n_heads, c.vocab, c.ctx_len,
     });
     try out.flush();
+
+    ggml.parallelBegin(generator.threads());
+    defer ggml.parallelEnd();
 
     var st = try E.State.init(gpa, c);
     defer st.deinit(gpa);
@@ -811,12 +817,16 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
     defer m.deinit();
     // cap the KV allocation: model context lengths can be 100k+
     const ctx_cap = try flagUsize(args, "--ctx", 4096);
+    generator.kernel_threads = try flagUsize(args, "--threads", 0);
     m.cfg.ctx_len = @min(m.cfg.ctx_len, ctx_cap);
     const c = m.cfg;
     try out.print("gguf: dim={d} layers={d} heads={d} vocab={d} ctx={d}\n", .{
         c.dim, c.n_layers, c.n_heads, c.vocab, c.ctx_len,
     });
     try out.flush();
+
+    ggml.parallelBegin(generator.threads());
+    defer ggml.parallelEnd();
 
     var st = try eng.State.init(gpa, c);
     defer st.deinit(gpa);

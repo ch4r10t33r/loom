@@ -22,7 +22,9 @@ pub const Type = enum(u32) {
     f32 = 0,
     f16 = 1,
     q4_0 = 2,
+    q4_1 = 3,
     q5_0 = 6,
+    q5_1 = 7,
     q8_0 = 8,
     q4_k = 12,
     q5_k = 13,
@@ -44,7 +46,9 @@ pub const Type = enum(u32) {
             .f32,
             .f16,
             .q4_0,
+            .q4_1,
             .q5_0,
+            .q5_1,
             .q8_0,
             .q4_k,
             .q5_k,
@@ -76,7 +80,9 @@ pub const Type = enum(u32) {
 
 pub const QK_0: usize = 32; // block width for q4_0 / q8_0
 const Q4_0_BLOCK: usize = 2 + QK_0 / 2; // f16 scale + 16 nibble bytes = 18
+const Q4_1_BLOCK: usize = 2 + 2 + QK_0 / 2; // f16 scale + f16 min + nibbles = 20
 const Q5_0_BLOCK: usize = 2 + 4 + QK_0 / 2; // f16 scale + 32 high bits + nibbles = 22
+const Q5_1_BLOCK: usize = 2 + 2 + 4 + QK_0 / 2; // + f16 min = 24
 const Q8_0_BLOCK: usize = 2 + QK_0; // f16 scale + 32 int8 = 34
 
 pub const QK_K: usize = 256; // super-block width for K-quants
@@ -91,7 +97,9 @@ pub fn rowBytes(t: Type, n: usize) usize {
         .f32 => n * 4,
         .f16 => n * 2,
         .q4_0 => (n / QK_0) * Q4_0_BLOCK,
+        .q4_1 => (n / QK_0) * Q4_1_BLOCK,
         .q5_0 => (n / QK_0) * Q5_0_BLOCK,
+        .q5_1 => (n / QK_0) * Q5_1_BLOCK,
         .q8_0 => (n / QK_0) * Q8_0_BLOCK,
         .q4_k => (n / QK_K) * Q4_K_BLOCK,
         .q5_k => (n / QK_K) * Q5_K_BLOCK,
@@ -110,7 +118,7 @@ pub fn tensorBytes(t: Type, ne0: usize, rows: usize) usize {
 pub fn blockElems(t: Type) usize {
     return switch (t) {
         .f32, .f16 => 1,
-        .q4_0, .q5_0, .q8_0 => QK_0,
+        .q4_0, .q4_1, .q5_0, .q5_1, .q8_0 => QK_0,
         .q4_k, .q5_k, .q6_k => QK_K,
         // codebook types: iq4_nl and mxfp4 are 32-wide, the rest are 256-wide
         .iq4_nl, .mxfp4 => iq.QK_NL,
@@ -138,7 +146,9 @@ pub fn tensorBytesChecked(t: Type, ne0: usize, rows: usize, ne2: usize) !usize {
 pub fn blockBytes(t: Type) usize {
     return switch (t) {
         .q4_0 => Q4_0_BLOCK,
+        .q4_1 => Q4_1_BLOCK,
         .q5_0 => Q5_0_BLOCK,
+        .q5_1 => Q5_1_BLOCK,
         .q8_0 => Q8_0_BLOCK,
         .q4_k => Q4_K_BLOCK,
         .q5_k => Q5_K_BLOCK,
@@ -157,20 +167,246 @@ pub fn blockBytes(t: Type) usize {
     };
 }
 
+// ---- SIMD helpers (issue #11) ------------------------------------------------
+
+/// Lanes per vector op. 8 f32 is 32 bytes: two NEON registers on aarch64, one
+/// AVX register on x86-64, and it lets the backend keep several accumulators
+/// in flight. Zig lowers @Vector to whatever the target actually has, so this
+/// stays portable rather than becoming per-arch intrinsics.
+const LANES = 8;
+const Vf = @Vector(LANES, f32);
+
+/// Dot product of two equal-length f32 slices.
+///
+/// The scalar version was a serial dependency chain: every `acc += a*b` waits
+/// on the previous add, so the FPU stalls on latency rather than running at
+/// throughput. Four independent accumulators plus vector lanes break that
+/// chain, which is most of the win here -- more than the lane count alone
+/// suggests.
+inline fn dotF32(a: []const f32, b: []const f32) f32 {
+    std.debug.assert(a.len == b.len);
+    var acc0: Vf = @splat(0);
+    var acc1: Vf = @splat(0);
+    var acc2: Vf = @splat(0);
+    var acc3: Vf = @splat(0);
+    var i: usize = 0;
+    while (i + 4 * LANES <= a.len) : (i += 4 * LANES) {
+        acc0 += @as(Vf, a[i..][0..LANES].*) * @as(Vf, b[i..][0..LANES].*);
+        acc1 += @as(Vf, a[i + LANES ..][0..LANES].*) * @as(Vf, b[i + LANES ..][0..LANES].*);
+        acc2 += @as(Vf, a[i + 2 * LANES ..][0..LANES].*) * @as(Vf, b[i + 2 * LANES ..][0..LANES].*);
+        acc3 += @as(Vf, a[i + 3 * LANES ..][0..LANES].*) * @as(Vf, b[i + 3 * LANES ..][0..LANES].*);
+    }
+    while (i + LANES <= a.len) : (i += LANES) {
+        acc0 += @as(Vf, a[i..][0..LANES].*) * @as(Vf, b[i..][0..LANES].*);
+    }
+    var acc = @reduce(.Add, acc0 + acc1 + acc2 + acc3);
+    while (i < a.len) : (i += 1) acc += a[i] * b[i];
+    return acc;
+}
+
+/// Sum of an f32 slice (the `m * sum(x)` term the affine "_1" kernels hoist).
+inline fn sumF32(a: []const f32) f32 {
+    var acc0: Vf = @splat(0);
+    var i: usize = 0;
+    while (i + LANES <= a.len) : (i += LANES) acc0 += @as(Vf, a[i..][0..LANES].*);
+    var acc = @reduce(.Add, acc0);
+    while (i < a.len) : (i += 1) acc += a[i];
+    return acc;
+}
+
+/// Low / high nibbles of 8 packed bytes, widened to f32 vectors. The K-quant
+/// dequant loops are almost entirely this operation.
+inline fn loNib(b: *const [LANES]u8) Vf {
+    const v: @Vector(LANES, u8) = b.*;
+    return @floatFromInt(v & @as(@Vector(LANES, u8), @splat(0x0F)));
+}
+inline fn hiNib(b: *const [LANES]u8) Vf {
+    const v: @Vector(LANES, u8) = b.*;
+    return @floatFromInt(v >> @as(@Vector(LANES, u3), @splat(4)));
+}
+
+/// Widen 8 f16 bit patterns to an f32 vector in one step.
+inline fn f16x8(bits: *const [LANES]u16) Vf {
+    const h: @Vector(LANES, f16) = @bitCast(@as(@Vector(LANES, u16), bits.*));
+    return @floatCast(h);
+}
+
 inline fn f16FromBytes(b: []const u8) f32 {
     const bits = std.mem.readInt(u16, b[0..2], .little);
     return @floatCast(@as(f16, @bitCast(bits)));
+}
+
+// ---- row-parallel matvec (issue #11) -----------------------------------------
+
+/// A matvec splits cleanly across rows: each row writes one `out` element and
+/// reads shared, immutable weight bytes and input vector, so workers never
+/// touch the same memory. Splitting by row therefore needs no locking and no
+/// changes to the kernels -- each worker calls the same kernel on a sub-slice.
+///
+/// The pool is explicitly started and stopped around a generation rather than
+/// living for the process lifetime, because without a futex or condition
+/// variable (Zig 0.16 moved those under `Io`, which the kernels deliberately
+/// do not depend on) idle workers would have to spin. Spawning ~10 threads
+/// costs tens of microseconds against a generation lasting seconds, so tying
+/// their lifetime to a request is both simpler and cheaper than keeping them
+/// parked.
+const MAX_WORKERS = 32;
+
+/// Rows below this are not worth distributing: the hand-off costs more than
+/// the work. Norm and router projections are tiny and frequent.
+const MIN_ROWS_PER_THREAD = 64;
+
+/// Spin iterations before falling back to yielding. A matvec is tens of
+/// microseconds, so the interesting waits are far shorter than a context
+/// switch; yielding immediately turned an 8x parallel win into 1.1x.
+const SPIN_BEFORE_YIELD: u32 = 40_000;
+
+const Pool = struct {
+    n: usize = 0, // live workers, 0 = run inline
+    threads: [MAX_WORKERS]std.Thread = undefined,
+    quit: std.atomic.Value(bool) = .init(false),
+    /// Bumped once per job; a worker runs when it sees a value it has not run.
+    seq: std.atomic.Value(u64) = .init(0),
+    /// Workers still inside the current job.
+    active: std.atomic.Value(usize) = .init(0),
+    /// Next unclaimed row block.
+    cursor: std.atomic.Value(usize) = .init(0),
+
+    // job description, written before `seq` is published and read after
+    job_ty: Type = .f32,
+    job_out: []f32 = &.{},
+    job_data: []const u8 = &.{},
+    job_x: []const f32 = &.{},
+    job_rows: usize = 0,
+    job_cols: usize = 0,
+    job_rb: usize = 0,
+    job_chunk: usize = 0,
+};
+
+var pool: Pool = .{};
+
+/// Start `n` worker threads (0 or 1 disables parallelism). Safe to call when
+/// already started: it is a no-op. Not thread-safe against itself -- call it
+/// from the thread that owns the generation.
+pub fn parallelBegin(n: usize) void {
+    if (pool.n != 0) return;
+    const want = @min(n, MAX_WORKERS);
+    if (want <= 1) return;
+    pool.quit.store(false, .monotonic);
+    pool.seq.store(0, .monotonic);
+    pool.active.store(0, .monotonic);
+    var started: usize = 0;
+    // `want` includes the calling thread, so spawn one fewer.
+    while (started + 1 < want) : (started += 1) {
+        pool.threads[started] = std.Thread.spawn(.{}, worker, .{started}) catch break;
+    }
+    pool.n = started;
+}
+
+pub fn parallelEnd() void {
+    if (pool.n == 0) return;
+    pool.quit.store(true, .release);
+    // wake workers out of their spin so they observe `quit`
+    _ = pool.seq.fetchAdd(1, .release);
+    for (pool.threads[0..pool.n]) |t| t.join();
+    pool.n = 0;
+}
+
+fn worker(_: usize) void {
+    var seen: u64 = 0;
+    var idle: u32 = 0;
+    while (true) {
+        const s = pool.seq.load(.acquire);
+        if (s == seen) {
+            if (pool.quit.load(.acquire)) return;
+            // Gaps between matvecs during a generation are microseconds, and a
+            // yield costs a context switch -- far more than the wait. Spin
+            // first, and only fall back to yielding once the pause looks long
+            // (between requests), so an idle pool does not burn cores.
+            idle += 1;
+            if (idle < SPIN_BEFORE_YIELD) {
+                std.atomic.spinLoopHint();
+            } else {
+                std.Thread.yield() catch {};
+            }
+            continue;
+        }
+        idle = 0;
+        seen = s;
+        if (pool.quit.load(.acquire)) return;
+        runChunks();
+        _ = pool.active.fetchSub(1, .release);
+    }
+}
+
+/// Claim and run row blocks until the job is exhausted. Shared by the workers
+/// and the submitting thread, so the submitter contributes work instead of
+/// idling.
+fn runChunks() void {
+    while (true) {
+        const start = pool.cursor.fetchAdd(pool.job_chunk, .acq_rel);
+        if (start >= pool.job_rows) return;
+        const end = @min(start + pool.job_chunk, pool.job_rows);
+        dispatch(
+            pool.job_ty,
+            pool.job_out[start..end],
+            pool.job_data[start * pool.job_rb .. end * pool.job_rb],
+            pool.job_x,
+            end - start,
+            pool.job_cols,
+        );
+    }
 }
 
 /// out[r] = sum_c W[r][c] * x[c] over a row-major tensor of `rows` rows and
 /// `cols` columns stored in format `t` at `data`.
 pub fn matvec(t: Type, out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
     std.debug.assert(out.len == rows and x.len == cols);
+    const workers = pool.n;
+    if (workers == 0 or rows < 2 * MIN_ROWS_PER_THREAD) {
+        return dispatch(t, out, data, x, rows, cols);
+    }
+
+    // Split into more blocks than threads so a slow core does not hold up the
+    // whole matvec: workers claim the next block when they finish one.
+    const rb = rowBytes(t, cols);
+    const per = @max(MIN_ROWS_PER_THREAD, (rows + (workers + 1) * 2 - 1) / ((workers + 1) * 2));
+    pool.job_ty = t;
+    pool.job_out = out;
+    pool.job_data = data;
+    pool.job_x = x;
+    pool.job_rows = rows;
+    pool.job_cols = cols;
+    pool.job_rb = rb;
+    pool.job_chunk = per;
+    pool.cursor.store(0, .monotonic);
+    pool.active.store(workers, .monotonic);
+    // release: everything above must be visible before a worker sees the seq
+    _ = pool.seq.fetchAdd(1, .release);
+
+    runChunks(); // the submitting thread works too
+
+    // Workers are running right now, so this wait is short by construction:
+    // spin rather than yield.
+    var spins: u32 = 0;
+    while (pool.active.load(.acquire) != 0) {
+        spins += 1;
+        if (spins < SPIN_BEFORE_YIELD) {
+            std.atomic.spinLoopHint();
+        } else {
+            std.Thread.yield() catch {};
+        }
+    }
+}
+
+fn dispatch(t: Type, out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
     switch (t) {
         .f32 => matvecF32(out, data, x, rows, cols),
         .f16 => matvecF16(out, data, x, rows, cols),
         .q4_0 => matvecQ40(out, data, x, rows, cols),
+        .q4_1 => matvecQ41(out, data, x, rows, cols),
         .q5_0 => matvecQ50(out, data, x, rows, cols),
+        .q5_1 => matvecQ51(out, data, x, rows, cols),
         .q8_0 => matvecQ80(out, data, x, rows, cols),
         .q4_k, .q5_k, .q6_k => matvecK(t, out, data, x, rows, cols),
         else => matvecCodebook(t, out, data, x, rows, cols),
@@ -221,10 +457,7 @@ fn matvecCodebook(t: Type, out: []f32, data: []const u8, x: []const f32, rows: u
         var b: usize = 0;
         while (b < blocks_per_row) : (b += 1) {
             const n = dequantBlockCodebook(t, row[b * bs ..][0..bs], &vals);
-            const xb = x[b * blk ..][0..blk];
-            var partial: f32 = 0;
-            for (vals[0..n], xb) |v, xv| partial += v * xv;
-            acc += partial;
+            acc += dotF32(vals[0..n], x[b * blk ..][0..blk]);
         }
         out[r] = acc;
     }
@@ -255,10 +488,7 @@ fn matvecK(t: Type, out: []f32, data: []const u8, x: []const f32, rows: usize, c
                 .q6_k => dequantBlockQ6K(block, &vals),
                 else => unreachable,
             }
-            const xb = x[b * QK_K ..][0..QK_K];
-            var partial: f32 = 0;
-            for (vals, xb) |v, xv| partial += v * xv;
-            acc += partial;
+            acc += dotF32(&vals, x[b * QK_K ..][0..QK_K]);
         }
         out[r] = acc;
     }
@@ -293,13 +523,15 @@ fn dequantBlockQ4K(block: []const u8, vals: *[QK_K]f32) void {
         scaleMinK4(is + 1, scales, &sc, &mn);
         const d2 = d * @as(f32, @floatFromInt(sc));
         const m2 = dmin * @as(f32, @floatFromInt(mn));
+        const vd1: Vf = @splat(d1);
+        const vm1: Vf = @splat(m1);
+        const vd2: Vf = @splat(d2);
+        const vm2: Vf = @splat(m2);
         var l: usize = 0;
-        while (l < 32) : (l += 1) {
-            vals[y + l] = d1 * @as(f32, @floatFromInt(qs[q + l] & 0xF)) - m1;
-        }
-        l = 0;
-        while (l < 32) : (l += 1) {
-            vals[y + 32 + l] = d2 * @as(f32, @floatFromInt(qs[q + l] >> 4)) - m2;
+        while (l < 32) : (l += LANES) {
+            const b = qs[q + l ..][0..LANES];
+            vals[y + l ..][0..LANES].* = vd1 * loNib(b) - vm1;
+            vals[y + 32 + l ..][0..LANES].* = vd2 * hiNib(b) - vm2;
         }
         y += 64;
         q += 32;
@@ -328,15 +560,20 @@ fn dequantBlockQ5K(block: []const u8, vals: *[QK_K]f32) void {
         scaleMinK4(is + 1, scales, &sc, &mn);
         const d2 = d * @as(f32, @floatFromInt(sc));
         const m2 = dmin * @as(f32, @floatFromInt(mn));
+        const vd1: Vf = @splat(d1);
+        const vm1: Vf = @splat(m1);
+        const vd2: Vf = @splat(d2);
+        const vm2: Vf = @splat(m2);
+        const v16: Vf = @splat(16);
+        const vz: Vf = @splat(0);
         var l: usize = 0;
-        while (l < 32) : (l += 1) {
-            const hi: f32 = if (qh[l] & hb1 != 0) 16 else 0;
-            vals[y + l] = d1 * (@as(f32, @floatFromInt(qs[q + l] & 0xF)) + hi) - m1;
-        }
-        l = 0;
-        while (l < 32) : (l += 1) {
-            const hi: f32 = if (qh[l] & hb2 != 0) 16 else 0;
-            vals[y + 32 + l] = d2 * (@as(f32, @floatFromInt(qs[q + l] >> 4)) + hi) - m2;
+        while (l < 32) : (l += LANES) {
+            const b = qs[q + l ..][0..LANES];
+            const h: @Vector(LANES, u8) = qh[l..][0..LANES].*;
+            const set1 = (h & @as(@Vector(LANES, u8), @splat(hb1))) != @as(@Vector(LANES, u8), @splat(0));
+            const set2 = (h & @as(@Vector(LANES, u8), @splat(hb2))) != @as(@Vector(LANES, u8), @splat(0));
+            vals[y + l ..][0..LANES].* = vd1 * (loNib(b) + @select(f32, set1, v16, vz)) - vm1;
+            vals[y + 32 + l ..][0..LANES].* = vd2 * (hiNib(b) + @select(f32, set2, v16, vz)) - vm2;
         }
         y += 64;
         q += 32;
@@ -357,21 +594,40 @@ fn dequantBlockQ6K(block: []const u8, vals: *[QK_K]f32) void {
     var qho: usize = 0;
     var sco: usize = 0;
     var n: usize = 0;
+    const v32: Vf = @splat(32);
+    const m0f: @Vector(LANES, u8) = @splat(0x0F);
+    const m3: @Vector(LANES, u8) = @splat(3);
     while (n < QK_K) : (n += 128) {
-        var l: usize = 0;
-        while (l < 32) : (l += 1) {
-            const is = l / 16;
-            const ql = ql_all[qlo..];
-            const qh = qh_all[qho..];
-            const sc = sc_all[sco..];
-            const q1: i32 = @as(i32, (ql[l] & 0xF) | ((qh[l] >> 0 & 3) << 4)) - 32;
-            const q2: i32 = @as(i32, (ql[l + 32] & 0xF) | ((qh[l] >> 2 & 3) << 4)) - 32;
-            const q3: i32 = @as(i32, (ql[l] >> 4) | ((qh[l] >> 4 & 3) << 4)) - 32;
-            const q4: i32 = @as(i32, (ql[l + 32] >> 4) | ((qh[l] >> 6 & 3) << 4)) - 32;
-            vals[y + l] = d * i8f(sc[is]) * @as(f32, @floatFromInt(q1));
-            vals[y + l + 32] = d * i8f(sc[is + 2]) * @as(f32, @floatFromInt(q2));
-            vals[y + l + 64] = d * i8f(sc[is + 4]) * @as(f32, @floatFromInt(q3));
-            vals[y + l + 96] = d * i8f(sc[is + 6]) * @as(f32, @floatFromInt(q4));
+        const ql = ql_all[qlo..];
+        const qh = qh_all[qho..];
+        const sc = sc_all[sco..];
+        // `is` is l/16, so it is constant across each half of the 32-wide run.
+        // Splitting the loop hoists the four scale lookups out of it and makes
+        // the body pure vector work.
+        var half: usize = 0;
+        while (half < 2) : (half += 1) {
+            const is = half;
+            const s1: Vf = @splat(d * i8f(sc[is]));
+            const s2: Vf = @splat(d * i8f(sc[is + 2]));
+            const s3: Vf = @splat(d * i8f(sc[is + 4]));
+            const s4: Vf = @splat(d * i8f(sc[is + 6]));
+            var l: usize = half * 16;
+            while (l < half * 16 + 16) : (l += LANES) {
+                const a: @Vector(LANES, u8) = ql[l..][0..LANES].*;
+                const b: @Vector(LANES, u8) = ql[l + 32 ..][0..LANES].*;
+                const h: @Vector(LANES, u8) = qh[l..][0..LANES].*;
+                const sh4: @Vector(LANES, u3) = @splat(4);
+                const sh2: @Vector(LANES, u3) = @splat(2);
+                const sh6: @Vector(LANES, u3) = @splat(6);
+                const q1: Vf = @floatFromInt((a & m0f) | ((h & m3) << sh4));
+                const q2: Vf = @floatFromInt((b & m0f) | (((h >> sh2) & m3) << sh4));
+                const q3: Vf = @floatFromInt((a >> sh4) | (((h >> sh4) & m3) << sh4));
+                const q4: Vf = @floatFromInt((b >> sh4) | (((h >> sh6) & m3) << sh4));
+                vals[y + l ..][0..LANES].* = s1 * (q1 - v32);
+                vals[y + l + 32 ..][0..LANES].* = s2 * (q2 - v32);
+                vals[y + l + 64 ..][0..LANES].* = s3 * (q3 - v32);
+                vals[y + l + 96 ..][0..LANES].* = s4 * (q4 - v32);
+            }
         }
         y += 128;
         qlo += 64;
@@ -380,7 +636,7 @@ fn dequantBlockQ6K(block: []const u8, vals: *[QK_K]f32) void {
     }
 }
 
-inline fn i8f(b: u8) f32 {
+fn i8f(b: u8) f32 {
     return @floatFromInt(@as(i8, @bitCast(b)));
 }
 
@@ -388,10 +644,7 @@ fn matvecF32(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: us
     const w: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, data[0 .. rows * cols * 4]));
     var r: usize = 0;
     while (r < rows) : (r += 1) {
-        const row = w[r * cols ..][0..cols];
-        var acc: f32 = 0;
-        for (row, x) |wv, xv| acc += wv * xv;
-        out[r] = acc;
+        out[r] = dotF32(w[r * cols ..][0..cols], x);
     }
 }
 
@@ -400,9 +653,14 @@ fn matvecF16(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: us
     var r: usize = 0;
     while (r < rows) : (r += 1) {
         const row = w[r * cols ..][0..cols];
-        var acc: f32 = 0;
-        for (row, x) |bits, xv| {
-            acc += @as(f32, @floatCast(@as(f16, @bitCast(bits)))) * xv;
+        var vacc: Vf = @splat(0);
+        var i: usize = 0;
+        while (i + LANES <= cols) : (i += LANES) {
+            vacc += f16x8(row[i..][0..LANES]) * @as(Vf, x[i..][0..LANES].*);
+        }
+        var acc = @reduce(.Add, vacc);
+        while (i < cols) : (i += 1) {
+            acc += @as(f32, @floatCast(@as(f16, @bitCast(row[i])))) * x[i];
         }
         out[r] = acc;
     }
@@ -433,6 +691,78 @@ fn matvecQ40(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: us
                 partial += lo * xb[j] + hi * xb[j + QK_0 / 2];
             }
             acc += partial * scale;
+        }
+        out[r] = acc;
+    }
+}
+
+/// Q4_1 / Q5_1: the affine "_1" variants. Unlike Q4_0/Q5_0 there is no fixed
+/// -8/-16 offset; each block carries its own minimum, so a value is
+/// `d*q + m` with q unsigned. Rare in modern files, but llama.cpp's quant
+/// *mixes* still fold a handful of them into otherwise K-quant checkpoints,
+/// and one unreadable tensor blocks a whole model (issue #51).
+fn matvecQ41(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
+    std.debug.assert(cols % QK_0 == 0);
+    const blocks_per_row = cols / QK_0;
+    const rb = blocks_per_row * Q4_1_BLOCK;
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        const row = data[r * rb ..][0..rb];
+        var acc: f32 = 0;
+        var b: usize = 0;
+        while (b < blocks_per_row) : (b += 1) {
+            const block = row[b * Q4_1_BLOCK ..][0..Q4_1_BLOCK];
+            const d = f16FromBytes(block[0..2]);
+            const m = f16FromBytes(block[2..4]);
+            const qs = block[4..][0 .. QK_0 / 2];
+            const xb = x[b * QK_0 ..][0..QK_0];
+            // sum(d*q + m)*x = d*sum(q*x) + m*sum(x): hoist the min out of the
+            // inner loop rather than adding it per lane.
+            var dot_q: f32 = 0;
+            var j: usize = 0;
+            while (j < QK_0 / 2) : (j += 1) {
+                dot_q += @as(f32, @floatFromInt(qs[j] & 0xF)) * xb[j] +
+                    @as(f32, @floatFromInt(qs[j] >> 4)) * xb[j + QK_0 / 2];
+            }
+            acc += d * dot_q + m * sumF32(xb);
+        }
+        out[r] = acc;
+    }
+}
+
+fn matvecQ51(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
+    std.debug.assert(cols % QK_0 == 0);
+    const blocks_per_row = cols / QK_0;
+    const rb = blocks_per_row * Q5_1_BLOCK;
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        const row = data[r * rb ..][0..rb];
+        var acc: f32 = 0;
+        var b: usize = 0;
+        while (b < blocks_per_row) : (b += 1) {
+            const block = row[b * Q5_1_BLOCK ..][0..Q5_1_BLOCK];
+            const d = f16FromBytes(block[0..2]);
+            const m = f16FromBytes(block[2..4]);
+            const qh = std.mem.readInt(u32, block[4..8], .little);
+            const qs = block[8..][0 .. QK_0 / 2];
+            const xb = x[b * QK_0 ..][0..QK_0];
+            var dot_q: f32 = 0;
+            var sum_x: f32 = 0;
+            var j: u5 = 0;
+            while (true) {
+                // 5th bit: lane j from bit j, lane j+16 from bit j+16 (the
+                // +12 shift lands it at 0x10 directly, as in llama.cpp).
+                const xh0: u8 = @intCast(((qh >> j) << 4) & 0x10);
+                const xh1: u8 = @intCast((qh >> (j + 12)) & 0x10);
+                const x0 = xb[j];
+                const x1 = xb[@as(usize, j) + QK_0 / 2];
+                dot_q += @as(f32, @floatFromInt((qs[j] & 0xF) | xh0)) * x0 +
+                    @as(f32, @floatFromInt((qs[j] >> 4) | xh1)) * x1;
+                sum_x += x0 + x1;
+                if (j == 15) break;
+                j += 1;
+            }
+            acc += d * dot_q + m * sum_x;
         }
         out[r] = acc;
     }
@@ -551,6 +881,29 @@ pub fn dequantRow(t: Type, out: []f32, data: []const u8, r: usize, cols: usize) 
                     const xh1: u8 = @intCast((qh >> (j + 12)) & 0x10);
                     ob[j] = @as(f32, @floatFromInt(@as(i32, (qs[j] & 0xF) | xh0) - 16)) * scale;
                     ob[@as(usize, j) + QK_0 / 2] = @as(f32, @floatFromInt(@as(i32, (qs[j] >> 4) | xh1) - 16)) * scale;
+                    if (j == 15) break;
+                    j += 1;
+                }
+            }
+        },
+        .q4_1, .q5_1 => {
+            const rb = rowBytes(t, cols);
+            const row = data[r * rb ..][0..rb];
+            const bs: usize = if (t == .q4_1) Q4_1_BLOCK else Q5_1_BLOCK;
+            var b: usize = 0;
+            while (b * QK_0 < cols) : (b += 1) {
+                const block = row[b * bs ..][0..bs];
+                const d = f16FromBytes(block[0..2]);
+                const m = f16FromBytes(block[2..4]);
+                const qh: u32 = if (t == .q5_1) std.mem.readInt(u32, block[4..8], .little) else 0;
+                const qs = block[if (t == .q5_1) 8 else 4..][0 .. QK_0 / 2];
+                const ob = out[b * QK_0 ..][0..QK_0];
+                var j: u5 = 0;
+                while (true) {
+                    const xh0: u8 = if (t == .q5_1) @intCast(((qh >> j) << 4) & 0x10) else 0;
+                    const xh1: u8 = if (t == .q5_1) @intCast((qh >> (j + 12)) & 0x10) else 0;
+                    ob[j] = @as(f32, @floatFromInt((qs[j] & 0xF) | xh0)) * d + m;
+                    ob[@as(usize, j) + QK_0 / 2] = @as(f32, @floatFromInt((qs[j] >> 4) | xh1)) * d + m;
                     if (j == 15) break;
                     j += 1;
                 }
@@ -757,4 +1110,93 @@ test "tensorBytesChecked rejects overflow and ragged quant rows (issue #29)" {
     // sane shapes still compute
     try std.testing.expectEqual(@as(usize, 4 * 16), try tensorBytesChecked(.f32, 16, 1, 1));
     try std.testing.expectEqual(@as(usize, Q4_0_BLOCK * 2), try tensorBytesChecked(.q4_0, 64, 1, 1));
+}
+
+test "matvec agrees with dequantRow for every supported type" {
+    // The two paths are independent implementations of the same thing, and
+    // some matvec kernels take algebraic shortcuts the dequant path does not:
+    // Q4_1/Q5_1 hoist the per-block minimum out of the inner loop as
+    // `d*sum(q*x) + m*sum(x)`. That identity is easy to get subtly wrong and
+    // impossible to notice by eye, so pin it.
+    const gpa = std.testing.allocator;
+    const cols = QK_K; // a whole number of blocks for every type here
+    const rows = 3;
+
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rnd = prng.random();
+
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 4.0;
+
+    const types = [_]Type{ .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q4_k, .q5_k, .q6_k, .f32, .f16 };
+    for (types) |t| {
+        const bytes = tensorBytes(t, cols, rows);
+        const data = try gpa.alloc(u8, bytes);
+        defer gpa.free(data);
+        // Arbitrary bytes are a valid encoding for every one of these formats:
+        // each field is a scale, a min or a quantized lane, none of which have
+        // invalid bit patterns. Clear one exponent bit of each f16 so no block
+        // scale lands on NaN/Inf, which would make the comparison meaningless.
+        rnd.bytes(data);
+        for (0..bytes / 2) |i| data[i * 2 + 1] &= 0xFB;
+
+        const got = try gpa.alloc(f32, rows);
+        defer gpa.free(got);
+        matvec(t, got, data, x, rows, cols);
+
+        const row = try gpa.alloc(f32, cols);
+        defer gpa.free(row);
+        for (0..rows) |r| {
+            dequantRow(t, row, data, r, cols);
+            var want: f32 = 0;
+            for (row, x) |w, xv| want += w * xv;
+            // f32 accumulation in a different order, so compare relatively
+            const tol = @max(@abs(want), @abs(got[r])) * 1e-4 + 1e-3;
+            std.testing.expectApproxEqAbs(want, got[r], tol) catch |e| {
+                std.debug.print("{s} row {d}: matvec {d} vs dequant-dot {d}\n", .{ @tagName(t), r, got[r], want });
+                return e;
+            };
+        }
+    }
+}
+
+test "parallel matvec produces bit-identical results to inline" {
+    // Row-splitting must not perturb a single element: each output row is one
+    // independent dot product, so unlike a reduction split there is no
+    // reassociation and the result should match exactly, not approximately.
+    // Anything else means rows are being mapped to the wrong weight bytes.
+    const gpa = std.testing.allocator;
+    const cols = QK_K;
+    const rows = 257; // deliberately prime-ish: exercises a ragged last block
+
+    var prng = std.Random.DefaultPrng.init(0xBEEF);
+    const rnd = prng.random();
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 4.0;
+
+    for ([_]Type{ .q4_k, .q6_k, .q4_0, .f32 }) |t| {
+        const data = try gpa.alloc(u8, tensorBytes(t, cols, rows));
+        defer gpa.free(data);
+        rnd.bytes(data);
+        for (0..data.len / 2) |i| data[i * 2 + 1] &= 0xFB; // keep f16 scales finite
+
+        const serial = try gpa.alloc(f32, rows);
+        defer gpa.free(serial);
+        matvec(t, serial, data, x, rows, cols); // pool not started: inline
+
+        parallelBegin(8);
+        defer parallelEnd();
+        try std.testing.expect(pool.n > 0); // otherwise this test proves nothing
+
+        const par = try gpa.alloc(f32, rows);
+        defer gpa.free(par);
+        // repeat: a race shows up intermittently, so a single pass is weak
+        for (0..8) |_| {
+            @memset(par, std.math.nan(f32));
+            matvec(t, par, data, x, rows, cols);
+            try std.testing.expectEqualSlices(f32, serial, par);
+        }
+    }
 }

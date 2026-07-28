@@ -16,6 +16,7 @@ const Engine = engine_mod.Engine;
 const tokenizer = @import("../engine/tokenizer.zig");
 const sampler = @import("../engine/sampler.zig");
 const deepseek = @import("../gguf/deepseek.zig");
+const ggml = @import("../gguf/ggml.zig");
 const llama = @import("../gguf/llama.zig");
 const chat_template = @import("../gguf/chat_template.zig");
 const expert_fetch = @import("../p2p/expert_fetch.zig");
@@ -148,6 +149,36 @@ pub const Generator = union(enum) {
     }
 };
 
+/// Threads to run kernels on when nothing is configured.
+///
+/// Two cores are held back, not one: a node keeps p2p, gossip, heartbeat and
+/// repair threads running throughout a generation, and the OS needs somewhere
+/// to put them. Measured on a 10-core Apple M5 (4 performance + 6 efficiency)
+/// with TinyLlama 1.1B Q4_K_M, median of three 64-token runs:
+///
+///     threads  1 -> 6.0 tok/s
+///              4 -> 23.7
+///              6 -> 22.4
+///              8 -> 26.0   <- cpu_count - 2
+///              9 -> 22.1
+///
+/// Past that, oversubscription against the node's own threads costs more than
+/// the extra cores return, and efficiency cores contribute little. Override
+/// with `--threads` when the shape of the machine is different.
+pub fn defaultThreads() usize {
+    const n = std.Thread.getCpuCount() catch 1;
+    return if (n <= 3) 1 else n - 2;
+}
+
+/// Process-wide kernel thread count. 0 means "use defaultThreads()"; 1
+/// disables the pool, which is what makes a threaded-vs-serial comparison
+/// possible without rebuilding.
+pub var kernel_threads: usize = 0;
+
+pub fn threads() usize {
+    return if (kernel_threads == 0) defaultThreads() else kernel_threads;
+}
+
 fn clampMax(max_tokens: usize, budget: ?u64, prompt_tokens: usize) usize {
     if (budget) |b| {
         const room = if (b > prompt_tokens) b - prompt_tokens else 0;
@@ -237,6 +268,13 @@ fn genGgufInner(
     parse_special: bool,
 ) !Result {
     const c = m.cfg;
+
+    // Row-parallel kernels for the duration of this generation (issue #11).
+    // Scoped to the request rather than the process: without a condition
+    // variable in the kernels, parked workers would have to spin, and a node
+    // sitting idle overnight must not peg every core.
+    ggml.parallelBegin(threads());
+    defer ggml.parallelEnd();
 
     const toks = try m.encodePrompt(gpa, prompt_text, parse_special);
     defer gpa.free(toks);
