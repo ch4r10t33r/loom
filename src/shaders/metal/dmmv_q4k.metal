@@ -1,23 +1,24 @@
 // Q4_K dequantize-multiply-matrix-vector.
 //
-// One SIMD group (32 lanes) per output row, each lane taking whole 32-value
-// sub-blocks, reduced with simd_sum.
+// One SIMD group per output row. Within a super-block, lane `i` handles
+// element `i` of each 32-byte group, so at any instant the 32 lanes read 32
+// *consecutive* bytes — one coalesced transaction instead of a scatter.
 //
-// The two shapes that were tried first and are worth not repeating:
+// Three shapes have been tried here; the two that failed are worth not
+// repeating.
 //
-//   one thread per row  -- adjacent lanes then read addresses a whole row
-//     apart (1152 bytes for a 2048-wide tensor), so every access is
-//     uncoalesced and the memory system sees a scatter. Correct, and slower
-//     than eight CPU threads even with dispatch overhead removed.
+//   one thread per row -- adjacent lanes read addresses a whole row apart
+//     (1152 bytes for a 2048-wide tensor). Correct, and slower than eight CPU
+//     threads even with all dispatch overhead removed.
 //
-//   one threadgroup per row with a tree reduction over threadgroup memory --
-//     a tree reduction whose group size is not a power of two silently drops
-//     lanes, and the output stays plausible. simd_sum has no such hazard: it
-//     is one instruction over a fixed 32-lane group, and needs no threadgroup
-//     memory or barriers at all.
+//   one SIMD group per row, each lane taking whole 32-value sub-blocks -- a
+//     lane then walks 32 consecutive bytes on its own while its neighbours
+//     walk unrelated regions, so the group still issues a scatter every step,
+//     and the inner loop is scalar.
 //
-// Lanes 2k and 2k+1 read the same 32 packed bytes (low and high nibbles), so
-// each pair shares a cache line and consecutive pairs walk consecutive bytes.
+// Each byte carries two values: the low nibble belongs to sub-block 2h and the
+// high nibble to sub-block 2h+1, which have different scales. So one load
+// feeds two scaled multiply-adds, and the byte is never read twice.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -54,31 +55,31 @@ kernel void dmmv_q4k(
     const uint row = tgid * nsg + sgid;
     if (row >= dims.rows) return;
 
-    const uint blocks = dims.cols / QK_K;      // super-blocks in this row
-    const uint nsub   = blocks * 8;            // 32-value sub-blocks
+    const uint blocks = dims.cols / QK_K;
     device const uchar *w = weights + (ulong)row * blocks * Q4_K_BLOCK;
 
     float acc = 0.0f;
-    for (uint s = lane; s < nsub; s += SIMD_W) {
-        const uint b = s >> 3;                 // super-block
-        const uint j = s & 7;                  // sub-block within it
+    for (uint b = 0; b < blocks; b++) {
         device const uchar *blk = w + b * Q4_K_BLOCK;
         const float d    = (float)((device const half *)blk)[0];
         const float dmin = (float)((device const half *)blk)[1];
-        uchar sc, mn;
-        scale_min_k4(j, blk + 4, sc, mn);
-        device const uchar *src = blk + 16 + (j >> 1) * 32;
-        device const float *xb  = x + b * QK_K + j * 32;
-        const bool high = (j & 1) != 0;
+        device const uchar *scales = blk + 4;
+        device const uchar *qs     = blk + 16;
+        device const float *xb     = x + b * QK_K;
 
-        float sum = 0.0f, xsum = 0.0f;
-        for (uint i = 0; i < 32; i++) {
-            const uchar q = high ? (src[i] >> 4) : (src[i] & 0x0F);
-            const float xv = xb[i];
-            sum  += (float)q * xv;
-            xsum += xv;
+        for (uint h = 0; h < 4; h++) {
+            uchar sc0, mn0, sc1, mn1;
+            scale_min_k4(2 * h + 0, scales, sc0, mn0);
+            scale_min_k4(2 * h + 1, scales, sc1, mn1);
+
+            // 32 lanes read 32 consecutive bytes
+            const uchar byte = qs[h * 32 + lane];
+            const float xlo = xb[(2 * h + 0) * 32 + lane];
+            const float xhi = xb[(2 * h + 1) * 32 + lane];
+
+            acc += (d * (float)sc0 * (float)(byte & 0x0F) - dmin * (float)mn0) * xlo;
+            acc += (d * (float)sc1 * (float)(byte >> 4)   - dmin * (float)mn1) * xhi;
         }
-        acc += d * (float)sc * sum - dmin * (float)mn * xsum;
     }
 
     acc = simd_sum(acc);
