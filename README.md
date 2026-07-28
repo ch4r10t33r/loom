@@ -701,7 +701,10 @@ types and NVFP4:
 | microscaling | `MXFP4` |
 
 Affine types (float/legacy/K) use a fused matvec on the raw mmap'd bytes, with
-no wholesale dequantization. The IQ and MXFP4 types are *codebook* quants —
+no wholesale dequantization. `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K` and `Q8_0`
+additionally quantize the activation vector to int8 once per matvec and dot it
+against the packed weights as integers, which removes the dequantize step
+entirely — worth 2x to 9x depending on the format. The IQ and MXFP4 types are *codebook* quants —
 a block stores an index into a static grid table rather than a value to scale —
 so they decode through `src/gguf/iq.zig` against tables transcribed from
 llama.cpp. Because a wrong table entry there would silently corrupt weights
