@@ -108,29 +108,67 @@ small and #12/#13 are not.
 2. **#12 — Metal. Substrate and kernels done. On Apple Silicon it cannot win
    much at decode, and the reason is architectural rather than fixable.**
 
-   Effective bandwidth against tensor size, one dispatch per command buffer:
+   Effective bandwidth against tensor size, one dispatch per command buffer.
+   Best-of-20 at cols=2048 on an M5 (10 GPU cores, 16 GB), against 8 CPU
+   threads:
 
-   | rows | bytes read | GPU | CPU, 8 threads |
-   |---|---|---|---|
-   | 2,048 | 2.4 MB | 7.9 GB/s | 51.3 GB/s |
-   | 5,632 | 6.5 MB | 13.8 | 46.0 |
-   | 16,384 | 18.9 MB | 19.8 | 51.2 |
-   | 32,000 | 36.9 MB | 24.9 | 53.0 |
-   | 65,536 | 75.5 MB | 38.0 | 53.7 |
-   | 131,072 | 151.0 MB | **61.4** | 53.5 |
+   | rows | bytes read | GPU before | GPU after | CPU, 8 threads |
+   |---|---|---|---|---|
+   | 2,048 | 2.4 MB | 0.146 ms | 0.139 ms | 0.05 ms |
+   | 5,632 | 6.5 MB | 0.238 | 0.186 | 0.13 |
+   | 16,384 | 18.9 MB | 0.416 | 0.419 | 0.28 |
+   | 32,000 | 36.9 MB | 0.639 | 0.612 | 0.62 |
+   | 65,536 | 75.5 MB | 1.212 | **0.919** | 1.30 |
+   | 131,072 | 151.0 MB | 2.381 | **1.609** | 2.57 |
 
-   The CPU is flat at roughly 50 GB/s across four orders of magnitude, which
-   is the signature of a memory-bandwidth-bound workload: it is already
-   extracting close to what the memory system will give. The GPU climbs from
-   7.9 to 61.4 GB/s as its fixed dispatch cost amortizes, and tops out only
-   **15% above the CPU** — on tensors four times larger than anything in a
-   1.1B model.
+   At 131,072 rows that is 63 GB/s before and **94 GB/s** after.
 
-   That is the whole story, and it is a property of the machine. Apple Silicon
-   is unified memory: the CPU cores and the GPU read the *same* DRAM over the
-   *same* bus. A quantized matvec moves far more bytes than it does
-   arithmetic, so both processors run into the same wall, and the GPU's
-   advantage shrinks to how much more of the bus it can saturate.
+   **The earlier "bandwidth wall" reading was wrong, and the way it was wrong
+   is worth recording.** The first version of this table topped out at 61 GB/s
+   and was read as the machine's ceiling, on the reasoning that unified memory
+   makes the CPU and GPU share one bus. But 61 GB/s was *our kernel's*
+   achieved bandwidth, and nothing had measured the hardware's. A kernel doing
+   nothing but streaming reads — sum a large f32 buffer, one float4 per lane —
+   reaches **~110 GB/s** on the same M5 (`LOOM_BW_PROBE=1 zig build test
+   -Dgpu=metal`). The ceiling was ours, not the machine's, and 61 was 55% of
+   it.
+
+   Two changes closed most of the gap:
+
+   1. **Four bytes per lane instead of one.** The original kernel was
+      perfectly coalesced but issued a quarter-width load, so the inner loop
+      ran four times as often, with four times the address arithmetic and four
+      times the scale unpacking, and never had enough loads in flight to cover
+      their own latency. Each lane now takes four consecutive quant bytes; the
+      32 lanes still cover a super-block's 128 bytes, in one step rather than
+      four.
+   2. **Branchless 6-bit scale unpack.** This was not optional. With one byte
+      per lane every lane had the same sub-block index and the `j < 4` test
+      was uniform across the SIMD group. Widening the load makes the index
+      vary with the lane, so the branch diverges and the group executes both
+      sides. Measured on its own, the widened kernel *without* this change was
+      **slower than the original at every size below 131,072 rows** — the win
+      only appeared once the branch was gone.
+
+   Two things were tried and are not kept, both measured: unrolling the block
+   loop by two on independent accumulators (+6% at 131k rows, −30% between 5k
+   and 32k), and hoisting the loop body into a `static inline` helper (−30% at
+   16k).
+
+   **A note on measurement.** These numbers are best-of-20, not means. The
+   benchmark previously averaged, and on a machine whose GPU is shared with
+   the window server that measures whatever else was drawing: repeated runs of
+   an unchanged kernel varied by 50%, wider than most of the effects under
+   test. Averages briefly showed the widened-but-branchy kernel as a 1.4x win
+   when it was in fact a regression.
+
+   `MIN_GPU_ROWS` drops from 100,000 to 65,536 accordingly — the crossover
+   moved, but not far enough to reach a 1.1B model, whose largest tensor is
+   the 32,000-row output head. **Decode on this hardware is still CPU
+   territory**, and the reason is unchanged even though the number was wrong:
+   the CPU sits at ~53 GB/s flat, and even a GPU at 94 GB/s cannot overcome a
+   ~262 us fixed cost per command buffer when a tensor's worth of work is tens
+   of microseconds.
 
    **Where a GPU still earns its place**, and neither is decode on this
    hardware:

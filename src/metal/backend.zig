@@ -59,9 +59,17 @@ const elementwise_src = @embedFile("../shaders/metal/elementwise.metal");
 /// 32000-row output head -- so Metal correctly declines every matvec and the
 /// build matches the CPU rather than losing to it. That changes with larger
 /// models, and with batched prefill, where each dispatch carries far more
-/// work. It also changes if the kernel improves: one SIMD group per row with
-/// a scalar inner loop is a long way from what the hardware can do.
-const MIN_GPU_ROWS = 100_000;
+/// work.
+///
+/// Lowered from 100,000 after the kernel was widened from one byte per lane
+/// to four (see dmmv_q4k.metal). Best-of-20 at cols=2048 on an M5, GPU ms
+/// against 8 CPU threads:
+///
+///     rows     before   after   cpu
+///     32,000    0.639   0.612   0.62    -- a tie, so still declined
+///     65,536    1.212   0.919   1.30    -- consistent 1.25-1.48x win
+///     131,072   2.381   1.609   2.57    -- 1.5-1.6x
+const MIN_GPU_ROWS = 65_536;
 
 /// Apple GPUs execute in 32-lane SIMD groups; the kernel assigns one per row.
 const SIMD_W = 32;
@@ -760,21 +768,100 @@ test "metal scaling: where does the gpu actually win" {
             cb.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), rows * SIMD_W, group);
             cb.commitAndWait();
         }
-        const t0 = now(io);
+        // Best-of rather than mean. This machine shares its GPU with the
+        // window server, so a mean over 20 runs measures whatever else was
+        // drawing at the time -- repeated runs of an unchanged kernel varied
+        // by 50%, which is wider than most of the effects being measured. The
+        // fastest run is the one least contended, and it is the statistic
+        // that stays comparable across sessions.
+        var gpu: i128 = std.math.maxInt(i64);
         for (0..N) |_| {
+            const t0 = now(io);
             const cb = cx.dev.commandBuffer();
             cb.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), rows * SIMD_W, group);
             cb.commitAndWait();
+            const dt = now(io) - t0;
+            if (dt < gpu) gpu = dt;
         }
-        const gpu = @divTrunc(now(io) - t0, N);
 
         cpu.matvec(.q4_k, dst, data, x, rows, cols);
-        const t1 = now(io);
-        for (0..N) |_| cpu.matvec(.q4_k, dst, data, x, rows, cols);
-        const cpu_ns = @divTrunc(now(io) - t1, N);
+        var cpu_ns: i128 = std.math.maxInt(i64);
+        for (0..N) |_| {
+            const t1 = now(io);
+            cpu.matvec(.q4_k, dst, data, x, rows, cols);
+            const dt = now(io) - t1;
+            if (dt < cpu_ns) cpu_ns = dt;
+        }
 
         const g: f64 = @as(f64, @floatFromInt(gpu)) / 1e6;
         const c2: f64 = @as(f64, @floatFromInt(cpu_ns)) / 1e6;
         std.debug.print("  {d:>7}   {d:>8.3} ms   {d:>8.3} ms   {d:>5.2}x\n", .{ rows, g, c2, c2 / g });
+    }
+}
+
+test "probe: peak streaming-read bandwidth" {
+    // Our dmmv_q4k tops out near 61 GB/s and that was read as the machine's
+    // ceiling. That reading is only sound if a kernel doing nothing but
+    // streaming reads cannot do better. This does the least work per byte a
+    // kernel can: sum a large f32 buffer, one float4 per lane.
+    // Skipped by default: it prints, and the build runner's --listen protocol
+    // does not tolerate a large stdout write from a test. Run it with
+    // `LOOM_BW_PROBE=1 zig build test -Dgpu=metal`.
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    if (std.c.getenv("LOOM_BW_PROBE") == null) return error.SkipZigTest;
+    const src =
+        \\#include <metal_stdlib>
+        \\using namespace metal;
+        \\kernel void stream_sum(device const float4* x [[buffer(0)]],
+        \\                       device float* out      [[buffer(1)]],
+        \\                       device const uint* n4  [[buffer(2)]],
+        \\                       uint gid [[thread_position_in_grid]],
+        \\                       uint gsz [[threads_per_grid]]) {
+        \\    float4 acc = 0;
+        \\    for (uint i = gid; i < n4[0]; i += gsz) acc += x[i];
+        \\    out[gid] = acc.x + acc.y + acc.z + acc.w;
+        \\}
+    ;
+    var thr: std.Io.Threaded = .init(std.testing.allocator, .{});
+    defer thr.deinit();
+    const tio = thr.io();
+    const now = struct {
+        fn f(i: std.Io) i128 {
+            return std.Io.Clock.Timestamp.now(i, .awake).raw.toNanoseconds();
+        }
+    }.f;
+
+    var d = mtl.Device.init() catch return error.SkipZigTest;
+    defer d.deinit();
+    var pipe = d.pipeline(src, "stream_sum") catch return error.SkipZigTest;
+    defer pipe.deinit();
+
+    std.debug.print("\n  device {s}\n", .{d.name()});
+    for ([_]usize{ 64, 256, 512 }) |mb| {
+        const bytes = mb << 20;
+        var xb = try d.alloc(bytes);
+        defer xb.deinit();
+        @memset(xb.slice(f32), 1.0);
+        const grid: usize = 1 << 16;
+        var ob = try d.alloc(grid * @sizeOf(f32));
+        defer ob.deinit();
+        var nb = try d.alloc(@sizeOf(u32));
+        defer nb.deinit();
+        nb.slice(u32)[0] = @intCast(bytes / 16);
+
+        var best: u64 = std.math.maxInt(u64);
+        for (0..10) |it| {
+            const t0 = now(tio);
+            const cb = d.commandBuffer();
+            cb.dispatch(pipe, &.{ xb, ob, nb }, &.{ 0, 0, 0 }, null, grid, 256);
+            cb.commitAndWait();
+            const dt: u64 = @intCast(now(tio) - t0);
+            if (it >= 2 and dt < best) best = dt;
+        }
+        std.debug.print("  {d:>4} MB  {d:>7.3} ms  {d:>6.1} GB/s\n", .{
+            mb,
+            @as(f64, @floatFromInt(best)) / 1e6,
+            @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(best)),
+        });
     }
 }
