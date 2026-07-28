@@ -105,57 +105,49 @@ small and #12/#13 are not.
    to it. Fourteen operations, and every engine now calls through them. No
    behaviour change: the bit-identical, golden-vector and architecture tests
    all pass unchanged, which is the proof it was a pure refactor.
-2. **#12 — Metal. Substrate and kernels done. It does not yet beat the CPU on
-   a small model, and the measurements say why.**
+2. **#12 — Metal. Substrate and kernels done. On Apple Silicon it cannot win
+   much at decode, and the reason is architectural rather than fixable.**
 
-   Sweeping the shape on an M5, one dispatch per command buffer — which is
-   what a dependency chain forces:
+   Effective bandwidth against tensor size, one dispatch per command buffer:
 
-   | rows | GPU | CPU, 8 threads | ratio |
+   | rows | bytes read | GPU | CPU, 8 threads |
    |---|---|---|---|
-   | 2,048 | 0.383 ms | 0.066 ms | 0.17x |
-   | 5,632 | 0.522 | 0.132 | 0.25x |
-   | 32,000 | 1.374 | 0.723 | 0.53x |
-   | 65,536 | 1.685 | 1.441 | 0.86x |
-   | 131,072 | 1.808 | 2.765 | **1.53x** |
+   | 2,048 | 2.4 MB | 7.9 GB/s | 51.3 GB/s |
+   | 5,632 | 6.5 MB | 13.8 | 46.0 |
+   | 16,384 | 18.9 MB | 19.8 | 51.2 |
+   | 32,000 | 36.9 MB | 24.9 | 53.0 |
+   | 65,536 | 75.5 MB | 38.0 | 53.7 |
+   | 131,072 | 151.0 MB | **61.4** | 53.5 |
 
-   So the GPU is about **1.9x faster per row** and carries **~0.36 ms of fixed
-   cost**, and it does not overtake eight CPU threads until roughly 100k rows.
-   For a 1.1B model nothing clears that bar — the largest tensor is the
-   32000-row output head — so Metal correctly declines every matvec and the
-   build matches the CPU rather than losing to it.
+   The CPU is flat at roughly 50 GB/s across four orders of magnitude, which
+   is the signature of a memory-bandwidth-bound workload: it is already
+   extracting close to what the memory system will give. The GPU climbs from
+   7.9 to 61.4 GB/s as its fixed dispatch cost amortizes, and tops out only
+   **15% above the CPU** — on tensors four times larger than anything in a
+   1.1B model.
 
-   **Two earlier numbers in this document were wrong, and the corrections are
-   the useful part.**
+   That is the whole story, and it is a property of the machine. Apple Silicon
+   is unified memory: the CPU cores and the GPU read the *same* DRAM over the
+   *same* bus. A quantized matvec moves far more bytes than it does
+   arithmetic, so both processors run into the same wall, and the GPU's
+   advantage shrinks to how much more of the bus it can saturate.
 
-   The kernel was reported at 8x the CPU. That came from fifty identical
-   dispatches issued back to back with no barriers, where the GPU overlaps
-   them: it measured *throughput*. A forward pass is a dependency chain and
-   gets *latency*. Benchmark the shape the code actually runs.
+   **Where a GPU still earns its place**, and neither is decode on this
+   hardware:
 
-   The fixed cost was attributed to command-buffer submission, and batching
-   dispatches into one buffer was expected to remove it. It did not: putting a
-   whole FFN block in one command buffer with one encoder changed 1.039 ms to
-   1.034 ms. Neither command buffers nor encoder boundaries were the cost.
-   What remains is per-dispatch latency in a dependent chain, which batching
-   cannot remove.
+   - **Prefill.** A batch of N tokens reuses each weight N times, which turns
+     a bandwidth-bound problem into a compute-bound one. That is the regime a
+     GPU is built for, and the one place a large win should exist here.
+   - **Discrete GPUs.** Dedicated VRAM has its own bus, several times wider
+     than host DRAM, so the shared-bandwidth argument above does not apply —
+     though the host-to-VRAM upload tier does (see below).
 
-   What would actually move it, in order of expected return:
-
-   - **A better kernel.** One SIMD group per row with a scalar inner loop over
-     32 values is a long way from the hardware. Vectorized loads and more
-     parallelism per row attack the 11.5 ns/row directly, and that is the term
-     that decides the crossover.
-   - **Batched prefill on the GPU.** Each dispatch then carries N tokens of
-     work against the same fixed cost, which is the regime GPUs are built for
-     and where the crossover moves down sharply.
-   - **Larger models.** A 30B MoE's tensors are far bigger than a 1.1B dense
-     model's, and the fixed cost amortizes.
-
-   Done: the substrate, `dmmv_q4k`, the elementwise and norm kernels,
-   device-resident activation buffers, a whole FFN block in one command
-   buffer, and one encoder with barriers only between dependent dispatches.
-   All validated against exact CPU references.
+   Done: the substrate, `dmmv_q4k` (coalesced, one SIMD group per row), the
+   elementwise and norm kernels, device-resident activations, a whole FFN
+   block in one command buffer, one encoder with barriers only between
+   dependent dispatches. All validated against exact CPU references. Metal
+   declines any matvec it would lose on, so the build matches the CPU rather
+   than losing to it.
 
 3. **Distributed integration.** Peer-fetched experts wrapped zero-copy on
    Apple; a VRAM tier with pinning on discrete GPUs.
@@ -167,6 +159,23 @@ small and #12/#13 are not.
    demonstrate a win on some real workload — most likely batched prefill or a
    larger model — and only the structure that produced that win is worth
    porting.
+
+## What this means for the target, honestly
+
+For **decode** on unified memory, the ceiling is the memory bus and the CPU is
+already near it. Measured on this machine, for a 1.1B Q4_K_M model reading
+0.64 GB per token:
+
+| | bandwidth | tokens/sec |
+|---|---|---|
+| the real forward pass today | 36 GB/s | 56 |
+| the CPU kernels in isolation | 53 GB/s | 83 |
+| the GPU, on tensors large enough | 61 GB/s | 96 |
+
+So the next win for decode is not a GPU. It is closing the gap between the 36
+GB/s a full forward pass achieves and the 53 GB/s the kernels already reach on
+their own — the difference is attention, the elementwise ops and the types
+still on the slow dequantize path, not the matmuls.
 
 ## Scale, honestly
 
