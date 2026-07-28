@@ -80,6 +80,17 @@ jobs:
       - name: Unit tests
         run: zig "${ZIG}" build test --summary all
 
+      # Gates on invariants, not on wall-clock. A shared CI runner's absolute
+      # timings are meaningless, but "batching beats unbatched" and "threads
+      # beat one thread" are properties of the code and hold on any machine.
+      # Both of the performance bugs found so far -- batching wired into only
+      # one of two prefill paths, twice -- would have failed this.
+      - name: Benchmark invariants
+        run: |
+          set -eux
+          zig "${ZIG}" build -Doptimize=ReleaseFast -Dcommit="${GITHUB_SHA}"
+          ./zig-out/bin/loom bench --check
+
   docker:
     name: image build, smoke test, publish on main
     runs-on: ubuntu-latest

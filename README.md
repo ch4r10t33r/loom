@@ -141,6 +141,18 @@ Metal on Apple, Vulkan on Linux and Windows — are planned in
 [ZINC](https://github.com/zolotukhin/zinc) used for its Apple Silicon
 bring-up.
 
+## Benchmarking
+
+```sh
+loom bench          # kernel timings plus invariant checks
+loom bench --check  # non-zero exit if an invariant fails; CI runs this
+```
+
+CI gates on **invariants** ("batching beats unbatched", "threads beat one
+thread", "the selected path beats the alternative") rather than on wall-clock,
+because a shared runner's absolute timings are noise while those relationships
+are properties of the code. See [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md).
+
 ## Chat UI
 
 `loom node` serves a small chat app at **`http://127.0.0.1:8555`** (change with
