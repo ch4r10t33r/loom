@@ -285,6 +285,7 @@ This section states the protocol's shape and invariants. Field-level detail is i
 | **Gossip mesh** | Every node announces its holdings every 3 s; peers merge into a peer table | Transitive discovery; carries committee membership |
 | **Query path** | Fetch a missing shard: committee members first, then the mesh | Digest-verified; fails only if no reachable holder exists anywhere |
 | **Eager repair** | A 2 s loop re-fetches any wanted-but-missing shard from all known peers | Dead peers are retried, not forgotten; a returning holder is drained within one tick |
+| **Liveness** | First-hand contact only; 30 s TTL gates holder claims, never addresses | Hearsay cannot revive a dead peer, so death is detectable without committee membership |
 | **Wire messages** | Binary frames (Heartbeat, Announce, ExpertRequest/Response) with adaptive Snappy [13] | Requests pin the version, so a cross-version peer is refused (the hardfork guard) |
 
 Two design choices hold the protocol together.
@@ -301,6 +302,33 @@ survives the bootnode's departure. Heartbeats (5 s) carry liveness plus the
 manifest version, a monotonic holdings sequence number, a bitmap digest, and a
 load hint. That is enough to detect staleness and spread load without shipping the
 full bitmap on every beat.
+
+**Liveness is first-hand only, and it gates holder claims rather than
+addresses.** Two properties are easily conflated and must not be. An address is
+useful indefinitely — the eager-repair policy never forgets one, so a returning
+holder is picked up without re-bootstrapping. A *holdings claim* is only as good
+as the evidence that its owner still answers. Loom therefore tags every peer-table
+update with how it was learned: `first_hand` (we exchanged with that peer, or it
+connected to us) or `hearsay` (another peer listed it). Only first-hand contact
+refreshes a peer's last-seen time; a peer unheard-from for 30 s (ten gossip
+rounds) stops being offered as a holder while its address is retained.
+
+The distinction is not academic. Without it no death is detectable in a swarm of
+three or more, because the survivors keep echoing the dead node's entry to one
+another and each echo renews it. Measured on a three-node run, an origin holding
+the full model was killed and both survivors still advertised it as a live holder
+six minutes later. Nor can liveness be delegated to the committee heartbeat,
+which watches committee members only: the origin is the bootnode and sits in no
+committee, so the node that was the sole holder of 332 of 1,664 expert shards was
+monitored by nobody.
+
+**Under-replication is reported, not inferred.** A node's status line names the
+number of shards fewer than R live peers hold. Redundancy is an arithmetic
+consequence of membership, not a setting that can be asserted: two joiners at
+`--hold-fraction 0.40` cover 80% of one copy and cannot reach R=2 however
+correctly the shards are assigned. Measured on the same run, exactly 332 shards
+sat at one holder under `--r-target 2`, and before this was surfaced nothing said
+so.
 
 **Figure 2. Committee and mesh.**
 
@@ -591,6 +619,7 @@ the spec governs the p2p protocol and the roadmap governs status.
 | 2026-07-27 | MoE routing extracted to `src/gguf/moe.zig` and shared by both engines, including the expert-to-shard binding used for distributed fetch | The routing was never DeepSeek-specific: upstream funnels every MoE architecture through one routing function differing in four knobs (gating function, selection bias, gate renormalization, constant scale). Sharing it means a new architecture needs an attention variant, not a new engine |
 | 2026-07-27 | The llama engine generalized into one GQA engine covering `llama` (Mixtral), `qwen2moe`, `qwen3moe` and `glm4moe`; optional features detected from the file's tensors, with only the RoPE style pinned per architecture | Distributed serving previously required `deepseek2`, even though sharding, sync and repair were already architecture-agnostic — a Mixtral store distributed correctly but could not be served. Feature detection follows the checkpoint rather than a table of beliefs about each architecture, which is also what makes the qwen3 explicit `head_dim` and the glm4 NextN skip fall out naturally. Verified end to end: for all five architectures a node holding roughly 30% of shards serves with hit rate below 1 and produces output token-identical to a full-copy origin |
 | 2026-07-28 | A node serves a GGUF locally when it is not expert-sharded, instead of falling back to the synthetic checkpoint | A dense model has no routed experts, so it shards into fixed ranges and cannot be served *distributed* — but it is a complete model file, and answering from an unrelated synthetic checkpoint reads as a broken model rather than as an unsupported topology |
+| 2026-07-28 | Peer liveness is evidence-tagged: only `first_hand` contact refreshes last-seen, `hearsay` (a peer appearing in another peer's table) does not; a peer stale for 30 s is withheld from holder selection and from the peer count while its address is retained for eager repair. Nodes report the number of shards held by fewer than R live peers | Liveness previously came only from the committee heartbeat, which watches committee members; a bootnode/origin belongs to no committee, so the node solely holding 332 of 1,664 expert shards was monitored by nobody. Independently, hearsay refreshed last-seen, so in any swarm of three or more the survivors' echoes kept a dead peer alive indefinitely — measured, an origin killed at t=0 was still advertised as a holder at t+6 min. Separating address (keep forever) from holdings claim (expire) preserves the eager-churn policy while making death detectable. Under-replication is surfaced because R is an arithmetic consequence of membership, not a setting: n nodes at hold-fraction f cannot exceed R = n*f |
 | 2026-07-28 | A chat UI is compiled into the binary and served on its own listener (`--ui-port`, default 8555), sharing the HTTP implementation and generator with the OpenAI API; plus a periodic console status line (`--status-secs`) | Nothing in the system reported its own state: exercising a node meant hand-writing HTTP, and membership and holdings move with no request arriving, so an event-only log made a churning node look idle. Serving the page same-origin with the API removes any CORS or host configuration. The UI separates decode speed from time-to-first-token, because on a partial node the first token also pays for the prefill's expert fetches |
 | 2026-07-28 | `/health` reports whether the served weights are one of loom's random-weight fixtures, and the UI says so | A fixture answers with meaningless text by construction; unlabelled, that is indistinguishable from a broken model and was the first thing a new user saw |
 | 2026-07-28 | Q4_1 and Q5_1 implemented, completing every non-ternary GGML type | Three Q5_1 tensors out of 377 blocked an entire 8.9 GB checkpoint. llama.cpp quant *mixes* fold a handful of legacy types into otherwise K-quant files, so one missing format costs a whole model |

@@ -265,7 +265,7 @@ fn route(ctx: *Ctx, req: Request, wi: *Io.Writer) !?Response {
 /// Liveness plus the two numbers worth watching from the UI header: how many
 /// peers are reachable, and what fraction of expert reads were served locally.
 fn handleHealth(ctx: *Ctx) !Response {
-    const n_peers: usize = if (ctx.peers) |p| p.count() else 0;
+    const n_peers: usize = if (ctx.peers) |p| p.liveCount() else 0;
     const model_esc = try jsonEscapeAlloc(ctx.gpa, ctx.model_id);
     defer ctx.gpa.free(model_esc);
     const body = try std.fmt.allocPrint(
