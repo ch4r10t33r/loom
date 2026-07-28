@@ -13,8 +13,17 @@
 
 const std = @import("std");
 const Io = std.Io;
+const stats_mod = @import("../core/stats.zig");
 
 pub const NO_COMMITTEE: u32 = 0xFFFF_FFFF;
+
+/// How we came to know this entry, which decides whether it proves liveness.
+///
+///  - `first_hand`: we exchanged with this peer, or it connected to us.
+///  - `hearsay`: another peer listed it. Enough to learn the address (and to
+///    start a fresh entry's TTL, so a genuinely new peer gets a grace period
+///    in which to be contacted), never enough to keep a stale one alive.
+pub const Evidence = enum { first_hand, hearsay };
 
 pub const PeerInfo = struct {
     addr: []u8, // owned "host:port"
@@ -28,6 +37,24 @@ pub const PeerInfo = struct {
 /// Bound on distinct peers retained (audit #7 P1 unbounded table): beyond this
 /// the coldest (oldest last_seen) entry is evicted on insert.
 pub const MAX_PEERS: usize = 4096;
+
+/// A peer not heard from for this long is no longer counted as a holder.
+///
+/// Gossip refreshes `last_seen_ns` every 3 s, so this is ~10 missed rounds.
+/// The entry itself is *kept* — the eager-churn policy in gossip.zig never
+/// forgets an address, so a peer that comes back is picked up again without
+/// re-bootstrapping, and a node whose only seed has died does not become
+/// unreachable by pruning it.
+///
+/// What staleness must gate is the *holdings claim*, which is a different
+/// thing from the address. Liveness cannot be left to the committee
+/// heartbeat: that monitors committee members, and the most important node in
+/// a swarm need not be one. Measured on a three-node run, an origin that
+/// seeded the model sat outside every committee while solely holding 332 of
+/// 1664 expert shards; it was killed and six minutes later both survivors
+/// still advertised it as a live holder, so every fetch for those shards
+/// would have been aimed at a dead node and no repair was ever triggered.
+pub const PEER_TTL_NS: i128 = 30 * std.time.ns_per_s;
 
 pub const Table = struct {
     gpa: std.mem.Allocator,
@@ -55,7 +82,7 @@ pub const Table = struct {
 
     /// Insert or refresh a peer. Skips our own address. Returns true if the
     /// entry was new (useful for logging discovery).
-    pub fn merge(self: *Table, addr: []const u8, version_hex: []const u8, holdings_hex: []const u8, committee_id: u32, holdings_seq: u64, now_ns: i128) !bool {
+    pub fn merge(self: *Table, addr: []const u8, version_hex: []const u8, holdings_hex: []const u8, committee_id: u32, holdings_seq: u64, now_ns: i128, evidence: Evidence) !bool {
         if (std.mem.eql(u8, addr, self.self_addr)) return false;
         if (version_hex.len != 64) return error.BadVersionHex;
         // reject a bitmap that is not exactly one bit per shard (issue #28)
@@ -67,7 +94,13 @@ pub const Table = struct {
 
         for (self.entries.items) |*e| {
             if (std.mem.eql(u8, e.addr, addr)) {
-                e.last_seen_ns = now_ns; // liveness always refreshes
+                // Only direct contact refreshes liveness. A peer's table is
+                // hearsay: it says an address exists, not that it answers.
+                // Refreshing on hearsay makes death undetectable in any swarm
+                // of three or more, because the survivors keep echoing the
+                // dead node's entry to each other forever — measured, the
+                // origin stayed "live" indefinitely after being killed.
+                if (evidence == .first_hand) e.last_seen_ns = now_ns;
                 // a strictly-lower seq must not clobber fresher holdings/version
                 // (audit #7 P1); seq 0 (text GOSSIP) never regresses a known seq
                 if (holdings_seq < e.holdings_seq) return false;
@@ -140,7 +173,13 @@ pub const Table = struct {
         }
         const byte_i = id / 8;
         const bit: u8 = @as(u8, 1) << @intCast(id % 8);
+        const now = stats_mod.nowNs(self.io);
         for (self.entries.items) |e| {
+            // A stale peer's bitmap is a claim about a node that may be gone.
+            // Returning it would send every fetch for these shards to a dead
+            // address to time out, and would hide from the repair loop that
+            // the shard now has no holder at all.
+            if (now - e.last_seen_ns > PEER_TTL_NS) continue;
             if (byte_i * 2 + 1 >= e.holdings_hex.len) continue;
             const b = std.fmt.parseInt(u8, e.holdings_hex[byte_i * 2 ..][0..2], 16) catch continue;
             if (b & bit != 0) try out.append(gpa, try gpa.dupe(u8, e.addr));
@@ -185,6 +224,67 @@ pub const Table = struct {
         return self.entries.items.len;
     }
 
+    /// Number of shards in [0, n_ranges) that fewer than `min` *live* peers
+    /// advertise. `own` is this node's own holdings, which are not in the
+    /// table. Returns 0 when no peer has published a bitmap yet, since "no
+    /// data" and "no coverage" must not read the same.
+    ///
+    /// This exists because under-replication was otherwise silent. A swarm
+    /// where every node takes `--hold-fraction 0.40` cannot reach R=2 with
+    /// only two joiners — 2 x 40% = 80% of one full copy — and the assignment
+    /// is not wrong, the arithmetic is short. Measured on a three-node run:
+    /// 332 of 1664 expert shards had exactly one holder under `--r-target 2`,
+    /// and nothing said so.
+    pub fn underReplicated(self: *Table, gpa: std.mem.Allocator, n_ranges: usize, min: usize, own_bits: ?[]const u8) !?usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        if (n_ranges == 0) return null;
+
+        const counts = try gpa.alloc(u8, n_ranges);
+        defer gpa.free(counts);
+        @memset(counts, 0);
+
+        const now = stats_mod.nowNs(self.io);
+        var any = false;
+        for (self.entries.items) |e| {
+            if (now - e.last_seen_ns > PEER_TTL_NS) continue;
+            if (e.holdings_hex.len == 0) continue;
+            any = true;
+            for (0..n_ranges) |id| {
+                const byte_i = id / 8;
+                if (byte_i * 2 + 1 >= e.holdings_hex.len) break;
+                const b = std.fmt.parseInt(u8, e.holdings_hex[byte_i * 2 ..][0..2], 16) catch continue;
+                if (b & (@as(u8, 1) << @intCast(id % 8)) != 0) counts[id] +|= 1;
+            }
+        }
+        if (!any) return null;
+
+        var short: usize = 0;
+        for (counts, 0..) |c, id| {
+            var n: usize = c;
+            if (own_bits) |ob| {
+                const bi = id / 8;
+                if (bi < ob.len and ob[bi] & (@as(u8, 1) << @intCast(id % 8)) != 0) n += 1;
+            }
+            if (n < min) short += 1;
+        }
+        return short;
+    }
+
+    /// Peers heard from within PEER_TTL_NS. This is what the status line and
+    /// the hardfork majority count should use; `count` includes tombstones the
+    /// eager-churn policy is still retrying.
+    pub fn liveCount(self: *Table) usize {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        const now = stats_mod.nowNs(self.io);
+        var n: usize = 0;
+        for (self.entries.items) |e| {
+            if (now - e.last_seen_ns <= PEER_TTL_NS) n += 1;
+        }
+        return n;
+    }
+
     /// Serialize the table as `addr=<a> version=<v> holdings=<h>` lines into
     /// `list` (for the GOSSIP response). Caller provides/owns the list.
     pub fn dump(self: *Table, gpa: std.mem.Allocator, list: *std.ArrayList(u8)) !usize {
@@ -210,9 +310,9 @@ test "table merges, dedupes, refuses self" {
     defer t.deinit();
 
     const v = "aa" ** 32;
-    try std.testing.expect(try t.merge("127.0.0.1:9001", v, "ff01", 2, 1, 1)); // new
-    try std.testing.expect(!try t.merge("127.0.0.1:9001", v, "ab00", NO_COMMITTEE, 2, 2)); // refresh keeps committee
-    try std.testing.expect(!try t.merge("127.0.0.1:9000", v, "ff01", 2, 1, 3)); // self
+    try std.testing.expect(try t.merge("127.0.0.1:9001", v, "ff01", 2, 1, 1, .first_hand)); // new
+    try std.testing.expect(!try t.merge("127.0.0.1:9001", v, "ab00", NO_COMMITTEE, 2, 2, .first_hand)); // refresh keeps committee
+    try std.testing.expect(!try t.merge("127.0.0.1:9000", v, "ff01", 2, 1, 3, .first_hand)); // self
     try std.testing.expect(t.count() == 1);
 
     var out = std.ArrayList(u8).empty;
@@ -238,7 +338,76 @@ test "merge rejects a holdings bitmap of the wrong size (issue #28)" {
     t.expected_holdings_hex_len = 4; // 2 bytes of bitmap = 16 shards
     const v = "0" ** 64;
     // an oversized attacker bitmap is refused instead of being stored
-    try std.testing.expectError(error.BadHoldingsLength, t.merge("peer:1", v, "00" ** 4096, 0, 1, 0));
+    try std.testing.expectError(error.BadHoldingsLength, t.merge("peer:1", v, "00" ** 4096, 0, 1, 0, .first_hand));
     // the correctly sized one is accepted
-    try std.testing.expect(try t.merge("peer:1", v, "ffff", 0, 1, 0));
+    try std.testing.expect(try t.merge("peer:1", v, "ffff", 0, 1, 0, .first_hand));
+}
+
+test "a stale peer stops being a holder but keeps its table entry" {
+    // The regression this pins: liveness was decided only by the committee
+    // heartbeat, so a non-committee origin could die unnoticed and go on being
+    // handed out as the holder of shards nobody else had.
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    var t = Table.init(gpa, threaded.io(), "127.0.0.1:9000");
+    defer t.deinit();
+
+    const now = stats_mod.nowNs(t.io);
+    const v = [_]u8{'0'} ** 64;
+    _ = try t.merge("127.0.0.1:9101", &v, "ff", NO_COMMITTEE, 1, now, .first_hand);
+
+    {
+        const h = try t.holdersOf(gpa, 3);
+        defer {
+            for (h) |a| gpa.free(a);
+            gpa.free(h);
+        }
+        try std.testing.expectEqual(@as(usize, 1), h.len);
+    }
+    try std.testing.expectEqual(@as(usize, 1), t.liveCount());
+
+    // Age it past the TTL by rewriting last_seen, as a missed gossip round would.
+    t.entries.items[0].last_seen_ns = now - (PEER_TTL_NS + 1);
+
+    {
+        const h = try t.holdersOf(gpa, 3);
+        defer {
+            for (h) |a| gpa.free(a);
+            gpa.free(h);
+        }
+        try std.testing.expectEqual(@as(usize, 0), h.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), t.liveCount());
+    // ...but the address is retained, so eager-churn retry can still reach it.
+    try std.testing.expectEqual(@as(usize, 1), t.count());
+}
+
+test "hearsay about a peer does not keep it alive" {
+    // Three nodes, one dies: the two survivors go on listing it in the tables
+    // they exchange. If those echoes refreshed liveness, no TTL could ever
+    // fire and the death would be invisible -- which is what was measured
+    // before Evidence existed.
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+
+    var t = Table.init(gpa, threaded.io(), "127.0.0.1:9000");
+    defer t.deinit();
+
+    const now = stats_mod.nowNs(t.io);
+    const v = [_]u8{'0'} ** 64;
+    _ = try t.merge("127.0.0.1:9101", &v, "ff", NO_COMMITTEE, 1, now, .first_hand);
+    t.entries.items[0].last_seen_ns = now - (PEER_TTL_NS + 1);
+
+    // a survivor echoes the dead node's entry
+    _ = try t.merge("127.0.0.1:9101", &v, "ff", NO_COMMITTEE, 2, now, .hearsay);
+    try std.testing.expectEqual(@as(usize, 0), t.liveCount());
+    // the echo may still carry newer holdings; only liveness is withheld
+    try std.testing.expectEqual(@as(u64, 2), t.entries.items[0].holdings_seq);
+
+    // direct contact revives it
+    _ = try t.merge("127.0.0.1:9101", &v, "ff", NO_COMMITTEE, 3, now, .first_hand);
+    try std.testing.expectEqual(@as(usize, 1), t.liveCount());
 }

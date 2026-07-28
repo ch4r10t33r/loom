@@ -367,7 +367,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     defer table.deinit();
     const zero_version = "0" ** 64;
     for (peer_strs.items) |ps| {
-        _ = table.merge(ps, zero_version, "", peers.NO_COMMITTEE, 0, stats.nowNs(io)) catch {};
+        _ = table.merge(ps, zero_version, "", peers.NO_COMMITTEE, 0, stats.nowNs(io), .hearsay) catch {};
     }
 
     if (opts.gguf_path) |gp| {
@@ -411,7 +411,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                 if (sync.PeerAddr.parse(m)) |a| {
                     try srcs.append(gpa, a);
                     // committee members seed the table WITH their committee id
-                    _ = table.merge(m, "0" ** 64, "", joined_committee_id, 0, stats.nowNs(io)) catch {};
+                    _ = table.merge(m, "0" ** 64, "", joined_committee_id, 0, stats.nowNs(io), .hearsay) catch {};
                 } else |_| {}
             }
             try srcs.appendSlice(gpa, peer_list.items);
@@ -738,6 +738,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             .store = if (store) |*st| st else null,
             .gen = &gen,
             .committee = committee_members.len,
+            .r_target = opts.r_target,
+            .gpa = gpa,
             .interval_ns = @as(u64, opts.status_secs) * std.time.ns_per_s,
             .start_ns = stats.nowNs(io),
         };

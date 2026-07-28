@@ -77,7 +77,10 @@ fn exchange(ctx: *Ctx, addr_str: []const u8) !void {
         const vhex = hashmod.toHex(e.manifest_version);
         const hhex = bytesToHexAlloc(gpa, e.holdings_bitmap) catch continue;
         defer gpa.free(hhex);
-        _ = ctx.table.merge(e.addr, &vhex, hhex, e.committee_id, e.holdings_seq, now) catch continue;
+        // The dialed peer's own entry is proof it answered; the rest of its
+        // batch is what it has heard from others.
+        const ev: peers.Evidence = if (std.mem.eql(u8, e.addr, addr_str)) .first_hand else .hearsay;
+        _ = ctx.table.merge(e.addr, &vhex, hhex, e.committee_id, e.holdings_seq, now, ev) catch continue;
     }
 }
 
