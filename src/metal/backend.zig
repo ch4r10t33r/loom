@@ -32,26 +32,36 @@ pub const MAX_BATCH = cpu.MAX_BATCH;
 const dmmv_q4k_src = @embedFile("../shaders/metal/dmmv_q4k.metal");
 const elementwise_src = @embedFile("../shaders/metal/elementwise.metal");
 
-/// Below this many rows the round trip costs more than the work it is waiting
-/// for, and the CPU path wins outright.
+/// Below this many rows the CPU path wins outright, so the GPU is not used.
 ///
-/// This is not a guess; it is the crossover the benchmark measures. On an M5:
+/// The threshold is measured, and the measurement corrected an earlier and
+/// much more optimistic one. Sweeping the shape on an M5, one dispatch per
+/// command buffer (which is what a dependency chain forces):
 ///
-///     gpu kernel   3.2 ns/row      cpu, 8 threads  22.4 ns/row
-///     submission   0.358 ms fixed  (commit + wait, per matvec)
+///     rows      gpu       cpu(8t)   ratio
+///     2048      0.383 ms  0.066 ms   0.17x
+///     5632      0.522     0.132      0.25x
+///     32000     1.374     0.723      0.53x
+///     65536     1.685     1.441      0.86x
+///     131072    1.808     2.765      1.53x
 ///
-///     0.358 / (22.4 - 3.2) ns  =>  ~18,600 rows
+/// So the GPU is roughly 1.9x faster *per row* and carries ~0.36 ms of fixed
+/// cost, and it does not overtake eight CPU threads until about 100k rows.
 ///
-/// The kernel is eight times faster per row; it just cannot pay off a fixed
-/// 0.358 ms until the tensor is very large. For TinyLlama only the 32000-row
-/// output head clears the bar — everything else is 2048 or 5632 rows and
-/// belongs on the CPU.
+/// An earlier version of this constant was 18,000, derived from a kernel
+/// measured at 8x the CPU. That figure came from fifty identical dispatches
+/// issued back to back with no barriers, where the GPU overlaps them and the
+/// number is throughput. A forward pass is a dependency chain and gets
+/// latency, not throughput. The lesson is in the constant: benchmark the
+/// shape the code actually runs.
 ///
-/// This threshold is a symptom, not a design. It drops to roughly zero once a
-/// whole forward pass is encoded into one command buffer instead of one
-/// dispatch per operation, at which point the eight-times figure is the one
-/// that shows up end to end.
-const MIN_GPU_ROWS = 18_000;
+/// For a 1.1B model nothing clears this bar -- the largest tensor is the
+/// 32000-row output head -- so Metal correctly declines every matvec and the
+/// build matches the CPU rather than losing to it. That changes with larger
+/// models, and with batched prefill, where each dispatch carries far more
+/// work. It also changes if the kernel improves: one SIMD group per row with
+/// a scalar inner loop is a long way from what the hardware can do.
+const MIN_GPU_ROWS = 100_000;
 
 /// Apple GPUs execute in 32-lane SIMD groups; the kernel assigns one per row.
 const SIMD_W = 32;
@@ -451,18 +461,28 @@ pub fn ffnBlock(
     const len_dim = extern struct { n: u32 }{ .n = @intCast(dim) };
     const group = SIMD_W * SIMDGROUPS_PER_GROUP;
 
+    // One encoder for the whole block. A barrier goes only where a dispatch
+    // reads what the previous one wrote; the gate and up projections are
+    // independent and overlap, which is the point of opening the encoder in
+    // concurrent dispatch mode.
     const cb = cx.dev.commandBuffer();
+    const e = cb.encoder();
     // normed = rmsnorm(x) * norm_w
-    cb.dispatch(cx.rmsnorm_p, &.{ cx.act[0], cx.scratch_x, cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&nd), SIMD_W, SIMD_W);
-    // gate = Wg . normed ; up = Wu . normed   (independent, same buffer)
-    cb.dispatch(cx.q4k, &.{ gw.buf, cx.act[1], cx.act[2] }, &.{ gw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ffn * SIMD_W, group);
-    cb.dispatch(cx.q4k, &.{ uw.buf, cx.act[1], cx.act[3] }, &.{ uw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ffn * SIMD_W, group);
+    e.dispatch(cx.rmsnorm_p, &.{ cx.act[0], cx.scratch_x, cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&nd), SIMD_W, SIMD_W);
+    e.barrier();
+    // gate = Wg . normed ; up = Wu . normed  — independent, no barrier between
+    e.dispatch(cx.q4k, &.{ gw.buf, cx.act[1], cx.act[2] }, &.{ gw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ffn * SIMD_W, group);
+    e.dispatch(cx.q4k, &.{ uw.buf, cx.act[1], cx.act[3] }, &.{ uw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ffn * SIMD_W, group);
+    e.barrier();
     // act = silu(gate) * up, in place over act[2]
-    cb.dispatch(cx.swiglu_p, &.{ cx.act[2], cx.act[3], cx.act[2] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_ffn), ffn, 64);
+    e.dispatch(cx.swiglu_p, &.{ cx.act[2], cx.act[3], cx.act[2] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_ffn), ffn, 64);
+    e.barrier();
     // ffn_out = Wd . act
-    cb.dispatch(cx.q4k, &.{ dw.buf, cx.act[2], cx.act[3] }, &.{ dw.off, 0, 0 }, std.mem.asBytes(&dims_down), dim * SIMD_W, group);
+    e.dispatch(cx.q4k, &.{ dw.buf, cx.act[2], cx.act[3] }, &.{ dw.off, 0, 0 }, std.mem.asBytes(&dims_down), dim * SIMD_W, group);
+    e.barrier();
     // x += ffn_out
-    cb.dispatch(cx.add_p, &.{ cx.act[0], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), dim, 64);
+    e.dispatch(cx.add_p, &.{ cx.act[0], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), dim, 64);
+    e.end();
     cb.commitAndWait();
 
     @memcpy(x, cx.act[0].slice(f32)[0..dim]);
@@ -692,4 +712,69 @@ test "resident ffn block vs the cpu ffn" {
         }
     }.f;
     std.debug.print("  ffn block: gpu (1 command buffer) {d:.3} ms   cpu (8 threads) {d:.3} ms\n", .{ ms(gpu), ms(cpu_ns) });
+}
+
+test "metal scaling: where does the gpu actually win" {
+    // A dependency chain on the GPU pays launch latency per step, and a
+    // single-token decode of a small model gives each dispatch very little
+    // work to amortize it with. Sweep the shape to find where the GPU starts
+    // winning, rather than assuming it does.
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    parallelBegin(8);
+    defer parallelEnd();
+    const cx = &(ctx orelse return error.SkipZigTest);
+
+    var t: std.Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+    const now = struct {
+        fn f(i: std.Io) i128 {
+            return std.Io.Clock.Timestamp.now(i, .awake).raw.toNanoseconds();
+        }
+    }.f;
+
+    const cols = 2048;
+    std.debug.print("\n  rows      gpu(1 cb)      cpu(8t)   ratio\n", .{});
+    for ([_]usize{ 2048, 5632, 16384, 32000, 65536, 131072 }) |rows| {
+        const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, cols, rows));
+        defer gpa.free(data);
+        var prng = std.Random.DefaultPrng.init(7);
+        prng.random().bytes(data);
+        for (0..data.len / 2) |i| data[i * 2 + 1] &= 0xFB;
+        const x = try gpa.alloc(f32, cols);
+        defer gpa.free(x);
+        for (x) |*v| v.* = prng.random().float(f32) - 0.5;
+        const dst = try gpa.alloc(f32, rows);
+        defer gpa.free(dst);
+        if (rows * 4 > cx.scratch_out.len) continue;
+        @memcpy(cx.scratch_x.slice(f32)[0..cols], x);
+        const w = wrapFor(cx, data) orelse continue;
+        const dims = Dims{ .rows = @intCast(rows), .cols = @intCast(cols) };
+        const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+
+        const N = 20;
+        // warm
+        {
+            const cb = cx.dev.commandBuffer();
+            cb.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), rows * SIMD_W, group);
+            cb.commitAndWait();
+        }
+        const t0 = now(io);
+        for (0..N) |_| {
+            const cb = cx.dev.commandBuffer();
+            cb.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), rows * SIMD_W, group);
+            cb.commitAndWait();
+        }
+        const gpu = @divTrunc(now(io) - t0, N);
+
+        cpu.matvec(.q4_k, dst, data, x, rows, cols);
+        const t1 = now(io);
+        for (0..N) |_| cpu.matvec(.q4_k, dst, data, x, rows, cols);
+        const cpu_ns = @divTrunc(now(io) - t1, N);
+
+        const g: f64 = @as(f64, @floatFromInt(gpu)) / 1e6;
+        const c2: f64 = @as(f64, @floatFromInt(cpu_ns)) / 1e6;
+        std.debug.print("  {d:>7}   {d:>8.3} ms   {d:>8.3} ms   {d:>5.2}x\n", .{ rows, g, c2, c2 / g });
+    }
 }
