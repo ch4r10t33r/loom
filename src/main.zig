@@ -119,14 +119,14 @@ fn usage(out: *Io.Writer) !void {
         \\            [--gguf FILE | --bootstrap HOST:PORT]
         \\            [--peers H:P,H:P,...] [--hold-fraction F] [--range-mb M]
         \\            [--advertise HOST:PORT] [--r-target N] [--free-quota TOKENS] [--admin-token TOK]
-        \\            [--ui-addr A] [--ui-port P] [--status-secs N] [--threads N]
+        \\            [--ui-addr A] [--ui-port P] [--status-secs N] [--threads N] [--batch N]
         \\  loom light [--full-nodes H:P[,...]] [--openai-port P --openai-full-nodes H:P[,...]]
         \\             [--rpc-addr A] [--rpc-port P] [--openai-addr A] [--client-id ID]
         \\  loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2|llama|qwen2moe|qwen3moe|glm4moe]
         \\  loom gguf info <file> [--range-mb M]
         \\  loom gguf shard <file>
         \\  loom gguf run <file.gguf | store-dir> [--prompt STR] [--max-tokens N] [--temp T]
-        \\                [--seed S] [--ctx N] [--threads N] [--committee H:P,...] [--peers H:P,...]
+        \\                [--seed S] [--ctx N] [--threads N] [--batch N] [--committee H:P,...] [--peers H:P,...]
         \\  loom gen <dir> [--glm] [--seed N]
         \\  loom info <dir>
         \\  loom iobench <file> [--threads N] [--block-mb M] [--reads R]
@@ -393,6 +393,7 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .ui_port = try flagU16(args, "--ui-port", @intCast(try envU64(env, "UI_PORT", 8555))),
         .status_secs = @intCast(try flagUsize(args, "--status-secs", 30)),
         .kernel_threads = try flagUsize(args, "--threads", 0),
+        .prefill_batch = try flagUsize(args, "--batch", 0),
         .chat_format = flagStr(args, "--chat-format"),
     });
 }
@@ -737,6 +738,7 @@ fn runStoreWith(
 
     const ctx_cap = try flagUsize(args, "--ctx", 4096);
     generator.kernel_threads = try flagUsize(args, "--threads", 0);
+    generator.prefill_batch = try flagUsize(args, "--batch", 0);
     m.cfg.ctx_len = @min(m.cfg.ctx_len, ctx_cap);
     const c = m.cfg;
     try out.print("gguf: dim={d} layers={d} heads={d} vocab={d} ctx={d}\n", .{
@@ -767,7 +769,17 @@ fn runStoreWith(
     const t0 = stats.nowNs(io);
     var pos: usize = 0;
     try out.print("output: ", .{});
-    for (prompt_toks) |tok| {
+    if (@hasDecl(E, "stepBatch")) {
+        // Batched prefill: the prompt is known up front, so weights are
+        // unpacked once for several tokens rather than once per token.
+        while (pos < prompt_toks.len) {
+            if (pos >= c.ctx_len) return out.print("\nprompt exceeds context\n", .{});
+            const take = @min(@min(generator.batchSize(), prompt_toks.len - pos), c.ctx_len - pos);
+            try E.stepBatch(&m, &st, prompt_toks[pos..][0..take], pos);
+            for (prompt_toks[pos..][0..take]) |tok| try m.decodeToken(out, tok);
+            pos += take;
+        }
+    } else for (prompt_toks) |tok| {
         if (pos >= c.ctx_len) return out.print("\nprompt exceeds context\n", .{});
         try E.step(&m, &st, tok, pos);
         try m.decodeToken(out, tok);
@@ -818,6 +830,7 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
     // cap the KV allocation: model context lengths can be 100k+
     const ctx_cap = try flagUsize(args, "--ctx", 4096);
     generator.kernel_threads = try flagUsize(args, "--threads", 0);
+    generator.prefill_batch = try flagUsize(args, "--batch", 0);
     m.cfg.ctx_len = @min(m.cfg.ctx_len, ctx_cap);
     const c = m.cfg;
     try out.print("gguf: dim={d} layers={d} heads={d} vocab={d} ctx={d}\n", .{
@@ -844,7 +857,16 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
     var pos: usize = 0;
     // prefill (echo the prompt as we go)
     try out.print("output: ", .{});
-    for (prompt_toks) |tok| {
+    if (@hasDecl(eng, "stepBatch")) {
+        // Batched prefill: unpack each weight once for several tokens.
+        while (pos < prompt_toks.len) {
+            if (pos >= c.ctx_len) return out.print("\nprompt exceeds context\n", .{});
+            const take = @min(@min(generator.batchSize(), prompt_toks.len - pos), c.ctx_len - pos);
+            try eng.stepBatch(&m, &st, prompt_toks[pos..][0..take], pos);
+            for (prompt_toks[pos..][0..take]) |tok| try m.decodeToken(out, tok);
+            pos += take;
+        }
+    } else for (prompt_toks) |tok| {
         if (pos >= c.ctx_len) return out.print("\nprompt exceeds context\n", .{});
         try eng.step(&m, &st, tok, pos);
         try m.decodeToken(out, tok);

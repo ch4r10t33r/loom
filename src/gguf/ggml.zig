@@ -183,7 +183,7 @@ const Vf = @Vector(LANES, f32);
 /// throughput. Four independent accumulators plus vector lanes break that
 /// chain, which is most of the win here -- more than the lane count alone
 /// suggests.
-inline fn dotF32(a: []const f32, b: []const f32) f32 {
+pub inline fn dotF32(a: []const f32, b: []const f32) f32 {
     std.debug.assert(a.len == b.len);
     var acc0: Vf = @splat(0);
     var acc1: Vf = @splat(0);
@@ -202,6 +202,20 @@ inline fn dotF32(a: []const f32, b: []const f32) f32 {
     var acc = @reduce(.Add, acc0 + acc1 + acc2 + acc3);
     while (i < a.len) : (i += 1) acc += a[i] * b[i];
     return acc;
+}
+
+/// out += w * v, vectorized. The attention value-accumulation step, which runs
+/// once per cached position per head per layer -- scalar, it dominated prefill
+/// once the projections were batched.
+pub inline fn axpy(out: []f32, v: []const f32, w: f32) void {
+    std.debug.assert(out.len == v.len);
+    const vw: Vf = @splat(w);
+    var i: usize = 0;
+    while (i + LANES <= out.len) : (i += LANES) {
+        const o: Vf = out[i..][0..LANES].*;
+        out[i..][0..LANES].* = o + vw * @as(Vf, v[i..][0..LANES].*);
+    }
+    while (i < out.len) : (i += 1) out[i] += w * v[i];
 }
 
 /// Sum of an f32 slice (the `m * sum(x)` term the affine "_1" kernels hoist).
@@ -281,6 +295,8 @@ const Pool = struct {
     job_cols: usize = 0,
     job_rb: usize = 0,
     job_chunk: usize = 0,
+    /// >1 selects the batched kernels, which read activations from qxn_buf.
+    job_n: usize = 1,
 };
 
 var pool: Pool = .{};
@@ -343,10 +359,17 @@ fn worker(_: usize) void {
 /// and the submitting thread, so the submitter contributes work instead of
 /// idling.
 fn runChunks() void {
+    // Batched jobs read activations from this thread's own qxn_buf, so fill it
+    // before claiming any work -- once per worker per job, not per chunk.
+    if (pool.job_n > 1) quantizeXN(pool.job_x, pool.job_n, pool.job_cols);
     while (true) {
         const start = pool.cursor.fetchAdd(pool.job_chunk, .acq_rel);
         if (start >= pool.job_rows) return;
         const end = @min(start + pool.job_chunk, pool.job_rows);
+        if (pool.job_n > 1) {
+            matmulRows(pool.job_ty, pool.job_out, pool.job_data, pool.job_n, pool.job_rows, pool.job_cols, start, end);
+            continue;
+        }
         dispatch(
             pool.job_ty,
             pool.job_out[start..end],
@@ -355,6 +378,231 @@ fn runChunks() void {
             end - start,
             pool.job_cols,
         );
+    }
+}
+
+// ---- batched matmul (prefill) ------------------------------------------------
+//
+// Decoding one token at a time re-reads and re-unpacks every weight for every
+// token. During prefill the whole prompt is known up front, so the same
+// unpacked weight can serve several tokens: unpack once, dot N times.
+//
+// That matters because the unpack, not the dot, is the expensive half of a
+// quantized kernel. Measured on a 2048x5632 Q4_K tensor, Apple M5:
+//
+//     N=1   0.90 ms/token   (the single-vector kernel)
+//     N=4   0.57 ms/token   1.6x
+//     N=8   0.37 ms/token   2.4x
+//     N=16  0.39 ms/token   2.3x   <- register pressure, past the sweet spot
+//
+// so the batch is capped at 8.
+
+pub const MAX_BATCH = 8;
+
+/// Activations for a batch, grouped by block so all N tokens' lanes for one
+/// weight sub-block sit adjacent: the inner loop unpacks a sub-block once and
+/// then walks N contiguous activation blocks.
+///
+/// Thread-local, and each worker fills its own copy at the start of a job. The
+/// alternative -- quantize once on the submitting thread and share -- is what
+/// this was first written as, and it silently produced wrong results for every
+/// row a worker handled, because a worker's thread-local buffer was never
+/// filled. Re-quantizing costs O(n*cols) against a chunk's O(rows*cols), under
+/// 2% here, which is a cheap price for not sharing mutable state across
+/// threads at all.
+threadlocal var qxn_buf: [MAX_QX_BLOCKS][MAX_BATCH]XBlock = undefined;
+
+fn quantizeXN(xs: []const f32, n: usize, cols: usize) void {
+    const nb = cols / QK_0;
+    std.debug.assert(nb <= MAX_QX_BLOCKS and n <= MAX_BATCH);
+    for (0..n) |k| {
+        const x = xs[k * cols ..][0..cols];
+        for (0..nb) |b| {
+            const src = x[b * QK_0 ..][0..QK_0];
+            var amax: f32 = 0;
+            for (src) |v| amax = @max(amax, @abs(v));
+            const d = amax / 127.0;
+            const inv: f32 = if (d != 0) 1.0 / d else 0;
+            var sum: i32 = 0;
+            for (src, 0..) |v, i| {
+                const q: i8 = @intFromFloat(@round(v * inv));
+                qxn_buf[b][k].q[i] = q;
+                sum += q;
+            }
+            qxn_buf[b][k].d = d;
+            qxn_buf[b][k].sum = sum;
+        }
+    }
+}
+
+/// out[k*rows + r] = dot(W[r], xs[k*cols ..]) for k in 0..n.
+///
+/// Bit-identical to calling `matvec` n times, including on the int8 paths:
+/// the activation quantization is per-vector and deterministic, so batching
+/// changes only the order weights are unpacked in, never a value.
+pub fn matmul(t: Type, out: []f32, data: []const u8, xs: []const f32, n: usize, rows: usize, cols: usize) void {
+    std.debug.assert(out.len == n * rows and xs.len == n * cols);
+    if (n == 0) return;
+    if (n == 1) return matvec(t, out, data, xs, rows, cols);
+
+    // Types without a batched kernel still work, just without the saving.
+    const batched = switch (t) {
+        .q4_k, .q6_k, .q8_0 => true,
+        else => false,
+    };
+    if (!batched or n > MAX_BATCH) {
+        for (0..n) |k| matvec(t, out[k * rows ..][0..rows], data, xs[k * cols ..][0..cols], rows, cols);
+        return;
+    }
+
+    const workers = pool.n;
+    if (workers == 0 or rows < 2 * MIN_ROWS_PER_THREAD) {
+        quantizeXN(xs, n, cols);
+        return matmulRows(t, out, data, n, rows, cols, 0, rows);
+    }
+    // Reuse the matvec pool by describing the job in the same fields; the
+    // batch variant is distinguished by job_n > 1.
+    const rb = rowBytes(t, cols);
+    const per = @max(MIN_ROWS_PER_THREAD, (rows + (workers + 1) * 2 - 1) / ((workers + 1) * 2));
+    pool.job_ty = t;
+    pool.job_out = out;
+    pool.job_data = data;
+    pool.job_x = xs;
+    pool.job_rows = rows;
+    pool.job_cols = cols;
+    pool.job_rb = rb;
+    pool.job_chunk = per;
+    pool.job_n = n;
+    pool.cursor.store(0, .monotonic);
+    pool.active.store(workers, .monotonic);
+    _ = pool.seq.fetchAdd(1, .release);
+    runChunks();
+    var spins: u32 = 0;
+    while (pool.active.load(.acquire) != 0) {
+        spins += 1;
+        if (spins < SPIN_BEFORE_YIELD) std.atomic.spinLoopHint() else std.Thread.yield() catch {};
+    }
+    pool.job_n = 1;
+}
+
+/// Batched kernels for rows [r0, r1). Activations must already be in
+/// `qxn_buf`; `out` is the whole [n*rows] destination.
+fn matmulRows(t: Type, out: []f32, data: []const u8, n: usize, rows: usize, cols: usize, r0: usize, r1: usize) void {
+    switch (t) {
+        .q4_k => matmulQ4K(out, data, n, rows, cols, r0, r1),
+        .q6_k => matmulQ6K(out, data, n, rows, cols, r0, r1),
+        .q8_0 => matmulQ80(out, data, n, rows, cols, r0, r1),
+        else => unreachable,
+    }
+}
+
+fn matmulQ4K(out: []f32, data: []const u8, n: usize, rows: usize, cols: usize, r0: usize, r1: usize) void {
+    const bpr = cols / QK_K;
+    const rb = bpr * Q4_K_BLOCK;
+    for (r0..r1) |r| {
+        const row = data[r * rb ..][0..rb];
+        var acc: [MAX_BATCH]f32 = @splat(0);
+        for (0..bpr) |b| {
+            const block = row[b * Q4_K_BLOCK ..][0..Q4_K_BLOCK];
+            const d = f16FromBytes(block[0..2]);
+            const dmin = f16FromBytes(block[2..4]);
+            const scales: *const [12]u8 = block[4..16];
+            const qs = block[16..][0 .. QK_K / 2];
+            for (0..QK_K / QK_0) |j| {
+                var sc: u8 = undefined;
+                var mn: u8 = undefined;
+                scaleMinK4(j, scales, &sc, &mn);
+                const w = nib32(qs[(j / 2) * QK_0 ..][0..QK_0], j % 2 == 1); // once
+                const ds = d * @as(f32, @floatFromInt(sc));
+                const dm = dmin * @as(f32, @floatFromInt(mn));
+                const blk = &qxn_buf[b * (QK_K / QK_0) + j];
+                for (0..n) |k| {
+                    const xb = &blk[k];
+                    const dot = dotW32(w, &xb.q);
+                    acc[k] += xb.d * (ds * @as(f32, @floatFromInt(dot)) -
+                        dm * @as(f32, @floatFromInt(xb.sum)));
+                }
+            }
+        }
+        for (0..n) |k| out[k * rows + r] = acc[k];
+    }
+}
+
+fn matmulQ6K(out: []f32, data: []const u8, n: usize, rows: usize, cols: usize, r0: usize, r1: usize) void {
+    const bpr = cols / QK_K;
+    const rb = bpr * Q6_K_BLOCK;
+    const m0f: @Vector(QK_0, u8) = @splat(0x0F);
+    const m3: @Vector(QK_0, u8) = @splat(3);
+    for (r0..r1) |r| {
+        const row = data[r * rb ..][0..rb];
+        var acc: [MAX_BATCH]f32 = @splat(0);
+        for (0..bpr) |b| {
+            const block = row[b * Q6_K_BLOCK ..][0..Q6_K_BLOCK];
+            const ql_all = block[0 .. QK_K / 2];
+            const qh_all = block[QK_K / 2 ..][0 .. QK_K / 4];
+            const sc_all = block[QK_K / 2 + QK_K / 4 ..][0 .. QK_K / 16];
+            const d = f16FromBytes(block[QK_K / 2 + QK_K / 4 + QK_K / 16 ..][0..2]);
+            for (0..2) |h2| {
+                const ql = ql_all[h2 * 64 ..][0..64];
+                const qh = qh_all[h2 * 32 ..][0..32];
+                const sc = sc_all[h2 * 8 ..][0..8];
+                const a: @Vector(QK_0, u8) = ql[0..QK_0].*;
+                const bb: @Vector(QK_0, u8) = ql[32..64].*;
+                const h: @Vector(QK_0, u8) = qh[0..QK_0].*;
+                const sh4: @Vector(QK_0, u3) = @splat(4);
+                const sh2: @Vector(QK_0, u3) = @splat(2);
+                const sh6: @Vector(QK_0, u3) = @splat(6);
+                const w: [4]@Vector(QK_0, i16) = .{
+                    @as(@Vector(QK_0, u8), (a & m0f) | ((h & m3) << sh4)),
+                    @as(@Vector(QK_0, u8), (bb & m0f) | (((h >> sh2) & m3) << sh4)),
+                    @as(@Vector(QK_0, u8), (a >> sh4) | (((h >> sh4) & m3) << sh4)),
+                    @as(@Vector(QK_0, u8), (bb >> sh4) | (((h >> sh6) & m3) << sh4)),
+                };
+                for (0..4) |g| {
+                    const wv = w[g];
+                    const lo_w: @Vector(16, i16) = std.simd.extract(wv, 0, 16);
+                    const hi_w: @Vector(16, i16) = std.simd.extract(wv, 16, 16);
+                    const s0 = i8f(sc[g * 2]);
+                    const s1 = i8f(sc[g * 2 + 1]);
+                    const blk = &qxn_buf[b * 8 + h2 * 4 + g];
+                    for (0..n) |k| {
+                        const xb = &blk[k];
+                        const X: @Vector(QK_0, i16) = @as(@Vector(QK_0, i8), xb.q);
+                        const lo_x: @Vector(16, i16) = std.simd.extract(X, 0, 16);
+                        const hi_x: @Vector(16, i16) = std.simd.extract(X, 16, 16);
+                        const dot_lo = @reduce(.Add, @as(@Vector(16, i32), lo_w * lo_x));
+                        const dot_hi = @reduce(.Add, @as(@Vector(16, i32), hi_w * hi_x));
+                        const sum_lo = @reduce(.Add, @as(@Vector(16, i32), lo_x));
+                        const sum_hi = @reduce(.Add, @as(@Vector(16, i32), hi_x));
+                        acc[k] += d * xb.d * (s0 * (@as(f32, @floatFromInt(dot_lo)) - 32.0 * @as(f32, @floatFromInt(sum_lo))) +
+                            s1 * (@as(f32, @floatFromInt(dot_hi)) - 32.0 * @as(f32, @floatFromInt(sum_hi))));
+                    }
+                }
+            }
+        }
+        for (0..n) |k| out[k * rows + r] = acc[k];
+    }
+}
+
+fn matmulQ80(out: []f32, data: []const u8, n: usize, rows: usize, cols: usize, r0: usize, r1: usize) void {
+    const bpr = cols / QK_0;
+    const rb = bpr * Q8_0_BLOCK;
+    for (r0..r1) |r| {
+        const row = data[r * rb ..][0..rb];
+        var acc: [MAX_BATCH]f32 = @splat(0);
+        for (0..bpr) |b| {
+            const block = row[b * Q8_0_BLOCK ..][0..Q8_0_BLOCK];
+            const d = f16FromBytes(block[0..2]);
+            const W: @Vector(QK_0, i16) = @as(@Vector(QK_0, i8), @bitCast(block[2..][0..QK_0].*));
+            const blk = &qxn_buf[b];
+            for (0..n) |k| {
+                const xb = &blk[k];
+                const X: @Vector(QK_0, i16) = @as(@Vector(QK_0, i8), xb.q);
+                const dot = @reduce(.Add, @as(@Vector(QK_0, i32), W * X));
+                acc[k] += d * xb.d * @as(f32, @floatFromInt(dot));
+            }
+        }
+        for (0..n) |k| out[k * rows + r] = acc[k];
     }
 }
 
@@ -1436,6 +1684,62 @@ test "parallel matvec produces bit-identical results to inline" {
             @memset(par, std.math.nan(f32));
             matvec(t, par, data, x, rows, cols);
             try std.testing.expectEqualSlices(f32, serial, par);
+        }
+    }
+}
+
+test "matmul is bit-identical to repeated matvec" {
+    // Batching changes only the order weights are unpacked in. The activation
+    // quantization is per-vector and deterministic, so a batched result must
+    // equal the single-vector result exactly -- not approximately. A tolerance
+    // here would hide exactly the bugs this is meant to catch: an off-by-one
+    // in the per-token activation stride, or a scale applied to the wrong
+    // token's lanes.
+    const gpa = std.testing.allocator;
+    const cols = QK_K * 2;
+    const rows = 133;
+
+    var prng = std.Random.DefaultPrng.init(0x5EED);
+    const rnd = prng.random();
+
+    for ([_]Type{ .q4_k, .q6_k, .q8_0, .q5_k, .f32 }) |t| {
+        const data = try gpa.alloc(u8, tensorBytes(t, cols, rows));
+        defer gpa.free(data);
+        rnd.bytes(data);
+        for (0..data.len / 2) |i| data[i * 2 + 1] &= 0xFB;
+
+        for ([_]usize{ 2, 3, 5, MAX_BATCH }) |n| {
+            const xs = try gpa.alloc(f32, n * cols);
+            defer gpa.free(xs);
+            // Deliberately different magnitudes per token: a shared or stale
+            // activation scale would go unnoticed with uniform inputs.
+            for (0..n) |k| {
+                for (xs[k * cols ..][0..cols]) |*v| {
+                    v.* = (rnd.float(f32) - 0.5) * @as(f32, @floatFromInt(k + 1));
+                }
+            }
+
+            const want = try gpa.alloc(f32, n * rows);
+            defer gpa.free(want);
+            for (0..n) |k| {
+                matvec(t, want[k * rows ..][0..rows], data, xs[k * cols ..][0..cols], rows, cols);
+            }
+
+            const got = try gpa.alloc(f32, n * rows);
+            defer gpa.free(got);
+            matmul(t, got, data, xs, n, rows, cols);
+            std.testing.expectEqualSlices(f32, want, got) catch |e| {
+                std.debug.print("{s} n={d}\n", .{ @tagName(t), n });
+                return e;
+            };
+
+            // and again with the worker pool live, which routes through a
+            // different code path in runChunks
+            parallelBegin(4);
+            defer parallelEnd();
+            @memset(got, std.math.nan(f32));
+            matmul(t, got, data, xs, n, rows, cols);
+            try std.testing.expectEqualSlices(f32, want, got);
         }
     }
 }

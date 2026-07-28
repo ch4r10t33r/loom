@@ -95,7 +95,23 @@ intrinsics) and matvecs run row-parallel across a worker pool. Measured on a
 | SIMD, single-threaded | 6.0 | 5.5x |
 | SIMD + 8 threads | 26.0 | 23.6x |
 | + int8 activations, 1 thread | 15.0 | 13.6x |
-| **+ int8 activations, 8 threads** | **51.9** | **47x** |
+| + int8 activations, 8 threads | 51.9 | 47x |
+| **+ vectorized attention** | **57.8** | **53x** |
+
+Prefill is batched separately, because the prompt is known up front: the same
+unpacked weight serves several tokens instead of being unpacked once per
+token. A 145-token prefill on the same model, best of three:
+
+| `--batch` | time |
+|---|---|
+| 1 (off) | 2.65 s |
+| 4 | 2.01 s |
+| **8** | **1.87 s** |
+
+That is 1.4x rather than the 2.4x the kernel microbenchmark shows in
+isolation, because attention is quadratic in prompt length and is not batched
+— it is bound by the KV cache rather than by weight reads, so there is nothing
+to amortize there.
 
 The last step is the one worth understanding. Profiling the kernels showed
 **76-92% of a quantized matvec was the dequantize, not the dot** — each block
