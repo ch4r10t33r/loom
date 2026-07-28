@@ -105,11 +105,28 @@ small and #12/#13 are not.
    to it. Fourteen operations, and every engine now calls through them. No
    behaviour change: the bit-identical, golden-vector and architecture tests
    all pass unchanged, which is the proof it was a pure refactor.
-2. **#12 — Metal.** ObjC shim, device/buffer/pipeline/command, zero-copy GGUF
-   wrapping, then kernels in dependency order: `dmmv` for Q4_K and Q6_K first
-   (they are the whole of a Q4_K_M model), then attention, RMSNorm, RoPE,
-   SwiGLU, softmax. Correctness against the CPU path per kernel, the same way
-   the codebook decoders were checked against llama.cpp.
+2. **#12 — Metal. Substrate done, one kernel correct, not yet fast.**
+   The ObjC shim, device/buffer/pipeline/command layer and zero-copy GGUF
+   wrapping all work, and Q4_K `dmmv` matches the exact CPU reference. It is
+   currently **2.4x slower than the CPU path** end to end (18.1 vs 43.0 tok/s
+   on TinyLlama 1.1B), for a structural reason rather than a kernel one:
+
+   - **One command-buffer commit-and-wait per matvec.** At roughly 150 matvecs
+     per token, submission latency alone dominates. The fix is to encode the
+     whole forward pass into one command buffer and commit once per token —
+     which is why the elementwise ops were routed through the backend seam.
+   - **Activations copied in and out per call**, because only Q4_K is on the
+     GPU and everything else still runs on the host, so they ping-pong across
+     every op boundary.
+   - **The kernel is deliberately naive**: one thread per row, scalar inner
+     loop, no threadgroup cooperation or vectorization yet.
+
+   Correctness first was the right order — the substrate is proven, and the
+   remaining work is dispatch batching and kernel tuning rather than
+   architecture.
+
+   Remaining kernels in dependency order: Q6_K `dmmv`, then RMSNorm, RoPE,
+   SwiGLU, softmax and attention, so activations can stay resident.
 3. **Distributed integration.** Peer-fetched experts wrapped zero-copy on
    Apple; a VRAM tier with pinning on discrete GPUs.
 4. **#13 — Vulkan.** Same kernels as compute shaders, plus the upload tier
