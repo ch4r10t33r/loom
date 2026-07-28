@@ -34,6 +34,12 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    // Metal needs one Objective-C translation unit and two system frameworks.
+    // Only compiled when the backend is selected, so a CPU build never needs a
+    // macOS SDK path or an ObjC compiler.
+    if (std.mem.eql(u8, gpu, "metal")) {
+        addMetal(b, exe);
+    }
     b.installArtifact(exe);
 
     // `zig build run -- <args>`
@@ -55,7 +61,23 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
+    if (std.mem.eql(u8, gpu, "metal")) addMetal(b, unit_tests);
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+}
+
+/// Compile the Metal shim and link the frameworks it needs. ARC is on so the
+/// shim can use ordinary Objective-C object lifetime; modules so it can
+/// `@import` the frameworks without a bridging header.
+fn addMetal(b: *std.Build, c: *std.Build.Step.Compile) void {
+    const m = c.root_module;
+    m.addCSourceFile(.{
+        .file = b.path("src/metal/shim.m"),
+        .flags = &.{ "-fobjc-arc", "-fmodules" },
+    });
+    m.addIncludePath(b.path("src/metal"));
+    m.linkFramework("Metal", .{});
+    m.linkFramework("Foundation", .{});
+    m.link_libc = true;
 }

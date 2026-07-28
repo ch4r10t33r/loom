@@ -44,7 +44,7 @@ pub const kind: Kind = blk: {
 
 const impl = switch (kind) {
     .cpu => @import("cpu.zig"),
-    .metal => @compileError("the Metal backend is not implemented yet (issue #12); build without -Dgpu"),
+    .metal => @import("../metal/backend.zig"),
     .vulkan => @compileError("the Vulkan backend is not implemented yet (issue #13); build without -Dgpu"),
 };
 
