@@ -14,6 +14,7 @@ typedef void *loom_mtl_buffer;
 typedef void *loom_mtl_pipeline;
 typedef void *loom_mtl_queue;
 typedef void *loom_mtl_cmdbuf;
+typedef void *loom_mtl_encoder;
 
 // ---- device ----
 loom_mtl_device loom_mtl_device_create(void);
@@ -52,5 +53,20 @@ void loom_mtl_encode(loom_mtl_cmdbuf cb, loom_mtl_pipeline p,
                      size_t n_buffers, const void *constants, size_t constants_len,
                      size_t grid_x, size_t group_x);
 void loom_mtl_cmdbuf_commit_wait(loom_mtl_cmdbuf cb);
+
+// One encoder, many dispatches.
+//
+// `loom_mtl_encode` above opens a fresh compute encoder per dispatch, and an
+// encoder boundary is a full pipeline drain: a six-dispatch block pays six of
+// them. These let a caller open one encoder, issue several dispatches into it,
+// and place a barrier only where one dispatch genuinely reads what the
+// previous one wrote.
+loom_mtl_encoder loom_mtl_encoder_begin(loom_mtl_cmdbuf cb);
+void loom_mtl_encoder_dispatch(loom_mtl_encoder e, loom_mtl_pipeline p,
+                               const loom_mtl_buffer *buffers, const size_t *offsets,
+                               size_t n_buffers, const void *constants,
+                               size_t constants_len, size_t grid_x, size_t group_x);
+void loom_mtl_encoder_barrier(loom_mtl_encoder e);
+void loom_mtl_encoder_end(loom_mtl_encoder e);
 
 #endif

@@ -105,53 +105,68 @@ small and #12/#13 are not.
    to it. Fourteen operations, and every engine now calls through them. No
    behaviour change: the bit-identical, golden-vector and architecture tests
    all pass unchanged, which is the proof it was a pure refactor.
-2. **#12 — Metal. Substrate and kernels done; dispatch structure is the
-   remaining gap.**
+2. **#12 — Metal. Substrate and kernels done. It does not yet beat the CPU on
+   a small model, and the measurements say why.**
 
-   The decisive measurement, on an M5:
+   Sweeping the shape on an M5, one dispatch per command buffer — which is
+   what a dependency chain forces:
 
-   | | time |
-   |---|---|
-   | empty command buffer, commit + wait | 15.4 us |
-   | + one trivial dispatch | 263.4 us |
-   | ten dispatches, one buffer | 262.3 us (26 us each) |
+   | rows | GPU | CPU, 8 threads | ratio |
+   |---|---|---|---|
+   | 2,048 | 0.383 ms | 0.066 ms | 0.17x |
+   | 5,632 | 0.522 | 0.132 | 0.25x |
+   | 32,000 | 1.374 | 0.723 | 0.53x |
+   | 65,536 | 1.685 | 1.441 | 0.86x |
+   | 131,072 | 1.808 | 2.765 | **1.53x** |
 
-   The cost is neither per dispatch nor the commit floor. It is a **fixed
-   ~262 us paid once per command buffer that contains any GPU work**. Ten
-   dispatches cost the same as one. So the unit of work that matters is not
-   the kernel, it is the buffer, and anything that forces the host to read an
-   intermediate splits one buffer in two and adds 262 us.
+   So the GPU is about **1.9x faster per row** and carries **~0.36 ms of fixed
+   cost**, and it does not overtake eight CPU threads until roughly 100k rows.
+   For a 1.1B model nothing clears that bar — the largest tensor is the
+   32000-row output head — so Metal correctly declines every matvec and the
+   build matches the CPU rather than losing to it.
 
-   With a matvec kernel measured at 18 us, that arithmetic decides everything:
+   **Two earlier numbers in this document were wrong, and the corrections are
+   the useful part.**
 
-   | dispatches per command buffer | predicted |
-   |---|---|
-   | one per matvec (~110 per token) | 33 tok/s |
-   | one per layer (22) | 134 tok/s |
-   | one per token | 504 tok/s |
+   The kernel was reported at 8x the CPU. That came from fifty identical
+   dispatches issued back to back with no barriers, where the GPU overlaps
+   them: it measured *throughput*. A forward pass is a dependency chain and
+   gets *latency*. Benchmark the shape the code actually runs.
 
-   The first row matches what was actually observed, which is the check that
-   the model is right rather than a convenient story.
+   The fixed cost was attributed to command-buffer submission, and batching
+   dispatches into one buffer was expected to remove it. It did not: putting a
+   whole FFN block in one command buffer with one encoder changed 1.039 ms to
+   1.034 ms. Neither command buffers nor encoder boundaries were the cost.
+   What remains is per-dispatch latency in a dependent chain, which batching
+   cannot remove.
 
-   Done so far: the Metal substrate, `dmmv_q4k` (8x faster per row than eight
-   CPU threads), the elementwise and norm kernels, device-resident activation
-   buffers, and a whole FFN block encoded into a single command buffer.
+   What would actually move it, in order of expected return:
 
-   Still slower than the CPU, and the reason is now specific: the shim opens a
-   **new compute encoder per dispatch**, so a six-dispatch FFN pays six encoder
-   boundaries. The FFN block measures 1.04 ms against the CPU's 0.47 ms, well
-   above the ~310 us the buffer arithmetic predicts. One encoder per command
-   buffer, with barriers only between genuinely dependent dispatches, is the
-   next change.
+   - **A better kernel.** One SIMD group per row with a scalar inner loop over
+     32 values is a long way from the hardware. Vectorized loads and more
+     parallelism per row attack the 11.5 ns/row directly, and that is the term
+     that decides the crossover.
+   - **Batched prefill on the GPU.** Each dispatch then carries N tokens of
+     work against the same fixed cost, which is the regime GPUs are built for
+     and where the crossover moves down sharply.
+   - **Larger models.** A 30B MoE's tensors are far bigger than a 1.1B dense
+     model's, and the fixed cost amortizes.
 
-   After that, the remaining kernels — Q6_K `dmmv`, RoPE, attention — so a
-   whole layer, and then a whole token, fits in one buffer.
+   Done: the substrate, `dmmv_q4k`, the elementwise and norm kernels,
+   device-resident activation buffers, a whole FFN block in one command
+   buffer, and one encoder with barriers only between dependent dispatches.
+   All validated against exact CPU references.
 
 3. **Distributed integration.** Peer-fetched experts wrapped zero-copy on
    Apple; a VRAM tier with pinning on discrete GPUs.
 
-4. **#13 — Vulkan.** Same kernels as compute shaders, plus the upload tier
-   that Apple does not need.
+4. **#13 — Vulkan. Not yet, and deliberately.** Porting a design that does not
+   beat the CPU would reproduce the same result against a second API, with
+   more work: a discrete GPU adds the host-to-VRAM upload tier that unified
+   memory avoids, so Vulkan starts strictly harder. Metal should first
+   demonstrate a win on some real workload — most likely batched prefill or a
+   larger model — and only the structure that produced that win is worth
+   porting.
 
 ## Scale, honestly
 
