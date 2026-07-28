@@ -539,10 +539,24 @@ pub const State = struct {
     // kv cache: [n_layers][ctx][kv_dim]
     k_cache: []f32,
     v_cache: []f32,
+    // Batched-prefill scratch: the same activations, MAX_BATCH wide. About a
+    // megabyte for a 2B-class model, allocated once per request.
+    bx: []f32,
+    bnormed: []f32,
+    bq: []f32,
+    bk: []f32,
+    bv: []f32,
+    battn: []f32,
+    bproj: []f32,
+    bgate: []f32,
+    bup: []f32,
+    bact: []f32,
+    bffn: []f32,
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config) !State {
         const kvd = cfg.kvDim();
         const ffn_max = cfg.maxFfn();
+        const B = ggml.MAX_BATCH;
         return .{
             .cfg = cfg,
             .x = try gpa.alloc(f32, cfg.dim),
@@ -562,15 +576,28 @@ pub const State = struct {
             .logits = try gpa.alloc(f32, cfg.vocab),
             .k_cache = try gpa.alloc(f32, cfg.n_layers * cfg.ctx_len * kvd),
             .v_cache = try gpa.alloc(f32, cfg.n_layers * cfg.ctx_len * kvd),
+            .bx = try gpa.alloc(f32, B * cfg.dim),
+            .bnormed = try gpa.alloc(f32, B * cfg.dim),
+            .bq = try gpa.alloc(f32, B * cfg.qDim()),
+            .bk = try gpa.alloc(f32, B * kvd),
+            .bv = try gpa.alloc(f32, B * kvd),
+            .battn = try gpa.alloc(f32, B * cfg.qDim()),
+            .bproj = try gpa.alloc(f32, B * cfg.dim),
+            .bgate = try gpa.alloc(f32, B * ffn_max),
+            .bup = try gpa.alloc(f32, B * ffn_max),
+            .bact = try gpa.alloc(f32, B * ffn_max),
+            .bffn = try gpa.alloc(f32, B * cfg.dim),
         };
     }
 
     pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
         inline for (.{
-            self.x,        self.normed,   self.q,      self.k,      self.v,
-            self.attn_out, self.gate,     self.up,     self.act,    self.ffn_out,
-            self.moe_acc,  self.router,   self.scores, self.logits, self.k_cache,
-            self.v_cache,  self.proj_out,
+            self.x,        self.normed,   self.q,      self.k,       self.v,
+            self.attn_out, self.gate,     self.up,     self.act,     self.ffn_out,
+            self.moe_acc,  self.router,   self.scores, self.logits,  self.k_cache,
+            self.v_cache,  self.proj_out, self.bx,     self.bnormed, self.bq,
+            self.bk,       self.bv,       self.battn,  self.bproj,   self.bgate,
+            self.bup,      self.bact,     self.bffn,
         }) |sl| gpa.free(sl);
     }
 };
@@ -706,9 +733,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             var t_i: usize = 0;
             while (t_i < seq) : (t_i += 1) {
                 const kt = st.k_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
-                var dot: f32 = 0;
-                for (qh, kt) |a, b| dot += a * b;
-                st.scores[t_i] = dot * scale;
+                st.scores[t_i] = ggml.dotF32(qh, kt) * scale;
             }
             tensor.softmax(st.scores[0..seq]);
             const oh = st.attn_out[h * hd ..][0..hd];
@@ -716,8 +741,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             t_i = 0;
             while (t_i < seq) : (t_i += 1) {
                 const vt = st.v_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
-                const w = st.scores[t_i];
-                for (oh, vt) |*o, vv| o.* += w * vv;
+                ggml.axpy(oh, vt, st.scores[t_i]);
             }
         }
         mv(l.attn_output, st.proj_out, st.attn_out);
@@ -731,66 +755,192 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             continue;
         }
 
-        mv(l.ffn_gate_inp.?, st.router[0..cfg.n_expert], st.normed);
-        var sel_buf: [moe.MAX_SELECTED]moe.Selected = undefined;
-        const sel = sel_buf[0..cfg.n_used];
-        const bias: ?[]const f32 = if (l.exp_probs_b) |b| tensorAsF32(b) else null;
-        moe.route(cfg.route, st.router[0..cfg.n_expert], bias, sel);
-
-        const acc = st.moe_acc;
-        @memset(acc, 0);
-        if (m.dist) |src| {
-            // warm the missing shards in parallel: per-layer miss latency
-            // becomes max(fetch), not sum(fetch)
-            var ids_buf: [moe.MAX_SELECTED]usize = undefined;
-            for (sel, 0..) |s, k| ids_buf[k] = m.expert_shard[li * cfg.n_expert + s.expert];
-            src.prefetch(ids_buf[0..sel.len]);
-        }
-        for (sel) |s| {
-            if (m.dist) |src| {
-                // One shard carries this expert's [gate, up, down] slices
-                // back to back, in that order (p2p/weights.zig).
-                const blk = try src.get(m.expert_shard[li * cfg.n_expert + s.expert]);
-                const gt = l.ffn_gate_exps.?;
-                const ut = l.ffn_up_exps.?;
-                const dt = l.ffn_down_exps.?;
-                const gl = gt.ne1 * ggml.rowBytes(gt.ty, gt.ne0);
-                const ul = ut.ne1 * ggml.rowBytes(ut.ty, ut.ne0);
-                const dl = dt.ne1 * ggml.rowBytes(dt.ty, dt.ne0);
-                denseFFN(
-                    st,
-                    .{ .ty = gt.ty, .data = blk[0..gl], .ne0 = gt.ne0, .ne1 = gt.ne1 },
-                    .{ .ty = ut.ty, .data = blk[gl..][0..ul], .ne0 = ut.ne0, .ne1 = ut.ne1 },
-                    .{ .ty = dt.ty, .data = blk[gl + ul ..][0..dl], .ne0 = dt.ne0, .ne1 = dt.ne1 },
-                );
-            } else {
-                denseFFN(
-                    st,
-                    try l.ffn_gate_exps.?.expert(s.expert),
-                    try l.ffn_up_exps.?.expert(s.expert),
-                    try l.ffn_down_exps.?.expert(s.expert),
-                );
-            }
-            for (acc, st.ffn_out) |*a, v| a.* += s.gate * v;
-        }
-        if (l.ffn_gate_shexp) |gs| {
-            denseFFN(st, gs, l.ffn_up_shexp.?, l.ffn_down_shexp.?);
-            if (l.ffn_gate_inp_shexp) |sg| {
-                // qwen2moe scales the shared expert by sigmoid(w . x). The
-                // others add it unweighted.
-                var logit: [1]f32 = undefined;
-                mv(sg, &logit, st.normed);
-                const g = tensor.sigmoid(logit[0]);
-                for (acc, st.ffn_out) |*a, v| a.* += g * v;
-            } else {
-                tensor.add(acc, st.ffn_out);
-            }
-        }
-        tensor.add(st.x, acc);
+        try moeLayer(m, st, l, li);
+        tensor.add(st.x, st.moe_acc);
     }
 
     tensor.rmsnorm(st.normed, st.x, tensorAsF32(m.output_norm), cfg.eps);
     mv(m.output, st.logits, st.normed);
+}
+
+/// One mixture-of-experts FFN layer: route `st.normed`, run the selected
+/// experts (fetching any this node does not hold), add the shared expert, and
+/// leave the result in `st.moe_acc`.
+///
+/// Split out of `step` so the batched prefill path can reuse it per token --
+/// tokens in a batch generally select different experts, so unlike the dense
+/// projections there is nothing to share across the batch.
+fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize) !void {
+    const cfg = m.cfg;
+    mv(l.ffn_gate_inp.?, st.router[0..cfg.n_expert], st.normed);
+    var sel_buf: [moe.MAX_SELECTED]moe.Selected = undefined;
+    const sel = sel_buf[0..cfg.n_used];
+    const bias: ?[]const f32 = if (l.exp_probs_b) |b| tensorAsF32(b) else null;
+    moe.route(cfg.route, st.router[0..cfg.n_expert], bias, sel);
+
+    const acc = st.moe_acc;
+    @memset(acc, 0);
+    if (m.dist) |src| {
+        // warm the missing shards in parallel: per-layer miss latency
+        // becomes max(fetch), not sum(fetch)
+        var ids_buf: [moe.MAX_SELECTED]usize = undefined;
+        for (sel, 0..) |s, k| ids_buf[k] = m.expert_shard[li * cfg.n_expert + s.expert];
+        src.prefetch(ids_buf[0..sel.len]);
+    }
+    for (sel) |s| {
+        if (m.dist) |src| {
+            // One shard carries this expert's [gate, up, down] slices
+            // back to back, in that order (p2p/weights.zig).
+            const blk = try src.get(m.expert_shard[li * cfg.n_expert + s.expert]);
+            const gt = l.ffn_gate_exps.?;
+            const ut = l.ffn_up_exps.?;
+            const dt = l.ffn_down_exps.?;
+            const gl = gt.ne1 * ggml.rowBytes(gt.ty, gt.ne0);
+            const ul = ut.ne1 * ggml.rowBytes(ut.ty, ut.ne0);
+            const dl = dt.ne1 * ggml.rowBytes(dt.ty, dt.ne0);
+            denseFFN(
+                st,
+                .{ .ty = gt.ty, .data = blk[0..gl], .ne0 = gt.ne0, .ne1 = gt.ne1 },
+                .{ .ty = ut.ty, .data = blk[gl..][0..ul], .ne0 = ut.ne0, .ne1 = ut.ne1 },
+                .{ .ty = dt.ty, .data = blk[gl + ul ..][0..dl], .ne0 = dt.ne0, .ne1 = dt.ne1 },
+            );
+        } else {
+            denseFFN(
+                st,
+                try l.ffn_gate_exps.?.expert(s.expert),
+                try l.ffn_up_exps.?.expert(s.expert),
+                try l.ffn_down_exps.?.expert(s.expert),
+            );
+        }
+        for (acc, st.ffn_out) |*a, v| a.* += s.gate * v;
+    }
+    if (l.ffn_gate_shexp) |gs| {
+        denseFFN(st, gs, l.ffn_up_shexp.?, l.ffn_down_shexp.?);
+        if (l.ffn_gate_inp_shexp) |sg| {
+            // qwen2moe scales the shared expert by sigmoid(w . x). The
+            // others add it unweighted.
+            var logit: [1]f32 = undefined;
+            mv(sg, &logit, st.normed);
+            const g = tensor.sigmoid(logit[0]);
+            for (acc, st.ffn_out) |*a, v| a.* += g * v;
+        } else {
+            tensor.add(acc, st.ffn_out);
+        }
+    }
+}
+
+/// Prefill `tokens` in one pass, writing their KV into the cache at
+/// `pos_base..`. Only the last token's logits are produced, which is all a
+/// prefill needs.
+///
+/// Decoding reads and unpacks every weight once per token. A prompt is known
+/// up front, so the same unpacked weight can serve the whole batch: unpack
+/// once, dot N times. That is worth ~2.4x on the projections, and it is why
+/// time-to-first-token falls even though decode speed is unchanged.
+///
+/// Attention is still per token -- it is bound by the KV cache, not by weight
+/// reads, so there is nothing to amortize. Routed experts are also still per
+/// token, because tokens in a batch generally select different experts and
+/// grouping them is a separate change.
+pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usize) !void {
+    const n = tokens.len;
+    std.debug.assert(n > 0 and n <= ggml.MAX_BATCH);
+    if (n == 1) return step(m, st, tokens[0], pos_base);
+
+    const cfg = m.cfg;
+    const hd = cfg.head_dim;
+    const kvd = cfg.kvDim();
+    const qd = cfg.qDim();
+    const q_per_kv = cfg.n_heads / cfg.n_kv_heads;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+
+    for (tokens, 0..) |tok, k| {
+        if (tok >= cfg.vocab) return error.TokenOutOfRange;
+        if (pos_base + k >= cfg.ctx_len) return error.ContextExhausted;
+        ggml.dequantRow(m.token_embd.ty, st.bx[k * cfg.dim ..][0..cfg.dim], m.token_embd.data, tok, cfg.dim);
+    }
+
+    for (m.layers, 0..) |l, li| {
+        // ---- attention ----
+        for (0..n) |k| {
+            tensor.rmsnorm(st.bnormed[k * cfg.dim ..][0..cfg.dim], st.bx[k * cfg.dim ..][0..cfg.dim], tensorAsF32(l.attn_norm), cfg.eps);
+        }
+        mmul(l.attn_q, st.bq[0 .. n * qd], st.bnormed[0 .. n * cfg.dim], n);
+        mmul(l.attn_k, st.bk[0 .. n * kvd], st.bnormed[0 .. n * cfg.dim], n);
+        mmul(l.attn_v, st.bv[0 .. n * kvd], st.bnormed[0 .. n * cfg.dim], n);
+
+        for (0..n) |k| {
+            const qk = st.bq[k * qd ..][0..qd];
+            const kk = st.bk[k * kvd ..][0..kvd];
+            const vk = st.bv[k * kvd ..][0..kvd];
+            addBias(qk, l.attn_q_bias);
+            addBias(kk, l.attn_k_bias);
+            addBias(vk, l.attn_v_bias);
+            headNorm(qk, l.attn_q_norm, cfg.n_heads, hd, cfg.eps);
+            headNorm(kk, l.attn_k_norm, cfg.n_kv_heads, hd, cfg.eps);
+            const pos = pos_base + k;
+            for (0..cfg.n_heads) |h| ropeApply(cfg.arch.rope, qk[h * hd ..][0..hd], cfg.rope_dim, pos, cfg.rope_base);
+            for (0..cfg.n_kv_heads) |h| ropeApply(cfg.arch.rope, kk[h * hd ..][0..hd], cfg.rope_dim, pos, cfg.rope_base);
+            const base = (li * cfg.ctx_len + pos) * kvd;
+            @memcpy(st.k_cache[base..][0..kvd], kk);
+            @memcpy(st.v_cache[base..][0..kvd], vk);
+        }
+
+        // Causal: token k sees positions 0..pos_base+k only, even though the
+        // whole batch is already in the cache.
+        for (0..n) |k| {
+            const seq = pos_base + k + 1;
+            const qk = st.bq[k * qd ..][0..qd];
+            const ok = st.battn[k * qd ..][0..qd];
+            for (0..cfg.n_heads) |h| {
+                const kvh = h / q_per_kv;
+                const qh = qk[h * hd ..][0..hd];
+                for (0..seq) |t_i| {
+                    const kt = st.k_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
+                    st.scores[t_i] = ggml.dotF32(qh, kt) * scale;
+                }
+                tensor.softmax(st.scores[0..seq]);
+                const oh = ok[h * hd ..][0..hd];
+                @memset(oh, 0);
+                for (0..seq) |t_i| {
+                    const vt = st.v_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
+                    ggml.axpy(oh, vt, st.scores[t_i]);
+                }
+            }
+        }
+        mmul(l.attn_output, st.bproj[0 .. n * cfg.dim], st.battn[0 .. n * qd], n);
+        for (0..n) |k| tensor.add(st.bx[k * cfg.dim ..][0..cfg.dim], st.bproj[k * cfg.dim ..][0..cfg.dim]);
+
+        // ---- FFN ----
+        for (0..n) |k| {
+            tensor.rmsnorm(st.bnormed[k * cfg.dim ..][0..cfg.dim], st.bx[k * cfg.dim ..][0..cfg.dim], tensorAsF32(l.ffn_norm), cfg.eps);
+        }
+        if (!l.is_moe) {
+            const f = l.ffn_gate.?.ne1;
+            mmul(l.ffn_gate.?, st.bgate[0 .. n * f], st.bnormed[0 .. n * cfg.dim], n);
+            mmul(l.ffn_up.?, st.bup[0 .. n * f], st.bnormed[0 .. n * cfg.dim], n);
+            for (0..n) |k| tensor.swiglu(st.bact[k * f ..][0..f], st.bgate[k * f ..][0..f], st.bup[k * f ..][0..f]);
+            mmul(l.ffn_down.?, st.bffn[0 .. n * cfg.dim], st.bact[0 .. n * f], n);
+            for (0..n) |k| tensor.add(st.bx[k * cfg.dim ..][0..cfg.dim], st.bffn[k * cfg.dim ..][0..cfg.dim]);
+            continue;
+        }
+        // MoE: routing differs per token, so run the expert FFN one token at a
+        // time through the existing single-token path.
+        for (0..n) |k| {
+            @memcpy(st.normed, st.bnormed[k * cfg.dim ..][0..cfg.dim]);
+            try moeLayer(m, st, l, li);
+            tensor.add(st.bx[k * cfg.dim ..][0..cfg.dim], st.moe_acc);
+        }
+    }
+
+    // Only the final token's logits matter for sampling.
+    const last = st.bx[(n - 1) * cfg.dim ..][0..cfg.dim];
+    tensor.rmsnorm(st.normed, last, tensorAsF32(m.output_norm), cfg.eps);
+    mv(m.output, st.logits, st.normed);
+}
+
+fn mmul(t: Tensor, out: []f32, xs: []const f32, n: usize) void {
+    ggml.matmul(t.ty, out, t.data, xs, n, t.ne1, t.ne0);
 }
 
 // ---- tests -------------------------------------------------------------------
@@ -930,5 +1080,59 @@ test "each supported architecture loads with the features it actually declares" 
         defer st.deinit(gpa);
         try step(&m, &st, 1, 0);
         for (st.logits) |v| try std.testing.expect(!std.math.isNan(v));
+    }
+}
+
+test "batched prefill matches token-by-token prefill" {
+    // The whole point of the batch path is that it changes nothing except how
+    // many tokens share an unpacked weight. Anything else -- a causal mask that
+    // lets a token see its successors, a KV write at the wrong position, a
+    // per-token RoPE angle taken from the batch index instead of the absolute
+    // position -- shows up as a divergence here and nowhere else, because the
+    // text it produces stays fluent either way.
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const gguf_mod = @import("gguf.zig");
+
+    for ([_][]const u8{ "llama", "qwen3moe", "glm4moe" }) |arch| {
+        var pbuf: [96]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pbuf, "test-batch-{s}.gguf", .{arch});
+        defer Io.Dir.cwd().deleteFile(io, path) catch {};
+        try gguf_mod.writeMoeFixture(gpa, io, path, 11, arch);
+
+        var m = try load(gpa, io, path);
+        defer m.deinit();
+
+        const toks = [_]u32{ 7, 21, 4, 90, 33, 8, 12, 5 };
+
+        var a = try State.init(gpa, m.cfg);
+        defer a.deinit(gpa);
+        for (toks, 0..) |t, i| try step(&m, &a, t, i);
+
+        var b = try State.init(gpa, m.cfg);
+        defer b.deinit(gpa);
+        try stepBatch(&m, &b, &toks, 0);
+
+        // Logits after the same prefix must agree. Batching reorders only the
+        // weight unpack, so the tolerance is for f32 summation order, not for
+        // any approximation.
+        for (a.logits, b.logits, 0..) |want, got, i| {
+            const tol = @max(@abs(want), @abs(got)) * 1e-3 + 1e-3;
+            std.testing.expectApproxEqAbs(want, got, tol) catch |e| {
+                std.debug.print("{s}: logit {d}: serial {d} vs batched {d}\n", .{ arch, i, want, got });
+                return e;
+            };
+        }
+
+        // and a split batch must continue correctly from a partial prefix
+        var c = try State.init(gpa, m.cfg);
+        defer c.deinit(gpa);
+        try stepBatch(&m, &c, toks[0..3], 0);
+        try stepBatch(&m, &c, toks[3..], 3);
+        for (a.logits, c.logits) |want, got| {
+            try std.testing.expectApproxEqAbs(want, got, @max(@abs(want), @abs(got)) * 1e-3 + 1e-3);
+        }
     }
 }

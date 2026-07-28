@@ -179,6 +179,15 @@ pub fn threads() usize {
     return if (kernel_threads == 0) defaultThreads() else kernel_threads;
 }
 
+/// Prefill batch size. 0 means the kernel maximum; 1 disables batching, which
+/// is what makes a batched-versus-serial prefill comparison possible without
+/// rebuilding.
+pub var prefill_batch: usize = 0;
+
+pub fn batchSize() usize {
+    return if (prefill_batch == 0) ggml.MAX_BATCH else @min(prefill_batch, ggml.MAX_BATCH);
+}
+
 fn clampMax(max_tokens: usize, budget: ?u64, prompt_tokens: usize) usize {
     if (budget) |b| {
         const room = if (b > prompt_tokens) b - prompt_tokens else 0;
@@ -287,12 +296,23 @@ fn genGgufInner(
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
 
-    // prefill (routed-expert reads fault in from peers via attachDist)
+    // Prefill (routed-expert reads fault in from peers via attachDist).
+    // Batched where the engine offers it: the whole prompt is known, so one
+    // unpacked weight can serve several tokens, which is most of
+    // time-to-first-token on a long prompt.
     var pos: usize = 0;
-    for (toks) |t| {
-        if (pos >= c.ctx_len) break;
-        try E.step(m, &st, t, pos);
-        pos += 1;
+    if (@hasDecl(E, "stepBatch")) {
+        while (pos < toks.len and pos < c.ctx_len) {
+            const take = @min(@min(batchSize(), toks.len - pos), c.ctx_len - pos);
+            try E.stepBatch(m, &st, toks[pos..][0..take], pos);
+            pos += take;
+        }
+    } else {
+        for (toks) |t| {
+            if (pos >= c.ctx_len) break;
+            try E.step(m, &st, t, pos);
+            pos += 1;
+        }
     }
 
     var aw = std.Io.Writer.Allocating.init(gpa);

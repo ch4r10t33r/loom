@@ -42,7 +42,8 @@ pub const Options = struct {
     ui_addr: []const u8 = "127.0.0.1", // bundled chat UI bind addr
     ui_port: u16 = 8555, // 0 = UI disabled
     status_secs: u32 = 30, // periodic console status; 0 = off
-    kernel_threads: usize = 0, // 0 = auto (cpu count - 1)
+    kernel_threads: usize = 0, // 0 = auto (cpu count - 2)
+    prefill_batch: usize = 0, // 0 = kernel max; 1 disables batched prefill
     p2p_addr: []const u8,
     p2p_port: u16,
     ram_bytes: u64,
@@ -294,6 +295,7 @@ fn attachGgufDist(m: *generator.GgufModel, gpa: std.mem.Allocator, src: *expert_
 pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void {
     try banner.print(out, "node");
     generator.kernel_threads = opts.kernel_threads;
+    generator.prefill_batch = opts.prefill_batch;
 
     const resolved = hf.resolve(gpa, io, opts.model, opts.cache_root) catch |e| {
         try out.print("model resolve failed ({s}): {s}\n", .{ opts.model, @errorName(e) });
