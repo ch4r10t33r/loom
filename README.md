@@ -83,6 +83,30 @@ once. The binaries are not code-signed or notarized.
 Docker images are published to `ghcr.io/ch4r10t33r/loom:latest` on every push
 to `main`.
 
+## Performance
+
+Kernels are SIMD (`@Vector`, so portable rather than per-architecture
+intrinsics) and matvecs run row-parallel across a worker pool. Measured on a
+10-core Apple M5, TinyLlama 1.1B Q4_K_M, median of three 64-token runs:
+
+| | tok/s | vs baseline |
+|---|---|---|
+| scalar, single-threaded (before) | 1.1 | 1x |
+| SIMD, single-threaded | 6.0 | 5.5x |
+| **SIMD + 8 threads** | **26.0** | **23.6x** |
+
+Row-splitting is exact, not approximate: each output row is one independent
+dot product, so there is no reassociation and results are bit-identical to the
+serial path at any thread count. The tests assert that rather than assuming it.
+
+Thread count defaults to `cpu_count - 2` — a node keeps p2p, gossip and repair
+threads running during a generation, and past that point oversubscription
+costs more than the extra cores return. Override with `--threads N`;
+`--threads 1` disables the pool.
+
+This is still CPU-only. GPU backends (Metal, Vulkan, CUDA) are
+[#10](https://github.com/ch4r10t33r/loom/issues/10)–[#14](https://github.com/ch4r10t33r/loom/issues/14).
+
 ## Chat UI
 
 `loom node` serves a small chat app at **`http://127.0.0.1:8555`** (change with

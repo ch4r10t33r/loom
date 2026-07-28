@@ -332,8 +332,25 @@ test "decoders reproduce llama.cpp bit-for-bit on golden vectors" {
     // reading of the format against itself; this checks it against the
     // implementation that produced the weights.
     const vectors = @import("iq_vectors.zig").vectors;
+    const ggml = @import("ggml.zig");
     var vals: [QK_K]f32 = undefined;
     for (vectors) |v| {
+        // The affine legacy types live in ggml.zig, not here; check them
+        // through the same public entry point a kernel uses.
+        if (std.mem.eql(u8, v.name, "q4_1") or std.mem.eql(u8, v.name, "q5_1")) {
+            const ty: ggml.Type = if (std.mem.eql(u8, v.name, "q4_1")) .q4_1 else .q5_1;
+            const nblk = v.input.len / v.block_bytes;
+            var got_a: [QK_K]f32 = undefined;
+            ggml.dequantRow(ty, got_a[0 .. v.width * nblk], v.input, 0, v.width * nblk);
+            for (got_a[0 .. v.width * nblk], v.expect) |f, want_bits| {
+                const want: f32 = @bitCast(want_bits);
+                if (f != want) {
+                    std.debug.print("{s}: got {d} want {d}\n", .{ v.name, f, want });
+                    return error.DecoderMismatch;
+                }
+            }
+            continue;
+        }
         const nblocks = v.input.len / v.block_bytes;
         var got: usize = 0;
         for (0..nblocks) |b| {
