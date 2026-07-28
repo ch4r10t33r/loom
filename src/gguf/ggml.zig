@@ -912,7 +912,6 @@ fn matvecQ6KInt(out: []f32, data: []const u8, x: []const f32, rows: usize, cols:
     }
 }
 
-
 /// Q5_K against int8 activations. Identical in shape to Q4_K, except the
 /// quantized value carries a fifth bit from `qh`, so q runs 0..31 instead of
 /// 0..15 and the per-sub-block high-bit mask advances by two each pair.
