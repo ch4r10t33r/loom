@@ -101,6 +101,7 @@ const Result = struct {
 pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) !void {
     const json = hasFlag(args, "--json");
     const strict = hasFlag(args, "--check");
+    if (hasFlag(args, "--pool")) return poolOverhead(gpa, io, out);
 
     var results = std.ArrayList(Result).empty;
     defer results.deinit(gpa);
@@ -275,4 +276,47 @@ fn hasFlag(args: [][]const u8, name: []const u8) bool {
         if (std.mem.eql(u8, a, name)) return true;
     }
     return false;
+}
+
+/// Cost of the worker-pool handshake itself, isolated from the work.
+///
+/// A forward pass makes ~155 matvec calls per token, so anything paid per
+/// call is multiplied by 155. Accounting for the token budget from the
+/// measured kernel rate leaves ~42 us per call unexplained, and the handshake
+/// -- publish a job, workers observe it, spin until the last one finishes --
+/// is the obvious candidate.
+pub fn poolOverhead(gpa: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
+    var prng = std.Random.DefaultPrng.init(11);
+    const rnd = prng.random();
+    const cols = 2048;
+
+    try out.print("\n  pool handshake cost, by matvec size\n", .{});
+    try out.print("  {s:>6} {s:>12} {s:>12} {s:>10}\n", .{ "rows", "pool on", "pool off", "overhead" });
+    for ([_]usize{ 64, 128, 256, 512, 2048, 5632 }) |rows| {
+        const data = try gpa.alloc(u8, ggml.tensorBytes(.q4_k, cols, rows));
+        defer gpa.free(data);
+        rnd.bytes(data);
+        for (0..data.len / 2) |i| data[i * 2 + 1] &= 0xFB;
+        const x = try gpa.alloc(f32, cols);
+        defer gpa.free(x);
+        for (x) |*v| v.* = rnd.float(f32) - 0.5;
+        const dst = try gpa.alloc(f32, rows);
+        defer gpa.free(dst);
+
+        const Ctx = struct { dst: []f32, data: []const u8, x: []const f32, rows: usize };
+        const c = Ctx{ .dst = dst, .data = data, .x = x, .rows = rows };
+        const body = struct {
+            fn f(cc: Ctx) void {
+                backend.matvec(.q4_k, cc.dst, cc.data, cc.x, cc.rows, cols);
+            }
+        }.f;
+
+        backend.parallelBegin(generator.threads());
+        const on = medianMs(io, 21, c, body);
+        backend.parallelEnd();
+        const off = medianMs(io, 21, c, body); // pool stopped: runs inline
+
+        try out.print("  {d:>6} {d:>9.4} ms {d:>9.4} ms {d:>7.1} us\n", .{ rows, on, off, (on - off) * 1000 });
+    }
+    try out.flush();
 }
