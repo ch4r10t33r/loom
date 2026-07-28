@@ -28,6 +28,7 @@
 const std = @import("std");
 const gguf = @import("gguf.zig");
 const ggml = @import("ggml.zig");
+const backend = @import("../compute/backend.zig");
 const tensor = @import("../core/tensor.zig");
 const weights = @import("../p2p/weights.zig");
 
@@ -91,11 +92,11 @@ pub fn route(cfg: RouteCfg, router_logits: []const f32, bias: ?[]const f32, sel:
     const scores = scores_buf[0..cfg.n_expert];
     switch (cfg.gating) {
         .sigmoid => for (router_logits, 0..) |l, i| {
-            scores[i] = tensor.sigmoid(l);
+            scores[i] = backend.sigmoid(l);
         },
         .softmax => {
             @memcpy(scores, router_logits);
-            tensor.softmax(scores);
+            backend.softmax(scores);
         },
     }
     var choice_buf: [MAX_EXPERTS]f32 = undefined;
@@ -192,8 +193,8 @@ test "sigmoid gating with selection bias picks by biased score, gates from raw" 
     route(cfg, &logits, &bias, &sel);
     try std.testing.expectEqual(@as(usize, 0), sel[0].expert);
     try std.testing.expectEqual(@as(usize, 3), sel[1].expert);
-    try std.testing.expectApproxEqAbs(tensor.sigmoid(0.0), sel[0].gate, 1e-6);
-    try std.testing.expectApproxEqAbs(tensor.sigmoid(3.0), sel[1].gate, 1e-6);
+    try std.testing.expectApproxEqAbs(backend.sigmoid(0.0), sel[0].gate, 1e-6);
+    try std.testing.expectApproxEqAbs(backend.sigmoid(3.0), sel[1].gate, 1e-6);
 }
 
 test "renormalization makes the top-k gates sum to one" {

@@ -349,3 +349,13 @@ The commit is stamped at build time via `-Dcommit=<sha>`; a plain local build
 reports `unknown`, which is itself worth knowing. `mode Debug` explains a
 roughly 10x slowdown, and the target triple is the first thing to check when a
 downloaded binary misbehaves on unexpected hardware.
+
+---
+
+## Build options
+
+| Option | Default | What it does |
+|---|---|---|
+| `-Doptimize=ReleaseFast` | `Debug` | Roughly 10x faster inference. Use it for anything but debugging. |
+| `-Dgpu=none\|metal\|vulkan` | `none` | Compute backend, resolved at compile time. The inactive backends are not compiled in, so a GPU toolchain never becomes a requirement for a CPU build. `metal` is macOS-only and `vulkan` is not available on macOS; both are still unimplemented (issues #12, #13) and fail the build with a message saying so rather than silently falling back to CPU. |
+| `-Dcommit=<sha>` | `unknown` | Stamped into `loom version`. CI sets it. |

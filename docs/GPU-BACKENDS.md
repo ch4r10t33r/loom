@@ -100,9 +100,11 @@ small and #12/#13 are not.
 
 ## Order of work
 
-1. **#10 — backend seam.** Move the CPU kernels behind an interface with the
-   comptime switch. No behaviour change; the existing bit-identical and
-   golden-vector tests are the proof it is a pure refactor.
+1. **#10 — backend seam. Done.** `src/compute/backend.zig` selects the backend
+   at comptime from `-Dgpu=`; `src/compute/cpu.zig` binds the existing kernels
+   to it. Fourteen operations, and every engine now calls through them. No
+   behaviour change: the bit-identical, golden-vector and architecture tests
+   all pass unchanged, which is the proof it was a pure refactor.
 2. **#12 — Metal.** ObjC shim, device/buffer/pipeline/command, zero-copy GGUF
    wrapping, then kernels in dependency order: `dmmv` for Q4_K and Q6_K first
    (they are the whole of a Q4_K_M model), then attention, RMSNorm, RoPE,
