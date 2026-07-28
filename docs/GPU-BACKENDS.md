@@ -105,31 +105,47 @@ small and #12/#13 are not.
    to it. Fourteen operations, and every engine now calls through them. No
    behaviour change: the bit-identical, golden-vector and architecture tests
    all pass unchanged, which is the proof it was a pure refactor.
-2. **#12 — Metal. Substrate done, kernel fast, dispatch not yet batched.**
-   The ObjC shim, device/buffer/pipeline/command layer and zero-copy GGUF
-   wrapping all work, and Q4_K `dmmv` matches the exact CPU reference.
+2. **#12 — Metal. Substrate and kernels done; dispatch structure is the
+   remaining gap.**
 
-   Measured, one 2048x5632 Q4_K matvec on an M5:
+   The decisive measurement, on an M5:
 
-   | | time | vs CPU |
-   |---|---|---|
-   | CPU, 8 threads | 0.144 ms | — |
-   | GPU kernel, amortized | **0.018 ms** | **8x faster** |
-   | GPU as currently called | 0.377 ms | 2.6x slower |
-   | of which submission | 0.358 ms | **95%** |
+   | | time |
+   |---|---|
+   | empty command buffer, commit + wait | 15.4 us |
+   | + one trivial dispatch | 263.4 us |
+   | ten dispatches, one buffer | 262.3 us (26 us each) |
 
-   The kernel is now comfortably faster than eight CPU threads. What is left
-   is entirely the calling convention: every matvec commits its own command
-   buffer and waits, and that round trip costs twenty times the kernel it is
-   waiting for. End to end the Metal build is still 20.1 tok/s against the
-   CPU's 39.0 for exactly that reason.
+   The cost is neither per dispatch nor the commit floor. It is a **fixed
+   ~262 us paid once per command buffer that contains any GPU work**. Ten
+   dispatches cost the same as one. So the unit of work that matters is not
+   the kernel, it is the buffer, and anything that forces the host to read an
+   intermediate splits one buffer in two and adds 262 us.
 
-   Getting the 8x requires the forward pass to stay on the GPU between
-   matmuls, so one command buffer covers a whole token instead of one
-   operation. That needs the remaining kernels — Q6_K `dmmv`, RMSNorm, RoPE,
-   SwiGLU, softmax, attention — so activations never have to come back to the
-   host. It is the reason the elementwise ops were routed through the seam in
-   #10.
+   With a matvec kernel measured at 18 us, that arithmetic decides everything:
+
+   | dispatches per command buffer | predicted |
+   |---|---|
+   | one per matvec (~110 per token) | 33 tok/s |
+   | one per layer (22) | 134 tok/s |
+   | one per token | 504 tok/s |
+
+   The first row matches what was actually observed, which is the check that
+   the model is right rather than a convenient story.
+
+   Done so far: the Metal substrate, `dmmv_q4k` (8x faster per row than eight
+   CPU threads), the elementwise and norm kernels, device-resident activation
+   buffers, and a whole FFN block encoded into a single command buffer.
+
+   Still slower than the CPU, and the reason is now specific: the shim opens a
+   **new compute encoder per dispatch**, so a six-dispatch FFN pays six encoder
+   boundaries. The FFN block measures 1.04 ms against the CPU's 0.47 ms, well
+   above the ~310 us the buffer arithmetic predicts. One encoder per command
+   buffer, with barriers only between genuinely dependent dispatches, is the
+   next change.
+
+   After that, the remaining kernels — Q6_K `dmmv`, RoPE, attention — so a
+   whole layer, and then a whole token, fits in one buffer.
 
 3. **Distributed integration.** Peer-fetched experts wrapped zero-copy on
    Apple; a VRAM tier with pinning on discrete GPUs.

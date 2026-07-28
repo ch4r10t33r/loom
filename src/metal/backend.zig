@@ -30,6 +30,7 @@ pub const sigmoid = cpu.sigmoid;
 pub const MAX_BATCH = cpu.MAX_BATCH;
 
 const dmmv_q4k_src = @embedFile("../shaders/metal/dmmv_q4k.metal");
+const elementwise_src = @embedFile("../shaders/metal/elementwise.metal");
 
 /// Below this many rows the round trip costs more than the work it is waiting
 /// for, and the CPU path wins outright.
@@ -61,6 +62,13 @@ const SIMDGROUPS_PER_GROUP = 4;
 const Ctx = struct {
     dev: mtl.Device,
     q4k: mtl.Pipeline,
+    rmsnorm_p: mtl.Pipeline,
+    swiglu_p: mtl.Pipeline,
+    add_p: mtl.Pipeline,
+    /// Device-resident activation scratch. The whole point of keeping these
+    /// on the GPU is that a block of work can be encoded into one command
+    /// buffer without the host reading anything in between.
+    act: [4]mtl.Buffer,
     /// Weight buffers are keyed by the page-aligned base of the mapping they
     /// came from, so one MTLBuffer serves every tensor in a GGUF rather than
     /// one per tensor.
@@ -93,6 +101,25 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const pn = dev.pipeline(elementwise_src, "rmsnorm") catch {
+        dev.deinit();
+        return;
+    };
+    const ps = dev.pipeline(elementwise_src, "swiglu") catch {
+        dev.deinit();
+        return;
+    };
+    const pa = dev.pipeline(elementwise_src, "add_inplace") catch {
+        dev.deinit();
+        return;
+    };
+    var act: [4]mtl.Buffer = undefined;
+    for (&act) |*b| {
+        b.* = dev.alloc(1 << 22) catch {
+            dev.deinit();
+            return;
+        };
+    }
     const sx = dev.alloc(1 << 20) catch {
         dev.deinit();
         return;
@@ -101,7 +128,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .scratch_x = sx, .scratch_out = so, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -117,6 +144,24 @@ fn wrapFor(cx: *Ctx, data: []const u8) ?struct { buf: mtl.Buffer, off: usize } {
     const base = std.mem.alignBackward(usize, @intFromPtr(data.ptr), page);
     const end = std.mem.alignForward(usize, @intFromPtr(data.ptr) + data.len, page);
     const gop = cx.wrapped.getOrPut(cx.gpa, base) catch return null;
+    const off = @intFromPtr(data.ptr) - base;
+
+    // A cached entry can be stale in two ways, and both are real rather than
+    // theoretical: a later tensor in the same mapping may extend past the
+    // region that was wrapped first, and an allocation freed and replaced by
+    // a larger one can land on the same page base. Keying by address alone
+    // therefore is not enough — re-wrap whenever the cached buffer does not
+    // cover what is being asked for, rather than silently handing back a
+    // buffer that is too short.
+    if (gop.found_existing and off + data.len > gop.value_ptr.len) {
+        gop.value_ptr.deinit();
+        gop.key_ptr.* = base;
+        gop.value_ptr.* = cx.dev.wrapHost(@as([*]const u8, @ptrFromInt(base))[0 .. end - base]) catch {
+            _ = cx.wrapped.remove(base);
+            return null;
+        };
+        return .{ .buf = gop.value_ptr.*, .off = off };
+    }
     if (!gop.found_existing) {
         const region = @as([*]const u8, @ptrFromInt(base))[0 .. end - base];
         gop.value_ptr.* = cx.dev.wrapHost(region) catch {
@@ -124,8 +169,6 @@ fn wrapFor(cx: *Ctx, data: []const u8) ?struct { buf: mtl.Buffer, off: usize } {
             return null;
         };
     }
-    // A later tensor may extend past the cached buffer; fall back if so.
-    const off = @intFromPtr(data.ptr) - base;
     if (off + data.len > gop.value_ptr.len) return null;
     return .{ .buf = gop.value_ptr.*, .off = off };
 }
@@ -301,4 +344,352 @@ test "metal dispatch cost breakdown" {
         \\    CPU, 8 threads          {d:6.3} ms   <- what it is beating
         \\
     , .{ ms(per_sync), ms(per_batched), ms(per_sync - per_batched), ms(per_cpu) });
+}
+
+test "metal submission floor" {
+    // Where exactly does the 0.358 ms go? An empty command buffer isolates
+    // the commit+wait floor from anything the kernel or encoder costs. If the
+    // floor is small, the overhead is encoder churn and is fixable cheaply; if
+    // it is the whole 0.358 ms, only batching whole layers will help.
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    parallelBegin(1);
+    defer parallelEnd();
+    const cx = &(ctx orelse return error.SkipZigTest);
+
+    var t: std.Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+    const now = struct {
+        fn f(i: std.Io) i128 {
+            return std.Io.Clock.Timestamp.now(i, .awake).raw.toNanoseconds();
+        }
+    }.f;
+    const N = 200;
+
+    // 1. empty command buffer: create, commit, wait
+    const t0 = now(io);
+    for (0..N) |_| cx.dev.commandBuffer().commitAndWait();
+    const empty = @divTrunc(now(io) - t0, N);
+
+    // 2. one trivial dispatch (1 row => the kernel does almost nothing)
+    const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), 16384);
+    defer gpa.free(data);
+    @memset(data, 0);
+    const w = wrapFor(cx, data).?;
+    const dims = Dims{ .rows = 1, .cols = 256 };
+    const t1 = now(io);
+    for (0..N) |_| {
+        const cb = cx.dev.commandBuffer();
+        cb.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), SIMD_W, SIMD_W);
+        cb.commitAndWait();
+    }
+    const one = @divTrunc(now(io) - t1, N);
+
+    // 3. ten dispatches, one command buffer (ten encoders, as the shim does)
+    const t2 = now(io);
+    for (0..N / 10) |_| {
+        const cb = cx.dev.commandBuffer();
+        for (0..10) |_| cb.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), SIMD_W, SIMD_W);
+        cb.commitAndWait();
+    }
+    const ten = @divTrunc(now(io) - t2, N / 10);
+
+    const us = struct {
+        fn f(ns: i128) f64 {
+            return @as(f64, @floatFromInt(ns)) / 1e3;
+        }
+    }.f;
+    std.debug.print(
+        \\
+        \\  empty commit+wait          {d:8.1} us   <- the irreducible floor
+        \\  + 1 trivial dispatch       {d:8.1} us
+        \\  10 dispatches, 1 buffer    {d:8.1} us  ({d:6.1} us each)
+        \\
+    , .{ us(empty), us(one), us(ten), us(ten) / 10 });
+}
+
+/// A whole FFN block in one command buffer: rmsnorm, gate and up projections,
+/// SwiGLU, the down projection, and the residual add — with every
+/// intermediate staying in device memory.
+///
+/// This is the shape the rest of the layer has to take. Measured on an M5, a
+/// command buffer costs ~262 us fixed no matter how many dispatches it holds
+/// (ten cost the same as one), while a matvec kernel is ~18 us. So the unit of
+/// work that matters is not the kernel, it is the buffer: anything that forces
+/// the host to read an intermediate splits one buffer into two and adds 262 us.
+///
+/// Returns false if the shapes do not fit the scratch buffers, in which case
+/// the caller runs the CPU path.
+pub fn ffnBlock(
+    x: []f32, // in/out: residual stream, updated in place
+    norm_w: []const f32,
+    eps: f32,
+    gate_w: WeightRef,
+    up_w: WeightRef,
+    down_w: WeightRef,
+    ffn: usize,
+) bool {
+    const cx = &(ctx orelse return false);
+    const dim = x.len;
+    if (gate_w.ty != .q4_k or up_w.ty != .q4_k or down_w.ty != .q4_k) return false;
+    if (dim % 256 != 0 or ffn % 256 != 0) return false;
+    if (ffn * 4 > cx.act[0].len or dim * 4 > cx.act[0].len) return false;
+
+    const gw = wrapFor(cx, gate_w.data) orelse return false;
+    const uw = wrapFor(cx, up_w.data) orelse return false;
+    const dw = wrapFor(cx, down_w.data) orelse return false;
+
+    // a0 = x (residual), a1 = normed, a2 = gate then act, a3 = up then ffn_out
+    @memcpy(cx.act[0].slice(f32)[0..dim], x);
+    @memcpy(cx.scratch_x.slice(f32)[0..dim], norm_w);
+
+    const nd = extern struct { n: u32, eps: f32 }{ .n = @intCast(dim), .eps = eps };
+    const dims_ffn = Dims{ .rows = @intCast(ffn), .cols = @intCast(dim) };
+    const dims_down = Dims{ .rows = @intCast(dim), .cols = @intCast(ffn) };
+    const len_ffn = extern struct { n: u32 }{ .n = @intCast(ffn) };
+    const len_dim = extern struct { n: u32 }{ .n = @intCast(dim) };
+    const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+
+    const cb = cx.dev.commandBuffer();
+    // normed = rmsnorm(x) * norm_w
+    cb.dispatch(cx.rmsnorm_p, &.{ cx.act[0], cx.scratch_x, cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&nd), SIMD_W, SIMD_W);
+    // gate = Wg . normed ; up = Wu . normed   (independent, same buffer)
+    cb.dispatch(cx.q4k, &.{ gw.buf, cx.act[1], cx.act[2] }, &.{ gw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ffn * SIMD_W, group);
+    cb.dispatch(cx.q4k, &.{ uw.buf, cx.act[1], cx.act[3] }, &.{ uw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ffn * SIMD_W, group);
+    // act = silu(gate) * up, in place over act[2]
+    cb.dispatch(cx.swiglu_p, &.{ cx.act[2], cx.act[3], cx.act[2] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_ffn), ffn, 64);
+    // ffn_out = Wd . act
+    cb.dispatch(cx.q4k, &.{ dw.buf, cx.act[2], cx.act[3] }, &.{ dw.off, 0, 0 }, std.mem.asBytes(&dims_down), dim * SIMD_W, group);
+    // x += ffn_out
+    cb.dispatch(cx.add_p, &.{ cx.act[0], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), dim, 64);
+    cb.commitAndWait();
+
+    @memcpy(x, cx.act[0].slice(f32)[0..dim]);
+    return true;
+}
+
+/// A weight tensor as the engines hold it: a type plus a slice of the mapping.
+pub const WeightRef = struct { ty: ggml.Type, data: []const u8 };
+
+test "resident ffn block matches the cpu path" {
+    const gpa = std.testing.allocator;
+    const dim = 2048;
+    const ffn = 5632;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(0xFF17);
+    const rnd = prng.random();
+    const mk = struct {
+        fn f(a: std.mem.Allocator, r: std.Random, rows: usize, cols: usize) ![]align(16384) u8 {
+            const d = try a.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, cols, rows));
+            r.bytes(d);
+            for (0..d.len / 2) |i| d[i * 2 + 1] &= 0xFB;
+            return d;
+        }
+    }.f;
+    const gate = try mk(gpa, rnd, ffn, dim);
+    defer gpa.free(gate);
+    const up = try mk(gpa, rnd, ffn, dim);
+    defer gpa.free(up);
+    const down = try mk(gpa, rnd, dim, ffn);
+    defer gpa.free(down);
+
+    const nw = try gpa.alloc(f32, dim);
+    defer gpa.free(nw);
+    for (nw) |*v| v.* = 0.5 + rnd.float(f32);
+    const x0 = try gpa.alloc(f32, dim);
+    defer gpa.free(x0);
+    for (x0) |*v| v.* = (rnd.float(f32) - 0.5) * 0.1;
+
+    // reference: the CPU ops, in the same order
+    const want = try gpa.alloc(f32, dim);
+    defer gpa.free(want);
+    @memcpy(want, x0);
+    {
+        const normed = try gpa.alloc(f32, dim);
+        defer gpa.free(normed);
+        const g = try gpa.alloc(f32, ffn);
+        defer gpa.free(g);
+        const u = try gpa.alloc(f32, ffn);
+        defer gpa.free(u);
+        const a = try gpa.alloc(f32, ffn);
+        defer gpa.free(a);
+        const o = try gpa.alloc(f32, dim);
+        defer gpa.free(o);
+        // Exact f32 matvecs, not cpu.matvec: the CPU Q4_K kernel quantizes
+        // activations to int8, and here that error passes through SwiGLU --
+        // a nonlinearity, which amplifies it wherever a gate value sits near
+        // zero. Comparing against it reports the CPU's own approximation as a
+        // GPU bug, compounded three matmuls deep. Same trap as the first
+        // dmmv test, one layer up.
+        const exactMatvec = struct {
+            fn f(a2: std.mem.Allocator, dstv: []f32, data: []const u8, xv: []const f32, rows: usize, cols: usize) !void {
+                const rowbuf = try a2.alloc(f32, cols);
+                defer a2.free(rowbuf);
+                for (0..rows) |r| {
+                    cpu.dequantRow(.q4_k, rowbuf, data, r, cols);
+                    var acc: f32 = 0;
+                    for (rowbuf, xv) |wv, xx| acc += wv * xx;
+                    dstv[r] = acc;
+                }
+            }
+        }.f;
+        cpu.rmsnorm(normed, want, nw, eps_test);
+        try exactMatvec(gpa, g, gate, normed, ffn, dim);
+        try exactMatvec(gpa, u, up, normed, ffn, dim);
+        cpu.swiglu(a, g, u);
+        try exactMatvec(gpa, o, down, a, dim, ffn);
+        cpu.add(want, o);
+    }
+
+    const got = try gpa.alloc(f32, dim);
+    defer gpa.free(got);
+    @memcpy(got, x0);
+    try std.testing.expect(ffnBlock(got, nw, eps_test, .{ .ty = .q4_k, .data = gate }, .{ .ty = .q4_k, .data = up }, .{ .ty = .q4_k, .data = down }, ffn));
+
+    // The CPU matvec quantizes activations to int8 and the Metal one does not,
+    // so this is a comparison of two different approximations of the same
+    // thing; bound it against the magnitude of the values, not exactly.
+    var worst: f32 = 0;
+    for (want, got) |a, b| worst = @max(worst, @abs(a - b) / @max(@max(@abs(a), @abs(b)), 1e-2));
+    if (worst > 0.05) {
+        std.debug.print("resident ffn: worst relative difference {d}\n", .{worst});
+        return error.FfnBlockMismatch;
+    }
+}
+
+const eps_test: f32 = 1e-5;
+
+test "metal elementwise kernels individually" {
+    const gpa = std.testing.allocator;
+    parallelBegin(1);
+    defer parallelEnd();
+    const cx = &(ctx orelse return error.SkipZigTest);
+    const n = 2048;
+
+    var prng = std.Random.DefaultPrng.init(3);
+    const rnd = prng.random();
+    const x = try gpa.alloc(f32, n);
+    defer gpa.free(x);
+    const w = try gpa.alloc(f32, n);
+    defer gpa.free(w);
+    for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 2;
+    for (w) |*v| v.* = 0.5 + rnd.float(f32);
+
+    // rmsnorm
+    @memcpy(cx.act[0].slice(f32)[0..n], x);
+    @memcpy(cx.scratch_x.slice(f32)[0..n], w);
+    const nd = extern struct { n: u32, eps: f32 }{ .n = n, .eps = eps_test };
+    {
+        const cb = cx.dev.commandBuffer();
+        cb.dispatch(cx.rmsnorm_p, &.{ cx.act[0], cx.scratch_x, cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&nd), SIMD_W, SIMD_W);
+        cb.commitAndWait();
+    }
+    const ref = try gpa.alloc(f32, n);
+    defer gpa.free(ref);
+    cpu.rmsnorm(ref, x, w, eps_test);
+    var worst_norm: f32 = 0;
+    for (ref, cx.act[1].slice(f32)[0..n]) |a, b| worst_norm = @max(worst_norm, @abs(a - b));
+
+    // swiglu
+    const up = try gpa.alloc(f32, n);
+    defer gpa.free(up);
+    for (up) |*v| v.* = rnd.float(f32) - 0.5;
+    @memcpy(cx.act[2].slice(f32)[0..n], x);
+    @memcpy(cx.act[3].slice(f32)[0..n], up);
+    const ln = extern struct { n: u32 }{ .n = n };
+    {
+        const cb = cx.dev.commandBuffer();
+        cb.dispatch(cx.swiglu_p, &.{ cx.act[2], cx.act[3], cx.act[2] }, &.{ 0, 0, 0 }, std.mem.asBytes(&ln), n, 64);
+        cb.commitAndWait();
+    }
+    cpu.swiglu(ref, x, up);
+    var worst_sw: f32 = 0;
+    for (ref, cx.act[2].slice(f32)[0..n]) |a, b| worst_sw = @max(worst_sw, @abs(a - b));
+
+    std.debug.print("  rmsnorm max abs diff {d}   swiglu {d}\n", .{ worst_norm, worst_sw });
+    try std.testing.expect(worst_norm < 1e-4);
+    try std.testing.expect(worst_sw < 1e-5);
+}
+
+test "resident ffn block vs the cpu ffn" {
+    // The question this whole exercise turns on: does putting a block of work
+    // in one command buffer beat the CPU, given a ~262 us fixed cost per
+    // buffer against ~18 us kernels?
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const dim = 2048;
+    const ffn = 5632;
+    parallelBegin(8);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(5);
+    const rnd = prng.random();
+    const mk = struct {
+        fn f(a: std.mem.Allocator, r: std.Random, rows: usize, cols: usize) ![]align(16384) u8 {
+            const d = try a.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, cols, rows));
+            r.bytes(d);
+            for (0..d.len / 2) |i| d[i * 2 + 1] &= 0xFB;
+            return d;
+        }
+    }.f;
+    const gate = try mk(gpa, rnd, ffn, dim);
+    defer gpa.free(gate);
+    const up = try mk(gpa, rnd, ffn, dim);
+    defer gpa.free(up);
+    const down = try mk(gpa, rnd, dim, ffn);
+    defer gpa.free(down);
+    const nw = try gpa.alloc(f32, dim);
+    defer gpa.free(nw);
+    for (nw) |*v| v.* = 1.0;
+    const x = try gpa.alloc(f32, dim);
+    defer gpa.free(x);
+    for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 0.1;
+
+    const normed = try gpa.alloc(f32, dim);
+    defer gpa.free(normed);
+    const g = try gpa.alloc(f32, ffn);
+    defer gpa.free(g);
+    const u = try gpa.alloc(f32, ffn);
+    defer gpa.free(u);
+    const o = try gpa.alloc(f32, dim);
+    defer gpa.free(o);
+
+    var t: std.Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+    const now = struct {
+        fn f(i: std.Io) i128 {
+            return std.Io.Clock.Timestamp.now(i, .awake).raw.toNanoseconds();
+        }
+    }.f;
+    const N = 40;
+
+    _ = ffnBlock(x, nw, eps_test, .{ .ty = .q4_k, .data = gate }, .{ .ty = .q4_k, .data = up }, .{ .ty = .q4_k, .data = down }, ffn);
+    const t0 = now(io);
+    for (0..N) |_| _ = ffnBlock(x, nw, eps_test, .{ .ty = .q4_k, .data = gate }, .{ .ty = .q4_k, .data = up }, .{ .ty = .q4_k, .data = down }, ffn);
+    const gpu = @divTrunc(now(io) - t0, N);
+
+    const t1 = now(io);
+    for (0..N) |_| {
+        cpu.rmsnorm(normed, x, nw, eps_test);
+        cpu.matvec(.q4_k, g, gate, normed, ffn, dim);
+        cpu.matvec(.q4_k, u, up, normed, ffn, dim);
+        cpu.swiglu(g, g, u);
+        cpu.matvec(.q4_k, o, down, g, dim, ffn);
+        cpu.add(x, o);
+    }
+    const cpu_ns = @divTrunc(now(io) - t1, N);
+
+    const ms = struct {
+        fn f(ns: i128) f64 {
+            return @as(f64, @floatFromInt(ns)) / 1e6;
+        }
+    }.f;
+    std.debug.print("  ffn block: gpu (1 command buffer) {d:.3} ms   cpu (8 threads) {d:.3} ms\n", .{ ms(gpu), ms(cpu_ns) });
 }
