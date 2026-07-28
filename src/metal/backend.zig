@@ -31,9 +31,26 @@ pub const MAX_BATCH = cpu.MAX_BATCH;
 
 const dmmv_q4k_src = @embedFile("../shaders/metal/dmmv_q4k.metal");
 
-/// Below this many rows the dispatch and synchronization cost more than the
-/// work: norm and router projections stay on the CPU.
-const MIN_GPU_ROWS = 512;
+/// Below this many rows the round trip costs more than the work it is waiting
+/// for, and the CPU path wins outright.
+///
+/// This is not a guess; it is the crossover the benchmark measures. On an M5:
+///
+///     gpu kernel   3.2 ns/row      cpu, 8 threads  22.4 ns/row
+///     submission   0.358 ms fixed  (commit + wait, per matvec)
+///
+///     0.358 / (22.4 - 3.2) ns  =>  ~18,600 rows
+///
+/// The kernel is eight times faster per row; it just cannot pay off a fixed
+/// 0.358 ms until the tensor is very large. For TinyLlama only the 32000-row
+/// output head clears the bar — everything else is 2048 or 5632 rows and
+/// belongs on the CPU.
+///
+/// This threshold is a symptom, not a design. It drops to roughly zero once a
+/// whole forward pass is encoded into one command buffer instead of one
+/// dispatch per operation, at which point the eight-times figure is the one
+/// that shows up end to end.
+const MIN_GPU_ROWS = 18_000;
 
 /// Apple GPUs execute in 32-lane SIMD groups; the kernel assigns one per row.
 const SIMD_W = 32;

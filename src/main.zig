@@ -82,6 +82,8 @@ pub fn main(init: std.process.Init) !void {
         try cmdGguf(gpa, io, out, args);
     } else if (std.mem.eql(u8, cmd, "light")) {
         try cmdLight(gpa, io, out, args);
+    } else if (std.mem.eql(u8, cmd, "bench")) {
+        try @import("bench.zig").run(gpa, io, out, args);
     } else if (std.mem.eql(u8, cmd, "version") or std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-V")) {
         try cmdVersion(out);
     } else {
@@ -132,6 +134,7 @@ fn usage(out: *Io.Writer) !void {
         \\  loom iobench <file> [--threads N] [--block-mb M] [--reads R]
         \\  loom run <dir> [--prompt STR] [--max-tokens N] [--ram-gb X]
         \\                 [--pin-gb Y] [--temp T] [--seed S] [--stats FILE] [--no-verify]
+        \\  loom bench [--json] [--check]
         \\  loom version
         \\
         \\--model SPEC: <local dir> | tiny | [hf:]org/repo[@rev]   (default: tiny)
