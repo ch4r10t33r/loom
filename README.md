@@ -91,9 +91,23 @@ intrinsics) and matvecs run row-parallel across a worker pool. Measured on a
 
 | | tok/s | vs baseline |
 |---|---|---|
-| scalar, single-threaded (before) | 1.1 | 1x |
+| scalar, single-threaded (original) | 1.1 | 1x |
 | SIMD, single-threaded | 6.0 | 5.5x |
-| **SIMD + 8 threads** | **26.0** | **23.6x** |
+| SIMD + 8 threads | 26.0 | 23.6x |
+| + int8 activations, 1 thread | 15.0 | 13.6x |
+| **+ int8 activations, 8 threads** | **51.9** | **47x** |
+
+The last step is the one worth understanding. Profiling the kernels showed
+**76-92% of a quantized matvec was the dequantize, not the dot** — each block
+was expanded into a 256-float scratch buffer and pushed through L1 only to be
+read straight back. Quantizing the *activation* vector to int8 once per matvec
+and dotting it against the packed weights as integers removes that buffer
+entirely and uses lanes four times as wide.
+
+That step is an approximation the earlier ones were not: the activation
+carries roughly 0.4% per-element error, so results are no longer bit-identical
+to the dequantize path. Over a long dot those errors are independent and
+largely cancel, and it is what every production CPU inference engine does.
 
 Row-splitting is exact, not approximate: each output row is one independent
 dot product, so there is no reassociation and results are bit-identical to the
