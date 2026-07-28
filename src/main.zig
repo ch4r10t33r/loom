@@ -35,7 +35,7 @@ pub const weights = @import("p2p/weights.zig");
 pub const sync = @import("p2p/sync.zig");
 pub const peers = @import("p2p/peers.zig");
 pub const gossip = @import("p2p/gossip.zig");
-pub const ggml = @import("gguf/ggml.zig");
+pub const backend = @import("compute/backend.zig");
 const generator = @import("node/generator.zig");
 pub const llama = @import("gguf/llama.zig");
 pub const deepseek = @import("gguf/deepseek.zig");
@@ -746,8 +746,8 @@ fn runStoreWith(
     });
     try out.flush();
 
-    ggml.parallelBegin(generator.threads());
-    defer ggml.parallelEnd();
+    backend.parallelBegin(generator.threads());
+    defer backend.parallelEnd();
 
     var st = try E.State.init(gpa, c);
     defer st.deinit(gpa);
@@ -838,8 +838,8 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
     });
     try out.flush();
 
-    ggml.parallelBegin(generator.threads());
-    defer ggml.parallelEnd();
+    backend.parallelBegin(generator.threads());
+    defer backend.parallelEnd();
 
     var st = try eng.State.init(gpa, c);
     defer st.deinit(gpa);

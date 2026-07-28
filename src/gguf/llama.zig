@@ -25,6 +25,7 @@ const std = @import("std");
 const Io = std.Io;
 const gguf = @import("gguf.zig");
 const ggml = @import("ggml.zig");
+const backend = @import("../compute/backend.zig");
 const tensor = @import("../core/tensor.zig");
 const spm = @import("spm.zig");
 const moe = @import("moe.zig");
@@ -556,7 +557,7 @@ pub const State = struct {
     pub fn init(gpa: std.mem.Allocator, cfg: Config) !State {
         const kvd = cfg.kvDim();
         const ffn_max = cfg.maxFfn();
-        const B = ggml.MAX_BATCH;
+        const B = backend.MAX_BATCH;
         return .{
             .cfg = cfg,
             .x = try gpa.alloc(f32, cfg.dim),
@@ -603,7 +604,7 @@ pub const State = struct {
 };
 
 fn mv(t: Tensor, out: []f32, x: []const f32) void {
-    ggml.matvec(t.ty, out, t.data, x, t.ne1, t.ne0);
+    backend.matvec(t.ty, out, t.data, x, t.ne1, t.ne0);
 }
 
 /// Norm weights are always f32 in practice; view the raw bytes as f32.
@@ -681,7 +682,7 @@ fn denseFFN(st: *State, gate_w: Tensor, up_w: Tensor, down_w: Tensor) void {
     const n = gate_w.ne1;
     mv(gate_w, st.gate[0..n], st.normed);
     mv(up_w, st.up[0..n], st.normed);
-    tensor.swiglu(st.act[0..n], st.gate[0..n], st.up[0..n]);
+    backend.swiglu(st.act[0..n], st.gate[0..n], st.up[0..n]);
     mv(down_w, st.ffn_out, st.act[0..n]);
 }
 
@@ -698,11 +699,11 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     // tokenizer, whose ceiling is an independent metadata array, so bound it
     // here rather than trusting the two to agree (security issue #29).
     if (token >= cfg.vocab) return error.TokenOutOfRange;
-    ggml.dequantRow(m.token_embd.ty, st.x, m.token_embd.data, token, cfg.dim);
+    backend.dequantRow(m.token_embd.ty, st.x, m.token_embd.data, token, cfg.dim);
 
     for (m.layers, 0..) |l, li| {
         // ---- attention ----
-        tensor.rmsnorm(st.normed, st.x, tensorAsF32(l.attn_norm), cfg.eps);
+        backend.rmsnorm(st.normed, st.x, tensorAsF32(l.attn_norm), cfg.eps);
         mv(l.attn_q, st.q, st.normed);
         mv(l.attn_k, st.k, st.normed);
         mv(l.attn_v, st.v, st.normed);
@@ -733,33 +734,33 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             var t_i: usize = 0;
             while (t_i < seq) : (t_i += 1) {
                 const kt = st.k_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
-                st.scores[t_i] = ggml.dotF32(qh, kt) * scale;
+                st.scores[t_i] = backend.dotF32(qh, kt) * scale;
             }
-            tensor.softmax(st.scores[0..seq]);
+            backend.softmax(st.scores[0..seq]);
             const oh = st.attn_out[h * hd ..][0..hd];
             @memset(oh, 0);
             t_i = 0;
             while (t_i < seq) : (t_i += 1) {
                 const vt = st.v_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
-                ggml.axpy(oh, vt, st.scores[t_i]);
+                backend.axpy(oh, vt, st.scores[t_i]);
             }
         }
         mv(l.attn_output, st.proj_out, st.attn_out);
-        tensor.add(st.x, st.proj_out);
+        backend.add(st.x, st.proj_out);
 
         // ---- FFN ----
-        tensor.rmsnorm(st.normed, st.x, tensorAsF32(l.ffn_norm), cfg.eps);
+        backend.rmsnorm(st.normed, st.x, tensorAsF32(l.ffn_norm), cfg.eps);
         if (!l.is_moe) {
             denseFFN(st, l.ffn_gate.?, l.ffn_up.?, l.ffn_down.?);
-            tensor.add(st.x, st.ffn_out);
+            backend.add(st.x, st.ffn_out);
             continue;
         }
 
         try moeLayer(m, st, l, li);
-        tensor.add(st.x, st.moe_acc);
+        backend.add(st.x, st.moe_acc);
     }
 
-    tensor.rmsnorm(st.normed, st.x, tensorAsF32(m.output_norm), cfg.eps);
+    backend.rmsnorm(st.normed, st.x, tensorAsF32(m.output_norm), cfg.eps);
     mv(m.output, st.logits, st.normed);
 }
 
@@ -821,10 +822,10 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize) !void {
             // others add it unweighted.
             var logit: [1]f32 = undefined;
             mv(sg, &logit, st.normed);
-            const g = tensor.sigmoid(logit[0]);
+            const g = backend.sigmoid(logit[0]);
             for (acc, st.ffn_out) |*a, v| a.* += g * v;
         } else {
-            tensor.add(acc, st.ffn_out);
+            backend.add(acc, st.ffn_out);
         }
     }
 }
@@ -844,7 +845,7 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize) !void {
 /// grouping them is a separate change.
 pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usize) !void {
     const n = tokens.len;
-    std.debug.assert(n > 0 and n <= ggml.MAX_BATCH);
+    std.debug.assert(n > 0 and n <= backend.MAX_BATCH);
     if (n == 1) return step(m, st, tokens[0], pos_base);
 
     const cfg = m.cfg;
@@ -857,13 +858,13 @@ pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usi
     for (tokens, 0..) |tok, k| {
         if (tok >= cfg.vocab) return error.TokenOutOfRange;
         if (pos_base + k >= cfg.ctx_len) return error.ContextExhausted;
-        ggml.dequantRow(m.token_embd.ty, st.bx[k * cfg.dim ..][0..cfg.dim], m.token_embd.data, tok, cfg.dim);
+        backend.dequantRow(m.token_embd.ty, st.bx[k * cfg.dim ..][0..cfg.dim], m.token_embd.data, tok, cfg.dim);
     }
 
     for (m.layers, 0..) |l, li| {
         // ---- attention ----
         for (0..n) |k| {
-            tensor.rmsnorm(st.bnormed[k * cfg.dim ..][0..cfg.dim], st.bx[k * cfg.dim ..][0..cfg.dim], tensorAsF32(l.attn_norm), cfg.eps);
+            backend.rmsnorm(st.bnormed[k * cfg.dim ..][0..cfg.dim], st.bx[k * cfg.dim ..][0..cfg.dim], tensorAsF32(l.attn_norm), cfg.eps);
         }
         mmul(l.attn_q, st.bq[0 .. n * qd], st.bnormed[0 .. n * cfg.dim], n);
         mmul(l.attn_k, st.bk[0 .. n * kvd], st.bnormed[0 .. n * cfg.dim], n);
@@ -897,31 +898,31 @@ pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usi
                 const qh = qk[h * hd ..][0..hd];
                 for (0..seq) |t_i| {
                     const kt = st.k_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
-                    st.scores[t_i] = ggml.dotF32(qh, kt) * scale;
+                    st.scores[t_i] = backend.dotF32(qh, kt) * scale;
                 }
-                tensor.softmax(st.scores[0..seq]);
+                backend.softmax(st.scores[0..seq]);
                 const oh = ok[h * hd ..][0..hd];
                 @memset(oh, 0);
                 for (0..seq) |t_i| {
                     const vt = st.v_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
-                    ggml.axpy(oh, vt, st.scores[t_i]);
+                    backend.axpy(oh, vt, st.scores[t_i]);
                 }
             }
         }
         mmul(l.attn_output, st.bproj[0 .. n * cfg.dim], st.battn[0 .. n * qd], n);
-        for (0..n) |k| tensor.add(st.bx[k * cfg.dim ..][0..cfg.dim], st.bproj[k * cfg.dim ..][0..cfg.dim]);
+        for (0..n) |k| backend.add(st.bx[k * cfg.dim ..][0..cfg.dim], st.bproj[k * cfg.dim ..][0..cfg.dim]);
 
         // ---- FFN ----
         for (0..n) |k| {
-            tensor.rmsnorm(st.bnormed[k * cfg.dim ..][0..cfg.dim], st.bx[k * cfg.dim ..][0..cfg.dim], tensorAsF32(l.ffn_norm), cfg.eps);
+            backend.rmsnorm(st.bnormed[k * cfg.dim ..][0..cfg.dim], st.bx[k * cfg.dim ..][0..cfg.dim], tensorAsF32(l.ffn_norm), cfg.eps);
         }
         if (!l.is_moe) {
             const f = l.ffn_gate.?.ne1;
             mmul(l.ffn_gate.?, st.bgate[0 .. n * f], st.bnormed[0 .. n * cfg.dim], n);
             mmul(l.ffn_up.?, st.bup[0 .. n * f], st.bnormed[0 .. n * cfg.dim], n);
-            for (0..n) |k| tensor.swiglu(st.bact[k * f ..][0..f], st.bgate[k * f ..][0..f], st.bup[k * f ..][0..f]);
+            for (0..n) |k| backend.swiglu(st.bact[k * f ..][0..f], st.bgate[k * f ..][0..f], st.bup[k * f ..][0..f]);
             mmul(l.ffn_down.?, st.bffn[0 .. n * cfg.dim], st.bact[0 .. n * f], n);
-            for (0..n) |k| tensor.add(st.bx[k * cfg.dim ..][0..cfg.dim], st.bffn[k * cfg.dim ..][0..cfg.dim]);
+            for (0..n) |k| backend.add(st.bx[k * cfg.dim ..][0..cfg.dim], st.bffn[k * cfg.dim ..][0..cfg.dim]);
             continue;
         }
         // MoE: routing differs per token, so run the expert FFN one token at a
@@ -929,18 +930,18 @@ pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usi
         for (0..n) |k| {
             @memcpy(st.normed, st.bnormed[k * cfg.dim ..][0..cfg.dim]);
             try moeLayer(m, st, l, li);
-            tensor.add(st.bx[k * cfg.dim ..][0..cfg.dim], st.moe_acc);
+            backend.add(st.bx[k * cfg.dim ..][0..cfg.dim], st.moe_acc);
         }
     }
 
     // Only the final token's logits matter for sampling.
     const last = st.bx[(n - 1) * cfg.dim ..][0..cfg.dim];
-    tensor.rmsnorm(st.normed, last, tensorAsF32(m.output_norm), cfg.eps);
+    backend.rmsnorm(st.normed, last, tensorAsF32(m.output_norm), cfg.eps);
     mv(m.output, st.logits, st.normed);
 }
 
 fn mmul(t: Tensor, out: []f32, xs: []const f32, n: usize) void {
-    ggml.matmul(t.ty, out, t.data, xs, n, t.ne1, t.ne0);
+    backend.matmul(t.ty, out, t.data, xs, n, t.ne1, t.ne0);
 }
 
 // ---- tests -------------------------------------------------------------------

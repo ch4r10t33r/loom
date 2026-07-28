@@ -16,7 +16,7 @@ const Engine = engine_mod.Engine;
 const tokenizer = @import("../engine/tokenizer.zig");
 const sampler = @import("../engine/sampler.zig");
 const deepseek = @import("../gguf/deepseek.zig");
-const ggml = @import("../gguf/ggml.zig");
+const backend = @import("../compute/backend.zig");
 const llama = @import("../gguf/llama.zig");
 const chat_template = @import("../gguf/chat_template.zig");
 const expert_fetch = @import("../p2p/expert_fetch.zig");
@@ -185,7 +185,7 @@ pub fn threads() usize {
 pub var prefill_batch: usize = 0;
 
 pub fn batchSize() usize {
-    return if (prefill_batch == 0) ggml.MAX_BATCH else @min(prefill_batch, ggml.MAX_BATCH);
+    return if (prefill_batch == 0) backend.MAX_BATCH else @min(prefill_batch, backend.MAX_BATCH);
 }
 
 fn clampMax(max_tokens: usize, budget: ?u64, prompt_tokens: usize) usize {
@@ -282,8 +282,8 @@ fn genGgufInner(
     // Scoped to the request rather than the process: without a condition
     // variable in the kernels, parked workers would have to spin, and a node
     // sitting idle overnight must not peg every core.
-    ggml.parallelBegin(threads());
-    defer ggml.parallelEnd();
+    backend.parallelBegin(threads());
+    defer backend.parallelEnd();
 
     const toks = try m.encodePrompt(gpa, prompt_text, parse_special);
     defer gpa.free(toks);
