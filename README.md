@@ -134,8 +134,12 @@ threads running during a generation, and past that point oversubscription
 costs more than the extra cores return. Override with `--threads N`;
 `--threads 1` disables the pool.
 
-This is still CPU-only. GPU backends (Metal, Vulkan, CUDA) are
-[#10](https://github.com/ch4r10t33r/loom/issues/10)–[#14](https://github.com/ch4r10t33r/loom/issues/14).
+This is still CPU-only, and the CPU path is not exhausted: Q4_K runs at about
+5.8 GB/s against roughly 70 GB/s of achievable bandwidth. GPU backends —
+Metal on Apple, Vulkan on Linux and Windows — are planned in
+[`docs/GPU-BACKENDS.md`](docs/GPU-BACKENDS.md), following the structure
+[ZINC](https://github.com/zolotukhin/zinc) used for its Apple Silicon
+bring-up.
 
 ## Chat UI
 
