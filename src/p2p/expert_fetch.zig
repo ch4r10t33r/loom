@@ -28,8 +28,11 @@ const sockopt = @import("../core/sockopt.zig");
 const hashmod = @import("../core/hash.zig");
 const stats_mod = @import("../core/stats.zig");
 const wire = @import("wire.zig");
+const expert_cache = @import("../engine/expert_cache.zig");
 
 pub const Stats = struct {
+    mapped: u64 = 0, // served zero-copy from the mmap'd store, no read at all
+    ram: u64 = 0, // served from the verified-block cache, no read and no hash
     local: u64 = 0, // served from held shards (disk/page cache)
     fetched: u64 = 0, // fetched from a peer this run
     fetch_bytes: u64 = 0,
@@ -47,27 +50,118 @@ pub const Source = struct {
     peers: []const sync.PeerAddr,
     /// reusable buffer for single-threaded get(); prefetch threads allocate
     scratch: []u8,
+    /// The local RAM tier. Without it every routed expert is re-read from
+    /// disk *and* re-hashed on every token: a 27-layer model activating 7
+    /// experts a layer does ~190 of those per token, ~950 MB hashed, which
+    /// measured at ~0.9 s/token and swamped everything else in the forward
+    /// pass. Verifying on first read still catches a poisoned block on disk
+    /// (audit #5 P0-2); re-verifying a block already in our own address space
+    /// on every subsequent access buys nothing.
+    ///
+    /// This is the tier the design has always specified as the top of the
+    /// fetch order -- the loom-format engine had it, the GGUF path did not.
+    cache: ?expert_cache.Lru = null,
+    /// Store mutation counter last seen. A repair or peer fetch that rewrites
+    /// a shard invalidates whatever we cached for it, so the whole cache is
+    /// dropped when this moves. Coarse, and it should be rare.
+    cache_seq: u64 = 0,
     stats: Stats = .{},
     stats_mutex: Io.Mutex = .init,
     rr: usize = 0, // round-robin start for holder spreading
 
     pub fn init(gpa: std.mem.Allocator, io: Io, store: *weights.Store, peers: []const sync.PeerAddr) !Source {
+        return initCached(gpa, io, store, peers, 0);
+    }
+
+    /// `cache_bytes` sizes the RAM tier; 0 disables it. Slots are one
+    /// maximum-length shard each, since a shard has to land contiguously to
+    /// be handed to a matmul.
+    pub fn initCached(
+        gpa: std.mem.Allocator,
+        io: Io,
+        store: *weights.Store,
+        peers: []const sync.PeerAddr,
+        cache_bytes: usize,
+    ) !Source {
+        // Sized by the largest *expert* shard, not the largest shard: the
+        // resident chunks are several times bigger and only ever read at
+        // startup, so letting them set the slot size throws away most of the
+        // budget.
+        const slot = @as(usize, @intCast(store.manifest.maxExpertShardLen()));
+        const slots = if (slot == 0) 0 else cache_bytes / slot;
         return .{
             .gpa = gpa,
             .io = io,
             .store = store,
             .peers = peers,
             .scratch = try gpa.alloc(u8, @intCast(store.manifest.maxShardLen())),
+            .cache = if (slots == 0) null else try expert_cache.Lru.init(gpa, slots, slot),
+            .cache_seq = store.holdingsSeq(),
         };
     }
 
     pub fn deinit(self: *Source) void {
         self.gpa.free(self.scratch);
+        if (self.cache) |*c| c.deinit(self.gpa);
+    }
+
+    /// Slots the RAM tier holds, for the startup banner.
+    pub fn cacheSlots(self: *const Source) usize {
+        return if (self.cache) |c| c.capacity else 0;
+    }
+
+    /// The three parts of an expert shard -- gate, up, down -- each as its own
+    /// slice. A shard is three separate file extents, so this is the shape it
+    /// naturally has; only the old copying path ever concatenated them.
+    pub const Parts = struct { gate: []const u8, up: []const u8, down: []const u8 };
+
+    /// Zero-copy shard access: pointers straight into the mapped store, valid
+    /// as long as the store stays mapped and the shard stays held.
+    ///
+    /// Returns null when the store is not mapped, the shard is not held, it
+    /// fails its digest, or it does not have exactly three extents -- in every
+    /// one of those cases the caller falls back to `get`. This is the whole
+    /// point of the exercise: a copy into a heap cache is a second resident
+    /// copy of bytes the page cache already holds, and on a machine where the
+    /// two do not both fit it costs far more than the copy itself.
+    pub fn getMapped(self: *Source, id: usize) ?Parts {
+        if (self.store.extentCount(id) != 3) return null;
+        const g = self.store.extentSlice(id, 0) orelse return null;
+        const u = self.store.extentSlice(id, 1) orelse return null;
+        const d = self.store.extentSlice(id, 2) orelse return null;
+        self.stats.mapped += 1;
+        return .{ .gate = g, .up = u, .down = d };
     }
 
     /// Materialize shard `id`. Local tier first; else fetch, verify, persist.
     /// Returns a slice of `self.scratch` (valid until the next get()).
     pub fn get(self: *Source, id: usize) ![]const u8 {
+        if (self.cache) |*c| {
+            const seq = self.store.holdingsSeq();
+            if (seq != self.cache_seq) {
+                c.clear();
+                self.cache_seq = seq;
+            } else if (c.find(id)) |blk| {
+                self.stats.ram += 1;
+                return blk[0..@intCast(self.store.manifest.rangeLen(id))];
+            }
+            const want: usize = @intCast(self.store.manifest.rangeLen(id));
+            if (self.store.holdings.has(id)) {
+                const slot = try c.reserve(id);
+                if (self.store.readRangeVerified(id, slot[1][0..want])) |data| {
+                    self.stats.local += 1;
+                    return data;
+                } else |_| {
+                    // publish-after-verify: a poisoned block must not become a
+                    // cache hit later (audit #5 P0-3)
+                    c.abort(id);
+                }
+            }
+            const n = try self.fetchShard(id, self.scratch);
+            const slot = try c.reserve(id);
+            @memcpy(slot[1][0..n], self.scratch[0..n]);
+            return slot[1][0..n];
+        }
         if (self.store.holdings.has(id)) {
             // verify the local block before matmul (audit #5 P0-2); on failure
             // fall through to a peer fetch (the bit was cleared by the verify)

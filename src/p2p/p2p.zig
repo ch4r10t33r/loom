@@ -253,7 +253,8 @@ fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer) !void
         const addr = fieldOf(line, "addr") orelse return wi.print("ERR bad_gossip\n", .{});
         const version = fieldOf(line, "version") orelse return wi.print("ERR bad_gossip\n", .{});
         const holdings = fieldOf(line, "holdings") orelse "";
-        _ = table.merge(addr, version, holdings, peers.NO_COMMITTEE, 0, stats.nowNs(ctx.io)) catch {
+        // inbound: this peer opened the connection, so it is demonstrably alive
+        _ = table.merge(addr, version, holdings, peers.NO_COMMITTEE, 0, stats.nowNs(ctx.io), .first_hand) catch {
             return wi.print("ERR bad_gossip\n", .{});
         };
         try sendPeerList(ctx, wi);
@@ -284,7 +285,7 @@ fn handleFrame(ctx: *Ctx, raw: []const u8, wi: *Io.Writer) !void {
             const vhex = hashmod.toHex(ann.manifest_version);
             const hhex = try bytesToHexAlloc(ctx.gpa, ann.holdings_bitmap);
             defer ctx.gpa.free(hhex);
-            _ = table.merge(ann.addr, &vhex, hhex, ann.committee_id, ann.holdings_seq, stats.nowNs(ctx.io)) catch {};
+            _ = table.merge(ann.addr, &vhex, hhex, ann.committee_id, ann.holdings_seq, stats.nowNs(ctx.io), .first_hand) catch {};
             try sendAnnounceBatch(ctx, wi);
         },
         .expert_request => {

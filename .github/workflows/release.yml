@@ -29,7 +29,12 @@ jobs:
           # on the OS it claims to support, rather than only being linked.
           - { target: x86_64-linux-musl,  runner: ubuntu-latest, asset: x86_64-linux,  anyzig: x86_64-linux,   sha: f9d5a09fbd7c019eecef1a397613ce5baec22872a1c3eb5ab4b1132e917c3d71, native: true }
           - { target: aarch64-linux-musl, runner: ubuntu-latest, asset: aarch64-linux, anyzig: x86_64-linux,   sha: f9d5a09fbd7c019eecef1a397613ce5baec22872a1c3eb5ab4b1132e917c3d71, native: false }
-          - { target: aarch64-macos,      runner: macos-latest,  asset: aarch64-macos, anyzig: aarch64-macos,  sha: c7d0d77dd5f21e44d67b09717b60435bc7b90b81873f543040f0bc4dd8622109, native: true }
+          # Built natively so it can link Metal: cross-compiling to macOS
+          # cannot find the frameworks (Zig resolves the SDK through xcrun for
+          # the host target only). Intel macOS stays a cross build and stays on
+          # the CPU, which is correct anyway — the Metal backend refuses a
+          # device without unified memory rather than push pages over PCIe.
+          - { target: aarch64-macos,      runner: macos-latest,  asset: aarch64-macos, anyzig: aarch64-macos,  sha: c7d0d77dd5f21e44d67b09717b60435bc7b90b81873f543040f0bc4dd8622109, native: true, build_native: true }
           - { target: x86_64-macos,       runner: macos-latest,  asset: x86_64-macos,  anyzig: aarch64-macos,  sha: c7d0d77dd5f21e44d67b09717b60435bc7b90b81873f543040f0bc4dd8622109, native: false }
 
     steps:
@@ -52,11 +57,20 @@ jobs:
       - name: Build
         run: |
           set -eux
-          zig "${ZIG}" build \
-            -Doptimize=ReleaseFast \
-            -Dtarget=${{ matrix.target }} \
-            -Dcommit="${GITHUB_SHA}" \
-            -p out
+          if [ "${{ matrix.build_native }}" = "true" ]; then
+            # No -Dtarget: build.zig only defaults to Metal for a native macOS
+            # target, because that is the only one whose frameworks it can find.
+            zig "${ZIG}" build \
+              -Doptimize=ReleaseFast \
+              -Dcommit="${GITHUB_SHA}" \
+              -p out
+          else
+            zig "${ZIG}" build \
+              -Doptimize=ReleaseFast \
+              -Dtarget=${{ matrix.target }} \
+              -Dcommit="${GITHUB_SHA}" \
+              -p out
+          fi
 
       # Linking is not evidence that it runs. Where the artifact matches the
       # runner, actually execute it.

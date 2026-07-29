@@ -397,6 +397,9 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .ui_port = try flagU16(args, "--ui-port", @intCast(try envU64(env, "UI_PORT", 8555))),
         .status_secs = @intCast(try flagUsize(args, "--status-secs", 30)),
         .kernel_threads = try flagUsize(args, "--threads", 0),
+        .mmap_weights = hasFlag(args, "--mmap-weights"),
+        .gpu_ops = hasFlag(args, "--gpu-ops"),
+        .no_gpu_layers = hasFlag(args, "--no-gpu-layers"),
         .prefill_batch = try flagUsize(args, "--batch", 0),
         .chat_format = flagStr(args, "--chat-format"),
     });
@@ -685,7 +688,10 @@ fn runStore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, dir: []const u8, ar
         }
     }
 
-    var src = try expert_fetch.Source.init(gpa, io, &store, peer_list.items);
+    // The RAM tier: without it every routed expert is re-read from disk and
+    // re-hashed on every token.
+    const cache_gb = try flagF64(args, "--ram-gb", 4.0);
+    var src = try expert_fetch.Source.initCached(gpa, io, &store, peer_list.items, @intFromFloat(cache_gb * GB));
     src.committee = committee_list.items;
 
     // resident completeness gate (audit #5 P0-4): the resident bundle
