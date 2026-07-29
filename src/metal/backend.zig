@@ -76,6 +76,8 @@ const attn_src = @embedFile("../shaders/metal/attn.metal");
 const rope_src = @embedFile("../shaders/metal/rope.metal");
 const moe_acc_src = @embedFile("../shaders/metal/moe_acc.metal");
 const dmmv_q5_1_src = @embedFile("../shaders/metal/dmmv_q5_1.metal");
+const dmmv_q5_0_src = @embedFile("../shaders/metal/dmmv_q5_0.metal");
+const dmmv_q8_0_src = @embedFile("../shaders/metal/dmmv_q8_0.metal");
 const elementwise_src = @embedFile("../shaders/metal/elementwise.metal");
 
 /// Below this many rows the CPU path wins outright, so the GPU is not used.
@@ -416,6 +418,8 @@ const Ctx = struct {
     q4k: mtl.Pipeline,
     q6k: mtl.Pipeline,
     q5_1: mtl.Pipeline,
+    q5_0: mtl.Pipeline,
+    q8_0: mtl.Pipeline,
     gemm_q4k: mtl.Pipeline,
     attn_p: mtl.Pipeline,
     rope_p: mtl.Pipeline,
@@ -509,6 +513,14 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const p50 = dev.pipeline(dmmv_q5_0_src, "dmmv_q5_0") catch {
+        dev.deinit();
+        return;
+    };
+    const p80 = dev.pipeline(dmmv_q8_0_src, "dmmv_q8_0") catch {
+        dev.deinit();
+        return;
+    };
     const psadd = dev.pipeline(moe_acc_src, "scaled_add") catch {
         dev.deinit();
         return;
@@ -548,7 +560,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .gemm_q4k = pg, .attn_p = pattn, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -1287,7 +1299,7 @@ pub fn frameStoreX(x: []f32) bool {
 fn colsMultiple(t: ggml.Type) usize {
     return switch (t) {
         .q4_k, .q6_k => 256,
-        .q5_1 => 32,
+        .q5_1, .q5_0, .q8_0 => 32,
         else => 256,
     };
 }
@@ -1311,6 +1323,8 @@ fn pipelineFor(cx: *Ctx, t: ggml.Type) ?mtl.Pipeline {
         .q4_k => cx.q4k,
         .q6_k => cx.q6k,
         .q5_1 => cx.q5_1,
+        .q5_0 => cx.q5_0,
+        .q8_0 => cx.q8_0,
         else => null,
     };
 }
@@ -2725,5 +2739,240 @@ test "probe: peak streaming-read bandwidth" {
             @as(f64, @floatFromInt(best)) / 1e6,
             @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(best)),
         });
+    }
+}
+
+test "metal q5_0 matvec agrees with the exact cpu reference" {
+    // Q5_0 is symmetric (d*(q-16)) with a 32-value block. Two things are easy to
+    // get wrong and both stay plausible: the fifth bit, which lives in a u32 at
+    // byte 2 with value i at bit i and value i+16 at bit i+16, and the -16
+    // offset, which has to be applied to every element and not to the block
+    // sum. Dropping either shifts results without making them obviously wrong.
+    const gpa = std.testing.allocator;
+    const cols = 1408; // DeepSeek's expert `down` width: 44 blocks of 32
+    const rows = 256;
+
+    var prng = std.Random.DefaultPrng.init(0x50A0);
+    const rnd = prng.random();
+    const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q5_0, cols, rows));
+    defer gpa.free(data);
+    rnd.bytes(data);
+    // Pin the scale, as the Q5_1 test does and for the same reason: random f16
+    // scales span five orders of magnitude, so summing 44 blocks in f32 is
+    // ill-conditioned whatever the kernel does and the comparison would
+    // measure summation order rather than correctness. The quants stay random.
+    var b: usize = 0;
+    while (b + 22 <= data.len) : (b += 22) {
+        std.mem.writeInt(u16, data[b..][0..2], 0x2C00, .little); // d = 0.0625
+    }
+
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+    const saved_min = min_rows;
+    const saved_ok = gpu_worthwhile;
+    const saved_use = use_gpu_ops;
+    min_rows = 0;
+    gpu_worthwhile = true;
+    use_gpu_ops = true;
+    defer {
+        min_rows = saved_min;
+        gpu_worthwhile = saved_ok;
+        use_gpu_ops = saved_use;
+    }
+
+    const got = try gpa.alloc(f32, rows);
+    defer gpa.free(got);
+    @memset(got, std.math.nan(f32));
+    matvec(.q5_0, got, data, x, rows, cols);
+
+    // Did the GPU path actually run? `matvec` falls back to `cpu.matvec` for
+    // any reason it declines, and the CPU kernel is int8-approximate, so a
+    // silent fallback presents as a slightly-wrong kernel rather than an
+    // unused one. This is the check that would have caught the real bug here:
+    // the type had no pipeline at all, so every expert `down` in the
+    // checkpoint took the host path and the batched MoE block never ran.
+    const cpu_ref = try gpa.alloc(f32, rows);
+    defer gpa.free(cpu_ref);
+    cpu.matvec(.q5_0, cpu_ref, data, x, rows, cols);
+    var identical: usize = 0;
+    for (got, cpu_ref) |g, c| {
+        if (g == c) identical += 1;
+    }
+    if (identical == rows) {
+        std.debug.print("q5_0: matvec fell back to the CPU -- the GPU path never ran\n", .{});
+        return error.SkipZigTest;
+    }
+
+    const row = try gpa.alloc(f32, cols);
+    defer gpa.free(row);
+    // f64 oracle: a sequential f32 sum over 1408 terms drifts by ~1.7e-4 of
+    // the summed mass, which is larger than the tolerance below, so an f32
+    // reference would report its own error as the kernel's.
+    for (0..rows) |r| {
+        cpu.dequantRow(.q5_0, row, data, r, cols);
+        var acc64: f64 = 0;
+        var mass64: f64 = 0;
+        for (row, x) |wv, xv| {
+            acc64 += @as(f64, wv) * @as(f64, xv);
+            mass64 += @abs(@as(f64, wv) * @as(f64, xv));
+        }
+        const want: f32 = @floatCast(acc64);
+        const mass: f32 = @floatCast(mass64);
+        const tol = mass * 1e-5;
+        std.testing.expectApproxEqAbs(want, got[r], tol) catch |e| {
+            std.debug.print("metal q5_0 row {d}: reference {d} vs gpu {d} (rel-to-mass {e:.2})\n", .{ r, want, got[r], @abs(want - got[r]) / mass });
+            return e;
+        };
+    }
+}
+
+test "metal q8_0 matvec agrees with the exact cpu reference" {
+    // Q8_0 has no unpacking at all -- the quants are already signed bytes -- so
+    // the only thing to get wrong is signedness. Reading them as unsigned turns
+    // every negative weight into a large positive one, which a model absorbs
+    // into plausible-looking text rather than failing.
+    const gpa = std.testing.allocator;
+    const cols = 1408; // DeepSeek's expert `down` width: 44 blocks of 32
+    const rows = 256;
+
+    var prng = std.Random.DefaultPrng.init(0x80A0);
+    const rnd = prng.random();
+    const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q8_0, cols, rows));
+    defer gpa.free(data);
+    rnd.bytes(data);
+    // Pin the scale, as the Q5_1 test does and for the same reason: random f16
+    // scales span five orders of magnitude, so summing 44 blocks in f32 is
+    // ill-conditioned whatever the kernel does and the comparison would
+    // measure summation order rather than correctness. The quants stay random.
+    var b: usize = 0;
+    while (b + 34 <= data.len) : (b += 34) {
+        std.mem.writeInt(u16, data[b..][0..2], 0x2C00, .little); // d = 0.0625
+    }
+
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+    const saved_min = min_rows;
+    const saved_ok = gpu_worthwhile;
+    const saved_use = use_gpu_ops;
+    min_rows = 0;
+    gpu_worthwhile = true;
+    use_gpu_ops = true;
+    defer {
+        min_rows = saved_min;
+        gpu_worthwhile = saved_ok;
+        use_gpu_ops = saved_use;
+    }
+
+    const got = try gpa.alloc(f32, rows);
+    defer gpa.free(got);
+    @memset(got, std.math.nan(f32));
+    matvec(.q8_0, got, data, x, rows, cols);
+
+    // Did the GPU path actually run? `matvec` falls back to `cpu.matvec` for
+    // any reason it declines, and the CPU kernel is int8-approximate, so a
+    // silent fallback presents as a slightly-wrong kernel rather than an
+    // unused one. This is the check that would have caught the real bug here:
+    // the type had no pipeline at all, so every expert `down` in the
+    // checkpoint took the host path and the batched MoE block never ran.
+    const cpu_ref = try gpa.alloc(f32, rows);
+    defer gpa.free(cpu_ref);
+    cpu.matvec(.q8_0, cpu_ref, data, x, rows, cols);
+    var identical: usize = 0;
+    for (got, cpu_ref) |g, c| {
+        if (g == c) identical += 1;
+    }
+    if (identical == rows) {
+        std.debug.print("q8_0: matvec fell back to the CPU -- the GPU path never ran\n", .{});
+        return error.SkipZigTest;
+    }
+
+    const row = try gpa.alloc(f32, cols);
+    defer gpa.free(row);
+    // f64 oracle: a sequential f32 sum over 1408 terms drifts by ~1.7e-4 of
+    // the summed mass, which is larger than the tolerance below, so an f32
+    // reference would report its own error as the kernel's.
+    for (0..rows) |r| {
+        cpu.dequantRow(.q8_0, row, data, r, cols);
+        var acc64: f64 = 0;
+        var mass64: f64 = 0;
+        for (row, x) |wv, xv| {
+            acc64 += @as(f64, wv) * @as(f64, xv);
+            mass64 += @abs(@as(f64, wv) * @as(f64, xv));
+        }
+        const want: f32 = @floatCast(acc64);
+        const mass: f32 = @floatCast(mass64);
+        const tol = mass * 1e-5;
+        std.testing.expectApproxEqAbs(want, got[r], tol) catch |e| {
+            std.debug.print("metal q8_0 row {d}: reference {d} vs gpu {d} (rel-to-mass {e:.2})\n", .{ r, want, got[r], @abs(want - got[r]) / mass });
+            return e;
+        };
+    }
+}
+
+test "moe block accepts every down-projection type real checkpoints use" {
+    // The bug this exists to prevent, stated plainly: DeepSeek-V2-Lite Q4_K_M
+    // stores `ffn_down_exps` as Q5_0 in some layers and Q8_0 in others, neither
+    // of which had a pipeline -- so `moeFfnBlock` declined at
+    // `pipelineFor(e.down.ty)` for every MoE layer in the checkpoint and the
+    // batched path was dead on the one model it was written for.
+    //
+    // It survived because the block's other test treats a decline as
+    // `error.SkipZigTest`. A backend that refuses everything passes a suite
+    // built that way. So this asserts acceptance rather than agreement -- the
+    // numbers are the other test's job -- and it *fails* on a decline.
+    const gpa = std.testing.allocator;
+    const dim = 2048;
+    const ffn = 1408;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+    const saved_use = use_gpu_ops;
+    use_gpu_ops = true;
+    defer use_gpu_ops = saved_use;
+
+    var prng = std.Random.DefaultPrng.init(0xD0);
+    const rnd = prng.random();
+
+    const normed = try gpa.alloc(f32, dim);
+    defer gpa.free(normed);
+    for (normed) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    const got = try gpa.alloc(f32, dim);
+    defer gpa.free(got);
+
+    // gate and up are Q4_K over `dim` in every mix that ships; `down` is the
+    // one that varies, and 1408 is not a multiple of 256 so it can never be a
+    // K-quant.
+    const wg = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, dim, ffn));
+    defer gpa.free(wg);
+    const wu = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, dim, ffn));
+    defer gpa.free(wu);
+    rnd.bytes(wg);
+    rnd.bytes(wu);
+
+    for ([_]ggml.Type{ .q5_0, .q8_0, .q5_1 }) |down_ty| {
+        const wd = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(down_ty, ffn, dim));
+        defer gpa.free(wd);
+        rnd.bytes(wd);
+        const refs = [_]ExpertRef{.{
+            .gate = .{ .ty = .q4_k, .data = wg },
+            .up = .{ .ty = .q4_k, .data = wu },
+            .down = .{ .ty = down_ty, .data = wd },
+            .weight = 1.0,
+        }};
+        if (!moeFfnBlock(normed, &refs, ffn, got)) {
+            std.debug.print("moe block declined a {t} down-projection: every MoE layer of such a checkpoint falls back to the host\n", .{down_ty});
+            return error.MoeBlockDeclinedARealType;
+        }
     }
 }

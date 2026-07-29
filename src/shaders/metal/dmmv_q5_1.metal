@@ -1,10 +1,15 @@
 // Q5_1 dequantize-multiply-matrix-vector.
 //
-// Needed because DeepSeek-V2-Lite's `ffn_down_exps` is Q5_1, and without a
-// kernel for it the MoE block declines the whole layer — the expert FFN is
-// ~40% of a token and none of it could reach the GPU. The lesson repeats: a
-// missing quant kernel does not cost the speed of that one tensor, it costs
-// every operation that would have shared its command buffer.
+// A missing quant kernel does not cost the speed of that one tensor, it costs
+// every operation that would have shared its command buffer: the MoE block
+// declines the whole layer if any of an expert's three tensors has no
+// pipeline, and the expert FFN is ~40% of a token.
+//
+// This kernel was written believing DeepSeek-V2-Lite Q4_K_M stored
+// `ffn_down_exps` as Q5_1. Reading the file's tensor types says otherwise --
+// it is Q5_0 and Q8_0, and contains no Q5_1 at all -- so this one covers other
+// checkpoints and `dmmv_q5_0.metal` is what unblocked that model. The habit
+// worth keeping is reading the checkpoint rather than the quant mix's name.
 //
 // Layout of one 32-value block (24 bytes):
 //
