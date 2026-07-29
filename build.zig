@@ -72,17 +72,21 @@ pub fn build(b: *std.Build) void {
     run_step.dependOn(&run_cmd.step);
 
     // `zig build test`
-    const unit_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "snappyz", .module = snappy.module("snappyz") },
-                .{ .name = "build_info", .module = build_info.createModule() },
-            },
-        }),
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "snappyz", .module = snappy.module("snappyz") },
+            .{ .name = "build_info", .module = build_info.createModule() },
+        },
     });
+    // Same reason as the executable: macOS links libc implicitly, so a `std.c`
+    // call compiles here and fails to build on Linux. The test binary needs it
+    // stated as explicitly as the exe does — CI runs on Linux and caught this
+    // when only the exe had been fixed.
+    test_mod.link_libc = true;
+    const unit_tests = b.addTest(.{ .root_module = test_mod });
     if (std.mem.eql(u8, gpu, "metal")) addMetal(b, unit_tests);
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
