@@ -76,3 +76,47 @@ regressions and to know where the time goes.
 Add the timing to `src/bench.zig` and, where there is a relationship that must
 hold, a `check(...)` for it. Prefer the invariant: a number that only ever
 gets printed will be ignored, while one that fails a build gets fixed.
+
+## The expert FFN runs 4.4x slower in the engine than in isolation
+
+Before building an MLA + MoE GPU path on the assumption that `expert ffn` is
+compute-bound, the assumption was checked. It does not hold, and the GPU is not
+the lever.
+
+`loom bench --ffn` runs exactly the shape DeepSeek-V2-Lite uses — dim 2048,
+moe_ffn 1408, gate/up Q4_K, down Q5_1, 5.16 MB per expert — over a ring of 64
+distinct experts so nothing sits in cache:
+
+| | ms per expert FFN | implied |
+|---|---|---|
+| bench, 8 threads | 0.254 | 21.3 GB/s |
+| bench, 1 thread | 1.150 | 4.7 GB/s |
+| **in-engine, 8 threads** | **1.08** | **4.8 GB/s** |
+
+The in-engine figure is a whisker from the bench's *single-threaded* number.
+Threading in the engine is not absent — forcing `--threads 1` moves `expert ffn`
+from 168.3 to 276.2 ms — but that is 1.64x where the same kernels on the same
+shapes get 4.52x.
+
+So roughly 4x of the expert FFN is being lost to something that is neither the
+kernel nor the quantization nor the thread count. Candidates not yet
+distinguished:
+
+- **TLB pressure.** The bench indexes a 330 MB slab (~20k pages); the engine
+  indexes an 8 GB LRU slab at random slot offsets (~500k pages). Random access
+  across that many pages defeats the page-walk caches in a way the bench cannot
+  reproduce.
+- **Contention with prefetch threads.** `Source.prefetch` spawns a thread per
+  missing shard for each MoE layer, and with ~24 disk misses per token those
+  are live for much of the forward pass, competing with the kernel pool for
+  four cores.
+- **Residency.** With `--mmap-weights` the costs move between buckets rather
+  than shrinking — `get` 219 -> 316 ms and `ffn` 208 -> 107 ms — which says the
+  page-touch cost is real and merely attributed to whoever reads the bytes
+  first, not that either arrangement avoids it.
+
+This matters more than the GPU work it displaced. `expert ffn` is ~40% of a
+token, so recovering the isolation number would be worth about 2x overall —
+against an estimated 1.3x for moving the same work to Metal, which would read
+the same pages from the same unified memory and inherit whichever of the above
+is responsible.
