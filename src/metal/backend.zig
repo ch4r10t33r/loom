@@ -18,7 +18,44 @@ const ggml = @import("../gguf/ggml.zig");
 const mtl = @import("device.zig");
 
 // Ops not yet on the GPU fall through unchanged.
-pub const matmul = cpu.matmul;
+const GemmDims = extern struct { rows: u32, cols: u32, n: u32 };
+
+/// Batched matvec for prefill. Falls back to the CPU for anything the kernel
+/// does not cover, so correctness never depends on the shape.
+///
+/// Unlike decode, this is *not* gated on the calibrated row threshold. That
+/// threshold answers a bandwidth question -- at one token per pass the GPU and
+/// the CPU are reading the same bus and the crossover is high. A batch reuses
+/// each weight n times, so the arithmetic intensity is n times higher and the
+/// answer is different; gating prefill on a decode measurement would be
+/// applying the wrong number.
+pub fn matmul(t: ggml.Type, out: []f32, data: []const u8, xs: []const f32, n: usize, rows: usize, cols: usize) void {
+    if (n <= 1) return matvec(t, out, data, xs, rows, cols);
+    const cx = &(ctx orelse return cpu.matmul(t, out, data, xs, n, rows, cols));
+    if (!gemm_worthwhile and calibrated and !calibrating) return cpu.matmul(t, out, data, xs, n, rows, cols);
+    if (t != .q4_k or n > MAX_BATCH or cols % 256 != 0) {
+        return cpu.matmul(t, out, data, xs, n, rows, cols);
+    }
+    if (xs.len * 4 > cx.scratch_x.len or out.len * 4 > cx.scratch_out.len) {
+        return cpu.matmul(t, out, data, xs, n, rows, cols);
+    }
+    const w = wrapFor(cx, data) orelse return cpu.matmul(t, out, data, xs, n, rows, cols);
+
+    @memcpy(cx.scratch_x.slice(f32)[0..xs.len], xs);
+    const dims = GemmDims{ .rows = @intCast(rows), .cols = @intCast(cols), .n = @intCast(n) };
+    const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+    const cb = cx.dev.commandBuffer();
+    cb.dispatch(
+        cx.gemm_q4k,
+        &.{ w.buf, cx.scratch_x, cx.scratch_out },
+        &.{ w.off, 0, 0 },
+        std.mem.asBytes(&dims),
+        rows * SIMD_W,
+        group,
+    );
+    cb.commitAndWait();
+    @memcpy(out, cx.scratch_out.slice(f32)[0..out.len]);
+}
 pub const dequantRow = cpu.dequantRow;
 pub const dotF32 = cpu.dotF32;
 pub const axpy = cpu.axpy;
@@ -31,6 +68,7 @@ pub const MAX_BATCH = cpu.MAX_BATCH;
 
 const dmmv_q4k_src = @embedFile("../shaders/metal/dmmv_q4k.metal");
 const dmmv_q6k_src = @embedFile("../shaders/metal/dmmv_q6k.metal");
+const gemm_q4k_src = @embedFile("../shaders/metal/gemm_q4k.metal");
 const elementwise_src = @embedFile("../shaders/metal/elementwise.metal");
 
 /// Below this many rows the CPU path wins outright, so the GPU is not used.
@@ -88,6 +126,10 @@ var min_rows: usize = MIN_GPU_ROWS;
 var gpu_worthwhile: bool = true;
 /// Whether the fused FFN block beat the CPU sequence on this model's shape.
 var ffn_worthwhile: bool = false;
+/// Whether the batched (prefill) kernel beat the CPU on this model's shape.
+/// Measured separately from decode: a batch reuses each weight n times, so the
+/// arithmetic intensity -- and therefore the answer -- is different.
+var gemm_worthwhile: bool = false;
 var calibrated: bool = false;
 /// True only while `calibrate` is running. Without it the gate below refuses
 /// the very call that is supposed to measure the block: `calibrate` marks
@@ -114,6 +156,7 @@ pub const Verdict = struct {
     matvec_min_rows: usize,
     matvec_used: bool,
     ffn_used: bool,
+    prefill_used: bool = false,
     ffn_gpu_ms: f64 = 0,
     ffn_cpu_ms: f64 = 0,
 };
@@ -246,6 +289,43 @@ pub fn calibrate(gpa: std.mem.Allocator, dim: usize, ffn: usize, shapes: []const
         verdict.ffn_cpu_ms = @as(f64, @floatFromInt(cms)) / 1e6;
     }
 
+    // Prefill, measured on the same tensor at a full batch.
+    for (shapes) |sh| {
+        if (sh.ty != .q4_k or sh.cols % 256 != 0) continue;
+        const nb = MAX_BATCH;
+        if (sh.rows * nb * 4 > cx_scratchOutLen()) continue;
+        const xb = gpa.alloc(f32, nb * sh.cols) catch continue;
+        defer gpa.free(xb);
+        for (xb, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 11)) * 0.01 - 0.05;
+        const ob = gpa.alloc(f32, nb * sh.rows) catch continue;
+        defer gpa.free(ob);
+
+        const now2 = struct {
+            fn f(i: std.Io) i128 {
+                return std.Io.Clock.Timestamp.now(i, .awake).raw.toNanoseconds();
+            }
+        }.f;
+        gemm_worthwhile = true;
+        for (0..2) |_| matmul(sh.ty, ob, sh.data, xb, nb, sh.rows, sh.cols);
+        var gg: i128 = std.math.maxInt(i64);
+        for (0..8) |_| {
+            const t0 = now2(tio);
+            matmul(sh.ty, ob, sh.data, xb, nb, sh.rows, sh.cols);
+            const dt = now2(tio) - t0;
+            if (dt < gg) gg = dt;
+        }
+        gemm_worthwhile = false;
+        var cc: i128 = std.math.maxInt(i64);
+        for (0..8) |_| {
+            const t0 = now2(tio);
+            cpu.matmul(sh.ty, ob, sh.data, xb, nb, sh.rows, sh.cols);
+            const dt = now2(tio) - t0;
+            if (dt < cc) cc = dt;
+        }
+        gemm_worthwhile = @as(f64, @floatFromInt(gg)) * MARGIN < @as(f64, @floatFromInt(cc));
+        break;
+    }
+
     const gms_keep = verdict.ffn_gpu_ms;
     const cms_keep = verdict.ffn_cpu_ms;
     verdict = .{
@@ -253,6 +333,7 @@ pub fn calibrate(gpa: std.mem.Allocator, dim: usize, ffn: usize, shapes: []const
         .matvec_min_rows = min_rows,
         .matvec_used = gpu_worthwhile,
         .ffn_used = ffn_worthwhile,
+        .prefill_used = gemm_worthwhile,
         .ffn_gpu_ms = gms_keep,
         .ffn_cpu_ms = cms_keep,
     };
@@ -293,6 +374,7 @@ const Ctx = struct {
     dev: mtl.Device,
     q4k: mtl.Pipeline,
     q6k: mtl.Pipeline,
+    gemm_q4k: mtl.Pipeline,
     rmsnorm_p: mtl.Pipeline,
     swiglu_p: mtl.Pipeline,
     add_p: mtl.Pipeline,
@@ -336,6 +418,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const pg = dev.pipeline(gemm_q4k_src, "gemm_q4k") catch {
+        dev.deinit();
+        return;
+    };
     const pn = dev.pipeline(elementwise_src, "rmsnorm") catch {
         dev.deinit();
         return;
@@ -363,7 +449,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .gemm_q4k = pg, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -566,6 +652,63 @@ test "metal q6_k matvec agrees with the exact cpu reference" {
             std.debug.print("metal q6_k row {d}: reference {d} vs gpu {d} (tol {d})\n", .{ r, want, got[r], tol });
             return e;
         };
+    }
+}
+
+test "metal batched matmul agrees with the exact cpu reference" {
+    // The seam's contract is that matmul equals n calls to matvec. Here the
+    // oracle is again dequantize-then-dot in f32 rather than cpu.matmul, whose
+    // batched kernels quantize activations to int8 and are approximate by
+    // design -- comparing against those reports the CPU's approximation as a
+    // GPU bug.
+    //
+    // Every batch element is checked, not just the first: the failure this is
+    // most likely to catch is an indexing slip between the n activation
+    // vectors or the n output vectors, which leaves element 0 correct.
+    const gpa = std.testing.allocator;
+    const cols = 512;
+    const rows = 64;
+    const n = MAX_BATCH;
+
+    var prng = std.Random.DefaultPrng.init(0x9E11A);
+    const rnd = prng.random();
+
+    const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, cols, rows));
+    defer gpa.free(data);
+    rnd.bytes(data);
+    for (0..data.len / 2) |i| data[i * 2 + 1] &= 0xFB;
+
+    const xs = try gpa.alloc(f32, n * cols);
+    defer gpa.free(xs);
+    for (xs) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+
+    const got = try gpa.alloc(f32, n * rows);
+    defer gpa.free(got);
+    @memset(got, std.math.nan(f32));
+    matmul(.q4_k, got, data, xs, n, rows, cols);
+
+    const row = try gpa.alloc(f32, cols);
+    defer gpa.free(row);
+    for (0..rows) |r| {
+        cpu.dequantRow(.q4_k, row, data, r, cols);
+        for (0..n) |k| {
+            const x = xs[k * cols ..][0..cols];
+            var want: f32 = 0;
+            var mass: f32 = 0;
+            for (row, x) |wv, xv| {
+                want += wv * xv;
+                mass += @abs(wv * xv);
+            }
+            const tol = mass * 1e-5;
+            std.testing.expectApproxEqAbs(want, got[k * rows + r], tol) catch |e| {
+                std.debug.print("metal gemm row {d} batch {d}: reference {d} vs gpu {d}\n", .{ r, k, want, got[k * rows + r] });
+                return e;
+            };
+        }
     }
 }
 

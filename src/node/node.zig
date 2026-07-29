@@ -306,6 +306,7 @@ fn printCompute(out: *Io.Writer) !void {
     if (v.matvec_used) try out.print(" (>= {d} rows)", .{v.matvec_min_rows});
     try out.print(", ffn block {s}", .{if (v.ffn_used) "gpu" else "cpu"});
     if (v.ffn_gpu_ms > 0) try out.print(" (gpu {d:.3} ms vs cpu {d:.3} ms)", .{ v.ffn_gpu_ms, v.ffn_cpu_ms });
+    try out.print(", prefill {s}", .{if (v.prefill_used) "gpu" else "cpu"});
     try out.print("\n", .{});
 }
 
