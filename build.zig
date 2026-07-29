@@ -16,7 +16,17 @@ pub fn build(b: *std.Build) void {
     // Compute backend, resolved at comptime in src/compute/backend.zig. The
     // inactive backends are not compiled, so a GPU toolchain never becomes a
     // requirement for a CPU build (issue #10).
-    const gpu = b.option([]const u8, "gpu", "Compute backend: none (default), metal, vulkan") orelse "none";
+    // Default to the platform's GPU backend where one exists. macOS gets
+    // Metal; everything else stays on the CPU until the Vulkan backend is
+    // written (issue #13), because defaulting to a backend that does not
+    // compile would just be a build failure with extra steps.
+    //
+    // Enabling a backend at build time is not the same as using it: the
+    // engine probes CPU against GPU on the loaded model's own shapes at
+    // startup and picks per operation. Building it in only makes that choice
+    // available.
+    const default_gpu: []const u8 = if (target.result.os.tag == .macos) "metal" else "none";
+    const gpu = b.option([]const u8, "gpu", "Compute backend: metal (default on macOS), vulkan, none") orelse default_gpu;
     const build_info = b.addOptions();
     build_info.addOption([]const u8, "version", version);
     build_info.addOption([]const u8, "commit", commit);

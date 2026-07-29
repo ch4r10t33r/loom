@@ -749,12 +749,28 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
         backend.add(st.x, st.proj_out);
 
         // ---- FFN ----
-        backend.rmsnorm(st.normed, st.x, tensorAsF32(l.ffn_norm), cfg.eps);
         if (!l.is_moe) {
-            denseFFN(st, l.ffn_gate.?, l.ffn_up.?, l.ffn_down.?);
+            // Offer the backend the whole block before falling back to the
+            // pieces. A GPU pays one command buffer for the block instead of
+            // one per matvec, and on an M5 that buffer costs ~262 us against
+            // ~18 us of kernel -- so which of the two shapes the engine hands
+            // over matters more than any kernel in it.
+            const g = l.ffn_gate.?;
+            if (backend.ffnBlock(
+                st.x,
+                tensorAsF32(l.ffn_norm),
+                cfg.eps,
+                .{ .ty = g.ty, .data = g.data },
+                .{ .ty = l.ffn_up.?.ty, .data = l.ffn_up.?.data },
+                .{ .ty = l.ffn_down.?.ty, .data = l.ffn_down.?.data },
+                g.ne1,
+            )) continue;
+            backend.rmsnorm(st.normed, st.x, tensorAsF32(l.ffn_norm), cfg.eps);
+            denseFFN(st, g, l.ffn_up.?, l.ffn_down.?);
             backend.add(st.x, st.ffn_out);
             continue;
         }
+        backend.rmsnorm(st.normed, st.x, tensorAsF32(l.ffn_norm), cfg.eps);
 
         try moeLayer(m, st, l, li);
         backend.add(st.x, st.moe_acc);

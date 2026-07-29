@@ -11,6 +11,7 @@ const rpc = @import("rpc.zig");
 const dns = @import("../p2p/dns.zig");
 const sockopt = @import("../core/sockopt.zig");
 const openai = @import("openai.zig");
+const backend = @import("../compute/backend.zig");
 const generator = @import("generator.zig");
 const deepseek = @import("../gguf/deepseek.zig");
 const llama = @import("../gguf/llama.zig");
@@ -284,9 +285,58 @@ fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8) !generator.G
     const arch = arch_buf[0..n];
 
     if (std.mem.eql(u8, arch, "deepseek2")) {
-        return .{ .deepseek = try deepseek.load(gpa, io, path) };
+        var m = try deepseek.load(gpa, io, path);
+        calibrateFor(gpa, m.cfg.dim, m.cfg.ffn, &m.layers[0], m.output);
+        return .{ .deepseek = m };
     }
-    return .{ .gqa = try llama.load(gpa, io, path) };
+    var m = try llama.load(gpa, io, path);
+    calibrateFor(gpa, m.cfg.dim, m.cfg.ffn, &m.layers[0], m.output);
+    return .{ .gqa = m };
+}
+
+/// Report what calibration decided. Printed after the model is loaded, since
+/// before that there is nothing measured to report.
+fn printCompute(out: *Io.Writer) !void {
+    const v = backend.lastVerdict();
+    if (!v.ran) return out.print("  compute    backend {s}\n", .{backend.name});
+    try out.print("  compute    backend {s}; measured on this model: matvec {s}", .{
+        backend.name,
+        if (v.matvec_used) "gpu" else "cpu",
+    });
+    if (v.matvec_used) try out.print(" (>= {d} rows)", .{v.matvec_min_rows});
+    try out.print(", ffn block {s}", .{if (v.ffn_used) "gpu" else "cpu"});
+    if (v.ffn_gpu_ms > 0) try out.print(" (gpu {d:.3} ms vs cpu {d:.3} ms)", .{ v.ffn_gpu_ms, v.ffn_cpu_ms });
+    try out.print("\n", .{});
+}
+
+/// Hand the compute backend the shapes this model will actually issue and let
+/// it decide, per operation, whether it is worth using. A backend built in is
+/// not a backend used: on unified memory the GPU loses at small shapes and
+/// wins at large ones, and where the line falls is a property of the machine.
+fn calibrateFor(gpa: std.mem.Allocator, dim: usize, ffn: usize, l: anytype, out_head: anytype) void {
+    var shapes: [3]backend.Shape = undefined;
+    var n: usize = 0;
+    if (l.ffn_gate) |g| {
+        shapes[n] = .{ .data = g.data, .ty = g.ty, .rows = g.ne1, .cols = g.ne0 };
+        n += 1;
+    }
+    if (l.ffn_down) |d| {
+        shapes[n] = .{ .data = d.data, .ty = d.ty, .rows = d.ne1, .cols = d.ne0 };
+        n += 1;
+    }
+    shapes[n] = .{ .data = out_head.data, .ty = out_head.ty, .rows = out_head.ne1, .cols = out_head.ne0 };
+    n += 1;
+    // The pool has to be up for this: it is what brings the GPU device online,
+    // and the CPU side of the comparison has to run with the same thread count
+    // a real generation gets or the measurement is rigged against it.
+    backend.parallelBegin(generator.threads());
+    defer backend.parallelEnd();
+    const triple: ?[3]backend.Shape = if (l.ffn_gate != null and l.ffn_up != null and l.ffn_down != null) .{
+        .{ .data = l.ffn_gate.?.data, .ty = l.ffn_gate.?.ty, .rows = l.ffn_gate.?.ne1, .cols = l.ffn_gate.?.ne0 },
+        .{ .data = l.ffn_up.?.data, .ty = l.ffn_up.?.ty, .rows = l.ffn_up.?.ne1, .cols = l.ffn_up.?.ne0 },
+        .{ .data = l.ffn_down.?.data, .ty = l.ffn_down.?.ty, .rows = l.ffn_down.?.ne1, .cols = l.ffn_down.?.ne0 },
+    } else null;
+    backend.calibrate(gpa, dim, ffn, shapes[0..n], triple);
 }
 
 fn attachGgufDist(m: *generator.GgufModel, gpa: std.mem.Allocator, src: *expert_fetch.Source) !void {
@@ -630,6 +680,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                         // `loom gguf gen` stamps its fixtures "loom <arch> fixture".
                         const gname = gguf_gen.m.generalName() orelse "";
                         synthetic = std.mem.startsWith(u8, gname, "loom ") and std.mem.endsWith(u8, gname, "fixture");
+                        try printCompute(out);
                         try out.print("  serving    distributed GGUF ({s}): ctx={d} chat={s}\n", .{
                             arch_name, gguf_gen.m.ctxLen(), @tagName(gguf_gen.chat_format),
                         });
@@ -671,6 +722,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                 served_model_id = std.fs.path.basename(gp);
                 const gname = gguf_gen.m.generalName() orelse "";
                 synthetic = std.mem.startsWith(u8, gname, "loom ") and std.mem.endsWith(u8, gname, "fixture");
+                try printCompute(out);
                 try out.print("  serving    local GGUF ({s}): ctx={d} chat={s}  (not expert-sharded: no distributed fetch)\n", .{
                     arch_name, gguf_gen.m.ctxLen(), @tagName(gguf_gen.chat_format),
                 });
