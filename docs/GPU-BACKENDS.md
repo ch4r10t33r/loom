@@ -451,3 +451,36 @@ criterion that has never been measured:
 Until that runs, the distributed claim is untested. Everything measured so far
 is single-node, where loom is a competent local engine and the thesis does not
 apply.
+
+## Heap cache vs zero-copy mmap: equivalent, and one is steadier
+
+Re-measured after verify-once landed, since the original comparison predated it
+and the per-access hash was the main reason the mapped path lost.
+
+Five paired runs, DeepSeek-V2-Lite, decode tok/s:
+
+| | median | range | spread |
+|---|---|---|---|
+| heap LRU (`--ram-gb 8`) | 2.57 | 1.87–2.84 | 38% |
+| zero-copy mmap (`--mmap-weights`) | 2.56 | 2.49–2.93 | 17% |
+
+**The medians are identical.** The first pair measured 1.96 against 2.93 and
+looked like a decisive 1.5x for mmap; the second reversed the totals. Neither
+was signal. On a machine that shares its cores and memory bandwidth with a
+desktop, a single pair cannot resolve a 20% effect, and this document has
+already recorded two conclusions that had to be withdrawn for exactly that
+reason.
+
+What *is* consistent is the spread: the heap path's worst run is 27% below its
+best, the mapped path's 15%. That matches the mechanism seen on Mistral-7B — an
+8 GB slab alongside a 10 GB model is enough memory pressure to make the bad
+runs bad — and for a serving system tail latency is worth as much as median.
+Not enough to change the default on, but enough to keep the flag and prefer it
+where memory is tight.
+
+The practical consequence is that this is not the cheap win. `expert ffn` is
+~40% of a token and runs entirely on the CPU, because `gpuLayersSupported`
+rejects MoE outright: DeepSeek gets none of the 1.9x the dense GQA path now
+gets from whole-token command buffers. That is the next real lever, and it is
+not small — MLA attention would have to be recorded too, since a host round
+trip between layers re-splits the command buffer.
