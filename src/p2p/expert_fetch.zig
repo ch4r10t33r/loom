@@ -105,6 +105,22 @@ pub const Source = struct {
         if (self.cache) |*c| c.deinit(self.gpa);
     }
 
+    /// Whether pointers returned by `get` stay valid across later `get` calls.
+    ///
+    /// They do when a shard lands in the RAM cache or is read straight out of
+    /// the mapping, and they do not when it lands in the single shared
+    /// `scratch` buffer — there the next call overwrites the previous result.
+    /// A caller that wants several experts live at once (recording a whole MoE
+    /// layer into one command buffer) has to know which it is getting.
+    pub fn stablePointers(self: *const Source, needed: usize) bool {
+        if (self.store.map != null) return true;
+        // The LRU is only stable for the caller if it can hold every expert the
+        // caller is about to ask for: a cache smaller than the layer's
+        // selection would evict the first expert to make room for the last.
+        const c = self.cache orelse return false;
+        return c.capacity >= needed;
+    }
+
     /// Slots the RAM tier holds, for the startup banner.
     pub fn cacheSlots(self: *const Source) usize {
         return if (self.cache) |c| c.capacity else 0;

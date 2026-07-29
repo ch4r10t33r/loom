@@ -575,6 +575,28 @@ fn denseFFN(st: *State, gate_w: Tensor, up_w: Tensor, down_w: Tensor) void {
 
 const Selected = moe.Selected;
 
+/// One expert's gate/up/down bytes, from the distributed store when there is
+/// one and straight out of the model mapping otherwise.
+fn expertParts(m: *const Model, l: anytype, li: usize, expert: usize) !expert_fetch.Source.Parts {
+    const gt = l.ffn_gate_exps.?;
+    const ut = l.ffn_up_exps.?;
+    const dt = l.ffn_down_exps.?;
+    if (m.dist) |src| {
+        const sid = m.expert_shard[li * m.cfg.n_expert + expert];
+        if (src.getMapped(sid)) |p| return p;
+        const blk = try src.get(sid);
+        const gl = gt.ne1 * ggml.rowBytes(gt.ty, gt.ne0);
+        const ul = ut.ne1 * ggml.rowBytes(ut.ty, ut.ne0);
+        const dl = dt.ne1 * ggml.rowBytes(dt.ty, dt.ne0);
+        return .{ .gate = blk[0..gl], .up = blk[gl..][0..ul], .down = blk[gl + ul ..][0..dl] };
+    }
+    return .{
+        .gate = (try gt.expert(expert)).data,
+        .up = (try ut.expert(expert)).data,
+        .down = (try dt.expert(expert)).data,
+    };
+}
+
 /// One token step; logits land in st.logits. Errors only when a distributed
 /// expert shard has no reachable holder (fail loud, not silently degraded).
 /// Per-phase timing for the decode loop, enabled with LOOM_PROFILE=1.
@@ -805,7 +827,41 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
                 for (sel, 0..) |s, k| ids_buf[k] = m.expert_shard[li * cfg.n_expert + s.expert];
                 src.prefetch(ids_buf[0..sel.len]);
             }
-            for (sel) |s| {
+            // Gather every selected expert first and hand the layer to the
+            // backend as one unit, when it will take it. Dispatching each
+            // expert separately costs a command buffer apiece; a MoE layer is
+            // six of them plus a shared one.
+            //
+            // Only when the source hands back pointers that survive the next
+            // `get`: with no RAM cache and no mapping every expert lands in
+            // the same scratch buffer, so collecting six of them would leave
+            // five dangling — and the resulting output is well-formed, which
+            // is the failure mode this codebase keeps meeting.
+            const batched = blk_b: {
+                if (!@hasDecl(backend, "moeFfnBlock")) break :blk_b false;
+                if (m.dist) |src| {
+                    if (!src.stablePointers(sel.len)) break :blk_b false;
+                }
+                const gt = l.ffn_gate_exps orelse break :blk_b false;
+                var refs: [moe.MAX_SELECTED]backend.ExpertRef = undefined;
+                const t_g1 = if (prof) Profile.now() else 0;
+                for (sel, 0..) |s, k| {
+                    const parts = expertParts(m, l, li, s.expert) catch break :blk_b false;
+                    refs[k] = .{
+                        .gate = .{ .ty = l.ffn_gate_exps.?.ty, .data = parts.gate },
+                        .up = .{ .ty = l.ffn_up_exps.?.ty, .data = parts.up },
+                        .down = .{ .ty = l.ffn_down_exps.?.ty, .data = parts.down },
+                        .weight = s.gate,
+                    };
+                }
+                if (prof) t_get += Profile.now() - t_g1;
+                const t_f1 = if (prof) Profile.now() else 0;
+                const ok = backend.moeFfnBlock(st.normed, refs[0..sel.len], gt.ne1, acc);
+                if (prof) t_ffn += Profile.now() - t_f1;
+                break :blk_b ok;
+            };
+
+            if (!batched) for (sel) |s| {
                 if (m.dist) |src| {
                     const sid = m.expert_shard[li * cfg.n_expert + s.expert];
                     const gt = l.ffn_gate_exps.?;
@@ -842,7 +898,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
                 const t_ac0 = if (prof) Profile.now() else 0;
                 for (acc, st.ffn_out) |*a, v| a.* += s.gate * v;
                 if (prof) t_acc += Profile.now() - t_ac0;
-            }
+            };
             if (l.ffn_gate_shexp) |gs| {
                 denseFFN(st, gs, l.ffn_up_shexp.?, l.ffn_down_shexp.?);
                 backend.add(acc, st.ffn_out);
