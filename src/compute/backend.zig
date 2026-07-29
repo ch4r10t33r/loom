@@ -92,6 +92,8 @@ pub const kvAppend = impl.kvAppend;
 pub const disableAttn = impl.disableAttn;
 /// Declare a reader for the device KV cache so appends start mirroring.
 pub const enableKvMirror = impl.enableKvMirror;
+/// Free the device KV cache when nothing will read it.
+pub const releaseKvCache = impl.releaseKvCache;
 
 // ---- frames ------------------------------------------------------------------
 //

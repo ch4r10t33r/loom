@@ -14,11 +14,15 @@
 using namespace metal;
 
 // Scores live in threadgroup memory, so the context this kernel can serve is
-// bounded by it: 2048 floats = 8 KB, comfortably inside Metal's 32 KB per
-// threadgroup. The host declines longer sequences rather than silently
-// truncating attention, which would be a correctness bug that still produces
+// bounded by it: 4096 floats = 16 KB, half of Metal's 32 KB per threadgroup.
+// The host declines longer sequences rather than silently truncating
+// attention, which would be a correctness bug that still produces
 // fluent-looking text.
-#define MAX_SEQ 2048
+//
+// 2048 was too low to be useful: a node's default context cap is 4096, and
+// Mistral-7B advertises 32768, so every real model fell straight back to the
+// host path with no indication of why.
+#define MAX_SEQ 4096
 
 struct AttnDims {
     uint n_heads;
