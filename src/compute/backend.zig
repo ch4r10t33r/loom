@@ -109,6 +109,12 @@ pub const registerArena = impl.registerArena;
 /// happens earlier, while the store is being opened.
 pub const materializeArenas = impl.materializeArenas;
 
+/// Command buffers submitted since the last call, and reset. A GPU backend
+/// pays a fixed per-submission cost that no kernel improvement touches, so
+/// this is the number that says whether the engine is handing the backend
+/// work in the right unit.
+pub const takeCmdBufCount = impl.takeCmdBufCount;
+
 /// Why the last `materializeArenas` came back empty, when it did.
 pub const arenaError = &impl.arena_error;
 

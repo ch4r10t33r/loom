@@ -101,7 +101,17 @@ pub const Device = struct {
         return .{ .handle = p };
     }
 
+    /// Command buffers created since the counter was last read.
+    ///
+    /// Counted rather than timed because it is the one quantity that says how
+    /// much of a token is submission overhead and is immune to what else the
+    /// machine is doing: a buffer costs ~262 us fixed on an M5 whatever it
+    /// holds, so `count x 262 us` is a floor on the token, and wall-clock on a
+    /// swapping box cannot separate that floor from page faults.
+    pub var cmdbufs: usize = 0;
+
     pub fn commandBuffer(self: Device) CommandBuffer {
+        cmdbufs += 1;
         return .{ .handle = c.loom_mtl_cmdbuf_create(self.queue).? };
     }
 };

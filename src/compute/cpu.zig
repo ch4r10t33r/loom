@@ -39,6 +39,10 @@ pub fn materializeArenas() usize {
     return 0;
 }
 
+pub fn takeCmdBufCount() usize {
+    return 0;
+}
+
 pub var arena_error: ?[]const u8 = null;
 
 /// The CPU has no device cache to set up and no fused attention to offer; the

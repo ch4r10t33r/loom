@@ -621,6 +621,20 @@ pub const Profile = struct {
     /// timing that did not move.
     pub var src_stats: ?expert_fetch.Stats = null;
     pub var cache_slots: usize = 0;
+    /// Command buffers the backend submitted, summed over the profiled tokens.
+    pub var cmdbufs: u64 = 0;
+
+    fn reset() void {
+        attn_ns = 0;
+        route_ns = 0;
+        acc_ns = 0;
+        head_ns = 0;
+        expert_get_ns = 0;
+        expert_ffn_ns = 0;
+        other_ns = 0;
+        tokens = 0;
+        cmdbufs = 0;
+    }
 
     pub fn enabled() bool {
         if (on == null) on = std.c.getenv("LOOM_PROFILE") != null;
@@ -660,9 +674,16 @@ pub const Profile = struct {
         );
     }
 
+    /// Report the window since the last call, then reset.
+    ///
+    /// Cumulative totals hide exactly what a running node needs to show. The
+    /// first touch of an expert hashes its whole 6 MB shard to verify it, so a
+    /// short profile is mostly that transient and a long one averages it away
+    /// -- neither says what the node is doing now. A window does.
     pub fn report(w: anytype) !void {
         const tot = attn_ns + expert_get_ns + expert_ffn_ns + other_ns;
         if (tot == 0 or tokens == 0) return;
+        defer reset();
         const pct = struct {
             fn f(a: i128, b: i128) f64 {
                 return 100.0 * @as(f64, @floatFromInt(a)) / @as(f64, @floatFromInt(b));
@@ -673,12 +694,22 @@ pub const Profile = struct {
                 return @as(f64, @floatFromInt(a)) / 1e6 / @as(f64, @floatFromInt(n));
             }
         }.f;
-        try w.print("profile over {d} tokens (ms/token)\n", .{tokens});
+        try w.print("profile: last {d} tokens (ms/token)\n", .{tokens});
         try w.print("  attention       {d:8.1}  {d:5.1}%\n", .{ ms(attn_ns, tokens), pct(attn_ns, tot) });
         try w.print("  expert get      {d:8.1}  {d:5.1}%\n", .{ ms(expert_get_ns, tokens), pct(expert_get_ns, tot) });
         try w.print("  expert ffn      {d:8.1}  {d:5.1}%\n", .{ ms(expert_ffn_ns, tokens), pct(expert_ffn_ns, tot) });
         try w.print("  everything else {d:8.1}  {d:5.1}%\n", .{ ms(other_ns, tokens), pct(other_ns, tot) });
         try w.print("  total           {d:8.1}\n", .{ms(tot, tokens)});
+        if (cmdbufs > 0) {
+            // A command buffer costs ~262 us fixed on an M5 whatever it holds,
+            // so this product is a floor on the token that no kernel work can
+            // move -- only handing the backend larger units can. Printed next
+            // to the total because the comparison is the whole point.
+            const per_tok = @as(f64, @floatFromInt(cmdbufs)) / @as(f64, @floatFromInt(tokens));
+            try w.print("  gpu submissions {d:8.1} /token  (~{d:.1} ms of the above at 262 us each)\n", .{
+                per_tok, per_tok * 0.262,
+            });
+        }
         // The "everything else" bucket was 17.5% and unattributed, which is
         // exactly the size at which it stops being a rounding error and starts
         // being the next thing to fix. Split into the three candidates.
@@ -917,6 +948,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             Profile.src_stats = src.stats;
             Profile.cache_slots = src.cacheSlots();
         }
+        Profile.cmdbufs += backend.takeCmdBufCount();
         const total = Profile.now() - t_step;
         Profile.attn_ns += t_attn;
         Profile.expert_get_ns += t_get;

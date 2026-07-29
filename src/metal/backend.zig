@@ -635,6 +635,14 @@ pub fn registerArena(mem: []const u8) bool {
 /// Worth doing eagerly and worth reporting: the first version deferred
 /// everything to first use and registered into a context that did not exist
 /// yet, so it silently did nothing and only the page-in counter disagreed.
+/// Command buffers submitted since the last call, and reset. The engine's
+/// profiler reports it per token.
+pub fn takeCmdBufCount() usize {
+    const n = mtl.Device.cmdbufs;
+    mtl.Device.cmdbufs = 0;
+    return n;
+}
+
 pub fn materializeArenas() usize {
     const cx = &(ctx orelse {
         arena_error = "no metal device";
