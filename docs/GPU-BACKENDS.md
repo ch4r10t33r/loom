@@ -198,6 +198,47 @@ small and #12/#13 are not.
    larger model — and only the structure that produced that win is worth
    porting.
 
+## The kernel is at the memory ceiling; submission is the gap
+
+Measured on an M5, Q4_K matvec at cols=2048, best-of, with and without the
+per-dispatch command buffer:
+
+| rows | bytes | gpu, 1 cb each | gpu, amortized | GB/s amortized | cpu, 8t |
+|---|---|---|---|---|---|
+| 2,048 | 2.4 MB | 0.152 ms | 0.035 ms | 67.4 | 0.049 ms |
+| 16,384 | 18.9 MB | 0.373 | 0.171 | 110.1 | 0.354 |
+| 32,000 | 36.9 MB | 0.504 | 0.323 | **114.2** | 0.662 |
+| 65,536 | 75.5 MB | 0.825 | 0.651 | 115.9 | 1.405 |
+| 131,072 | 151 MB | 1.465 | 1.306 | 115.6 | 2.440 |
+
+Two things follow, and the first corrects an earlier conclusion in this
+document.
+
+**The kernel is not the problem.** At 115 GB/s it is at the DRAM ceiling a pure
+streaming-read probe measures on this machine (~110 GB/s), and level with
+ZINC's own microbenchmark, which reports 109 GB/s at 27 MB. An earlier
+comparison here concluded loom's kernel was ~3x slower; that was an artifact of
+comparing loom's per-dispatch timings against ZINC's amortized ones. ZINC
+reports 259.81 us for a 27 MB shape, which is *less* than a single command
+buffer costs here, so its numbers cannot include one. Measurements taken under
+different conditions are not a comparison.
+
+**Submission is the gap.** At 32,000 rows the same kernel takes 0.504 ms with a
+command buffer per dispatch and 0.323 ms without — ~180 us of pure overhead,
+which is most of the difference between losing to the CPU and beating it 1.3x.
+Amortized, the GPU wins from 32,000 rows up; per-dispatch it does not win until
+131,072.
+
+**Where ZINC is genuinely ahead is small shapes.** It reports 239 GB/s at
+2.25 MB where loom manages 67 GB/s at 2.4 MB. Cache-resident matvecs are
+latency- and occupancy-bound rather than bandwidth-bound, and that is what
+ZINC's register-level work buys: scales held in `ushort4` registers rather than
+a thread-private array, fully unrolled inner loops, the 16-byte block header
+read as one `packed_uint4`, nibbles extracted four at a time from a `ushort`.
+Porting the first three of those gave loom nothing at DRAM-bound sizes, which
+is consistent — there is no headroom left there — and they are the right thing
+to revisit for models whose tensors sit in cache.
+
 ## Against ZINC, measured
 
 TinyLlama-1.1B Q4_K_M, 128 tokens, same prompt, M5, decode only (both engines
