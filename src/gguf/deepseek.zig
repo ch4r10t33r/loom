@@ -587,6 +587,9 @@ const Selected = moe.Selected;
 pub const Profile = struct {
     var on: ?bool = null;
     var attn_ns: i128 = 0;
+    var route_ns: i128 = 0;
+    var acc_ns: i128 = 0;
+    var head_ns: i128 = 0;
     var expert_get_ns: i128 = 0;
     var expert_ffn_ns: i128 = 0;
     var other_ns: i128 = 0;
@@ -619,7 +622,7 @@ pub const Profile = struct {
         const t: f64 = @floatFromInt(tot);
         const n: f64 = @floatFromInt(tokens);
         std.debug.print(
-            "profile {d} tok: attn {d:.1}ms/{d:.0}%  get {d:.1}ms/{d:.0}%  ffn {d:.1}ms/{d:.0}%  other {d:.1}ms/{d:.0}%  total {d:.1}ms\n",
+            "profile {d} tok: attn {d:.1}/{d:.0}%  get {d:.1}/{d:.0}%  ffn {d:.1}/{d:.0}%  other {d:.1}/{d:.0}%  total {d:.1}ms\n",
             .{
                 tokens,
                 @as(f64, @floatFromInt(attn_ns)) / 1e6 / n,
@@ -654,6 +657,12 @@ pub const Profile = struct {
         try w.print("  expert ffn      {d:8.1}  {d:5.1}%\n", .{ ms(expert_ffn_ns, tokens), pct(expert_ffn_ns, tot) });
         try w.print("  everything else {d:8.1}  {d:5.1}%\n", .{ ms(other_ns, tokens), pct(other_ns, tot) });
         try w.print("  total           {d:8.1}\n", .{ms(tot, tokens)});
+        // The "everything else" bucket was 17.5% and unattributed, which is
+        // exactly the size at which it stops being a rounding error and starts
+        // being the next thing to fix. Split into the three candidates.
+        try w.print("    of which: router {d:8.1}  expert-accum {d:8.1}  norm+lmhead {d:8.1}\n", .{
+            ms(route_ns, tokens), ms(acc_ns, tokens), ms(head_ns, tokens),
+        });
         if (src_stats) |g| {
             const acc = g.mapped + g.ram + g.local + g.fetched;
             if (acc > 0) try w.print(
@@ -670,6 +679,8 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     var t_attn: i128 = 0;
     var t_get: i128 = 0;
     var t_ffn: i128 = 0;
+    var t_route: i128 = 0;
+    var t_acc: i128 = 0;
     const cfg = m.cfg;
     const kd = cfg.keyDim();
     const nope = cfg.nope_dim;
@@ -776,11 +787,13 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             denseFFN(st, l.ffn_gate.?, l.ffn_up.?, l.ffn_down.?);
             backend.add(st.x, st.ffn_out);
         } else {
+            const t_r0 = if (prof) Profile.now() else 0;
             mv(l.ffn_gate_inp.?, st.router[0..cfg.n_expert], st.normed);
             var sel_buf: [moe.MAX_SELECTED]Selected = undefined;
             const sel = sel_buf[0..cfg.n_used];
             const bias: ?[]const f32 = if (l.exp_probs_b) |b| asF32(b) else null;
             moe.route(cfg.routeCfg(), st.router[0..cfg.n_expert], bias, sel);
+            if (prof) t_route += Profile.now() - t_r0;
 
             var acc_buf: [8192]f32 = undefined;
             const acc = acc_buf[0..cfg.dim];
@@ -826,7 +839,9 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
                         try l.ffn_down_exps.?.expert(s.expert),
                     );
                 }
+                const t_ac0 = if (prof) Profile.now() else 0;
                 for (acc, st.ffn_out) |*a, v| a.* += s.gate * v;
+                if (prof) t_acc += Profile.now() - t_ac0;
             }
             if (l.ffn_gate_shexp) |gs| {
                 denseFFN(st, gs, l.ffn_up_shexp.?, l.ffn_down_shexp.?);
@@ -836,8 +851,10 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
         }
     }
 
+    const t_h0 = if (prof) Profile.now() else 0;
     backend.rmsnorm(st.normed, st.x, asF32(m.output_norm), cfg.eps);
     mv(m.output, st.logits, st.normed);
+    const t_head = if (prof) Profile.now() - t_h0 else 0;
 
     if (prof) {
         if (m.dist) |src| {
@@ -848,6 +865,9 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
         Profile.attn_ns += t_attn;
         Profile.expert_get_ns += t_get;
         Profile.expert_ffn_ns += t_ffn;
+        Profile.route_ns += t_route;
+        Profile.acc_ns += t_acc;
+        Profile.head_ns += t_head;
         Profile.other_ns += total - t_attn - t_get - t_ffn;
         Profile.tokens += 1;
         if (Profile.tokens % 16 == 0) Profile.dump();
