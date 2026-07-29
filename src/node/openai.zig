@@ -140,7 +140,7 @@ fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
 
     // A streaming handler writes the SSE response to `wi` itself and returns
     // null; otherwise we get a buffered Response to write here.
-    if (try route(ctx, req, wi)) |resp| {
+    if (try route(ctx, req, wi, dl)) |resp| {
         defer if (resp.owned) ctx.gpa.free(resp.body);
         try writeHttp(wi, resp.status, resp.body, resp.content_type);
     }
@@ -239,7 +239,7 @@ const Response = struct { status: u16, body: []u8, owned: bool = true, content_t
 
 /// Returns a buffered Response to write, or null if the handler already wrote
 /// the response to `wi` (streaming).
-fn route(ctx: *Ctx, req: Request, wi: *Io.Writer) !?Response {
+fn route(ctx: *Ctx, req: Request, wi: *Io.Writer, dl: ?usize) !?Response {
     const gpa = ctx.gpa;
     const path = stripQuery(req.path);
 
@@ -255,7 +255,7 @@ fn route(ctx: *Ctx, req: Request, wi: *Io.Writer) !?Response {
         return handleModels(ctx) catch fallback();
     }
     if (eql(req.method, "POST") and (eql(path, "/v1/chat/completions") or eql(path, "/v1/completions"))) {
-        return handleCompletions(ctx, req, eql(path, "/v1/chat/completions"), wi) catch fallback();
+        return handleCompletions(ctx, req, eql(path, "/v1/chat/completions"), wi, dl) catch fallback();
     }
 
     const b = errorJson(gpa, "unknown route", "invalid_request_error", "not_found") catch return fallback();
@@ -283,7 +283,13 @@ fn handleModels(ctx: *Ctx) !Response {
     return .{ .status = 200, .body = body };
 }
 
-fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer) !?Response {
+fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer, dl: ?usize) !?Response {
+    // The request is parsed, so the slowloris window is closed and the
+    // connection is about to do real work. Generation on a partial node can
+    // take minutes before the first token — every expert it does not hold is a
+    // round trip — and the read-phase deadline would shut the socket down
+    // mid-prefill.
+    sockopt.refreshServe(ctx.io, dl);
     const gpa = ctx.gpa;
 
     // Identity from the bearer token (SPEC.md: out-of-band, not prompt-forgeable).
@@ -346,7 +352,7 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer) !?R
 
     // Streaming: write the SSE response to the connection and return null.
     if (stream) {
-        streamCompletions(ctx, wi, is_chat, model_id, client, prompt_text, max_tokens, temp, seed, budget, reserved);
+        streamCompletions(ctx, dl, wi, is_chat, model_id, client, prompt_text, max_tokens, temp, seed, budget, reserved);
         return null;
     }
 
@@ -402,6 +408,13 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer) !?R
 const StreamCtx = struct {
     wi: *Io.Writer,
     gpa: std.mem.Allocator,
+    io: Io,
+    /// Connection deadline slot, refreshed on every token. Without this a
+    /// generation slower than `SERVE_TIMEOUT_S` has its socket shut down
+    /// mid-answer by the idle reaper — measured across two machines, every
+    /// distributed request died at exactly 30 s no matter how much progress it
+    /// had made. A stream that is emitting tokens is not idle.
+    dl: ?usize,
     id: u64,
     model: []const u8,
     is_chat: bool,
@@ -413,6 +426,7 @@ const StreamCtx = struct {
     fn emit(ptr: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *StreamCtx = @ptrCast(@alignCast(ptr));
         self.emitted += 1;
+        sockopt.refreshServe(self.io, self.dl);
         const esc = try jsonEscapeAlloc(self.gpa, bytes);
         defer self.gpa.free(esc);
         if (self.is_chat) {
@@ -429,6 +443,7 @@ const StreamCtx = struct {
 /// best-effort (a dead client just ends the stream); metering is still charged.
 fn streamCompletions(
     ctx: *Ctx,
+    dl_slot: ?usize,
     wi: *Io.Writer,
     is_chat: bool,
     model_id: []const u8,
@@ -453,7 +468,7 @@ fn streamCompletions(
     }
     wi.flush() catch return;
 
-    var sctx = StreamCtx{ .wi = wi, .gpa = gpa, .id = id, .model = model_esc, .is_chat = is_chat };
+    var sctx = StreamCtx{ .wi = wi, .gpa = gpa, .io = ctx.io, .dl = dl_slot, .id = id, .model = model_esc, .is_chat = is_chat };
     const sink = generator.TokenSink{ .ctx = &sctx, .emit = StreamCtx.emit };
 
     const parse_special = is_chat and chat_template.usesSpecialMarkers(ctx.gen.chatFormat());

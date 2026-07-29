@@ -31,6 +31,22 @@ const stats = @import("stats.zig");
 /// Inbound connections: a client that stalls mid-request is dropped.
 pub const SERVE_TIMEOUT_S: i64 = 30;
 
+/// Deadline for a connection whose request has been fully parsed and is being
+/// answered.
+///
+/// `SERVE_TIMEOUT_S` guards the *read* phase — a slowloris opens a socket and
+/// dribbles headers forever (security issue #24). Once a complete request has
+/// been read, that risk is gone and the connection is doing work. Leaving the
+/// 30 s bound in place instead kills legitimate answers: measured across two
+/// machines on a 27 ms link, a distributed request could not produce its first
+/// token inside 30 s, so every one died mid-prefill with no error the client
+/// could distinguish from a crash.
+///
+/// Refreshing per token is not enough on its own, because there is no token to
+/// refresh on until prefill completes. So the phase change is explicit: parsed
+/// request -> generous deadline, then each token pushes it out again.
+pub const GENERATE_TIMEOUT_S: i64 = 900;
+
 /// Outbound peer dials: a peer that accepts and then goes silent must not hang
 /// gossip, repair, heartbeat, or the token-loop expert fetch.
 pub const PEER_TIMEOUT_S: i64 = 10;
@@ -92,6 +108,33 @@ pub fn track(io: Io, stream: net.Stream, seconds: i64) ?usize {
         return i;
     }
     return null;
+}
+
+/// Push a tracked connection's deadline out by `seconds` from now.
+///
+/// The deadline exists to kill connections that are *idle* — a slowloris holds
+/// a socket open sending nothing (security issue #24). Applied to the whole
+/// connection lifetime it kills working ones too: a generation slower than
+/// SERVE_TIMEOUT_S has its socket shut down mid-answer, with no error the
+/// client can distinguish from a crash. Measured across two machines on a
+/// 27 ms link, every distributed request died at exactly 30 s regardless of
+/// how much progress it had made — which is precisely the regime this project
+/// exists to serve.
+///
+/// So progress refreshes the deadline. A connection that is producing output
+/// is not idle; one that has gone quiet still reaps on schedule.
+pub fn refresh(io: Io, slot: ?usize, seconds: i64) void {
+    const i = slot orelse return;
+    const deadline = stats.nowNs(io) + @as(i128, seconds) * std.time.ns_per_s;
+    mutex.lockUncancelable(io);
+    defer mutex.unlock(io);
+    if (slots[i].active) slots[i].deadline_ns = deadline;
+}
+
+/// Refresh an inbound connection by the generation timeout. Used once when a
+/// request has been parsed, and again on every token produced.
+pub fn refreshServe(io: Io, slot: ?usize) void {
+    refresh(io, slot, GENERATE_TIMEOUT_S);
 }
 
 /// Release a slot. MUST be called before the handler closes its stream.
