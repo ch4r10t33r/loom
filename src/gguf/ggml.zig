@@ -657,9 +657,9 @@ fn dispatch(t: Type, out: []f32, data: []const u8, x: []const f32, rows: usize, 
         .f32 => matvecF32(out, data, x, rows, cols),
         .f16 => matvecF16(out, data, x, rows, cols),
         .q4_0 => matvecQ40Int(out, data, x, rows, cols),
-        .q4_1 => matvecQ41(out, data, x, rows, cols),
+        .q4_1 => matvecQ41Int(.q4_1, out, data, x, rows, cols),
         .q5_0 => matvecQ50(out, data, x, rows, cols),
-        .q5_1 => matvecQ51(out, data, x, rows, cols),
+        .q5_1 => matvecQ41Int(.q5_1, out, data, x, rows, cols),
         .q8_0 => matvecQ80Int(out, data, x, rows, cols),
         .q4_k => matvecQ4KInt(out, data, x, rows, cols),
         .q6_k => matvecQ6KInt(out, data, x, rows, cols),
@@ -841,7 +841,7 @@ fn matvecQ4KInt(out: []f32, data: []const u8, x: []const f32, rows: usize, cols:
 /// reference.
 pub fn usesInt8Activations(t: Type) bool {
     return switch (t) {
-        .q4_k, .q5_k, .q6_k, .q4_0, .q8_0 => true,
+        .q4_k, .q5_k, .q6_k, .q4_0, .q8_0, .q4_1, .q5_1 => true,
         else => false,
     };
 }
@@ -990,6 +990,57 @@ fn matvecQ40Int(out: []f32, data: []const u8, x: []const f32, rows: usize, cols:
 
 /// Q8_0 against int8 activations: both sides are already int8, so this is a
 /// straight integer dot with two scales.
+/// The affine `_1` family (Q4_1, Q5_1) against int8 activations.
+///
+/// These carry a per-block min as well as a scale, so a weight is `d*q + m`
+/// with q unsigned. That separates cleanly over a block:
+///
+///     sum_i (d*q_i + m) * x_i  =  d*dx*dot(q, xq) + m*dx*sum(xq)
+///
+/// so the min never enters the inner loop -- one integer dot and one integer
+/// sum, exactly as for Q4_0, with `m` folded in at the end.
+///
+/// This matters more than the type's rarity suggests. A `Q4_K_M` checkpoint is
+/// not uniformly Q4_K: llama.cpp's mixtures put `ffn_down` in a different type,
+/// and in DeepSeek-Coder-V2-Lite every `ffn_down_exps` -- a third of every
+/// expert's weights, and its largest tensor -- is Q5_1. Without this kernel
+/// that third fell to the exact dequantize-then-dot path, and expert FFN
+/// measured 5.5 GB/s against the ~53 GB/s the int8 kernels reach.
+fn matvecQ41Int(comptime t: Type, out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
+    const bs: usize = if (t == .q4_1) Q4_1_BLOCK else Q5_1_BLOCK;
+    const qoff: usize = if (t == .q5_1) 8 else 4;
+    const qx = quantizeX(x);
+    const blocks_per_row = cols / QK_0;
+    const rb = blocks_per_row * bs;
+    for (0..rows) |r| {
+        const row = data[r * rb ..][0..rb];
+        var acc: f32 = 0;
+        for (0..blocks_per_row) |b| {
+            const block = row[b * bs ..][0..bs];
+            const d = f16FromBytes(block[0..2]);
+            const m = f16FromBytes(block[2..4]);
+            const qh: u32 = if (t == .q5_1) std.mem.readInt(u32, block[4..8], .little) else 0;
+            const qs = block[qoff..][0 .. QK_0 / 2];
+            const xb = &qx[b];
+            var dot: i32 = 0;
+            var sum: i32 = 0;
+            // Lane i is in the low nibble of byte i, lane i+16 in the high
+            // nibble, and for Q5_1 the fifth bit comes from `qh`.
+            for (0..QK_0 / 2) |i| {
+                const sh: u5 = @intCast(i);
+                const lo: i32 = (qs[i] & 0x0F) | (if (t == .q5_1) @as(i32, @intCast(((qh >> sh) << 4) & 0x10)) else 0);
+                const hi: i32 = (qs[i] >> 4) | (if (t == .q5_1) @as(i32, @intCast((qh >> (sh + 12)) & 0x10)) else 0);
+                const x0: i32 = xb.q[i];
+                const x1: i32 = xb.q[i + QK_0 / 2];
+                dot += lo * x0 + hi * x1;
+                sum += x0 + x1;
+            }
+            acc += xb.d * (d * @as(f32, @floatFromInt(dot)) + m * @as(f32, @floatFromInt(sum)));
+        }
+        out[r] = acc;
+    }
+}
+
 fn matvecQ80Int(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
     const qx = quantizeX(x);
     const blocks_per_row = cols / QK_0;

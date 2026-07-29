@@ -566,7 +566,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                     committee_peers.append(gpa, a) catch {};
                 } else |_| {}
             }
-            gguf_src = try expert_fetch.Source.init(gpa, io, st, peer_list.items);
+            // The RAM tier, sized by the node's declared budget (--ram-gb).
+            // Without it every routed expert is re-read from disk and
+            // re-hashed on every token.
+            gguf_src = try expert_fetch.Source.initCached(gpa, io, st, peer_list.items, opts.ram_bytes);
             gguf_src.committee = committee_peers.items;
             // resident gate (audit #5 P0-4): the mmap'd resident bundle must be
             // present+verified, fetching gaps from peers, or inference reads

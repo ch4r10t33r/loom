@@ -36,7 +36,7 @@ pub const Stats = struct {
 };
 
 /// Intrusive doubly-linked LRU over a fixed slab of `capacity` block buffers.
-const Lru = struct {
+pub const Lru = struct {
     const NodeIdx = usize;
     const nil = std.math.maxInt(NodeIdx);
 
@@ -51,7 +51,7 @@ const Lru = struct {
     free_top: usize, // next never-used slot (fill before evicting)
     capacity: usize,
 
-    fn init(gpa: std.mem.Allocator, capacity: usize, block_bytes: usize) !Lru {
+    pub fn init(gpa: std.mem.Allocator, capacity: usize, block_bytes: usize) !Lru {
         return .{
             .slab = try gpa.alloc(u8, capacity * block_bytes),
             .block_bytes = block_bytes,
@@ -64,7 +64,7 @@ const Lru = struct {
         };
     }
 
-    fn deinit(self: *Lru, gpa: std.mem.Allocator) void {
+    pub fn deinit(self: *Lru, gpa: std.mem.Allocator) void {
         gpa.free(self.slab);
         gpa.free(self.ids);
         gpa.free(self.prev);
@@ -98,7 +98,7 @@ const Lru = struct {
     }
 
     /// Returns the held buffer if present (and marks it MRU).
-    fn find(self: *Lru, id: usize) ?[]u8 {
+    pub fn find(self: *Lru, id: usize) ?[]u8 {
         if (self.map.get(id)) |slot| {
             self.touch(slot);
             return self.buf(slot);
@@ -108,7 +108,7 @@ const Lru = struct {
 
     /// Reserve a slot for `id` (allocating a fresh one or evicting the LRU
     /// tail), returning its writable buffer. Caller must fill it.
-    fn reserve(self: *Lru, id: usize) !struct { usize, []u8 } {
+    pub fn reserve(self: *Lru, id: usize) !struct { usize, []u8 } {
         if (self.capacity == 0) return error.NoCapacity;
         var slot: NodeIdx = undefined;
         if (self.free_top < self.capacity) {
@@ -125,10 +125,20 @@ const Lru = struct {
         return .{ slot, self.buf(slot) };
     }
 
+    /// Drop every entry, keeping the allocation. Used when the backing store
+    /// is mutated underneath the cache and its contents can no longer be
+    /// trusted to match what is on disk.
+    pub fn clear(self: *Lru) void {
+        self.map.clearRetainingCapacity();
+        self.head = nil;
+        self.tail = nil;
+        self.free_top = 0;
+    }
+
     /// Undo a reserve whose fill failed (e.g. a poisoned expert): unmap and
     /// unlink the slot so a later get() re-fetches instead of returning the
     /// unverified buffer (audit #5 P0-3).
-    fn abort(self: *Lru, id: usize) void {
+    pub fn abort(self: *Lru, id: usize) void {
         if (self.map.fetchRemove(id)) |kv| {
             self.unlink(kv.value);
             // return the slot to the free pool if it was the newest allocation

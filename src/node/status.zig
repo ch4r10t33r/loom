@@ -21,6 +21,7 @@ const peers_mod = @import("../p2p/peers.zig");
 const weights = @import("../p2p/weights.zig");
 const generator = @import("generator.zig");
 const stats = @import("../core/stats.zig");
+const deepseek = @import("../gguf/deepseek.zig");
 
 pub const Reporter = struct {
     io: Io,
@@ -84,6 +85,7 @@ pub const Reporter = struct {
         if (hit > 0) self.out.print("  local-hit {d:.1}%", .{hit * 100.0}) catch return;
 
         self.out.print("  up {s}\n", .{fmtUptime(self.uptimeSecs())}) catch return;
+        if (deepseek.Profile.enabled()) deepseek.Profile.report(self.out) catch {};
         self.out.flush() catch return;
     }
 
