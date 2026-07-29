@@ -449,8 +449,9 @@ pub const State = struct {
     q_a: []f32,
     q: []f32, // n_heads * keyDim
     kv_a: []f32, // kv_lora + rope
-    k_nope: []f32,
-    v_t: []f32,
+    q_abs: []f32, // W_k^T q_nope, kv_lora_rank
+    c_acc: []f32, // sum_t p_t c_t, kv_lora_rank
+    row_tmp: []f32, // one dequantized kv_b row, kv_lora_rank
     head_out: []f32, // n_heads * v_head_dim
     proj_out: []f32,
     gate: []f32, // max(ffn, moe_ffn * max(1, n_shared))
@@ -472,8 +473,9 @@ pub const State = struct {
             .q_a = try gpa.alloc(f32, @max(cfg.q_lora_rank, 1)),
             .q = try gpa.alloc(f32, cfg.n_heads * cfg.keyDim()),
             .kv_a = try gpa.alloc(f32, cfg.kv_lora_rank + cfg.rope_dim),
-            .k_nope = try gpa.alloc(f32, cfg.nope_dim),
-            .v_t = try gpa.alloc(f32, cfg.v_head_dim),
+            .q_abs = try gpa.alloc(f32, cfg.kv_lora_rank),
+            .c_acc = try gpa.alloc(f32, cfg.kv_lora_rank),
+            .row_tmp = try gpa.alloc(f32, cfg.kv_lora_rank),
             .head_out = try gpa.alloc(f32, cfg.n_heads * cfg.v_head_dim),
             .proj_out = try gpa.alloc(f32, cfg.dim),
             .gate = try gpa.alloc(f32, ffn_max),
@@ -490,10 +492,10 @@ pub const State = struct {
 
     pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
         inline for (.{
-            self.x,      self.normed,     self.q_a,          self.q,        self.kv_a,
-            self.k_nope, self.v_t,        self.head_out,     self.proj_out, self.gate,
-            self.up,     self.act,        self.ffn_out,      self.router,   self.scores,
-            self.logits, self.c_kv_cache, self.k_rope_cache,
+            self.x,      self.normed, self.q_a,        self.q,            self.kv_a,
+            self.q_abs,  self.c_acc,  self.row_tmp,    self.head_out,     self.proj_out,
+            self.gate,   self.up,     self.act,        self.ffn_out,      self.router,
+            self.scores, self.logits, self.c_kv_cache, self.k_rope_cache,
         }) |sl| gpa.free(sl);
     }
 };
@@ -575,7 +577,99 @@ const Selected = moe.Selected;
 
 /// One token step; logits land in st.logits. Errors only when a distributed
 /// expert shard has no reachable holder (fail loud, not silently degraded).
+/// Per-phase timing for the decode loop, enabled with LOOM_PROFILE=1.
+///
+/// Added because two plausible bottleneck theories -- hashing every expert on
+/// every access, and O(seq) KV decompression in attention -- each predicted a
+/// large win, and fixing both moved 1.07 -> 1.3 tok/s. When a hypothesis
+/// survives a measurement that should have refuted it, the measurement is the
+/// thing to fix.
+pub const Profile = struct {
+    var on: ?bool = null;
+    var attn_ns: i128 = 0;
+    var expert_get_ns: i128 = 0;
+    var expert_ffn_ns: i128 = 0;
+    var other_ns: i128 = 0;
+    var tokens: u64 = 0;
+    /// Filled by the engine so the report can say whether the RAM tier is
+    /// actually being hit, rather than leaving that to be inferred from a
+    /// timing that did not move.
+    pub var src_stats: ?expert_fetch.Stats = null;
+    pub var cache_slots: usize = 0;
+
+    pub fn enabled() bool {
+        if (on == null) on = std.c.getenv("LOOM_PROFILE") != null;
+        return on.?;
+    }
+    /// 0.16 has no std.time.Timer or nanoTimestamp; the monotonic clock is
+    /// reached through Io, and a decode step has no Io. CLOCK_MONOTONIC via
+    /// libc is the cheapest thing that works from here, and this is a
+    /// diagnostic path anyway.
+    fn now() i128 {
+        var ts: std.c.timespec = undefined;
+        _ = std.c.clock_gettime(.MONOTONIC, &ts);
+        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+    }
+    /// Straight to stderr: this is a diagnostic, and routing it through the
+    /// node's status thread made it depend on plumbing that was itself under
+    /// investigation.
+    pub fn dump() void {
+        const tot = attn_ns + expert_get_ns + expert_ffn_ns + other_ns;
+        if (tot == 0 or tokens == 0) return;
+        const t: f64 = @floatFromInt(tot);
+        const n: f64 = @floatFromInt(tokens);
+        std.debug.print(
+            "profile {d} tok: attn {d:.1}ms/{d:.0}%  get {d:.1}ms/{d:.0}%  ffn {d:.1}ms/{d:.0}%  other {d:.1}ms/{d:.0}%  total {d:.1}ms\n",
+            .{
+                tokens,
+                @as(f64, @floatFromInt(attn_ns)) / 1e6 / n,
+                100 * @as(f64, @floatFromInt(attn_ns)) / t,
+                @as(f64, @floatFromInt(expert_get_ns)) / 1e6 / n,
+                100 * @as(f64, @floatFromInt(expert_get_ns)) / t,
+                @as(f64, @floatFromInt(expert_ffn_ns)) / 1e6 / n,
+                100 * @as(f64, @floatFromInt(expert_ffn_ns)) / t,
+                @as(f64, @floatFromInt(other_ns)) / 1e6 / n,
+                100 * @as(f64, @floatFromInt(other_ns)) / t,
+                t / 1e6 / n,
+            },
+        );
+    }
+
+    pub fn report(w: anytype) !void {
+        const tot = attn_ns + expert_get_ns + expert_ffn_ns + other_ns;
+        if (tot == 0 or tokens == 0) return;
+        const pct = struct {
+            fn f(a: i128, b: i128) f64 {
+                return 100.0 * @as(f64, @floatFromInt(a)) / @as(f64, @floatFromInt(b));
+            }
+        }.f;
+        const ms = struct {
+            fn f(a: i128, n: u64) f64 {
+                return @as(f64, @floatFromInt(a)) / 1e6 / @as(f64, @floatFromInt(n));
+            }
+        }.f;
+        try w.print("profile over {d} tokens (ms/token)\n", .{tokens});
+        try w.print("  attention       {d:8.1}  {d:5.1}%\n", .{ ms(attn_ns, tokens), pct(attn_ns, tot) });
+        try w.print("  expert get      {d:8.1}  {d:5.1}%\n", .{ ms(expert_get_ns, tokens), pct(expert_get_ns, tot) });
+        try w.print("  expert ffn      {d:8.1}  {d:5.1}%\n", .{ ms(expert_ffn_ns, tokens), pct(expert_ffn_ns, tot) });
+        try w.print("  everything else {d:8.1}  {d:5.1}%\n", .{ ms(other_ns, tokens), pct(other_ns, tot) });
+        try w.print("  total           {d:8.1}\n", .{ms(tot, tokens)});
+        if (src_stats) |g| {
+            const acc = g.ram + g.local + g.fetched;
+            if (acc > 0) try w.print(
+                "  expert tier: ram {d} ({d:.0}%)  disk {d}  peer {d}   cache slots {d}\n",
+                .{ g.ram, 100.0 * @as(f64, @floatFromInt(g.ram)) / @as(f64, @floatFromInt(acc)), g.local, g.fetched, cache_slots },
+            );
+        }
+    }
+};
+
 pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
+    const prof = Profile.enabled();
+    const t_step = if (prof) Profile.now() else 0;
+    var t_attn: i128 = 0;
+    var t_get: i128 = 0;
+    var t_ffn: i128 = 0;
     const cfg = m.cfg;
     const kd = cfg.keyDim();
     const nope = cfg.nope_dim;
@@ -614,7 +708,30 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             ropeApply(cfg, st.q[h * kd + nope ..][0..rope], pos);
         }
 
+        // MLA attention, in compressed space.
+        //
+        // The obvious way to write this is to decompress the cache: for every
+        // head, at every cached position, run W_k over c_t to rebuild that
+        // position's key, and W_v to rebuild its value. That is what this did,
+        // and it is O(seq) matvecs of (nope x kvr) and (vd x kvr) per head per
+        // layer -- at seq=100, 16 heads and 27 layers, about 86,000 matvecs
+        // per token. It also throws away the reason MLA exists: the whole
+        // point of a compressed KV cache is that K and V are never
+        // materialized.
+        //
+        // Both projections commute with the sum over positions, so both move
+        // out of the loop:
+        //
+        //   score_t = q_nope . (W_k c_t)  =  (W_k^T q_nope) . c_t  =  q_abs . c_t
+        //   o       = sum_t p_t (W_v c_t) =  W_v (sum_t p_t c_t)   =  W_v c_acc
+        //
+        // So W_k is absorbed into q once per head, and the value side
+        // accumulates in compressed space and decompresses once. Per head the
+        // per-position work drops from two matvecs (~131k MACs) to two dot
+        // products (kvr + rope = 576 MACs), against a fixed cost of one
+        // absorb and one matvec.
         const seq = pos + 1;
+        const t_a0 = if (prof) Profile.now() else 0;
         h = 0;
         while (h < cfg.n_heads) : (h += 1) {
             const q_nope = st.q[h * kd ..][0..nope];
@@ -624,24 +741,32 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             const k_rows = l.attn_kv_b.data[kb_base * ggml.rowBytes(l.attn_kv_b.ty, kvr) ..];
             const v_rows = l.attn_kv_b.data[(kb_base + nope) * ggml.rowBytes(l.attn_kv_b.ty, kvr) ..];
 
+            // q_abs = W_k^T q_nope, i.e. the rows of W_k weighted by q_nope.
+            // Row-at-a-time because the quantized layout is row-major: there
+            // is no column access without dequantizing anyway.
+            @memset(st.q_abs, 0);
+            for (q_nope, 0..) |qr, r| {
+                backend.dequantRow(l.attn_kv_b.ty, st.row_tmp, k_rows, r, kvr);
+                backend.axpy(st.q_abs, st.row_tmp, qr);
+            }
+
             var t_i: usize = 0;
             while (t_i < seq) : (t_i += 1) {
                 const c_t = st.c_kv_cache[(li * cfg.ctx_len + t_i) * kvr ..][0..kvr];
-                backend.matvec(l.attn_kv_b.ty, st.k_nope, k_rows, c_t, nope, kvr);
                 const kr_t = st.k_rope_cache[(li * cfg.ctx_len + t_i) * rope ..][0..rope];
-                st.scores[t_i] = (backend.dotF32(q_nope, st.k_nope) + backend.dotF32(q_rope, kr_t)) * scale;
+                st.scores[t_i] = (backend.dotF32(st.q_abs, c_t) + backend.dotF32(q_rope, kr_t)) * scale;
             }
             backend.softmax(st.scores[0..seq]);
 
-            const oh = st.head_out[h * vd ..][0..vd];
-            @memset(oh, 0);
+            @memset(st.c_acc, 0);
             t_i = 0;
             while (t_i < seq) : (t_i += 1) {
                 const c_t = st.c_kv_cache[(li * cfg.ctx_len + t_i) * kvr ..][0..kvr];
-                backend.matvec(l.attn_kv_b.ty, st.v_t, v_rows, c_t, vd, kvr);
-                backend.axpy(oh, st.v_t, st.scores[t_i]);
+                backend.axpy(st.c_acc, c_t, st.scores[t_i]);
             }
+            backend.matvec(l.attn_kv_b.ty, st.head_out[h * vd ..][0..vd], v_rows, st.c_acc, vd, kvr);
         }
+        if (prof) t_attn += Profile.now() - t_a0;
         mv(l.attn_output, st.proj_out, st.head_out);
         backend.add(st.x, st.proj_out);
 
@@ -669,7 +794,10 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             }
             for (sel) |s| {
                 if (m.dist) |src| {
+                    const t_g0 = if (prof) Profile.now() else 0;
                     const blk = try src.get(m.expert_shard[li * cfg.n_expert + s.expert]);
+                    if (prof) t_get += Profile.now() - t_g0;
+                    const t_f0 = if (prof) Profile.now() else 0;
                     const gt = l.ffn_gate_exps.?;
                     const ut = l.ffn_up_exps.?;
                     const dt = l.ffn_down_exps.?;
@@ -682,6 +810,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
                         .{ .ty = ut.ty, .data = blk[gl..][0..ul], .ne0 = ut.ne0, .ne1 = ut.ne1, .ne2 = 1 },
                         .{ .ty = dt.ty, .data = blk[gl + ul ..][0..dl], .ne0 = dt.ne0, .ne1 = dt.ne1, .ne2 = 1 },
                     );
+                    if (prof) t_ffn += Profile.now() - t_f0;
                 } else {
                     denseFFN(
                         st,
@@ -702,6 +831,20 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
 
     backend.rmsnorm(st.normed, st.x, asF32(m.output_norm), cfg.eps);
     mv(m.output, st.logits, st.normed);
+
+    if (prof) {
+        if (m.dist) |src| {
+            Profile.src_stats = src.stats;
+            Profile.cache_slots = src.cacheSlots();
+        }
+        const total = Profile.now() - t_step;
+        Profile.attn_ns += t_attn;
+        Profile.expert_get_ns += t_get;
+        Profile.expert_ffn_ns += t_ffn;
+        Profile.other_ns += total - t_attn - t_get - t_ffn;
+        Profile.tokens += 1;
+        if (Profile.tokens % 16 == 0) Profile.dump();
+    }
 }
 
 test "route: sigmoid gating with selection bias picks by biased score, gates from raw" {

@@ -62,6 +62,24 @@ pub const Manifest = struct {
         return m;
     }
 
+    /// Longest *routed-expert* shard, i.e. ignoring the resident chunks.
+    ///
+    /// These differ by more than they look: resident chunks are fixed 16 MB
+    /// slices of the dense prefix, while an expert shard is one expert's
+    /// tensors, around 4.6 MB in a 16B model. A RAM cache that sizes every
+    /// slot by the global maximum therefore wastes ~70% of its budget on
+    /// padding and holds a third of the experts it could -- measured, 512
+    /// slots for 1,664 expert shards and a 52% hit rate.
+    pub fn maxExpertShardLen(self: *const Manifest) u64 {
+        var m: u64 = 0;
+        var i: usize = self.n_resident;
+        while (i < self.nRanges()) : (i += 1) {
+            const n = self.rangeLen(i);
+            if (n > m) m = n;
+        }
+        return m;
+    }
+
     pub fn deinit(self: *Manifest, gpa: std.mem.Allocator) void {
         gpa.free(self.digests);
         gpa.free(self.extents);

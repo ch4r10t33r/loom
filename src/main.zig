@@ -685,7 +685,10 @@ fn runStore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, dir: []const u8, ar
         }
     }
 
-    var src = try expert_fetch.Source.init(gpa, io, &store, peer_list.items);
+    // The RAM tier: without it every routed expert is re-read from disk and
+    // re-hashed on every token.
+    const cache_gb = try flagF64(args, "--ram-gb", 4.0);
+    var src = try expert_fetch.Source.initCached(gpa, io, &store, peer_list.items, @intFromFloat(cache_gb * GB));
     src.committee = committee_list.items;
 
     // resident completeness gate (audit #5 P0-4): the resident bundle
