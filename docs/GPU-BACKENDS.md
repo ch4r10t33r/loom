@@ -239,6 +239,30 @@ Porting the first three of those gave loom nothing at DRAM-bound sizes, which
 is consistent — there is no headroom left there — and they are the right thing
 to revisit for models whose tensors sit in cache.
 
+## Default: the recorded path, chosen by measurement
+
+On a machine with a GPU, `loom node` times a real token both ways at load and
+uses whichever wins by 25%. `--no-gpu-layers` forces the host path. Measured on
+an M5 with TinyLlama-1.1B:
+
+    compute  backend metal; ... layers gpu (1 cmd buffer/token)
+             (gpu 8.41 ms/tok vs cpu 15.61 ms/tok)
+
+and the resulting decode is 109.3 tok/s against 50.7 with `--no-gpu-layers`.
+
+The measurement is a whole token issued exactly as generation issues it,
+because nothing smaller can be trusted about submission cost. Timing one
+operation in a tight loop lets successive `commitAndWait` calls pipeline; in
+the engine each operation is separated by other work and pays the latency in
+full. The per-operation calibration this replaces reported the fused FFN block
+at 1.107 ms against a CPU 9.837 ms -- the same CPU block measured 0.489 ms
+elsewhere -- and acting on it took decode from 56 to 9.1 tok/s. The whole-token
+number predicts 119 tok/s where 109 is observed, which is the accuracy a
+default needs.
+
+A build without a GPU backend never reaches this: `layerBlock` declines, both
+timings come out equal, and the 25% margin is not met.
+
 ## One command buffer per token: 1.9x, measured
 
 TinyLlama-1.1B Q4_K_M on an M5, 128 tokens, decode only:
