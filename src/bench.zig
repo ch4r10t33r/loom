@@ -109,6 +109,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
         }
     }
     if (hasFlag(args, "--pool")) return poolOverhead(gpa, io, out);
+    if (hasFlag(args, "--ffn")) return expertFfn(gpa, io, out);
 
     var results = std.ArrayList(Result).empty;
     defer results.deinit(gpa);
@@ -336,5 +337,92 @@ pub fn poolOverhead(gpa: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
 
         try out.print("  {d:>6} {d:>9.4} ms {d:>9.4} ms {d:>7.1} us\n", .{ rows, on, off, (on - off) * 1000 });
     }
+    try out.flush();
+}
+
+/// One MoE expert's FFN at DeepSeek-V2-Lite's real shapes and types, which is
+/// where a decode token actually spends its time.
+///
+/// Measured in the engine, expert FFN ran at ~5.7 GB/s while these same
+/// kernels reach ~53 GB/s on a standalone 2048x2048 sweep. Either the shape is
+/// the problem or the engine around the kernels is, and a synthetic sweep at
+/// 2048x2048 cannot tell those apart. This reproduces the exact call sequence
+/// -- gate and up over `dim`, SwiGLU, down over `moe_ffn` -- with gate/up in
+/// Q4_K and down in Q5_1, the mixture `Q4_K_M` actually produces.
+fn expertFfn(gpa: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
+    const dim = 2048;
+    const moe_ffn = 1408;
+    const N = 128;
+    // A ring of distinct experts, not one reused buffer. This is the whole
+    // point: a decode token touches ~208 *different* experts, so every byte
+    // comes from DRAM. Benchmarking one 5 MB expert in a tight loop measures
+    // it resident in cache and flatters the kernel by several times.
+    const RING = 64; // ~330 MB, past any cache on this class of machine
+
+    var prng = std.Random.DefaultPrng.init(0xE7E7);
+    const rnd = prng.random();
+
+    const gate_bytes = ggml.tensorBytes(.q4_k, dim, moe_ffn);
+    const up_bytes = gate_bytes;
+    const down_bytes = ggml.tensorBytes(.q5_1, moe_ffn, dim);
+    const set_bytes = gate_bytes + up_bytes + down_bytes;
+
+    const slab = try gpa.alloc(u8, set_bytes * RING);
+    defer gpa.free(slab);
+    rnd.bytes(slab);
+    for (0..slab.len / 2) |i| slab[i * 2 + 1] &= 0xFB; // keep f16 scales finite
+
+    const x = try gpa.alloc(f32, dim);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rnd.float(f32) - 0.5;
+    const g = try gpa.alloc(f32, moe_ffn);
+    defer gpa.free(g);
+    const u = try gpa.alloc(f32, moe_ffn);
+    defer gpa.free(u);
+    const a = try gpa.alloc(f32, moe_ffn);
+    defer gpa.free(a);
+    const o = try gpa.alloc(f32, dim);
+    defer gpa.free(o);
+
+    const One = struct {
+        fn run(sl: []const u8, sb: usize, i: usize, gb: usize, ub: usize, xx: []const f32, gg: []f32, uu: []f32, aa: []f32, oo: []f32) void {
+            const set = sl[(i % RING) * sb ..][0..sb];
+            backend.matvec(.q4_k, gg, set[0..gb], xx, moe_ffn, dim);
+            backend.matvec(.q4_k, uu, set[gb..][0..ub], xx, moe_ffn, dim);
+            backend.swiglu(aa, gg, uu);
+            backend.matvec(.q5_1, oo, set[gb + ub ..], aa, dim, moe_ffn);
+        }
+    };
+
+    const measure = struct {
+        fn f(ioo: Io, sl: []const u8, sb: usize, gb: usize, ub: usize, xx: []const f32, gg: []f32, uu: []f32, aa: []f32, oo: []f32) i128 {
+            var best: i128 = std.math.maxInt(i64);
+            for (0..N) |i| {
+                const t0 = nowNs(ioo);
+                One.run(sl, sb, i, gb, ub, xx, gg, uu, aa, oo);
+                const dt = nowNs(ioo) - t0;
+                if (dt < best) best = dt;
+            }
+            return best;
+        }
+    }.f;
+
+    backend.parallelBegin(generator.threads());
+    for (0..RING) |i| One.run(slab, set_bytes, i, gate_bytes, up_bytes, x, g, u, a, o); // warm the pool, not the cache
+    const bn = measure(io, slab, set_bytes, gate_bytes, up_bytes, x, g, u, a, o);
+    backend.parallelEnd();
+
+    backend.parallelBegin(1);
+    const b1 = measure(io, slab, set_bytes, gate_bytes, up_bytes, x, g, u, a, o);
+    backend.parallelEnd();
+
+    const msn = @as(f64, @floatFromInt(bn)) / 1e6;
+    const ms1 = @as(f64, @floatFromInt(b1)) / 1e6;
+    const fb: f64 = @floatFromInt(set_bytes);
+    try out.print("\nexpert ffn (dim={d} moe_ffn={d}, gate/up q4_k + down q5_1, {d:.2} MB/expert, {d} distinct)\n", .{
+        dim, moe_ffn, fb / (1 << 20), RING,
+    });
+    try out.print("  {d} threads  {d:7.3} ms  {d:6.1} GB/s\n", .{ generator.threads(), msn, fb / @as(f64, @floatFromInt(bn)) });
+    try out.print("  1 thread    {d:7.3} ms  {d:6.1} GB/s   (speedup {d:.2}x)\n", .{ ms1, fb / @as(f64, @floatFromInt(b1)), ms1 / msn });
     try out.flush();
 }

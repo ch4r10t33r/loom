@@ -31,6 +31,7 @@ const wire = @import("wire.zig");
 const expert_cache = @import("../engine/expert_cache.zig");
 
 pub const Stats = struct {
+    mapped: u64 = 0, // served zero-copy from the mmap'd store, no read at all
     ram: u64 = 0, // served from the verified-block cache, no read and no hash
     local: u64 = 0, // served from held shards (disk/page cache)
     fetched: u64 = 0, // fetched from a peer this run
@@ -107,6 +108,29 @@ pub const Source = struct {
     /// Slots the RAM tier holds, for the startup banner.
     pub fn cacheSlots(self: *const Source) usize {
         return if (self.cache) |c| c.capacity else 0;
+    }
+
+    /// The three parts of an expert shard -- gate, up, down -- each as its own
+    /// slice. A shard is three separate file extents, so this is the shape it
+    /// naturally has; only the old copying path ever concatenated them.
+    pub const Parts = struct { gate: []const u8, up: []const u8, down: []const u8 };
+
+    /// Zero-copy shard access: pointers straight into the mapped store, valid
+    /// as long as the store stays mapped and the shard stays held.
+    ///
+    /// Returns null when the store is not mapped, the shard is not held, it
+    /// fails its digest, or it does not have exactly three extents -- in every
+    /// one of those cases the caller falls back to `get`. This is the whole
+    /// point of the exercise: a copy into a heap cache is a second resident
+    /// copy of bytes the page cache already holds, and on a machine where the
+    /// two do not both fit it costs far more than the copy itself.
+    pub fn getMapped(self: *Source, id: usize) ?Parts {
+        if (self.store.extentCount(id) != 3) return null;
+        const g = self.store.extentSlice(id, 0) orelse return null;
+        const u = self.store.extentSlice(id, 1) orelse return null;
+        const d = self.store.extentSlice(id, 2) orelse return null;
+        self.stats.mapped += 1;
+        return .{ .gate = g, .up = u, .down = d };
     }
 
     /// Materialize shard `id`. Local tier first; else fetch, verify, persist.

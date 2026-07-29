@@ -15,6 +15,13 @@ pub fn hashBlock(bytes: []const u8) Digest {
     return d;
 }
 
+/// Incremental form of `hashBlock`, for a block whose bytes are not
+/// contiguous: an expert shard is three separate file extents (gate, up,
+/// down), so hashing it from a mapping means feeding three slices.
+pub fn blockHasher() Sha256 {
+    return Sha256.init(.{});
+}
+
 fn hashPair(a: Digest, b: Digest) Digest {
     var h = Sha256.init(.{});
     h.update(&a);

@@ -655,10 +655,10 @@ pub const Profile = struct {
         try w.print("  everything else {d:8.1}  {d:5.1}%\n", .{ ms(other_ns, tokens), pct(other_ns, tot) });
         try w.print("  total           {d:8.1}\n", .{ms(tot, tokens)});
         if (src_stats) |g| {
-            const acc = g.ram + g.local + g.fetched;
+            const acc = g.mapped + g.ram + g.local + g.fetched;
             if (acc > 0) try w.print(
-                "  expert tier: ram {d} ({d:.0}%)  disk {d}  peer {d}   cache slots {d}\n",
-                .{ g.ram, 100.0 * @as(f64, @floatFromInt(g.ram)) / @as(f64, @floatFromInt(acc)), g.local, g.fetched, cache_slots },
+                "  expert tier: mapped {d} ({d:.0}%)  ram {d}  disk {d}  peer {d}   cache slots {d}\n",
+                .{ g.mapped, 100.0 * @as(f64, @floatFromInt(g.mapped)) / @as(f64, @floatFromInt(acc)), g.ram, g.local, g.fetched, cache_slots },
             );
         }
     }
@@ -794,21 +794,28 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             }
             for (sel) |s| {
                 if (m.dist) |src| {
-                    const t_g0 = if (prof) Profile.now() else 0;
-                    const blk = try src.get(m.expert_shard[li * cfg.n_expert + s.expert]);
-                    if (prof) t_get += Profile.now() - t_g0;
-                    const t_f0 = if (prof) Profile.now() else 0;
+                    const sid = m.expert_shard[li * cfg.n_expert + s.expert];
                     const gt = l.ffn_gate_exps.?;
                     const ut = l.ffn_up_exps.?;
                     const dt = l.ffn_down_exps.?;
-                    const gl = gt.ne1 * ggml.rowBytes(gt.ty, gt.ne0);
-                    const ul = ut.ne1 * ggml.rowBytes(ut.ty, ut.ne0);
-                    const dl = dt.ne1 * ggml.rowBytes(dt.ty, dt.ne0);
+                    const t_g0 = if (prof) Profile.now() else 0;
+                    // Zero-copy where the store is mapped and the shard checks
+                    // out; the copying path is the fallback for peer fetches
+                    // and unmappable stores.
+                    const parts: expert_fetch.Source.Parts = src.getMapped(sid) orelse blk_p: {
+                        const blk = try src.get(sid);
+                        const gl = gt.ne1 * ggml.rowBytes(gt.ty, gt.ne0);
+                        const ul = ut.ne1 * ggml.rowBytes(ut.ty, ut.ne0);
+                        const dl = dt.ne1 * ggml.rowBytes(dt.ty, dt.ne0);
+                        break :blk_p .{ .gate = blk[0..gl], .up = blk[gl..][0..ul], .down = blk[gl + ul ..][0..dl] };
+                    };
+                    if (prof) t_get += Profile.now() - t_g0;
+                    const t_f0 = if (prof) Profile.now() else 0;
                     denseFFN(
                         st,
-                        .{ .ty = gt.ty, .data = blk[0..gl], .ne0 = gt.ne0, .ne1 = gt.ne1, .ne2 = 1 },
-                        .{ .ty = ut.ty, .data = blk[gl..][0..ul], .ne0 = ut.ne0, .ne1 = ut.ne1, .ne2 = 1 },
-                        .{ .ty = dt.ty, .data = blk[gl + ul ..][0..dl], .ne0 = dt.ne0, .ne1 = dt.ne1, .ne2 = 1 },
+                        .{ .ty = gt.ty, .data = parts.gate, .ne0 = gt.ne0, .ne1 = gt.ne1, .ne2 = 1 },
+                        .{ .ty = ut.ty, .data = parts.up, .ne0 = ut.ne0, .ne1 = ut.ne1, .ne2 = 1 },
+                        .{ .ty = dt.ty, .data = parts.down, .ne0 = dt.ne0, .ne1 = dt.ne1, .ne2 = 1 },
                     );
                     if (prof) t_ffn += Profile.now() - t_f0;
                 } else {
