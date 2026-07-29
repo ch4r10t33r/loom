@@ -32,18 +32,23 @@ pub fn build(b: *std.Build) void {
     build_info.addOption([]const u8, "commit", commit);
     build_info.addOption([]const u8, "gpu", gpu);
 
-    const exe = b.addExecutable(.{
-        .name = "loom",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "snappyz", .module = snappy.module("snappyz") },
-                .{ .name = "build_info", .module = build_info.createModule() },
-            },
-        }),
+    const exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "snappyz", .module = snappy.module("snappyz") },
+            .{ .name = "build_info", .module = build_info.createModule() },
+        },
     });
+    // Unconditionally, not only for the Metal build. macOS links libc whatever
+    // you ask for, so `std.c` calls compile there and fail to cross-compile
+    // for Linux with "dependency on libc must be explicitly specified" -- which
+    // is how the Linux build broke without anyone noticing. A networked daemon
+    // linking libc is unremarkable; silently building for one platform only is
+    // not.
+    exe_mod.link_libc = true;
+    const exe = b.addExecutable(.{ .name = "loom", .root_module = exe_mod });
     // Metal needs one Objective-C translation unit and two system frameworks.
     // Only compiled when the backend is selected, so a CPU build never needs a
     // macOS SDK path or an ObjC compiler.
