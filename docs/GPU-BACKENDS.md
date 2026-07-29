@@ -394,3 +394,60 @@ magnitude available before the GPU is the only remaining lever.
 - [ZINC Apple Silicon enablement notes](https://github.com/zolotukhin/zinc/blob/main/docs/APPLE_SILICON_METAL_ENABLEMENT.md)
 - [ZINC Metal backend reference](https://github.com/zolotukhin/zinc/blob/main/docs/APPLE_METAL_REFERENCE.md)
 - [whitepaper](../whitepaper/WHITEPAPER.md), principle 7 and the bandwidth table
+
+## Why Mistral-7B paged, and what it says about the thesis
+
+The 0.27 tok/s Mistral result above is not "the machine is too small". It is
+mostly a loom bug, and the rest is a category error about what the design
+claims.
+
+**The bug.** `--ctx` is applied by the caller *after* `loadGgufEngine` returns,
+so everything inside sizes itself off the model's advertised context. Mistral
+advertises 32768, and a KV cache is `layers x ctx x kvd x 4 x 2` — for a 7B
+that is **8 GB**. Plus 4.07 GB of weights, that is over 12 GB committed on a
+16 GB machine before a token is generated, and the model then pages against its
+own cache. A `memory` line in the startup banner makes this visible:
+
+    memory   weights 4.07 GB (mmap) + kv 8.00 GB
+
+The same run showed the GPU path measuring `gpu 45.85 ms/tok vs cpu 99.50` — a
+2.2x win — and then being refused, because 32768 exceeds what the attention
+kernel's threadgroup memory can serve. So the oversized context cost twice: the
+memory, and the GPU path.
+
+The fix is to apply the cap inside the load, before anything sizes off it, and
+to size calibration's scratch `State` to the handful of positions it actually
+walks rather than the full context. A first attempt at both hung the node
+during load and was reverted; it needs redoing carefully.
+
+**The category error.** Even fixed, Mistral-7B is the wrong model for loom's
+thesis. A *dense* model reads every weight on every token, so if the weights do
+not fit in RAM it is disk-bound, and distribution cannot help — fetching 4 GB
+per token from a peer is worse than reading it from local NVMe. That is the
+whitepaper's own bandwidth table.
+
+The thesis is specifically about **MoE**: only the routed experts change from
+token to token, roughly 11% of the weights, and the dense part stays resident
+everywhere. That is what makes the cluster's *collective* RAM the relevant
+quantity — the working set stays hot on some node even though no single box can
+hold it.
+
+**So proving it needs a different experiment**, and it is the v1 acceptance
+criterion that has never been measured:
+
+1. An MoE model larger than one node can comfortably hold.
+   DeepSeek-Coder-V2-Lite (8.9 GB, ~2.4B active) on a 16 GB box is exactly
+   right — single-node it already thrashes, measured at ~3 tok/s with 1.16 GB
+   per token coming off disk.
+2. Two *physical* machines. Peers on one host share its RAM and page cache, so
+   a localhost cluster proves nothing about capacity.
+3. The comparison: one node holding 100% and paging, against two nodes each
+   holding ~60% with the union of their hot sets resident.
+4. Success is the criterion already written down — aggregate cold-miss-to-disk
+   rate drops versus single-node, and tok/s rises — plus the tier latencies
+   that decide whether a given fabric makes the network tier worth using at
+   all.
+
+Until that runs, the distributed claim is untested. Everything measured so far
+is single-node, where loom is a competent local engine and the thesis does not
+apply.
