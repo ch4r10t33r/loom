@@ -21,7 +21,7 @@ pub const dequantRow = ggml.dequantRow;
 pub const WeightRef = struct { ty: ggml.Type, data: []const u8 };
 
 pub const Shape = struct { data: []const u8, ty: ggml.Type, rows: usize, cols: usize };
-pub const Verdict = struct { ran: bool, matvec_min_rows: usize, matvec_used: bool, ffn_used: bool, ffn_gpu_ms: f64 = 0, ffn_cpu_ms: f64 = 0 };
+pub const Verdict = struct { ran: bool, matvec_min_rows: usize, matvec_used: bool, ffn_used: bool, prefill_used: bool = false, ffn_gpu_ms: f64 = 0, ffn_cpu_ms: f64 = 0 };
 
 /// Nothing to calibrate: with one backend there is no choice to measure.
 pub fn calibrate(gpa: std.mem.Allocator, dim: usize, ffn: usize, shapes: []const Shape, triple: ?[3]Shape) void {
