@@ -82,6 +82,19 @@ pub const WeightRef = impl.WeightRef;
 /// buffer per matvec and can never be fast, whatever the kernels do.
 pub const ffnBlock = impl.ffnBlock;
 
+/// Allocate a device-resident KV cache. False means the backend declines and
+/// the engine keeps its own.
+pub const attnInit = impl.attnInit;
+
+/// Mirror one KV cache row into the backend's device copy. Must be called
+/// wherever the engine writes its own cache, prefill and decode alike.
+pub const kvAppend = impl.kvAppend;
+pub const disableAttn = impl.disableAttn;
+
+/// One layer of grouped-query attention against that cache, in one submission.
+/// False means the engine runs its own path.
+pub const attnHeads = impl.attnHeads;
+
 /// One shape the engine will issue, for calibration.
 pub const Shape = impl.Shape;
 
@@ -93,7 +106,11 @@ pub const Shape = impl.Shape;
 /// so a constant measured on one laptop is wrong on the next, and it is
 /// per-shape besides. This is the same argument the fetch path already makes
 /// for probing disk against network rather than assuming an order.
+/// Whether to act on the calibration verdict; see the backend for why this
+/// defaults off.
+pub const useGpuOps = &impl.use_gpu_ops;
 pub const calibrate = impl.calibrate;
+pub const calibrateAttn = impl.calibrateAttn;
 pub const lastVerdict = impl.lastVerdict;
 
 // ---- elementwise -------------------------------------------------------------

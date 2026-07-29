@@ -48,6 +48,9 @@ pub const Options = struct {
     /// rather than copying them into the RAM cache. See node.zig for why this
     /// is off by default.
     mmap_weights: bool = false,
+    /// Act on the compute backend's calibration verdict. Off by default; see
+    /// the backend for the measurement problem that makes it unsafe.
+    gpu_ops: bool = false,
     prefill_batch: usize = 0, // 0 = kernel max; 1 disables batched prefill
     p2p_addr: []const u8,
     p2p_port: u16,
@@ -275,7 +278,7 @@ fn openaiThread(ctx: *openai.Ctx) void {
 
 /// Load a GGUF through whichever engine its `general.architecture` selects.
 /// deepseek2 is MLA; everything else supported is GQA (llama.zig).
-fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8) !generator.GgufModel {
+fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8, gpu_ops: bool) !generator.GgufModel {
     var peek = try gguf_mod.parse(gpa, io, path);
     const arch_src = peek.getString("general.architecture") orelse "?";
     var arch_buf: [64]u8 = undefined;
@@ -286,11 +289,11 @@ fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8) !generator.G
 
     if (std.mem.eql(u8, arch, "deepseek2")) {
         var m = try deepseek.load(gpa, io, path);
-        calibrateFor(gpa, m.cfg.dim, m.cfg.ffn, &m.layers[0], m.output);
+        calibrateFor(gpa, gpu_ops, m.cfg.dim, m.cfg.ffn, m.cfg.n_layers, m.cfg.ctx_len, 0, 0, 0, 0, &m.layers[0], m.output);
         return .{ .deepseek = m };
     }
     var m = try llama.load(gpa, io, path);
-    calibrateFor(gpa, m.cfg.dim, m.cfg.ffn, &m.layers[0], m.output);
+    calibrateFor(gpa, gpu_ops, m.cfg.dim, m.cfg.ffn, m.cfg.n_layers, m.cfg.ctx_len, m.cfg.kvDim(), m.cfg.n_heads, m.cfg.n_kv_heads, m.cfg.head_dim, &m.layers[0], m.output);
     return .{ .gqa = m };
 }
 
@@ -307,6 +310,8 @@ fn printCompute(out: *Io.Writer) !void {
     try out.print(", ffn block {s}", .{if (v.ffn_used) "gpu" else "cpu"});
     if (v.ffn_gpu_ms > 0) try out.print(" (gpu {d:.3} ms vs cpu {d:.3} ms)", .{ v.ffn_gpu_ms, v.ffn_cpu_ms });
     try out.print(", prefill {s}", .{if (v.prefill_used) "gpu" else "cpu"});
+    try out.print(", attn {s}", .{if (v.attn_used) "gpu" else "cpu"});
+    if (v.attn_gpu_ms > 0) try out.print(" (gpu {d:.3} ms vs cpu {d:.3} ms)", .{ v.attn_gpu_ms, v.attn_cpu_ms });
     try out.print("\n", .{});
 }
 
@@ -314,7 +319,7 @@ fn printCompute(out: *Io.Writer) !void {
 /// it decide, per operation, whether it is worth using. A backend built in is
 /// not a backend used: on unified memory the GPU loses at small shapes and
 /// wins at large ones, and where the line falls is a property of the machine.
-fn calibrateFor(gpa: std.mem.Allocator, dim: usize, ffn: usize, l: anytype, out_head: anytype) void {
+fn calibrateFor(gpa: std.mem.Allocator, gpu_ops: bool, dim: usize, ffn: usize, n_layers: usize, ctx_len: usize, kvd: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, l: anytype, out_head: anytype) void {
     var shapes: [3]backend.Shape = undefined;
     var n: usize = 0;
     if (l.ffn_gate) |g| {
@@ -330,6 +335,7 @@ fn calibrateFor(gpa: std.mem.Allocator, dim: usize, ffn: usize, l: anytype, out_
     // The pool has to be up for this: it is what brings the GPU device online,
     // and the CPU side of the comparison has to run with the same thread count
     // a real generation gets or the measurement is rigged against it.
+    backend.useGpuOps.* = gpu_ops;
     backend.parallelBegin(generator.threads());
     defer backend.parallelEnd();
     const triple: ?[3]backend.Shape = if (l.ffn_gate != null and l.ffn_up != null and l.ffn_down != null) .{
@@ -338,6 +344,17 @@ fn calibrateFor(gpa: std.mem.Allocator, dim: usize, ffn: usize, l: anytype, out_
         .{ .data = l.ffn_down.?.data, .ty = l.ffn_down.?.ty, .rows = l.ffn_down.?.ne1, .cols = l.ffn_down.?.ne0 },
     } else null;
     backend.calibrate(gpa, dim, ffn, shapes[0..n], triple);
+    // kvd == 0 means the engine has no GQA-shaped cache to hand over —
+    // deepseek is MLA and keeps a compressed one — so there is nothing to
+    // allocate and the backend keeps declining `attnHeads`.
+    if (kvd != 0 and backend.attnInit(n_layers, ctx_len, kvd)) {
+        // Calibrate at a mid-length sequence: fused attention's cost is one
+        // command buffer regardless of seq, while the CPU loop grows with it,
+        // so the verdict at seq=1 and seq=ctx differ. 256 is a plausible
+        // working context rather than either extreme.
+        backend.calibrateAttn(gpa, n_heads, n_kv_heads, head_dim, @min(@as(usize, 256), ctx_len));
+        if (!gpu_ops) backend.disableAttn();
+    }
 }
 
 fn attachGgufDist(m: *generator.GgufModel, gpa: std.mem.Allocator, src: *expert_fetch.Source) !void {
@@ -666,7 +683,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                 // Pick the engine from the file's own architecture: MLA
                 // (deepseek2) or the GQA family (llama/Mixtral, qwen2moe,
                 // qwen3moe, glm4moe). Both attach to the same expert source.
-                if (loadGgufEngine(gpa, io, mpath)) |mdl| {
+                if (loadGgufEngine(gpa, io, mpath, opts.gpu_ops)) |mdl| {
                     gguf_gen = .{ .m = mdl, .src = &gguf_src, .ctx_cap = opts.ctx_cap };
                     gguf_gen.m.setCtxLen(@min(gguf_gen.m.ctxLen(), opts.ctx_cap));
                     const arch_name = gguf_gen.m.archName();
@@ -710,7 +727,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     var local_gguf = false;
     if (!serve_gguf) {
         if (opts.gguf_path) |gp| {
-            if (loadGgufEngine(gpa, io, gp)) |mdl| {
+            if (loadGgufEngine(gpa, io, gp, opts.gpu_ops)) |mdl| {
                 gguf_gen = .{ .m = mdl, .src = null, .ctx_cap = opts.ctx_cap };
                 gguf_gen.m.setCtxLen(@min(gguf_gen.m.ctxLen(), opts.ctx_cap));
                 const arch_name = gguf_gen.m.archName();

@@ -398,6 +398,7 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .status_secs = @intCast(try flagUsize(args, "--status-secs", 30)),
         .kernel_threads = try flagUsize(args, "--threads", 0),
         .mmap_weights = hasFlag(args, "--mmap-weights"),
+        .gpu_ops = hasFlag(args, "--gpu-ops"),
         .prefill_batch = try flagUsize(args, "--batch", 0),
         .chat_format = flagStr(args, "--chat-format"),
     });
