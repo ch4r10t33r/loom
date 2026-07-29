@@ -330,6 +330,17 @@ fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8, gpu_ops: boo
 /// before that there is nothing measured to report.
 fn printCompute(out: *Io.Writer, gpu_layers: bool) !void {
     const v = backend.lastVerdict();
+    // Before the verdict, because a weight mapping that failed to become
+    // resident is invisible in every other number until the page-in counter is
+    // read -- which is how it went unnoticed the first time.
+    const resident = backend.materializeArenas();
+    if (resident > 0) {
+        try out.print("  weights    {d:.1} GB device-resident\n", .{
+            @as(f64, @floatFromInt(resident)) / (1024.0 * 1024.0 * 1024.0),
+        });
+    } else if (backend.arenaError.*) |why| {
+        try out.print("  weights    not device-resident: {s}\n", .{why});
+    }
     if (!v.ran) return out.print("  compute    backend {s}\n", .{backend.name});
     try out.print("  compute    backend {s}; measured on this model: matvec {s}", .{
         backend.name,
@@ -710,12 +721,40 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             // return. But the model does not fit in this machine's page cache,
             // so ~1.16 GB of expert weights per token is faulted from disk
             // either way, and reading them through the mapping moves that cost
-            // into whoever touches the pages -- the matmul. The heap cache
-            // wins here only because it keeps a bounded set in anonymous
-            // memory the LRU controls rather than leaving residency to the
-            // kernel. On a node whose expert corpus fits in RAM the ordering
-            // should reverse, which is what this flag is for.
-            if (opts.mmap_weights) st.mapReadOnly();
+            // into whoever touches the pages -- the matmul.
+            //
+            // That table is superseded on a GPU build, and the reason it was
+            // ever true is below: the mapping was left to the kernel to keep
+            // resident, and the kernel evicted it. Handing the mapping to the
+            // compute backend, which wires it, reverses the ordering -- 4.1-5.4
+            // tok/s against 3.5-3.6 for the 8 GB heap cache on the same
+            // machine, with page-ins over a generation down from ~6.9 GB to
+            // ~1.4-2.2 GB. The heap cache still wins where there is no backend
+            // to hand it to, which is why this stays a flag rather than the
+            // default.
+            if (opts.mmap_weights) {
+                st.mapReadOnly();
+                // Hand the whole mapping to the compute backend as one
+                // allocation. Without this the GPU wraps each expert extent
+                // separately and the model is never resident -- which is the
+                // measured difference between 2.5 tok/s and llama.cpp's 47+ on
+                // this same checkpoint.
+                const mem = st.mapping();
+                const took = if (mem) |m2| backend.registerArena(m2) else false;
+                // Printed either way: a mapping that failed, or one the backend
+                // would not take, is otherwise invisible until someone reads a
+                // page-in counter -- which is exactly how it went unnoticed.
+                try out.print("  weights    mmap {s}{s}\n", .{
+                    if (mem) |m2| blk_s: {
+                        var b: [32]u8 = undefined;
+                        break :blk_s try std.fmt.bufPrint(&b, "{d:.1} GB", .{
+                            @as(f64, @floatFromInt(m2.len)) / (1024.0 * 1024.0 * 1024.0),
+                        });
+                    } else "failed",
+                    if (took) ", registered with the compute backend" else "",
+                });
+                try out.flush();
+            }
             gguf_src = try expert_fetch.Source.initCached(gpa, io, st, peer_list.items, opts.ram_bytes);
             gguf_src.committee = committee_peers.items;
             // resident gate (audit #5 P0-4): the mmap'd resident bundle must be

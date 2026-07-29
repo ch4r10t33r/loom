@@ -562,7 +562,136 @@ pub fn parallelEnd() void {
 /// A weight tensor resolved to its MTLBuffer and byte offset within it.
 pub const Wrapped = struct { buf: mtl.Buffer, off: usize };
 
+/// A registered region, before the device exists to wrap it.
+const Region = struct { base: usize, len: usize, done: bool = false };
+
+/// One device allocation covering part of a region.
+const Chunk = struct { base: usize, len: usize, buf: mtl.Buffer };
+
+/// Module-level rather than part of `Ctx`, because a store is mapped while the
+/// node is still assembling itself and the device is not up until the model
+/// loads. Registering into the context would have silently done nothing -- and
+/// did, until the page-in count refused to move.
+var regions: [MAX_ARENAS]?Region = @splat(null);
+var chunks: [MAX_CHUNKS]?Chunk = @splat(null);
+
+/// One per weight store. Two so a node serving its own GGUF *and* a sharded
+/// store is not a special case.
+const MAX_ARENAS = 2;
+
+/// A region is split across allocations because `maxBufferLength` is around
+/// half of physical RAM; eight covers any store this machine could map.
+const MAX_CHUNKS = 8;
+
+/// Why the last `materializeArenas` failed, for the caller to report. A
+/// mapping that silently declines to become resident is the whole bug this
+/// code exists to fix, so the reason has to be reachable.
+pub var arena_error: ?[]const u8 = null;
+
+/// Take a whole mapping, so every tensor inside it is reachable by offset.
+///
+/// The per-slice cache below keys on the page-aligned base of whatever it is
+/// handed. For a GGUF read as one mapping that already collapses to a single
+/// buffer, but a sharded expert store is read one expert extent at a time, and
+/// those bases are all different -- so the GPU ends up holding thousands of
+/// separate allocations over the same file, none of which keeps the model
+/// resident. Measured against llama.cpp on the same 10.4 GB checkpoint: the
+/// mapped-and-resident arrangement runs at 46.8-58.6 tok/s and faults in 249 MB
+/// over a generation, where per-extent wrapping faulted 6,728 MB and managed 2.5.
+///
+/// Registration only records the region; the device may not exist yet.
+pub fn registerArena(mem: []const u8) bool {
+    const page = std.heap.pageSize();
+    const base = std.mem.alignBackward(usize, @intFromPtr(mem.ptr), page);
+    const end = std.mem.alignForward(usize, @intFromPtr(mem.ptr) + mem.len, page);
+    for (&regions) |*slot| {
+        if (slot.*) |r| {
+            // Already covered: registering twice is not an error, and the
+            // second buffer would be the one wasting address space.
+            if (base >= r.base and end <= r.base + r.len) return true;
+            continue;
+        }
+        slot.* = .{ .base = base, .len = end - base };
+        return true;
+    }
+    return false;
+}
+
+/// Wrap every registered region now that the device exists, and report how many
+/// bytes are device-resident.
+///
+/// Worth doing eagerly and worth reporting: the first version deferred
+/// everything to first use and registered into a context that did not exist
+/// yet, so it silently did nothing and only the page-in counter disagreed.
+pub fn materializeArenas() usize {
+    const cx = &(ctx orelse {
+        arena_error = "no metal device";
+        return 0;
+    });
+    const page = std.heap.pageSize();
+    // Split at the device's own limit, which is around half of physical RAM:
+    // a 9.7 GB store is two allocations on a 16 GB machine and one on a 64 GB
+    // one, and asking for it whole simply fails.
+    const max_one = std.mem.alignBackward(usize, cx.dev.maxBufferLen(), page);
+    if (max_one == 0) {
+        arena_error = "device reports no maximum buffer length";
+        return 0;
+    }
+
+    var total: usize = 0;
+    for (&regions) |*slot| {
+        const r = if (slot.*) |*x| x else continue;
+        if (r.done) {
+            total += r.len;
+            continue;
+        }
+        var off: usize = 0;
+        while (off < r.len) {
+            const take = @min(max_one, r.len - off);
+            const ci = freeChunk() orelse {
+                arena_error = "too many weight regions to make resident";
+                return total;
+            };
+            const buf = cx.dev.wrapHost(@as([*]const u8, @ptrFromInt(r.base + off))[0..take]) catch |e| {
+                arena_error = @errorName(e);
+                return total;
+            };
+            // Wrapping alone only makes the pages addressable by the GPU; they
+            // stay as evictable as any other file mapping, which for a model
+            // larger than the free page cache means faulting the working set
+            // back in every token. Residency is the half that matters.
+            _ = cx.dev.makeResident(buf);
+            chunks[ci] = .{ .base = r.base + off, .len = take, .buf = buf };
+            off += take;
+        }
+        r.done = true;
+        total += r.len;
+    }
+    if (total > 0) arena_error = null;
+    return total;
+}
+
+fn freeChunk() ?usize {
+    for (chunks, 0..) |c, i| {
+        if (c == null) return i;
+    }
+    return null;
+}
+
 fn wrapFor(cx: *Ctx, data: []const u8) ?Wrapped {
+    // A registered mapping covers the slice outright, and hits here before any
+    // allocation happens.
+    const addr = @intFromPtr(data.ptr);
+    for (chunks) |slot| {
+        const ch = slot orelse continue;
+        // Whole slice inside one chunk, or not at all: a tensor straddling a
+        // split has no single buffer to name, and the per-slice path below
+        // handles the handful that do.
+        if (addr >= ch.base and addr + data.len <= ch.base + ch.len) {
+            return .{ .buf = ch.buf, .off = addr - ch.base };
+        }
+    }
+
     const page = std.heap.pageSize();
     const base = std.mem.alignBackward(usize, @intFromPtr(data.ptr), page);
     const end = std.mem.alignForward(usize, @intFromPtr(data.ptr) + data.len, page);

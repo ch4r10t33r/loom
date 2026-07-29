@@ -152,7 +152,13 @@ pub const Source = struct {
     /// Materialize shard `id`. Local tier first; else fetch, verify, persist.
     /// Returns a slice of `self.scratch` (valid until the next get()).
     pub fn get(self: *Source, id: usize) ![]const u8 {
-        if (self.cache) |*c| {
+        // Cache slots are sized for an expert shard, and the resident chunks
+        // are larger -- 16 MB against ~6 MB here. Reading one through the cache
+        // wrote past the end of its slot: with safety off that is a silent heap
+        // overflow, which is what it had been doing on every startup, since the
+        // resident gate reads exactly these shards.
+        if (self.cache) |*c| use_cache: {
+            if (self.store.manifest.rangeLen(id) > c.block_bytes) break :use_cache;
             const seq = self.store.holdingsSeq();
             if (seq != self.cache_seq) {
                 c.clear();
@@ -317,3 +323,69 @@ pub const Source = struct {
         return resp.payload.len;
     }
 };
+
+test "get: a shard larger than a cache slot bypasses the cache instead of overflowing it" {
+    const gpa = std.testing.allocator;
+    var thr: std.Io.Threaded = .init(gpa, .{});
+    defer thr.deinit();
+    const io = thr.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    // One resident chunk of 4 KB and one expert shard of 1 KB: the cache sizes
+    // its slots by the expert, so the resident chunk is four slots wide -- the
+    // shape that was writing past the end of the slab.
+    const resident_len: u64 = 4096;
+    const expert_len: u64 = 1024;
+    var blob = try gpa.alloc(u8, @intCast(resident_len + expert_len));
+    defer gpa.free(blob);
+    for (blob, 0..) |*b, k| b.* = @truncate(k *% 7);
+
+    // Heap-allocated: the store takes ownership of the manifest and frees it.
+    const digests = try gpa.dupe(hashmod.Digest, &.{
+        hashmod.hashBlock(blob[0..@intCast(resident_len)]),
+        hashmod.hashBlock(blob[@intCast(resident_len)..]),
+    });
+    const extents = try gpa.dupe(weights.Extent, &.{
+        .{ .offset = 0, .len = resident_len },
+        .{ .offset = resident_len, .len = expert_len },
+    });
+    const starts = try gpa.dupe(u32, &.{ 0, 1, 2 });
+    const total = resident_len + expert_len;
+    const version = try weights.computeVersion(gpa, .expert, total, 0, digests, extents, starts);
+    const manifest = weights.Manifest{
+        .mode = .expert,
+        .version = version,
+        .file_size = total,
+        .range_size = 0,
+        .n_resident = 1,
+        .digests = digests,
+        .extents = extents,
+        .extent_start = starts,
+    };
+
+    var wanted = try weights.Holdings.initEmpty(gpa, 2);
+    wanted.set(0);
+    wanted.set(1);
+    var store = try weights.createFromManifest(gpa, io, dir, manifest, wanted);
+    defer store.deinit();
+    try store.writeRange(0, blob[0..@intCast(resident_len)]);
+    try store.writeRange(1, blob[@intCast(resident_len)..]);
+
+    // Budget for exactly two expert-sized slots.
+    var src = try Source.initCached(gpa, io, &store, &.{}, 2 * @as(usize, @intCast(expert_len)));
+    defer src.deinit();
+    try std.testing.expect(src.cache != null);
+
+    const got = try src.get(0);
+    try std.testing.expectEqualSlices(u8, blob[0..@intCast(resident_len)], got);
+
+    // The expert still goes through the cache: the bypass is by size, not a
+    // blanket disable.
+    _ = try src.get(1);
+    const before = src.stats.ram;
+    _ = try src.get(1);
+    try std.testing.expect(src.stats.ram > before);
+}

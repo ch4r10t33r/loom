@@ -32,6 +32,30 @@ loom_mtl_buffer loom_mtl_buffer_wrap(loom_mtl_device d, void *ptr, size_t len) {
                                           deallocator:nil];
     return (__bridge_retained void *)buf;
 }
+size_t loom_mtl_max_buffer(loom_mtl_device d) {
+    id<MTLDevice> dev = (__bridge id<MTLDevice>)d;
+    return (size_t)dev.maxBufferLength;
+}
+int loom_mtl_resident(loom_mtl_device d, loom_mtl_queue q, loom_mtl_buffer b) {
+    if (@available(macOS 15.0, *)) {
+        id<MTLDevice> dev = (__bridge id<MTLDevice>)d;
+        id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)q;
+        id<MTLBuffer> buf = (__bridge id<MTLBuffer>)b;
+        MTLResidencySetDescriptor *desc = [[MTLResidencySetDescriptor alloc] init];
+        desc.initialCapacity = 1;
+        NSError *err = nil;
+        id<MTLResidencySet> set = [dev newResidencySetWithDescriptor:desc error:&err];
+        if (set == nil) return 0;
+        [set addAllocation:buf];
+        [set commit];
+        // requestResidency is the part that actually wires the pages; commit
+        // alone only publishes the membership.
+        [set requestResidency];
+        [queue addResidencySet:set];
+        return 1;
+    }
+    return 0;
+}
 loom_mtl_buffer loom_mtl_buffer_alloc(loom_mtl_device d, size_t len) {
     id<MTLDevice> dev = (__bridge id<MTLDevice>)d;
     id<MTLBuffer> buf = [dev newBufferWithLength:len options:MTLResourceStorageModeShared];

@@ -659,6 +659,12 @@ pub const Store = struct {
         self.verified_seq = self.holdingsSeq();
     }
 
+    /// The whole read-only mapping, for a compute backend that wants to make
+    /// the file device-resident in one allocation rather than per extent.
+    pub fn mapping(self: *const Store) ?[]const u8 {
+        return self.map;
+    }
+
     /// Extent `k` of shard `i` as a slice of the mapping, or null when the
     /// store is not mapped, the shard is not held, or it has not verified.
     ///
@@ -740,6 +746,8 @@ pub const Store = struct {
 
     pub fn deinit(self: *Store) void {
         self.file.close(self.io);
+        // Allocated lazily on the first verify, not only by `mapReadOnly`.
+        if (self.verified) |*v| v.deinit(self.gpa);
         self.manifest.deinit(self.gpa);
         self.holdings.deinit(self.gpa);
         self.wanted.deinit(self.gpa);

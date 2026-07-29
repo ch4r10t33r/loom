@@ -82,6 +82,36 @@ pub const WeightRef = impl.WeightRef;
 /// buffer per matvec and can never be fast, whatever the kernels do.
 pub const ffnBlock = impl.ffnBlock;
 
+/// One expert of a MoE layer, as `moeFfnBlock` takes them.
+pub const ExpertRef = impl.ExpertRef;
+
+/// A whole MoE layer -- every routed expert's FFN and the weighted sum of
+/// their outputs -- submitted as one unit. False when the backend declines,
+/// in which case the caller runs the experts itself.
+///
+/// Separate from `ffnBlock` because the accumulation between experts has to
+/// stay on the backend's side: a host-side weighted add between two expert
+/// FFNs ends the command buffer and puts each expert back on its own
+/// submission, which is the whole cost this exists to avoid.
+pub const moeFfnBlock = impl.moeFfnBlock;
+
+/// Register a whole weight mapping as one device allocation.
+///
+/// A backend that wraps host pointers on demand keys them by whatever slice it
+/// is handed, which for a sharded store is one allocation per expert -- and the
+/// model is then never resident, only faulted in a piece at a time. Handing the
+/// mapping over once lets every tensor in it be addressed by offset. False when
+/// the backend has no such notion (the CPU) or the region is too large for it.
+pub const registerArena = impl.registerArena;
+
+/// Make every registered mapping device-resident now that the device is up,
+/// returning the bytes resident. Call once the model is loaded; registration
+/// happens earlier, while the store is being opened.
+pub const materializeArenas = impl.materializeArenas;
+
+/// Why the last `materializeArenas` came back empty, when it did.
+pub const arenaError = &impl.arena_error;
+
 /// Allocate a device-resident KV cache. False means the backend declines and
 /// the engine keeps its own.
 pub const attnInit = impl.attnInit;

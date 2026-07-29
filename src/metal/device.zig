@@ -68,6 +68,19 @@ pub const Device = struct {
         return .{ .handle = b, .len = mem.len };
     }
 
+    /// Largest single allocation this device will make.
+    pub fn maxBufferLen(self: Device) usize {
+        return c.loom_mtl_max_buffer(self.handle);
+    }
+
+    /// Ask the OS to wire `buf`'s pages and keep them wired for this queue.
+    /// False when the OS predates residency sets: the buffer still works, its
+    /// pages are just evictable, which for a multi-gigabyte weight mapping is
+    /// the difference between resident and faulted in per use.
+    pub fn makeResident(self: Device, buf: Buffer) bool {
+        return c.loom_mtl_resident(self.handle, self.queue, buf.handle) != 0;
+    }
+
     /// Shared-storage allocation for activations, which the CPU also touches.
     pub fn alloc(self: Device, len: usize) Error!Buffer {
         const b = c.loom_mtl_buffer_alloc(self.handle, len) orelse return error.BufferCreateFailed;
