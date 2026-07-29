@@ -91,6 +91,28 @@ pub const attnInit = impl.attnInit;
 pub const kvAppend = impl.kvAppend;
 pub const disableAttn = impl.disableAttn;
 
+// ---- frames ------------------------------------------------------------------
+//
+// The unit a GPU backend cares about is the submission, not the kernel. On an
+// M5 a command buffer costs ~262 us against ~18 us for a matvec, and ZINC --
+// whose kernel is at parity with loom's -- drops from 53 to 11.8 tok/s when its
+// timing probe forces a commit between dispatches. So the seam has to let a
+// caller record many operations and submit once, which one-shot entry points
+// cannot express however good the kernels behind them are.
+
+/// Open a recording frame. False means the backend has nothing to batch.
+pub const beginFrame = impl.beginFrame;
+/// Submit and wait. Results are only valid after this returns.
+pub const endFrame = impl.endFrame;
+pub const frameOpen = impl.frameOpen;
+
+/// One whole GQA layer recorded into the open frame, residual included. The
+/// residual stream stays in device memory for the entire token.
+pub const LayerSpec = impl.LayerSpec;
+pub const layerBlock = impl.layerBlock;
+pub const frameLoadX = impl.frameLoadX;
+pub const frameStoreX = impl.frameStoreX;
+
 /// One layer of grouped-query attention against that cache, in one submission.
 /// False means the engine runs its own path.
 pub const attnHeads = impl.attnHeads;

@@ -27,6 +27,54 @@ pub fn attnInit(layers: usize, ctx_len: usize, kvd: usize) bool {
     return false;
 }
 pub fn disableAttn() void {}
+
+pub const LayerSpec = struct {
+    li: usize,
+    pos: usize,
+    attn_norm: []const f32,
+    ffn_norm: []const f32,
+    eps: f32,
+    wq: WeightRef,
+    wk: WeightRef,
+    wv: WeightRef,
+    wo: WeightRef,
+    gate: WeightRef,
+    up: WeightRef,
+    down: WeightRef,
+    dim: usize,
+    ffn: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    hd: usize,
+    rope_dim: usize,
+    rope_base: f32,
+    rope_neox: bool,
+    attn_scale: f32,
+};
+
+/// The CPU has no frame: there is no submission to amortize, so every one of
+/// these declines and the engine runs its own path.
+pub fn beginFrame() bool {
+    return false;
+}
+pub fn endFrame() void {}
+pub fn frameOpen() bool {
+    return false;
+}
+pub fn layerBlock(s: LayerSpec) bool {
+    _ = s;
+    return false;
+}
+pub fn frameLoadX(x: []const f32) bool {
+    _ = x;
+    return false;
+}
+pub fn frameStoreX(x: []f32) bool {
+    _ = x;
+    return false;
+}
+pub var frames_submitted: u64 = 0;
+pub var dispatches_submitted: u64 = 0;
 pub fn kvAppend(li: usize, pos: usize, k_new: []const f32, v_new: []const f32) bool {
     _ = .{ li, pos, k_new, v_new };
     return false;
