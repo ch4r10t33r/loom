@@ -630,6 +630,8 @@ pub const Store = struct {
     /// first use still catches a poisoned block (audit #5 P0-2); re-hashing
     /// ~950 MB per token to re-confirm bytes we already vouched for does not.
     /// Reset wholesale whenever `seq` moves, i.e. whenever a shard is written.
+    /// Shards whose digest has been checked this session. Allocated lazily on
+    /// first use so it applies to the pread path as well as the mapped one.
     verified: ?Holdings = null,
     verified_seq: u64 = 0,
 
@@ -683,6 +685,27 @@ pub const Store = struct {
     /// Hash shard `i` out of the mapping once, remembering the result. A
     /// mismatch clears the holdings bit exactly as `readRangeVerified` does,
     /// so eager repair re-fetches.
+    /// True if shard `i` has already been verified this session. Also handles
+    /// the generation reset, so callers need not.
+    fn markVerifiedOnce(self: *Store, i: usize) bool {
+        const seq = self.holdingsSeq();
+        if (self.verified) |*v| {
+            if (seq != self.verified_seq) {
+                v.clearAll();
+                self.verified_seq = seq;
+                return false;
+            }
+            return v.has(i);
+        }
+        self.verified = Holdings.initEmpty(self.gpa, self.manifest.nRanges()) catch return false;
+        self.verified_seq = seq;
+        return false;
+    }
+
+    fn setVerified(self: *Store, i: usize) void {
+        if (self.verified) |*v| v.set(i);
+    }
+
     fn ensureVerified(self: *Store, i: usize) bool {
         var v = &(self.verified orelse return false);
         const seq = self.holdingsSeq();
@@ -750,12 +773,27 @@ pub const Store = struct {
     /// the bit is cleared so eager repair re-fetches a good copy.
     pub fn readRangeVerified(self: *Store, i: usize, buf: []u8) ![]u8 {
         const data = try self.readRange(i, buf);
+        // Hash once per shard per session, not on every read.
+        //
+        // The property being defended (audit #5 P0-2) is that a poisoned or
+        // bitrotted block on disk never reaches a matmul. Checking on first
+        // read establishes that; checking again on the ten-thousandth read of
+        // the same bytes, from the same file, in the same process, establishes
+        // nothing new -- and it is not cheap. Measured on DeepSeek-V2-Lite,
+        // 27 shards per token miss the RAM cache and each one hashes 4.6 MB,
+        // about 80 ms/token of the 249 ms spent in `get`.
+        //
+        // The bit resets whenever `seq` moves, i.e. whenever any shard is
+        // written or a verification fails, so a repaired or refetched shard is
+        // always re-checked.
+        if (self.markVerifiedOnce(i)) return data;
         const got = hashmod.hashBlock(data);
         if (!hashmod.eql(got, self.manifest.digests[i])) {
             self.holdings.clear(i);
             _ = self.seq.fetchAdd(1, .monotonic);
             return error.RangeDigestMismatch;
         }
+        self.setVerified(i);
         return data;
     }
 
