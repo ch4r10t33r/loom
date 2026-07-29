@@ -473,6 +473,25 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     var advertise_buf: [128]u8 = undefined;
     const advertise = opts.advertise orelse
         try std.fmt.bufPrint(&advertise_buf, "127.0.0.1:{d}", .{opts.p2p_port});
+    // Loopback is the right default for a single box and silently wrong the
+    // moment a peer is not on it: the node still gossips, still fetches, and
+    // still looks healthy, because it only ever dials outward. What breaks is
+    // everything that needs someone to dial *in* -- the >=2-sources guarantee,
+    // and any repair a peer would initiate to recover shards this node holds.
+    // Measured across two machines: the remote origin listed this node as a
+    // holder of hundreds of shards it could not reach.
+    if (opts.advertise == null and peer_strs.items.len > 0) {
+        var external = false;
+        for (peer_strs.items) |ps| {
+            if (!std.mem.startsWith(u8, ps, "127.0.0.1") and !std.mem.startsWith(u8, ps, "localhost")) external = true;
+        }
+        if (external) try out.print(
+            "  WARNING    advertising {s} to non-local peers; they cannot dial back.\n" ++
+                "             Pass --advertise <reachable-host>:{d} or this node can never\n" ++
+                "             serve a shard it holds, and redundancy targets will not be met.\n",
+            .{ advertise, opts.p2p_port },
+        );
+    }
     var table = peers.Table.init(gpa, io, advertise);
     defer table.deinit();
     const zero_version = "0" ** 64;
