@@ -70,6 +70,7 @@ const dmmv_q4k_src = @embedFile("../shaders/metal/dmmv_q4k.metal");
 const dmmv_q6k_src = @embedFile("../shaders/metal/dmmv_q6k.metal");
 const gemm_q4k_src = @embedFile("../shaders/metal/gemm_q4k.metal");
 const attn_src = @embedFile("../shaders/metal/attn.metal");
+const rope_src = @embedFile("../shaders/metal/rope.metal");
 const elementwise_src = @embedFile("../shaders/metal/elementwise.metal");
 
 /// Below this many rows the CPU path wins outright, so the GPU is not used.
@@ -403,6 +404,8 @@ const Ctx = struct {
     q6k: mtl.Pipeline,
     gemm_q4k: mtl.Pipeline,
     attn_p: mtl.Pipeline,
+    rope_p: mtl.Pipeline,
+    kvw_p: mtl.Pipeline,
     /// Device-resident KV cache, [layers][ctx][kvd]. Allocated by `attnInit`.
     /// It lives here rather than in the engine's State because the whole point
     /// is that it never crosses the bus: only the one new row per layer per
@@ -418,7 +421,12 @@ const Ctx = struct {
     /// Device-resident activation scratch. The whole point of keeping these
     /// on the GPU is that a block of work can be encoded into one command
     /// buffer without the host reading anything in between.
-    act: [4]mtl.Buffer,
+    /// Device-resident activation slots. Eight rather than four because a
+    /// whole layer has to be recordable without touching the host: x, normed,
+    /// q, k, v, attn_out, gate, up. Anything that has to come back to the CPU
+    /// mid-layer ends the command buffer, which is the cost the whole design
+    /// exists to avoid.
+    act: [8]mtl.Buffer,
     /// Weight buffers are keyed by the page-aligned base of the mapping they
     /// came from, so one MTLBuffer serves every tensor in a GGUF rather than
     /// one per tensor.
@@ -463,6 +471,14 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const prope = dev.pipeline(rope_src, "rope_apply") catch {
+        dev.deinit();
+        return;
+    };
+    const pkvw = dev.pipeline(rope_src, "kv_write") catch {
+        dev.deinit();
+        return;
+    };
     const pn = dev.pipeline(elementwise_src, "rmsnorm") catch {
         dev.deinit();
         return;
@@ -475,7 +491,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    var act: [4]mtl.Buffer = undefined;
+    var act: [8]mtl.Buffer = undefined;
     for (&act) |*b| {
         b.* = dev.alloc(1 << 22) catch {
             dev.deinit();
@@ -490,7 +506,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .gemm_q4k = pg, .attn_p = pattn, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .gemm_q4k = pg, .attn_p = pattn, .rope_p = prope, .kvw_p = pkvw, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -536,6 +552,17 @@ fn wrapFor(cx: *Ctx, data: []const u8) ?struct { buf: mtl.Buffer, off: usize } {
 }
 
 const Dims = extern struct { rows: u32, cols: u32 };
+
+const RopeDims = extern struct {
+    n_heads: u32,
+    hd: u32,
+    rope_dim: u32,
+    pos: u32,
+    base: f32,
+    neox: u32,
+};
+
+const KvWriteDims = extern struct { kvd: u32, row: u32 };
 
 const AttnDims = extern struct {
     n_heads: u32,
@@ -641,6 +668,53 @@ pub fn calibrateAttn(gpa: std.mem.Allocator, n_heads: usize, n_kv_heads: usize, 
     verdict.attn_cpu_ms = @as(f64, @floatFromInt(c)) / 1e6;
 }
 
+// ---- frame: one command buffer for many operations ---------------------------
+
+/// An open recording frame. Operations encode into its encoder and nothing is
+/// committed until `endFrame`, so a whole token can cost one submission
+/// instead of one per operation.
+///
+/// This is the entire point of the exercise. A command buffer costs ~262 us on
+/// this machine against ~18 us for a matvec kernel, and ZINC -- whose kernels
+/// are at parity with loom's -- drops from 53 to 11.8 tok/s when its timing
+/// probe forces a commit between dispatches. Loom issued ~150 command buffers
+/// per token before this existed.
+const Frame = struct {
+    cb: mtl.CommandBuffer,
+    enc: mtl.Encoder,
+    dispatches: u32 = 0,
+};
+var frame: ?Frame = null;
+/// Command buffers and dispatches submitted since the last reset, so the
+/// per-token count is observable rather than inferred. ZINC tracks the same
+/// numbers for the same reason: without them a 2.89 -> 1.89 change cannot be
+/// told from noise.
+pub var frames_submitted: u64 = 0;
+pub var dispatches_submitted: u64 = 0;
+
+pub fn beginFrame() bool {
+    const cx = &(ctx orelse return false);
+    if (frame != null) return true;
+    const cb = cx.dev.commandBuffer();
+    frame = .{ .cb = cb, .enc = cb.encoder() };
+    return true;
+}
+
+/// Close and submit the frame. Blocking: the caller needs the results.
+pub fn endFrame() void {
+    if (frame) |*f| {
+        f.enc.end();
+        f.cb.commitAndWait();
+        frames_submitted += 1;
+        dispatches_submitted += f.dispatches;
+        frame = null;
+    }
+}
+
+pub fn frameOpen() bool {
+    return frame != null;
+}
+
 /// Force fused attention off, whatever calibration concluded.
 pub fn disableAttn() void {
     attn_worthwhile = false;
@@ -717,6 +791,173 @@ pub fn attnHeads(
     );
     cb.commitAndWait();
     @memcpy(out, cx.scratch_out.slice(f32)[0..out.len]);
+    return true;
+}
+
+/// Everything one GQA layer needs, so the whole layer is one call.
+pub const LayerSpec = struct {
+    li: usize,
+    pos: usize,
+    attn_norm: []const f32,
+    ffn_norm: []const f32,
+    eps: f32,
+    wq: WeightRef,
+    wk: WeightRef,
+    wv: WeightRef,
+    wo: WeightRef,
+    gate: WeightRef,
+    up: WeightRef,
+    down: WeightRef,
+    dim: usize,
+    ffn: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    hd: usize,
+    rope_dim: usize,
+    rope_base: f32,
+    rope_neox: bool,
+    attn_scale: f32,
+};
+
+/// Record one whole GQA layer into the open frame: norm, q/k/v projections,
+/// RoPE, KV append, attention, output projection, residual, then the FFN
+/// block. The residual stream stays in act[0] for the entire token and is
+/// never read by the host in between.
+///
+/// Returns false if anything about the layer is unsupported, in which case the
+/// caller runs its own path -- but note that a mid-token decline is not free:
+/// the engine has to fall back for the *whole* token, because act[0] is the
+/// only copy of the residual once recording has started.
+pub fn layerBlock(s: LayerSpec) bool {
+    const cx = &(ctx orelse return false);
+    const f = &(frame orelse return false);
+    const kb = cx.kv_k orelse return false;
+    const vb = cx.kv_v orelse return false;
+
+    const gp = pipelineFor(cx, s.gate.ty) orelse return false;
+    const upp = pipelineFor(cx, s.up.ty) orelse return false;
+    const dp = pipelineFor(cx, s.down.ty) orelse return false;
+    const qp = pipelineFor(cx, s.wq.ty) orelse return false;
+    const kp = pipelineFor(cx, s.wk.ty) orelse return false;
+    const vp = pipelineFor(cx, s.wv.ty) orelse return false;
+    const op = pipelineFor(cx, s.wo.ty) orelse return false;
+
+    const kvd = s.n_kv_heads * s.hd;
+    const qd = s.n_heads * s.hd;
+    if (kvd != cx.kv_kvd or s.pos >= cx.kv_ctx) return false;
+    if (s.dim % 256 != 0 or s.ffn % 256 != 0) return false;
+    if (@max(s.ffn, qd) * 4 > cx.act[0].len) return false;
+
+    const qw = wrapFor(cx, s.wq.data) orelse return false;
+    const kw = wrapFor(cx, s.wk.data) orelse return false;
+    const vw = wrapFor(cx, s.wv.data) orelse return false;
+    const ow = wrapFor(cx, s.wo.data) orelse return false;
+    const gw = wrapFor(cx, s.gate.data) orelse return false;
+    const uw = wrapFor(cx, s.up.data) orelse return false;
+    const dw = wrapFor(cx, s.down.data) orelse return false;
+
+    // Norm weights are small and change per layer; they ride in scratch_x,
+    // which nothing else holds across a dispatch.
+    if ((s.dim * 2) * 4 > cx.scratch_x.len) return false;
+    const sx = cx.scratch_x.slice(f32);
+    @memcpy(sx[0..s.dim], s.attn_norm);
+    @memcpy(sx[s.dim..][0..s.dim], s.ffn_norm);
+
+    const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+    const nd_attn = extern struct { n: u32, eps: f32 }{ .n = @intCast(s.dim), .eps = s.eps };
+    const dims_q = Dims{ .rows = @intCast(qd), .cols = @intCast(s.dim) };
+    const dims_kv = Dims{ .rows = @intCast(kvd), .cols = @intCast(s.dim) };
+    const dims_o = Dims{ .rows = @intCast(s.dim), .cols = @intCast(qd) };
+    const dims_ffn = Dims{ .rows = @intCast(s.ffn), .cols = @intCast(s.dim) };
+    const dims_down = Dims{ .rows = @intCast(s.dim), .cols = @intCast(s.ffn) };
+    const len_ffn = extern struct { n: u32 }{ .n = @intCast(s.ffn) };
+    const len_dim = extern struct { n: u32 }{ .n = @intCast(s.dim) };
+    const rope_q = RopeDims{
+        .n_heads = @intCast(s.n_heads),
+        .hd = @intCast(s.hd),
+        .rope_dim = @intCast(s.rope_dim),
+        .pos = @intCast(s.pos),
+        .base = s.rope_base,
+        .neox = if (s.rope_neox) 1 else 0,
+    };
+    const rope_k = RopeDims{
+        .n_heads = @intCast(s.n_kv_heads),
+        .hd = @intCast(s.hd),
+        .rope_dim = @intCast(s.rope_dim),
+        .pos = @intCast(s.pos),
+        .base = s.rope_base,
+        .neox = if (s.rope_neox) 1 else 0,
+    };
+    const kvw = KvWriteDims{
+        .kvd = @intCast(kvd),
+        .row = @intCast((s.li * cx.kv_ctx + s.pos) * kvd),
+    };
+    const attn = AttnDims{
+        .n_heads = @intCast(s.n_heads),
+        .n_kv_heads = @intCast(s.n_kv_heads),
+        .hd = @intCast(s.hd),
+        .seq = @intCast(s.pos + 1),
+        .kvd = @intCast(kvd),
+        .scale = s.attn_scale,
+    };
+    const layer_off = s.li * cx.kv_ctx * cx.kv_kvd * @sizeOf(f32);
+
+    // Slots: 0 = x (residual, lives across the whole token), 1 = normed,
+    // 2 = q, 3 = k, 4 = v, 5 = attn_out, 6 = gate, 7 = up.
+    const e = f.enc;
+    // normed = rmsnorm(x) * attn_norm
+    e.dispatch(cx.rmsnorm_p, &.{ cx.act[0], cx.scratch_x, cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&nd_attn), SIMD_W, SIMD_W);
+    e.barrier();
+    // q, k, v — mutually independent, so no barrier between them
+    e.dispatch(qp, &.{ qw.buf, cx.act[1], cx.act[2] }, &.{ qw.off, 0, 0 }, std.mem.asBytes(&dims_q), ((qd + 1) / 2) * SIMD_W, group);
+    e.dispatch(kp, &.{ kw.buf, cx.act[1], cx.act[3] }, &.{ kw.off, 0, 0 }, std.mem.asBytes(&dims_kv), ((kvd + 1) / 2) * SIMD_W, group);
+    e.dispatch(vp, &.{ vw.buf, cx.act[1], cx.act[4] }, &.{ vw.off, 0, 0 }, std.mem.asBytes(&dims_kv), ((kvd + 1) / 2) * SIMD_W, group);
+    e.barrier();
+    // RoPE q and k in place; v is not rotated
+    e.dispatch(cx.rope_p, &.{cx.act[2]}, &.{0}, std.mem.asBytes(&rope_q), s.n_heads * (s.rope_dim / 2), 64);
+    e.dispatch(cx.rope_p, &.{cx.act[3]}, &.{0}, std.mem.asBytes(&rope_k), s.n_kv_heads * (s.rope_dim / 2), 64);
+    e.barrier();
+    // append k,v to the device cache at [li][pos]
+    e.dispatch(cx.kvw_p, &.{ cx.act[3], cx.act[4], kb, vb }, &.{ 0, 0, 0, 0 }, std.mem.asBytes(&kvw), kvd, 64);
+    e.barrier();
+    // attention over positions 0..=pos
+    e.dispatch(cx.attn_p, &.{ cx.act[2], kb, vb, cx.act[5] }, &.{ 0, layer_off, layer_off, 0 }, std.mem.asBytes(&attn), s.n_heads * 64, 64);
+    e.barrier();
+    // x += Wo . attn_out   (into act[1], then added)
+    e.dispatch(op, &.{ ow.buf, cx.act[5], cx.act[1] }, &.{ ow.off, 0, 0 }, std.mem.asBytes(&dims_o), ((s.dim + 1) / 2) * SIMD_W, group);
+    e.barrier();
+    e.dispatch(cx.add_p, &.{ cx.act[0], cx.act[1] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), s.dim, 64);
+    e.barrier();
+    // ---- FFN ----
+    const nd_ffn = extern struct { n: u32, eps: f32 }{ .n = @intCast(s.dim), .eps = s.eps };
+    e.dispatch(cx.rmsnorm_p, &.{ cx.act[0], cx.scratch_x, cx.act[1] }, &.{ 0, s.dim * @sizeOf(f32), 0 }, std.mem.asBytes(&nd_ffn), SIMD_W, SIMD_W);
+    e.barrier();
+    e.dispatch(gp, &.{ gw.buf, cx.act[1], cx.act[6] }, &.{ gw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ((s.ffn + 1) / 2) * SIMD_W, group);
+    e.dispatch(upp, &.{ uw.buf, cx.act[1], cx.act[7] }, &.{ uw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ((s.ffn + 1) / 2) * SIMD_W, group);
+    e.barrier();
+    e.dispatch(cx.swiglu_p, &.{ cx.act[6], cx.act[7], cx.act[6] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_ffn), s.ffn, 64);
+    e.barrier();
+    e.dispatch(dp, &.{ dw.buf, cx.act[6], cx.act[1] }, &.{ dw.off, 0, 0 }, std.mem.asBytes(&dims_down), ((s.dim + 1) / 2) * SIMD_W, group);
+    e.barrier();
+    e.dispatch(cx.add_p, &.{ cx.act[0], cx.act[1] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), s.dim, 64);
+    e.barrier();
+    f.dispatches += 15;
+    return true;
+}
+
+/// Load the residual stream into the device slot the layer chain runs on.
+pub fn frameLoadX(x: []const f32) bool {
+    const cx = &(ctx orelse return false);
+    if (x.len * 4 > cx.act[0].len) return false;
+    @memcpy(cx.act[0].slice(f32)[0..x.len], x);
+    return true;
+}
+
+/// Read it back. Only valid after `endFrame`.
+pub fn frameStoreX(x: []f32) bool {
+    const cx = &(ctx orelse return false);
+    if (x.len * 4 > cx.act[0].len) return false;
+    @memcpy(x, cx.act[0].slice(f32)[0..x.len]);
     return true;
 }
 
@@ -1020,6 +1261,224 @@ test "metal fused attention matches the cpu head loop" {
                 return e;
             };
         }
+    }
+}
+
+test "metal layer block matches the cpu layer, end to end" {
+    // A whole layer recorded into one command buffer, against the same
+    // sequence run on the host. This has to exist before the engine is wired
+    // to it: the failure mode of a wrong RoPE pairing, a wrong KV row offset
+    // or a dropped residual is output that still reads fluently, and this
+    // session has already shipped that once.
+    //
+    // RoPE is reimplemented here rather than called, so the test is an
+    // independent statement of the rotation, not the same code twice.
+    const gpa = std.testing.allocator;
+    const dim = 256;
+    const ffn = 512;
+    const n_heads = 4;
+    const n_kv_heads = 2;
+    const hd = 64;
+    const rope_dim = 64;
+    const rope_base: f32 = 10000.0;
+    const eps: f32 = 1e-5;
+    const li = 1;
+    const layers = 3;
+    const ctx_len = 64;
+    const qd = n_heads * hd;
+    const kvd = n_kv_heads * hd;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+    if (!attnInit(layers, ctx_len, kvd)) return error.SkipZigTest;
+
+    const saved_use = use_gpu_ops;
+    const saved_attn = attn_worthwhile;
+    use_gpu_ops = true;
+    attn_worthwhile = true;
+    defer {
+        use_gpu_ops = saved_use;
+        attn_worthwhile = saved_attn;
+    }
+
+    var prng = std.Random.DefaultPrng.init(0x1A4E5);
+    const rnd = prng.random();
+
+    // Random bytes give random f16 super-block scales, which reach ~65504;
+    // chaining seven matvecs then produces values around 1e22 where a relative
+    // comparison means nothing. Pin d and dmin to modest constants (0.0625 and
+    // 0.03125) so the layer stays in a range where a tolerance is meaningful.
+    // The quantized nibbles stay random, which is what the kernel indexes.
+    const mk = struct {
+        // The alignment has to survive into the return type or the caller frees
+        // with alignment 1 and the allocator rejects it.
+        fn f(g: std.mem.Allocator, r: std.Random, rows: usize, cols: usize) ![]align(16384) u8 {
+            const d = try g.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, cols, rows));
+            r.bytes(d);
+            var b: usize = 0;
+            while (b + 144 <= d.len) : (b += 144) {
+                std.mem.writeInt(u16, d[b..][0..2], 0x2C00, .little); // d = 0.0625
+                std.mem.writeInt(u16, d[b + 2 ..][0..2], 0x2800, .little); // dmin = 0.03125
+            }
+            return d;
+        }
+    }.f;
+
+    const wq = try mk(gpa, rnd, qd, dim);
+    defer gpa.free(wq);
+    const wk = try mk(gpa, rnd, kvd, dim);
+    defer gpa.free(wk);
+    const wv = try mk(gpa, rnd, kvd, dim);
+    defer gpa.free(wv);
+    const wo = try mk(gpa, rnd, dim, qd);
+    defer gpa.free(wo);
+    const wg = try mk(gpa, rnd, ffn, dim);
+    defer gpa.free(wg);
+    const wu = try mk(gpa, rnd, ffn, dim);
+    defer gpa.free(wu);
+    const wd = try mk(gpa, rnd, dim, ffn);
+    defer gpa.free(wd);
+
+    const an = try gpa.alloc(f32, dim);
+    defer gpa.free(an);
+    const fn_ = try gpa.alloc(f32, dim);
+    defer gpa.free(fn_);
+    for (an) |*v| v.* = 0.5 + rnd.float(f32);
+    for (fn_) |*v| v.* = 0.5 + rnd.float(f32);
+
+    const x0 = try gpa.alloc(f32, dim);
+    defer gpa.free(x0);
+    for (x0) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    const spec = LayerSpec{
+        .li = li,
+        .pos = 0,
+        .attn_norm = an,
+        .ffn_norm = fn_,
+        .eps = eps,
+        .wq = .{ .ty = .q4_k, .data = wq },
+        .wk = .{ .ty = .q4_k, .data = wk },
+        .wv = .{ .ty = .q4_k, .data = wv },
+        .wo = .{ .ty = .q4_k, .data = wo },
+        .gate = .{ .ty = .q4_k, .data = wg },
+        .up = .{ .ty = .q4_k, .data = wu },
+        .down = .{ .ty = .q4_k, .data = wd },
+        .dim = dim,
+        .ffn = ffn,
+        .n_heads = n_heads,
+        .n_kv_heads = n_kv_heads,
+        .hd = hd,
+        .rope_dim = rope_dim,
+        .rope_base = rope_base,
+        .rope_neox = false,
+        .attn_scale = scale,
+    };
+
+    const got = try gpa.alloc(f32, dim);
+    defer gpa.free(got);
+    if (!beginFrame()) return error.SkipZigTest;
+    if (!frameLoadX(x0)) return error.SkipZigTest;
+    if (!layerBlock(spec)) {
+        endFrame();
+        return error.SkipZigTest;
+    }
+    endFrame();
+    if (!frameStoreX(got)) return error.SkipZigTest;
+
+    // ---- host reference ----
+    const want = try gpa.alloc(f32, dim);
+    defer gpa.free(want);
+    @memcpy(want, x0);
+    const normed = try gpa.alloc(f32, dim);
+    defer gpa.free(normed);
+    const q = try gpa.alloc(f32, qd);
+    defer gpa.free(q);
+    const k = try gpa.alloc(f32, kvd);
+    defer gpa.free(k);
+    const v = try gpa.alloc(f32, kvd);
+    defer gpa.free(v);
+    const ao = try gpa.alloc(f32, qd);
+    defer gpa.free(ao);
+    const tmp = try gpa.alloc(f32, @max(dim, ffn));
+    defer gpa.free(tmp);
+    const gbuf = try gpa.alloc(f32, ffn);
+    defer gpa.free(gbuf);
+    const ubuf = try gpa.alloc(f32, ffn);
+    defer gpa.free(ubuf);
+
+    // Exact dequantize-then-dot, not cpu.matvec: the CPU Q4_K kernel quantizes
+    // activations to int8 and is approximate by design (~0.4% per element).
+    // Chained across seven matvecs that compounds into percent-level drift and
+    // would be reported here as a GPU bug -- which is exactly what the first
+    // version of this test did.
+    const exact = struct {
+        fn f(g: std.mem.Allocator, o: []f32, data: []const u8, xv: []const f32, rows: usize, cols: usize) !void {
+            const rowbuf = try g.alloc(f32, cols);
+            defer g.free(rowbuf);
+            for (0..rows) |r| {
+                cpu.dequantRow(.q4_k, rowbuf, data, r, cols);
+                var a: f32 = 0;
+                for (rowbuf, xv) |wv2, x2| a += wv2 * x2;
+                o[r] = a;
+            }
+        }
+    }.f;
+
+    cpu.rmsnorm(normed, want, an, eps);
+    try exact(gpa, q, wq, normed, qd, dim);
+    try exact(gpa, k, wk, normed, kvd, dim);
+    try exact(gpa, v, wv, normed, kvd, dim);
+
+    // NORM RoPE, stated independently of the engine's implementation.
+    const rope = struct {
+        fn f(vec: []f32, nh: usize, head_dim: usize, rd: usize, pos: usize, base: f32) void {
+            for (0..nh) |h| {
+                const head = vec[h * head_dim ..][0..head_dim];
+                var i: usize = 0;
+                while (i + 1 < rd) : (i += 2) {
+                    const fr = std.math.pow(f32, base, -@as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(rd)));
+                    const ang = @as(f32, @floatFromInt(pos)) * fr;
+                    const c = @cos(ang);
+                    const sn = @sin(ang);
+                    const a = head[i];
+                    const b = head[i + 1];
+                    head[i] = a * c - b * sn;
+                    head[i + 1] = a * sn + b * c;
+                }
+            }
+        }
+    }.f;
+    rope(q, n_heads, hd, rope_dim, 0, rope_base);
+    rope(k, n_kv_heads, hd, rope_dim, 0, rope_base);
+
+    // seq == 1, so softmax over one score is exactly 1 and attn_out == v.
+    const q_per_kv = n_heads / n_kv_heads;
+    for (0..n_heads) |h| {
+        const kvh = h / q_per_kv;
+        @memcpy(ao[h * hd ..][0..hd], v[kvh * hd ..][0..hd]);
+    }
+    try exact(gpa, tmp[0..dim], wo, ao, dim, qd);
+    cpu.add(want, tmp[0..dim]);
+
+    cpu.rmsnorm(normed, want, fn_, eps);
+    try exact(gpa, gbuf, wg, normed, ffn, dim);
+    try exact(gpa, ubuf, wu, normed, ffn, dim);
+    cpu.swiglu(gbuf, gbuf, ubuf);
+    try exact(gpa, tmp[0..dim], wd, gbuf, dim, ffn);
+    cpu.add(want, tmp[0..dim]);
+
+    var mass: f32 = 0;
+    for (want) |wv2| mass += @abs(wv2);
+    // Against the mean magnitude of the result, not each element: a residual
+    // stream has elements near zero where a relative bound is meaningless.
+    const tol = (mass / @as(f32, @floatFromInt(dim))) * 1e-3;
+    for (0..dim) |i| {
+        std.testing.expectApproxEqAbs(want[i], got[i], tol) catch |e| {
+            std.debug.print("layer block dim {d}: cpu {d} vs gpu {d} (tol {d})\n", .{ i, want[i], got[i], tol });
+            return e;
+        };
     }
 }
 
