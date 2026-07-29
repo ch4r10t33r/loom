@@ -724,25 +724,32 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
         const cache_base = (li * cfg.ctx_len + pos) * kvd;
         @memcpy(st.k_cache[cache_base..][0..kvd], st.k);
         @memcpy(st.v_cache[cache_base..][0..kvd], st.v);
+        _ = backend.kvAppend(li, pos, st.k, st.v);
 
         // per-head attention over positions 0..=pos
         const seq = pos + 1;
-        h = 0;
-        while (h < cfg.n_heads) : (h += 1) {
-            const kvh = h / q_per_kv;
-            const qh = st.q[h * hd ..][0..hd];
-            var t_i: usize = 0;
-            while (t_i < seq) : (t_i += 1) {
-                const kt = st.k_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
-                st.scores[t_i] = backend.dotF32(qh, kt) * scale;
-            }
-            backend.softmax(st.scores[0..seq]);
-            const oh = st.attn_out[h * hd ..][0..hd];
-            @memset(oh, 0);
-            t_i = 0;
-            while (t_i < seq) : (t_i += 1) {
-                const vt = st.v_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
-                backend.axpy(oh, vt, st.scores[t_i]);
+        // Offer the whole head loop to the backend first. The host cache above
+        // is still written either way: the backend keeps its own device copy,
+        // and if it ever declines mid-generation the engine's cache has to be
+        // authoritative or the fallback produces garbage.
+        if (!backend.attnHeads(li, pos, st.q, st.attn_out, cfg.n_heads, cfg.n_kv_heads, hd, scale)) {
+            h = 0;
+            while (h < cfg.n_heads) : (h += 1) {
+                const kvh = h / q_per_kv;
+                const qh = st.q[h * hd ..][0..hd];
+                var t_i: usize = 0;
+                while (t_i < seq) : (t_i += 1) {
+                    const kt = st.k_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
+                    st.scores[t_i] = backend.dotF32(qh, kt) * scale;
+                }
+                backend.softmax(st.scores[0..seq]);
+                const oh = st.attn_out[h * hd ..][0..hd];
+                @memset(oh, 0);
+                t_i = 0;
+                while (t_i < seq) : (t_i += 1) {
+                    const vt = st.v_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
+                    backend.axpy(oh, vt, st.scores[t_i]);
+                }
             }
         }
         mv(l.attn_output, st.proj_out, st.attn_out);
@@ -901,6 +908,7 @@ pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usi
             const base = (li * cfg.ctx_len + pos) * kvd;
             @memcpy(st.k_cache[base..][0..kvd], kk);
             @memcpy(st.v_cache[base..][0..kvd], vk);
+            _ = backend.kvAppend(li, pos_base + k, kk, vk);
         }
 
         // Causal: token k sees positions 0..pos_base+k only, even though the

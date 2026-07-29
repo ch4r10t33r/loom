@@ -32,7 +32,7 @@ const GemmDims = extern struct { rows: u32, cols: u32, n: u32 };
 pub fn matmul(t: ggml.Type, out: []f32, data: []const u8, xs: []const f32, n: usize, rows: usize, cols: usize) void {
     if (n <= 1) return matvec(t, out, data, xs, rows, cols);
     const cx = &(ctx orelse return cpu.matmul(t, out, data, xs, n, rows, cols));
-    if (!gemm_worthwhile and calibrated and !calibrating) return cpu.matmul(t, out, data, xs, n, rows, cols);
+    if (!calibrating and (!use_gpu_ops or !gemm_worthwhile) and calibrated) return cpu.matmul(t, out, data, xs, n, rows, cols);
     if (t != .q4_k or n > MAX_BATCH or cols % 256 != 0) {
         return cpu.matmul(t, out, data, xs, n, rows, cols);
     }
@@ -69,6 +69,7 @@ pub const MAX_BATCH = cpu.MAX_BATCH;
 const dmmv_q4k_src = @embedFile("../shaders/metal/dmmv_q4k.metal");
 const dmmv_q6k_src = @embedFile("../shaders/metal/dmmv_q6k.metal");
 const gemm_q4k_src = @embedFile("../shaders/metal/gemm_q4k.metal");
+const attn_src = @embedFile("../shaders/metal/attn.metal");
 const elementwise_src = @embedFile("../shaders/metal/elementwise.metal");
 
 /// Below this many rows the CPU path wins outright, so the GPU is not used.
@@ -130,12 +131,33 @@ var ffn_worthwhile: bool = false;
 /// Measured separately from decode: a batch reuses each weight n times, so the
 /// arithmetic intensity -- and therefore the answer -- is different.
 var gemm_worthwhile: bool = false;
+/// Whether fused attention beat the engine's own head loop. Off until
+/// measured: one command buffer per layer is a real cost, and at short
+/// sequences the CPU loop is trivial.
+var attn_worthwhile: bool = false;
 var calibrated: bool = false;
 /// True only while `calibrate` is running. Without it the gate below refuses
 /// the very call that is supposed to measure the block: `calibrate` marks
 /// itself done on entry, and `ffn_worthwhile` starts false, so the probe was
 /// declined and the block reported "cpu" without ever having been timed.
 var calibrating: bool = false;
+
+/// Master switch for acting on the calibration verdict.
+///
+/// Off by default, and the reason is a measurement failure worth recording.
+/// Calibration times each operation in a tight loop, where consecutive
+/// `commitAndWait` calls pipeline and the GPU's per-submission latency is
+/// largely hidden. In the engine each operation is separated by other work and
+/// pays that latency in full. The gap is not subtle: isolated calibration
+/// reported the fused FFN block at 1.107 ms against a CPU 9.837 ms and enabled
+/// every GPU path, and end-to-end decode then fell from 56 to 9.1 tok/s on the
+/// same model -- a 6x regression chosen by a measurement that looked rigorous.
+///
+/// The verdict is still computed and printed, because it is useful to see. It
+/// is simply not acted on until calibration measures a representative
+/// sequence -- a whole layer as the engine issues it -- rather than one
+/// operation at a time. `--gpu-ops` opts in for experiments.
+pub var use_gpu_ops: bool = false;
 
 /// How much faster the GPU must be before it is chosen. 1.25 = 25%.
 ///
@@ -157,6 +179,9 @@ pub const Verdict = struct {
     matvec_used: bool,
     ffn_used: bool,
     prefill_used: bool = false,
+    attn_used: bool = false,
+    attn_gpu_ms: f64 = 0,
+    attn_cpu_ms: f64 = 0,
     ffn_gpu_ms: f64 = 0,
     ffn_cpu_ms: f64 = 0,
 };
@@ -180,6 +205,8 @@ pub const Shape = struct {
     rows: usize,
     cols: usize,
 };
+
+pub const AttnShape = struct { n_heads: usize, n_kv_heads: usize, hd: usize, seq: usize };
 
 pub fn calibrate(gpa: std.mem.Allocator, dim: usize, ffn: usize, shapes: []const Shape, triple: ?[3]Shape) void {
     if (calibrated) return;
@@ -375,6 +402,16 @@ const Ctx = struct {
     q4k: mtl.Pipeline,
     q6k: mtl.Pipeline,
     gemm_q4k: mtl.Pipeline,
+    attn_p: mtl.Pipeline,
+    /// Device-resident KV cache, [layers][ctx][kvd]. Allocated by `attnInit`.
+    /// It lives here rather than in the engine's State because the whole point
+    /// is that it never crosses the bus: only the one new row per layer per
+    /// token is written, O(kvd), instead of the whole cache being staged every
+    /// step, O(seq*kvd).
+    kv_k: ?mtl.Buffer = null,
+    kv_v: ?mtl.Buffer = null,
+    kv_ctx: usize = 0,
+    kv_kvd: usize = 0,
     rmsnorm_p: mtl.Pipeline,
     swiglu_p: mtl.Pipeline,
     add_p: mtl.Pipeline,
@@ -422,6 +459,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const pattn = dev.pipeline(attn_src, "attn_head") catch {
+        dev.deinit();
+        return;
+    };
     const pn = dev.pipeline(elementwise_src, "rmsnorm") catch {
         dev.deinit();
         return;
@@ -449,7 +490,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .gemm_q4k = pg, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .gemm_q4k = pg, .attn_p = pattn, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -496,6 +537,189 @@ fn wrapFor(cx: *Ctx, data: []const u8) ?struct { buf: mtl.Buffer, off: usize } {
 
 const Dims = extern struct { rows: u32, cols: u32 };
 
+const AttnDims = extern struct {
+    n_heads: u32,
+    n_kv_heads: u32,
+    hd: u32,
+    seq: u32,
+    kvd: u32,
+    scale: f32,
+};
+
+/// Threadgroup `scores[]` bounds the context this kernel can serve; see
+/// attn.metal. Declining beyond it is the only safe option — silently
+/// truncating attention produces text that still reads fluently.
+const ATTN_MAX_SEQ: usize = 2048;
+
+/// Allocate the device KV cache. Returns false if it will not fit or there is
+/// no device, in which case the engine keeps its own cache and the CPU path.
+pub fn attnInit(layers: usize, ctx_len: usize, kvd: usize) bool {
+    const cx = &(ctx orelse return false);
+    if (cx.kv_k != null) return true;
+    if (ctx_len > ATTN_MAX_SEQ) return false;
+    const bytes = layers * ctx_len * kvd * @sizeOf(f32);
+    if (bytes == 0) return false;
+    const k = cx.dev.alloc(bytes) catch return false;
+    const v = cx.dev.alloc(bytes) catch {
+        var kk = k;
+        kk.deinit();
+        return false;
+    };
+    @memset(k.slice(f32), 0);
+    @memset(v.slice(f32), 0);
+    cx.kv_k = k;
+    cx.kv_v = v;
+    cx.kv_ctx = ctx_len;
+    cx.kv_kvd = kvd;
+    return true;
+}
+
+/// Time fused attention against the engine's own head loop and record which
+/// wins. Separate from `calibrate` because it needs the device cache to exist,
+/// which is allocated after the model is loaded.
+pub fn calibrateAttn(gpa: std.mem.Allocator, n_heads: usize, n_kv_heads: usize, hd: usize, seq: usize) void {
+    const cx = &(ctx orelse return);
+    if (cx.kv_k == null or seq == 0 or seq > cx.kv_ctx) return;
+    const kvd = cx.kv_kvd;
+
+    var thr: std.Io.Threaded = .init(gpa, .{});
+    defer thr.deinit();
+    const tio = thr.io();
+    const now = struct {
+        fn f(i: std.Io) i128 {
+            return std.Io.Clock.Timestamp.now(i, .awake).raw.toNanoseconds();
+        }
+    }.f;
+
+    const q = gpa.alloc(f32, n_heads * hd) catch return;
+    defer gpa.free(q);
+    for (q, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 19)) * 0.01 - 0.09;
+    const kc = gpa.alloc(f32, seq * kvd) catch return;
+    defer gpa.free(kc);
+    const vc = gpa.alloc(f32, seq * kvd) catch return;
+    defer gpa.free(vc);
+    for (kc, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 23)) * 0.01 - 0.11;
+    for (vc, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 29)) * 0.01 - 0.14;
+    const out = gpa.alloc(f32, n_heads * hd) catch return;
+    defer gpa.free(out);
+    const scores = gpa.alloc(f32, seq) catch return;
+    defer gpa.free(scores);
+
+    for (0..seq) |t| _ = kvAppend(0, t, kc[t * kvd ..][0..kvd], vc[t * kvd ..][0..kvd]);
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const q_per_kv = n_heads / n_kv_heads;
+
+    attn_worthwhile = true;
+    for (0..2) |_| _ = attnHeads(0, seq - 1, q, out, n_heads, n_kv_heads, hd, scale);
+    var g: i128 = std.math.maxInt(i64);
+    for (0..8) |_| {
+        const t0 = now(tio);
+        _ = attnHeads(0, seq - 1, q, out, n_heads, n_kv_heads, hd, scale);
+        const dt = now(tio) - t0;
+        if (dt < g) g = dt;
+    }
+    attn_worthwhile = false;
+
+    var c: i128 = std.math.maxInt(i64);
+    for (0..8) |_| {
+        const t0 = now(tio);
+        for (0..n_heads) |h| {
+            const kvh = h / q_per_kv;
+            const qh = q[h * hd ..][0..hd];
+            for (0..seq) |t| scores[t] = cpu.dotF32(qh, kc[t * kvd + kvh * hd ..][0..hd]) * scale;
+            cpu.softmax(scores);
+            const oh = out[h * hd ..][0..hd];
+            @memset(oh, 0);
+            for (0..seq) |t| cpu.axpy(oh, vc[t * kvd + kvh * hd ..][0..hd], scores[t]);
+        }
+        const dt = now(tio) - t0;
+        if (dt < c) c = dt;
+    }
+    attn_worthwhile = @as(f64, @floatFromInt(g)) * MARGIN < @as(f64, @floatFromInt(c));
+    verdict.attn_used = attn_worthwhile;
+    verdict.attn_gpu_ms = @as(f64, @floatFromInt(g)) / 1e6;
+    verdict.attn_cpu_ms = @as(f64, @floatFromInt(c)) / 1e6;
+}
+
+/// Force fused attention off, whatever calibration concluded.
+pub fn disableAttn() void {
+    attn_worthwhile = false;
+}
+
+/// Mirror one cache row into device memory.
+///
+/// Separate from `attnHeads` on purpose. Prefill and decode are different code
+/// paths in the engine (`stepBatch` and `step`), and only one of them used to
+/// do the append -- so the device cache held zeros for every prefilled
+/// position while the host cache was complete, and decode attended over them.
+/// The output stayed fluent and was wrong, which is the worst failure mode
+/// available. Appending wherever the host cache is written, independently of
+/// who later reads it, is what makes the two impossible to desynchronise.
+pub fn kvAppend(li: usize, pos: usize, k_new: []const f32, v_new: []const f32) bool {
+    // No reader, no mirror. When fused attention is off the device cache is
+    // dead weight, and writing it is not free: keeping it updated through a
+    // 576-token prefill is 12,672 writes into device memory and took decode
+    // from 56 to 3 tok/s with the GPU otherwise unused.
+    if (!attn_worthwhile) return false;
+    const cx = &(ctx orelse return false);
+    const kb = cx.kv_k orelse return false;
+    const vb = cx.kv_v orelse return false;
+    if (pos >= cx.kv_ctx or k_new.len != cx.kv_kvd or v_new.len != cx.kv_kvd) return false;
+    const row = (li * cx.kv_ctx + pos) * cx.kv_kvd;
+    @memcpy(kb.slice(f32)[row..][0..cx.kv_kvd], k_new);
+    @memcpy(vb.slice(f32)[row..][0..cx.kv_kvd], v_new);
+    return true;
+}
+
+/// One layer's grouped-query attention over the device cache: score, softmax
+/// and weight-sum every head in one dispatch. The cache must already contain
+/// positions 0..=pos, via `kvAppend`.
+///
+/// Returns false when the backend cannot take it, so the engine falls back to
+/// its own path and its own cache stays authoritative.
+pub fn attnHeads(
+    li: usize,
+    pos: usize,
+    q: []const f32,
+    out: []f32,
+    n_heads: usize,
+    n_kv_heads: usize,
+    hd: usize,
+    scale: f32,
+) bool {
+    const cx = &(ctx orelse return false);
+    const kb = cx.kv_k orelse return false;
+    const vb = cx.kv_v orelse return false;
+    const seq = pos + 1;
+    if (!attn_worthwhile) return false;
+    if (seq > cx.kv_ctx or n_kv_heads == 0 or n_heads % n_kv_heads != 0) return false;
+    if (q.len * 4 > cx.scratch_x.len or out.len * 4 > cx.scratch_out.len) return false;
+    @memcpy(cx.scratch_x.slice(f32)[0..q.len], q);
+
+    const dims = AttnDims{
+        .n_heads = @intCast(n_heads),
+        .n_kv_heads = @intCast(n_kv_heads),
+        .hd = @intCast(hd),
+        .seq = @intCast(seq),
+        .kvd = @intCast(cx.kv_kvd),
+        .scale = scale,
+    };
+    const layer_off = li * cx.kv_ctx * cx.kv_kvd * @sizeOf(f32);
+    const group: usize = 64; // two SIMD groups; hd is 64..128 in practice
+    const cb = cx.dev.commandBuffer();
+    cb.dispatch(
+        cx.attn_p,
+        &.{ cx.scratch_x, kb, vb, cx.scratch_out },
+        &.{ 0, layer_off, layer_off, 0 },
+        std.mem.asBytes(&dims),
+        n_heads * group,
+        group,
+    );
+    cb.commitAndWait();
+    @memcpy(out, cx.scratch_out.slice(f32)[0..out.len]);
+    return true;
+}
+
 /// The dmmv pipeline for a quantization, or null when there is no kernel for
 /// it and the caller must fall back to the CPU.
 fn pipelineFor(cx: *Ctx, t: ggml.Type) ?mtl.Pipeline {
@@ -509,7 +733,7 @@ fn pipelineFor(cx: *Ctx, t: ggml.Type) ?mtl.Pipeline {
 pub fn matvec(t: ggml.Type, out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
     const cx = &(ctx orelse return cpu.matvec(t, out, data, x, rows, cols));
     const pipe = pipelineFor(cx, t);
-    if (!gpu_worthwhile or pipe == null or rows < min_rows or cols % 256 != 0) {
+    if (!use_gpu_ops or !gpu_worthwhile or pipe == null or rows < min_rows or cols % 256 != 0) {
         return cpu.matvec(t, out, data, x, rows, cols);
     }
     if (x.len * 4 > cx.scratch_x.len or out.len * 4 > cx.scratch_out.len) {
@@ -566,6 +790,10 @@ test "metal q4_k matvec agrees with the exact cpu reference" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest; // no Metal device on this host
+
+    const saved_use4 = use_gpu_ops;
+    use_gpu_ops = true;
+    defer use_gpu_ops = saved_use4;
 
     const got = try gpa.alloc(f32, rows);
     defer gpa.free(got);
@@ -625,11 +853,14 @@ test "metal q6_k matvec agrees with the exact cpu reference" {
     // Force the GPU path regardless of what calibration would have decided.
     const saved_min = min_rows;
     const saved_ok = gpu_worthwhile;
+    const saved_use = use_gpu_ops;
     min_rows = 0;
     gpu_worthwhile = true;
+    use_gpu_ops = true;
     defer {
         min_rows = saved_min;
         gpu_worthwhile = saved_ok;
+        use_gpu_ops = saved_use;
     }
 
     const got = try gpa.alloc(f32, rows);
@@ -686,6 +917,15 @@ test "metal batched matmul agrees with the exact cpu reference" {
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
 
+    const saved_useg = use_gpu_ops;
+    const saved_gemm = gemm_worthwhile;
+    use_gpu_ops = true;
+    gemm_worthwhile = true;
+    defer {
+        use_gpu_ops = saved_useg;
+        gemm_worthwhile = saved_gemm;
+    }
+
     const got = try gpa.alloc(f32, n * rows);
     defer gpa.free(got);
     @memset(got, std.math.nan(f32));
@@ -706,6 +946,77 @@ test "metal batched matmul agrees with the exact cpu reference" {
             const tol = mass * 1e-5;
             std.testing.expectApproxEqAbs(want, got[k * rows + r], tol) catch |e| {
                 std.debug.print("metal gemm row {d} batch {d}: reference {d} vs gpu {d}\n", .{ r, k, want, got[k * rows + r] });
+                return e;
+            };
+        }
+    }
+}
+
+test "metal fused attention matches the cpu head loop" {
+    // Checks three things that are each easy to get wrong and hard to see:
+    // the GQA head mapping (query head h reads KV head h/(nh/nkv)), the
+    // softmax normalisation, and the layer offset into the shared cache. A
+    // wrong head mapping still produces well-formed output.
+    const gpa = std.testing.allocator;
+    const n_heads = 8;
+    const n_kv_heads = 2;
+    const hd = 64;
+    const kvd = n_kv_heads * hd;
+    const layers = 3;
+    const ctx_len = 128;
+    const li = 2; // not layer 0, so a missing layer offset shows up
+    const seq = 37; // not a multiple of the threadgroup size
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+    if (!attnInit(layers, ctx_len, kvd)) return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(0xA77E);
+    const rnd = prng.random();
+
+    const q = try gpa.alloc(f32, n_heads * hd);
+    defer gpa.free(q);
+    for (q) |*v| v.* = rnd.float(f32) - 0.5;
+
+    // Host mirror of the cache, filled the same way the engine would.
+    const kc = try gpa.alloc(f32, seq * kvd);
+    defer gpa.free(kc);
+    const vc = try gpa.alloc(f32, seq * kvd);
+    defer gpa.free(vc);
+    for (kc) |*v| v.* = rnd.float(f32) - 0.5;
+    for (vc) |*v| v.* = rnd.float(f32) - 0.5;
+
+    const got = try gpa.alloc(f32, n_heads * hd);
+    defer gpa.free(got);
+    // Append every position, as decode does, so the incremental path is what
+    // is under test rather than a bulk upload.
+    const saved_attn = attn_worthwhile;
+    attn_worthwhile = true;
+    defer attn_worthwhile = saved_attn;
+    for (0..seq) |t| {
+        if (!kvAppend(li, t, kc[t * kvd ..][0..kvd], vc[t * kvd ..][0..kvd])) return error.SkipZigTest;
+        if (!attnHeads(li, t, q, got, n_heads, n_kv_heads, hd, scale)) return error.SkipZigTest;
+    }
+
+    const scores = try gpa.alloc(f32, seq);
+    defer gpa.free(scores);
+    const q_per_kv = n_heads / n_kv_heads;
+    for (0..n_heads) |h| {
+        const kvh = h / q_per_kv;
+        const qh = q[h * hd ..][0..hd];
+        for (0..seq) |t| {
+            scores[t] = cpu.dotF32(qh, kc[t * kvd + kvh * hd ..][0..hd]) * scale;
+        }
+        cpu.softmax(scores);
+        var want = [_]f32{0} ** hd;
+        for (0..seq) |t| {
+            cpu.axpy(&want, vc[t * kvd + kvh * hd ..][0..hd], scores[t]);
+        }
+        for (0..hd) |i| {
+            std.testing.expectApproxEqAbs(want[i], got[h * hd + i], 1e-4) catch |e| {
+                std.debug.print("attn head {d} dim {d}: cpu {d} vs gpu {d}\n", .{ h, i, want[i], got[h * hd + i] });
                 return e;
             };
         }
@@ -883,7 +1194,7 @@ pub fn ffnBlock(
 ) bool {
     const cx = &(ctx orelse return false);
     const dim = x.len;
-    if (!ffn_worthwhile and calibrated and !calibrating) return false;
+    if (!calibrating and (!use_gpu_ops or !ffn_worthwhile) and calibrated) return false;
     // Per tensor, not one type for all three. A `Q4_K_M` checkpoint is a
     // mixture: llama.cpp puts gate and up in Q4_K and `ffn_down` in Q6_K (or
     // Q5_1, on DeepSeek). Requiring a single type meant this block declined
