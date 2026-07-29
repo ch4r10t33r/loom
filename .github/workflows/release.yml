@@ -61,12 +61,12 @@ jobs:
             # No -Dtarget: build.zig only defaults to Metal for a native macOS
             # target, because that is the only one whose frameworks it can find.
             zig "${ZIG}" build \
-              -Doptimize=ReleaseFast \
+              -Doptimize=ReleaseSafe \
               -Dcommit="${GITHUB_SHA}" \
               -p out
           else
             zig "${ZIG}" build \
-              -Doptimize=ReleaseFast \
+              -Doptimize=ReleaseSafe \
               -Dtarget=${{ matrix.target }} \
               -Dcommit="${GITHUB_SHA}" \
               -p out

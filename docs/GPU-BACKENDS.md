@@ -332,8 +332,14 @@ every layer's FFN output was half stale. There is now a `rowsPerGroup` /
 
 A fourth was a measurement error rather than a bug: a plain `zig build` is a
 Debug build and overwrites `zig-out/bin/loom`, and a benchmark run against it
-reported 3.2 tok/s where ReleaseFast gives 57.7. Always rebuild with
-`-Doptimize=ReleaseFast` before measuring.
+reported 3.2 tok/s where ReleaseFast gives 57.7. Always rebuild optimized
+before measuring.
+
+Which optimized mode matters too, and by less than you might guess: ReleaseSafe
+costs about 11% against ReleaseFast on DeepSeek-V2-Lite decode (91.0-91.8 vs
+80.8-82.6 ms/token), and *none* of it lands in the GPU kernels -- the expert FFN
+block measures 41.1 ms in both. The difference is bounds checking on the host
+loops. Releases ship ReleaseSafe; quote which one a number came from.
 
 ## Against ZINC, measured
 

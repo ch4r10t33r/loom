@@ -73,10 +73,10 @@ shared experts, embeddings) is mmap'd and every node holds it in full.
 ## Step 0 — build
 
 ```sh
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseSafe
 ```
 
-Use ReleaseFast. The debug build is roughly 10x slower and this model is large
+Use ReleaseSafe, which is what releases ship. The debug build is roughly 10x slower and this model is large
 enough that you will notice.
 
 > If you edit code between steps, re-run `zig build`. `zig build test` builds

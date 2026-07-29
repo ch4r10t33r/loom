@@ -202,15 +202,26 @@ resolves it automatically).
 
 ```sh
 zig build                        # debug binary -> zig-out/bin/loom
-zig build -Doptimize=ReleaseFast # ~10x faster inference
+zig build -Doptimize=ReleaseSafe # what releases ship: fast, bounds checks on
+zig build -Doptimize=ReleaseFast # ~11% faster again, no bounds checks
 zig build test                   # unit tests
 zig build run -- <args>          # build + run in one step
 ```
 
+Releases and the container image are **ReleaseSafe**, not ReleaseFast. loom is a
+daemon that accepts weight shards from peers and writes them into buffers, and
+the difference between the two is whether an out-of-bounds write is caught or
+executed. It was not hypothetical: a shard-cache slot sized for a routed expert
+was being handed a larger resident chunk on the startup path every node runs,
+and ReleaseFast wrote 16 MB into a 6.3 MB buffer and carried on producing
+plausible text. Measured cost on DeepSeek-V2-Lite decode: 80.8-82.6 against
+91.0-91.8 ms/token, about 11%, none of it in the GPU kernels -- the expert FFN
+is 41.1 ms either way.
+
 Cross-compiling is a flag, since Zig ships every target:
 
 ```sh
-zig build -Doptimize=ReleaseFast -Dtarget=x86_64-linux-musl -p out
+zig build -Doptimize=ReleaseSafe -Dtarget=x86_64-linux-musl -p out
 ```
 
 Releases are cut by pushing a tag (`v0.1.0`), which builds all four targets and
@@ -218,7 +229,7 @@ publishes them; see [`.github/workflows/release.yml`](.github/workflows/release.
 
 ## Docker
 
-A multi-stage [`Dockerfile`](Dockerfile) builds a ReleaseFast binary (Zig 0.16.0
+A multi-stage [`Dockerfile`](Dockerfile) builds a ReleaseSafe binary (Zig 0.16.0
 is fetched by anyzig at build time) into a ~120 MB Debian-slim runtime image.
 
 A prebuilt image is published to the GitHub Container Registry on every push to

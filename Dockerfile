@@ -4,7 +4,7 @@
 # fetched on demand by anyzig (matching the project's local workflow); the
 # runtime image carries only the compiled binary.
 
-# ---- builder: fetch Zig 0.16.0 via anyzig, compile a ReleaseFast binary ----
+# ---- builder: fetch Zig 0.16.0 via anyzig, compile a ReleaseSafe binary ----
 # Base pinned by digest, not tag (security issue #33): a tag is mutable, so
 # an unpinned base silently changes what is built and shipped.
 # debian:bookworm-slim as of 2026-07-27. Re-pin when refreshing for CVEs.
@@ -49,7 +49,7 @@ COPY src ./src
 # `zig 0.16.0` triggers anyzig to fetch Zig 0.16.0; the build then fetches the
 # snappy dependency (git+https) and compiles.
 ARG COMMIT=unknown
-RUN zig 0.16.0 build -Doptimize=ReleaseFast -Dcommit="$COMMIT"
+RUN zig 0.16.0 build -Doptimize=ReleaseSafe -Dcommit="$COMMIT"
 
 # ---- runtime: minimal image with just the binary ----
 FROM debian@sha256:7b140f374b289a7c2befc338f42ebe6441b7ea838a042bbd5acbfca6ec875818 AS runtime

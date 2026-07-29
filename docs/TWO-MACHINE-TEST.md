@@ -107,10 +107,10 @@ expect a few minutes for ~10 GB.
 
 ```bash
 git clone https://github.com/ch4r10t33r/loom && cd loom
-zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseSafe
 ```
 
-ReleaseFast matters here; the debug build is roughly 10x slower.
+An optimized build matters here; the debug build is roughly 10x slower.
 
 Note both LAN addresses now — every step below needs them:
 

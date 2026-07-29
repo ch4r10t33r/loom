@@ -338,7 +338,7 @@ target triple, the Zig version that compiled it, and the optimization mode:
 loom 0.1.0 (1e35bba...)
   target   aarch64-macos-none
   zig      0.16.0
-  mode     ReleaseFast
+  mode     ReleaseSafe
 ```
 
 `loom node` and `loom light` print the same identity as a banner at startup,
@@ -356,6 +356,7 @@ downloaded binary misbehaves on unexpected hardware.
 
 | Option | Default | What it does |
 |---|---|---|
-| `-Doptimize=ReleaseFast` | `Debug` | Roughly 10x faster inference. Use it for anything but debugging. |
+| `-Doptimize=ReleaseSafe` | `Debug` | What releases and the container image ship. Roughly 10x faster than Debug, with bounds checks kept. |
+| `-Doptimize=ReleaseFast` | `Debug` | A further ~11% over ReleaseSafe by dropping bounds checks. Not what loom ships: a node writes peer-supplied shards into buffers, and this is the mode in which a 16 MB write into a 6.3 MB slot ran silently rather than trapping. Reasonable for a benchmark, not for a daemon on a network. |
 | `-Dgpu=none\|metal\|vulkan` | `none` | Compute backend, resolved at compile time. The inactive backends are not compiled in, so a GPU toolchain never becomes a requirement for a CPU build. `metal` is macOS-only and `vulkan` is not available on macOS; both are still unimplemented (issues #12, #13) and fail the build with a message saying so rather than silently falling back to CPU. |
 | `-Dcommit=<sha>` | `unknown` | Stamped into `loom version`. CI sets it. |
