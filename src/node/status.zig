@@ -21,6 +21,7 @@ const peers_mod = @import("../p2p/peers.zig");
 const weights = @import("../p2p/weights.zig");
 const generator = @import("generator.zig");
 const stats = @import("../core/stats.zig");
+const deepseek = @import("../gguf/deepseek.zig");
 
 pub const Reporter = struct {
     io: Io,
@@ -32,6 +33,10 @@ pub const Reporter = struct {
     gen: *generator.Generator,
     /// Members of this node's committee, as configured at join.
     committee: usize,
+    /// Redundancy target, for the under-replication warning. 0 disables it.
+    r_target: usize,
+    /// Scratch for the per-shard holder count.
+    gpa: std.mem.Allocator,
     interval_ns: u64,
     start_ns: i128,
     /// Set false to stop the loop; the thread exits within one interval.
@@ -42,7 +47,7 @@ pub const Reporter = struct {
     }
 
     fn line(self: *Reporter) void {
-        const n_peers: usize = if (self.table) |t| t.count() else 0;
+        const n_peers: usize = if (self.table) |t| t.liveCount() else 0;
 
         self.out_lock.lockUncancelable(self.io);
         defer self.out_lock.unlock(self.io);
@@ -57,12 +62,30 @@ pub const Reporter = struct {
             self.out.print("  shards {d}/{d} ({d:.1}%)", .{ held, total, pct }) catch return;
         }
 
+        // The condition that must never be silent: shards the swarm holds in
+        // fewer copies than asked for. At zero live peers there is nothing to
+        // say beyond "peers 0", which the line already carries.
+        if (self.r_target > 1 and n_peers > 0) {
+            if (self.store) |st| {
+                const short = self.table.?.underReplicated(
+                    self.gpa,
+                    st.manifest.nRanges(),
+                    self.r_target,
+                    st.holdings.bits,
+                ) catch null;
+                if (short) |k| {
+                    if (k > 0) self.out.print("  UNDER-REPLICATED {d} (want R={d})", .{ k, self.r_target }) catch return;
+                }
+            }
+        }
+
         // Only meaningful once something has been served; printing 0.0% before
         // the first request reads as a fault rather than as "no data yet".
         const hit = self.gen.hitRate();
         if (hit > 0) self.out.print("  local-hit {d:.1}%", .{hit * 100.0}) catch return;
 
         self.out.print("  up {s}\n", .{fmtUptime(self.uptimeSecs())}) catch return;
+        if (deepseek.Profile.enabled()) deepseek.Profile.report(self.out) catch {};
         self.out.flush() catch return;
     }
 

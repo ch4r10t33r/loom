@@ -67,6 +67,80 @@ pub const dequantRow = impl.dequantRow;
 pub const dotF32 = impl.dotF32;
 pub const axpy = impl.axpy;
 
+// ---- fused blocks ------------------------------------------------------------
+
+/// Weight tensor as the fused entry points take it.
+pub const WeightRef = impl.WeightRef;
+
+/// A whole FFN block submitted as one unit. Returns false when the backend
+/// declines the shape or type, in which case the caller runs the pieces.
+///
+/// This is on the seam because the unit of work a GPU cares about is not the
+/// kernel. Measured on an M5, a command buffer costs ~262 us fixed no matter
+/// how many dispatches it holds while a matvec kernel is ~18 us, so an engine
+/// that only ever hands the backend individual matvecs forces one command
+/// buffer per matvec and can never be fast, whatever the kernels do.
+pub const ffnBlock = impl.ffnBlock;
+
+/// Allocate a device-resident KV cache. False means the backend declines and
+/// the engine keeps its own.
+pub const attnInit = impl.attnInit;
+
+/// Mirror one KV cache row into the backend's device copy. Must be called
+/// wherever the engine writes its own cache, prefill and decode alike.
+pub const kvAppend = impl.kvAppend;
+pub const disableAttn = impl.disableAttn;
+/// Declare a reader for the device KV cache so appends start mirroring.
+pub const enableKvMirror = impl.enableKvMirror;
+/// Free the device KV cache when nothing will read it.
+pub const releaseKvCache = impl.releaseKvCache;
+/// Whether a device KV cache exists; without one the recorded path cannot run.
+pub const hasKvCache = impl.hasKvCache;
+
+// ---- frames ------------------------------------------------------------------
+//
+// The unit a GPU backend cares about is the submission, not the kernel. On an
+// M5 a command buffer costs ~262 us against ~18 us for a matvec, and ZINC --
+// whose kernel is at parity with loom's -- drops from 53 to 11.8 tok/s when its
+// timing probe forces a commit between dispatches. So the seam has to let a
+// caller record many operations and submit once, which one-shot entry points
+// cannot express however good the kernels behind them are.
+
+/// Open a recording frame. False means the backend has nothing to batch.
+pub const beginFrame = impl.beginFrame;
+/// Submit and wait. Results are only valid after this returns.
+pub const endFrame = impl.endFrame;
+pub const frameOpen = impl.frameOpen;
+
+/// One whole GQA layer recorded into the open frame, residual included. The
+/// residual stream stays in device memory for the entire token.
+pub const LayerSpec = impl.LayerSpec;
+pub const layerBlock = impl.layerBlock;
+pub const frameLoadX = impl.frameLoadX;
+pub const frameStoreX = impl.frameStoreX;
+
+/// One layer of grouped-query attention against that cache, in one submission.
+/// False means the engine runs its own path.
+pub const attnHeads = impl.attnHeads;
+
+/// One shape the engine will issue, for calibration.
+pub const Shape = impl.Shape;
+
+/// Measure this backend against the CPU on the loaded model's own shapes and
+/// decide, per operation, which to use. Called once at model load.
+///
+/// The alternative -- a compiled-in row threshold -- cannot be right: the
+/// crossover depends on the ratio between a machine's GPU and its CPU cores,
+/// so a constant measured on one laptop is wrong on the next, and it is
+/// per-shape besides. This is the same argument the fetch path already makes
+/// for probing disk against network rather than assuming an order.
+/// Whether to act on the calibration verdict; see the backend for why this
+/// defaults off.
+pub const useGpuOps = &impl.use_gpu_ops;
+pub const calibrate = impl.calibrate;
+pub const calibrateAttn = impl.calibrateAttn;
+pub const lastVerdict = impl.lastVerdict;
+
 // ---- elementwise -------------------------------------------------------------
 
 pub const rmsnorm = impl.rmsnorm;

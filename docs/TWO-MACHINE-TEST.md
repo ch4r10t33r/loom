@@ -332,3 +332,46 @@ it, and pulling either machine exercises real repair.
 - [MULTI-NODE-WALKTHROUGH.md](MULTI-NODE-WALKTHROUGH.md) — the same flow on one host, plus integrity and corruption-healing checks
 - [CLI.md](CLI.md) — every flag in detail
 - [spec/SPEC.md](../spec/SPEC.md) — committees, wire protocol, trust model
+
+
+## Mixed Mac + Linux
+
+Yes, and for the capacity experiment it is arguably better than two Macs.
+
+**What is platform-neutral.** The distribution plane is: GGUF byte ranges,
+SHA-256 leaf digests, a Merkle-rooted manifest, and binary wire frames written
+little-endian. None of that depends on the host — a shard hashed on Linux
+verifies on macOS and vice versa. Compute is node-local by design, so a peer
+never sees another node's activations, only its expert bytes.
+
+**What is not.** The two nodes will not produce *identical* text. A Mac
+defaults to the recorded Metal path (f32 activations) while a Linux node runs
+the CPU kernels (int8 activations, approximate by ~0.4% per element). Both are
+valid forward passes and each node answers its own requests, so this is fine
+for serving and for the capacity measurement. It is not fine for anything that
+assumes bit-identical output across nodes — the earlier three-node run asserted
+identical text, and that held only because every node was on the same CPU path.
+Redundant-recompute verification (v2) has to account for this before it can
+compare two nodes' answers.
+
+**What was broken until now.** Loom did not build for Linux at all: a profiler
+added during Metal work called `std.c.getenv` and `std.c.clock_gettime`, and
+libc was only linked for the Metal build. macOS links libc regardless, so it
+compiled there and failed everywhere else with "dependency on libc must be
+explicitly specified". Since the release workflow ships
+`x86_64-linux-musl` and `aarch64-linux-musl`, that broke the Linux artifacts
+too. libc is now linked for every target; all four release targets verified.
+
+**Why a Linux box helps the experiment.** The point is pooling RAM across nodes
+that individually cannot hold the model. A second machine with *different* RAM
+makes the result stronger, not weaker: it shows the capacity argument does not
+depend on two identical boxes. And a Linux box with a discrete GPU is the only
+hardware that can eventually test the Vulkan backend, where discrete VRAM
+removes the shared-bus ceiling that caps the Metal win at ~1.9x.
+
+**One caveat to plan around.** Loom has no Vulkan backend yet, so a Linux node
+runs on CPU. If that machine is also the one holding most of the shards, its
+serving throughput will be the CPU number, not the Metal number. For the
+capacity experiment that is fine — what is being measured is cold-miss-to-disk
+rate and whether the working set stays resident somewhere — but do not read a
+mixed-cluster tok/s figure as a per-node performance result.

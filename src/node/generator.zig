@@ -301,7 +301,13 @@ fn genGgufInner(
     // unpacked weight can serve several tokens, which is most of
     // time-to-first-token on a long prompt.
     var pos: usize = 0;
-    if (@hasDecl(E, "stepBatch")) {
+    // A model on the recorded path prefills through `step` too. Mixing the two
+    // means the prompt's KV rows are produced by one code path and the decode
+    // rows by another, which is a correctness question before it is a
+    // performance one -- and the recorded path is where the whole token lives
+    // in device memory, so it cannot consume a batch anyway.
+    const recorded = @hasField(@TypeOf(m.*), "gpu_layers") and m.gpu_layers;
+    if (@hasDecl(E, "stepBatch") and !recorded) {
         while (pos < toks.len and pos < c.ctx_len) {
             const take = @min(@min(batchSize(), toks.len - pos), c.ctx_len - pos);
             try E.stepBatch(m, &st, toks[pos..][0..take], pos);

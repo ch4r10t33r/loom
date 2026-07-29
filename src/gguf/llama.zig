@@ -178,6 +178,9 @@ pub const Model = struct {
     /// come through Source.get() — local tier or peer fetch — instead of the
     /// (possibly sparse) memory map.
     dist: ?*expert_fetch.Source = null,
+    /// Set at load when every layer can be recorded into one command buffer.
+    /// See gpuLayersSupported.
+    gpu_layers: bool = false,
     /// (layer * n_expert + e) -> manifest shard id; built by attachDist.
     expert_shard: []usize = &.{},
 
@@ -688,6 +691,146 @@ fn denseFFN(st: *State, gate_w: Tensor, up_w: Tensor, down_w: Tensor) void {
 
 /// One token step; logits land in `st.logits`. Errors only when a distributed
 /// expert shard has no reachable holder (fail loud, not silently degraded).
+/// Whether every layer can be recorded into one command buffer.
+///
+/// Decided once, at load, rather than per layer -- and that is a correctness
+/// requirement, not a convenience. Once recording starts the residual lives
+/// only in device memory and the KV cache rows for the layers already recorded
+/// have been written on the device; a mid-token fall back to the host path
+/// would leave the two caches disagreeing and produce fluent, wrong output.
+/// So the whole stack qualifies or none of it does.
+pub fn gpuLayersSupported(m: *const Model) bool {
+    const c = m.cfg;
+    if (c.dim % 256 != 0) return false;
+    if (c.n_kv_heads == 0 or c.n_heads % c.n_kv_heads != 0) return false;
+    for (m.layers) |l| {
+        if (l.is_moe) return false;
+        // Bias and per-head q/k norm have no kernel; either would need a host
+        // step in the middle of the layer.
+        if (l.attn_q_bias != null or l.attn_k_bias != null or l.attn_v_bias != null) return false;
+        if (l.attn_q_norm != null or l.attn_k_norm != null) return false;
+        const g = l.ffn_gate orelse return false;
+        const u = l.ffn_up orelse return false;
+        const d = l.ffn_down orelse return false;
+        if (g.ne1 % 256 != 0) return false;
+        for ([_]ggml.Type{ l.attn_q.ty, l.attn_k.ty, l.attn_v.ty, l.attn_output.ty, g.ty, u.ty, d.ty }) |t| {
+            // Matches pipelineFor in the Metal backend. A type without a kernel
+            // does not merely run slower, it splits the command buffer.
+            if (t != .q4_k and t != .q6_k) return false;
+        }
+    }
+    return true;
+}
+
+/// Decide whether the recorded path is worth using, by running the real
+/// forward pass both ways and timing it.
+///
+/// Earlier calibration timed one operation in a tight loop, where successive
+/// `commitAndWait` calls pipeline and per-submission latency is largely
+/// hidden. In the engine each operation is separated by other work and pays it
+/// in full, so that measurement reported the fused FFN block at 1.107 ms
+/// against a CPU 9.837 ms -- when the same CPU block measured 0.489 ms
+/// elsewhere -- and enabling every GPU path on its advice took decode from 56
+/// to 9.1 tok/s. The only measurement that cannot lie about submission cost is
+/// the whole token, issued exactly as generation issues it.
+pub fn calibrateGpuLayers(m: *Model, gpa: std.mem.Allocator) bool {
+    if (!gpuLayersSupported(m)) return false;
+
+    var st = State.init(gpa, m.cfg) catch return false;
+    defer st.deinit(gpa);
+
+    const now = struct {
+        fn f() i128 {
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(.MONOTONIC, &ts);
+            return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+        }
+    }.f;
+
+    const REPS = 6;
+
+    const timeSteps = struct {
+        fn f(mm: *Model, ss: *State, recorded: bool, reps: usize, clock: *const fn () i128) ?i128 {
+            const saved = mm.gpu_layers;
+            mm.gpu_layers = recorded;
+            defer mm.gpu_layers = saved;
+            // Warm: first token pays shader warm-up and page faults either way.
+            step(mm, ss, 1, 0) catch return null;
+            var best: i128 = std.math.maxInt(i64);
+            for (0..reps) |i| {
+                const t0 = clock();
+                step(mm, ss, 1, i + 1) catch return null;
+                const dt = clock() - t0;
+                if (dt < best) best = dt;
+            }
+            return best;
+        }
+    }.f;
+
+    // The recorded path first: it is the one that has to justify itself, and
+    // running it against a cold cache would flatter the CPU.
+    const g = timeSteps(m, &st, true, REPS, &now) orelse return false;
+    const c = timeSteps(m, &st, false, REPS, &now) orelse return false;
+
+    // The same 25% margin the other verdicts use: a wrong choice costs every
+    // token of the run, a tie resolved to the CPU costs nothing.
+    const win = @as(f64, @floatFromInt(g)) * 1.25 < @as(f64, @floatFromInt(c));
+    last_layer_gpu_ns = g;
+    last_layer_cpu_ns = c;
+    return win;
+}
+
+/// Last calibration timings, for the startup banner. Nanoseconds per token.
+pub var last_layer_gpu_ns: i128 = 0;
+pub var last_layer_cpu_ns: i128 = 0;
+
+/// Record every layer of one token into a single command buffer. Returns false
+/// before anything is recorded if the backend declines, so the caller can use
+/// its own path; once it returns true, `st.x` holds the result.
+fn stepRecorded(m: *const Model, st: *State, pos: usize) bool {
+    const cfg = m.cfg;
+    const hd = cfg.head_dim;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    if (!backend.beginFrame()) return false;
+    if (!backend.frameLoadX(st.x)) {
+        backend.endFrame();
+        return false;
+    }
+    for (m.layers, 0..) |l, li| {
+        const ok = backend.layerBlock(.{
+            .li = li,
+            .pos = pos,
+            .attn_norm = tensorAsF32(l.attn_norm),
+            .ffn_norm = tensorAsF32(l.ffn_norm),
+            .eps = cfg.eps,
+            .wq = .{ .ty = l.attn_q.ty, .data = l.attn_q.data },
+            .wk = .{ .ty = l.attn_k.ty, .data = l.attn_k.data },
+            .wv = .{ .ty = l.attn_v.ty, .data = l.attn_v.data },
+            .wo = .{ .ty = l.attn_output.ty, .data = l.attn_output.data },
+            .gate = .{ .ty = l.ffn_gate.?.ty, .data = l.ffn_gate.?.data },
+            .up = .{ .ty = l.ffn_up.?.ty, .data = l.ffn_up.?.data },
+            .down = .{ .ty = l.ffn_down.?.ty, .data = l.ffn_down.?.data },
+            .dim = cfg.dim,
+            .ffn = l.ffn_gate.?.ne1,
+            .n_heads = cfg.n_heads,
+            .n_kv_heads = cfg.n_kv_heads,
+            .hd = hd,
+            .rope_dim = cfg.rope_dim,
+            .rope_base = cfg.rope_base,
+            .rope_neox = cfg.arch.rope == .neox,
+            .attn_scale = scale,
+        });
+        if (!ok) {
+            // Nothing has been committed, so the device KV cache has not been
+            // written and st.x is untouched: dropping the frame is clean.
+            backend.endFrame();
+            return false;
+        }
+    }
+    backend.endFrame();
+    return backend.frameStoreX(st.x);
+}
+
 pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     const cfg = m.cfg;
     const hd = cfg.head_dim;
@@ -700,6 +843,14 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     // here rather than trusting the two to agree (security issue #29).
     if (token >= cfg.vocab) return error.TokenOutOfRange;
     backend.dequantRow(m.token_embd.ty, st.x, m.token_embd.data, token, cfg.dim);
+
+    // The whole layer stack in one command buffer, when the backend can take
+    // it. Everything after this point is the per-operation path.
+    if (m.gpu_layers and stepRecorded(m, st, pos)) {
+        backend.rmsnorm(st.normed, st.x, tensorAsF32(m.output_norm), cfg.eps);
+        mv(m.output, st.logits, st.normed);
+        return;
+    }
 
     for (m.layers, 0..) |l, li| {
         // ---- attention ----
@@ -724,37 +875,60 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
         const cache_base = (li * cfg.ctx_len + pos) * kvd;
         @memcpy(st.k_cache[cache_base..][0..kvd], st.k);
         @memcpy(st.v_cache[cache_base..][0..kvd], st.v);
+        _ = backend.kvAppend(li, pos, st.k, st.v);
 
         // per-head attention over positions 0..=pos
         const seq = pos + 1;
-        h = 0;
-        while (h < cfg.n_heads) : (h += 1) {
-            const kvh = h / q_per_kv;
-            const qh = st.q[h * hd ..][0..hd];
-            var t_i: usize = 0;
-            while (t_i < seq) : (t_i += 1) {
-                const kt = st.k_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
-                st.scores[t_i] = backend.dotF32(qh, kt) * scale;
-            }
-            backend.softmax(st.scores[0..seq]);
-            const oh = st.attn_out[h * hd ..][0..hd];
-            @memset(oh, 0);
-            t_i = 0;
-            while (t_i < seq) : (t_i += 1) {
-                const vt = st.v_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
-                backend.axpy(oh, vt, st.scores[t_i]);
+        // Offer the whole head loop to the backend first. The host cache above
+        // is still written either way: the backend keeps its own device copy,
+        // and if it ever declines mid-generation the engine's cache has to be
+        // authoritative or the fallback produces garbage.
+        if (!backend.attnHeads(li, pos, st.q, st.attn_out, cfg.n_heads, cfg.n_kv_heads, hd, scale)) {
+            h = 0;
+            while (h < cfg.n_heads) : (h += 1) {
+                const kvh = h / q_per_kv;
+                const qh = st.q[h * hd ..][0..hd];
+                var t_i: usize = 0;
+                while (t_i < seq) : (t_i += 1) {
+                    const kt = st.k_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
+                    st.scores[t_i] = backend.dotF32(qh, kt) * scale;
+                }
+                backend.softmax(st.scores[0..seq]);
+                const oh = st.attn_out[h * hd ..][0..hd];
+                @memset(oh, 0);
+                t_i = 0;
+                while (t_i < seq) : (t_i += 1) {
+                    const vt = st.v_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
+                    backend.axpy(oh, vt, st.scores[t_i]);
+                }
             }
         }
         mv(l.attn_output, st.proj_out, st.attn_out);
         backend.add(st.x, st.proj_out);
 
         // ---- FFN ----
-        backend.rmsnorm(st.normed, st.x, tensorAsF32(l.ffn_norm), cfg.eps);
         if (!l.is_moe) {
-            denseFFN(st, l.ffn_gate.?, l.ffn_up.?, l.ffn_down.?);
+            // Offer the backend the whole block before falling back to the
+            // pieces. A GPU pays one command buffer for the block instead of
+            // one per matvec, and on an M5 that buffer costs ~262 us against
+            // ~18 us of kernel -- so which of the two shapes the engine hands
+            // over matters more than any kernel in it.
+            const g = l.ffn_gate.?;
+            if (backend.ffnBlock(
+                st.x,
+                tensorAsF32(l.ffn_norm),
+                cfg.eps,
+                .{ .ty = g.ty, .data = g.data },
+                .{ .ty = l.ffn_up.?.ty, .data = l.ffn_up.?.data },
+                .{ .ty = l.ffn_down.?.ty, .data = l.ffn_down.?.data },
+                g.ne1,
+            )) continue;
+            backend.rmsnorm(st.normed, st.x, tensorAsF32(l.ffn_norm), cfg.eps);
+            denseFFN(st, g, l.ffn_up.?, l.ffn_down.?);
             backend.add(st.x, st.ffn_out);
             continue;
         }
+        backend.rmsnorm(st.normed, st.x, tensorAsF32(l.ffn_norm), cfg.eps);
 
         try moeLayer(m, st, l, li);
         backend.add(st.x, st.moe_acc);
@@ -885,6 +1059,7 @@ pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usi
             const base = (li * cfg.ctx_len + pos) * kvd;
             @memcpy(st.k_cache[base..][0..kvd], kk);
             @memcpy(st.v_cache[base..][0..kvd], vk);
+            _ = backend.kvAppend(li, pos_base + k, kk, vk);
         }
 
         // Causal: token k sees positions 0..pos_base+k only, even though the

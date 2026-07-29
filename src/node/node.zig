@@ -11,6 +11,7 @@ const rpc = @import("rpc.zig");
 const dns = @import("../p2p/dns.zig");
 const sockopt = @import("../core/sockopt.zig");
 const openai = @import("openai.zig");
+const backend = @import("../compute/backend.zig");
 const generator = @import("generator.zig");
 const deepseek = @import("../gguf/deepseek.zig");
 const llama = @import("../gguf/llama.zig");
@@ -43,6 +44,19 @@ pub const Options = struct {
     ui_port: u16 = 8555, // 0 = UI disabled
     status_secs: u32 = 30, // periodic console status; 0 = off
     kernel_threads: usize = 0, // 0 = auto (cpu count - 2)
+    /// Serve routed experts zero-copy from a read-only mapping of the store
+    /// rather than copying them into the RAM cache. See node.zig for why this
+    /// is off by default.
+    mmap_weights: bool = false,
+    /// Act on the compute backend's calibration verdict. Off by default; see
+    /// the backend for the measurement problem that makes it unsafe.
+    gpu_ops: bool = false,
+    /// Force the recorded whole-layer path off. It is otherwise decided by
+    /// measurement: the node times a real token both ways at load and uses
+    /// whichever wins. Separate from `gpu_ops` so the per-operation GPU paths
+    /// and the recorded path can be bisected against each other -- they are
+    /// different mechanisms and can fail independently.
+    no_gpu_layers: bool = false,
     prefill_batch: usize = 0, // 0 = kernel max; 1 disables batched prefill
     p2p_addr: []const u8,
     p2p_port: u16,
@@ -270,7 +284,11 @@ fn openaiThread(ctx: *openai.Ctx) void {
 
 /// Load a GGUF through whichever engine its `general.architecture` selects.
 /// deepseek2 is MLA; everything else supported is GQA (llama.zig).
-fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8) !generator.GgufModel {
+/// Set by `loadGgufEngine` so the banner can report whether the whole layer
+/// stack records into one command buffer.
+var gguf_layers_gpu: bool = false;
+
+fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8, gpu_ops: bool, no_gpu_layers: bool) !generator.GgufModel {
     var peek = try gguf_mod.parse(gpa, io, path);
     const arch_src = peek.getString("general.architecture") orelse "?";
     var arch_buf: [64]u8 = undefined;
@@ -280,9 +298,101 @@ fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8) !generator.G
     const arch = arch_buf[0..n];
 
     if (std.mem.eql(u8, arch, "deepseek2")) {
-        return .{ .deepseek = try deepseek.load(gpa, io, path) };
+        var m = try deepseek.load(gpa, io, path);
+        calibrateFor(gpa, gpu_ops, m.cfg.dim, m.cfg.ffn, m.cfg.n_layers, m.cfg.ctx_len, 0, 0, 0, 0, &m.layers[0], m.output);
+        return .{ .deepseek = m };
     }
-    return .{ .gqa = try llama.load(gpa, io, path) };
+    var m = try llama.load(gpa, io, path);
+    calibrateFor(gpa, gpu_ops, m.cfg.dim, m.cfg.ffn, m.cfg.n_layers, m.cfg.ctx_len, m.cfg.kvDim(), m.cfg.n_heads, m.cfg.n_kv_heads, m.cfg.head_dim, &m.layers[0], m.output);
+    // Decided by measurement, after the device KV cache exists. The mirror has
+    // to be on *before* the timing run or the recorded path reads a cache the
+    // host path never filled and the comparison is between a correct forward
+    // pass and a broken one.
+    // `hasKvCache` gates this because calibration builds a scratch `State`,
+    // and that is sized by the model's context: 8 GB for a 7B advertising
+    // 32768. Measuring a path that cannot run -- attnInit declines any context
+    // past what the attention kernel's threadgroup memory serves -- would
+    // allocate all of it to learn nothing.
+    if (!no_gpu_layers and backend.hasKvCache() and llama.gpuLayersSupported(&m)) {
+        backend.enableKvMirror();
+        backend.parallelBegin(generator.threads());
+        m.gpu_layers = llama.calibrateGpuLayers(&m, gpa);
+        backend.parallelEnd();
+        // Nothing reads the device cache if both the recorded path and fused
+        // attention lost, and it is hundreds of megabytes on a 7B model.
+        if (!m.gpu_layers and !backend.lastVerdict().attn_used) backend.releaseKvCache();
+    }
+    gguf_layers_gpu = m.gpu_layers;
+    return .{ .gqa = m };
+}
+
+/// Report what calibration decided. Printed after the model is loaded, since
+/// before that there is nothing measured to report.
+fn printCompute(out: *Io.Writer, gpu_layers: bool) !void {
+    const v = backend.lastVerdict();
+    if (!v.ran) return out.print("  compute    backend {s}\n", .{backend.name});
+    try out.print("  compute    backend {s}; measured on this model: matvec {s}", .{
+        backend.name,
+        if (v.matvec_used) "gpu" else "cpu",
+    });
+    if (v.matvec_used) try out.print(" (>= {d} rows)", .{v.matvec_min_rows});
+    try out.print(", ffn block {s}", .{if (v.ffn_used) "gpu" else "cpu"});
+    if (v.ffn_gpu_ms > 0) try out.print(" (gpu {d:.3} ms vs cpu {d:.3} ms)", .{ v.ffn_gpu_ms, v.ffn_cpu_ms });
+    try out.print(", prefill {s}", .{if (v.prefill_used) "gpu" else "cpu"});
+    try out.print(", attn {s}", .{if (v.attn_used) "gpu" else "cpu"});
+    if (gpu_layers) {
+        try out.print(", layers gpu (1 cmd buffer/token)", .{});
+    } else if (llama.last_layer_cpu_ns > 0) {
+        try out.print(", layers cpu", .{});
+    }
+    if (llama.last_layer_cpu_ns > 0) try out.print(" (gpu {d:.2} ms/tok vs cpu {d:.2} ms/tok)", .{
+        @as(f64, @floatFromInt(llama.last_layer_gpu_ns)) / 1e6,
+        @as(f64, @floatFromInt(llama.last_layer_cpu_ns)) / 1e6,
+    });
+    if (v.attn_gpu_ms > 0) try out.print(" (gpu {d:.3} ms vs cpu {d:.3} ms)", .{ v.attn_gpu_ms, v.attn_cpu_ms });
+    try out.print("\n", .{});
+}
+
+/// Hand the compute backend the shapes this model will actually issue and let
+/// it decide, per operation, whether it is worth using. A backend built in is
+/// not a backend used: on unified memory the GPU loses at small shapes and
+/// wins at large ones, and where the line falls is a property of the machine.
+fn calibrateFor(gpa: std.mem.Allocator, gpu_ops: bool, dim: usize, ffn: usize, n_layers: usize, ctx_len: usize, kvd: usize, n_heads: usize, n_kv_heads: usize, head_dim: usize, l: anytype, out_head: anytype) void {
+    var shapes: [3]backend.Shape = undefined;
+    var n: usize = 0;
+    if (l.ffn_gate) |g| {
+        shapes[n] = .{ .data = g.data, .ty = g.ty, .rows = g.ne1, .cols = g.ne0 };
+        n += 1;
+    }
+    if (l.ffn_down) |d| {
+        shapes[n] = .{ .data = d.data, .ty = d.ty, .rows = d.ne1, .cols = d.ne0 };
+        n += 1;
+    }
+    shapes[n] = .{ .data = out_head.data, .ty = out_head.ty, .rows = out_head.ne1, .cols = out_head.ne0 };
+    n += 1;
+    // The pool has to be up for this: it is what brings the GPU device online,
+    // and the CPU side of the comparison has to run with the same thread count
+    // a real generation gets or the measurement is rigged against it.
+    backend.useGpuOps.* = gpu_ops;
+    backend.parallelBegin(generator.threads());
+    defer backend.parallelEnd();
+    const triple: ?[3]backend.Shape = if (l.ffn_gate != null and l.ffn_up != null and l.ffn_down != null) .{
+        .{ .data = l.ffn_gate.?.data, .ty = l.ffn_gate.?.ty, .rows = l.ffn_gate.?.ne1, .cols = l.ffn_gate.?.ne0 },
+        .{ .data = l.ffn_up.?.data, .ty = l.ffn_up.?.ty, .rows = l.ffn_up.?.ne1, .cols = l.ffn_up.?.ne0 },
+        .{ .data = l.ffn_down.?.data, .ty = l.ffn_down.?.ty, .rows = l.ffn_down.?.ne1, .cols = l.ffn_down.?.ne0 },
+    } else null;
+    backend.calibrate(gpa, dim, ffn, shapes[0..n], triple);
+    // kvd == 0 means the engine has no GQA-shaped cache to hand over —
+    // deepseek is MLA and keeps a compressed one — so there is nothing to
+    // allocate and the backend keeps declining `attnHeads`.
+    if (kvd != 0 and backend.attnInit(n_layers, ctx_len, kvd)) {
+        // Calibrate at a mid-length sequence: fused attention's cost is one
+        // command buffer regardless of seq, while the CPU loop grows with it,
+        // so the verdict at seq=1 and seq=ctx differ. 256 is a plausible
+        // working context rather than either extreme.
+        backend.calibrateAttn(gpa, n_heads, n_kv_heads, head_dim, @min(@as(usize, 256), ctx_len));
+        if (!gpu_ops) backend.disableAttn();
+    }
 }
 
 fn attachGgufDist(m: *generator.GgufModel, gpa: std.mem.Allocator, src: *expert_fetch.Source) !void {
@@ -367,7 +477,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     defer table.deinit();
     const zero_version = "0" ** 64;
     for (peer_strs.items) |ps| {
-        _ = table.merge(ps, zero_version, "", peers.NO_COMMITTEE, 0, stats.nowNs(io)) catch {};
+        _ = table.merge(ps, zero_version, "", peers.NO_COMMITTEE, 0, stats.nowNs(io), .hearsay) catch {};
     }
 
     if (opts.gguf_path) |gp| {
@@ -411,7 +521,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                 if (sync.PeerAddr.parse(m)) |a| {
                     try srcs.append(gpa, a);
                     // committee members seed the table WITH their committee id
-                    _ = table.merge(m, "0" ** 64, "", joined_committee_id, 0, stats.nowNs(io)) catch {};
+                    _ = table.merge(m, "0" ** 64, "", joined_committee_id, 0, stats.nowNs(io), .hearsay) catch {};
                 } else |_| {}
             }
             try srcs.appendSlice(gpa, peer_list.items);
@@ -566,7 +676,28 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                     committee_peers.append(gpa, a) catch {};
                 } else |_| {}
             }
-            gguf_src = try expert_fetch.Source.init(gpa, io, st, peer_list.items);
+            // Read weights straight out of a read-only mapping instead of
+            // copying them into the heap cache. Off by default, because on the
+            // one machine this has been measured -- 16 GB serving an 8.9 GB
+            // model -- it is slower, and the reason is worth recording.
+            //
+            //   config              get     ffn    total ms/token
+            //   no cache          375.9    64.8    480.0
+            //   2 GB heap cache   269.0    73.7    409.7
+            //   8 GB heap cache    87.9   179.6    362.4
+            //   mmap, zero-copy    34.5   369.7    484.9
+            //
+            // Zero-copy does exactly what it claims: `get` falls to a pointer
+            // return. But the model does not fit in this machine's page cache,
+            // so ~1.16 GB of expert weights per token is faulted from disk
+            // either way, and reading them through the mapping moves that cost
+            // into whoever touches the pages -- the matmul. The heap cache
+            // wins here only because it keeps a bounded set in anonymous
+            // memory the LRU controls rather than leaving residency to the
+            // kernel. On a node whose expert corpus fits in RAM the ordering
+            // should reverse, which is what this flag is for.
+            if (opts.mmap_weights) st.mapReadOnly();
+            gguf_src = try expert_fetch.Source.initCached(gpa, io, st, peer_list.items, opts.ram_bytes);
             gguf_src.committee = committee_peers.items;
             // resident gate (audit #5 P0-4): the mmap'd resident bundle must be
             // present+verified, fetching gaps from peers, or inference reads
@@ -590,7 +721,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                 // Pick the engine from the file's own architecture: MLA
                 // (deepseek2) or the GQA family (llama/Mixtral, qwen2moe,
                 // qwen3moe, glm4moe). Both attach to the same expert source.
-                if (loadGgufEngine(gpa, io, mpath)) |mdl| {
+                if (loadGgufEngine(gpa, io, mpath, opts.gpu_ops, opts.no_gpu_layers)) |mdl| {
                     gguf_gen = .{ .m = mdl, .src = &gguf_src, .ctx_cap = opts.ctx_cap };
                     gguf_gen.m.setCtxLen(@min(gguf_gen.m.ctxLen(), opts.ctx_cap));
                     const arch_name = gguf_gen.m.archName();
@@ -605,6 +736,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                         // `loom gguf gen` stamps its fixtures "loom <arch> fixture".
                         const gname = gguf_gen.m.generalName() orelse "";
                         synthetic = std.mem.startsWith(u8, gname, "loom ") and std.mem.endsWith(u8, gname, "fixture");
+                        try printCompute(out, gguf_layers_gpu);
                         try out.print("  serving    distributed GGUF ({s}): ctx={d} chat={s}\n", .{
                             arch_name, gguf_gen.m.ctxLen(), @tagName(gguf_gen.chat_format),
                         });
@@ -633,7 +765,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     var local_gguf = false;
     if (!serve_gguf) {
         if (opts.gguf_path) |gp| {
-            if (loadGgufEngine(gpa, io, gp)) |mdl| {
+            if (loadGgufEngine(gpa, io, gp, opts.gpu_ops, opts.no_gpu_layers)) |mdl| {
                 gguf_gen = .{ .m = mdl, .src = null, .ctx_cap = opts.ctx_cap };
                 gguf_gen.m.setCtxLen(@min(gguf_gen.m.ctxLen(), opts.ctx_cap));
                 const arch_name = gguf_gen.m.archName();
@@ -646,6 +778,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                 served_model_id = std.fs.path.basename(gp);
                 const gname = gguf_gen.m.generalName() orelse "";
                 synthetic = std.mem.startsWith(u8, gname, "loom ") and std.mem.endsWith(u8, gname, "fixture");
+                try printCompute(out, gguf_layers_gpu);
                 try out.print("  serving    local GGUF ({s}): ctx={d} chat={s}  (not expert-sharded: no distributed fetch)\n", .{
                     arch_name, gguf_gen.m.ctxLen(), @tagName(gguf_gen.chat_format),
                 });
@@ -738,6 +871,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             .store = if (store) |*st| st else null,
             .gen = &gen,
             .committee = committee_members.len,
+            .r_target = opts.r_target,
+            .gpa = gpa,
             .interval_ns = @as(u64, opts.status_secs) * std.time.ns_per_s,
             .start_ns = stats.nowNs(io),
         };
