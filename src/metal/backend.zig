@@ -777,6 +777,13 @@ pub fn enableKvMirror() void {
     kv_mirror = true;
 }
 
+/// Whether a device KV cache exists. Without one the recorded path cannot run
+/// at all, so there is nothing to measure.
+pub fn hasKvCache() bool {
+    const cx = &(ctx orelse return false);
+    return cx.kv_k != null;
+}
+
 /// Force fused attention off, whatever calibration concluded.
 pub fn disableAttn() void {
     attn_worthwhile = false;

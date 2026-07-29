@@ -25,7 +25,14 @@ pub fn build(b: *std.Build) void {
     // engine probes CPU against GPU on the loaded model's own shapes at
     // startup and picks per operation. Building it in only makes that choice
     // available.
-    const default_gpu: []const u8 = if (target.result.os.tag == .macos) "metal" else "none";
+    // Only for a *native* macOS build. Cross-compiling to macOS cannot link
+    // the Metal and Foundation frameworks -- Zig finds the SDK through xcrun
+    // for the host target only -- so defaulting to Metal on any macOS target
+    // breaks `-Dtarget=aarch64-macos`, which is exactly how the release
+    // workflow builds. A release job that wants the GPU path passes
+    // `-Dgpu=metal` and must build natively.
+    const native_macos = target.result.os.tag == .macos and target.query.isNative();
+    const default_gpu: []const u8 = if (native_macos) "metal" else "none";
     const gpu = b.option([]const u8, "gpu", "Compute backend: metal (default on macOS), vulkan, none") orelse default_gpu;
     const build_info = b.addOptions();
     build_info.addOption([]const u8, "version", version);
