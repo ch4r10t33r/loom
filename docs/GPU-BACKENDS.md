@@ -198,6 +198,31 @@ small and #12/#13 are not.
    larger model — and only the structure that produced that win is worth
    porting.
 
+## Against ZINC, measured
+
+TinyLlama-1.1B Q4_K_M, 128 tokens, same prompt, M5, decode only (both engines
+report decode separately from prefill):
+
+| engine | backend actually used | tok/s |
+|---|---|---|
+| loom | **CPU** (Metal built in, declined by calibration) | 55.7, 56.0, 56.2 |
+| ZINC | **Metal** | 52.9, 53.0, 56.1 |
+
+Loom matches ZINC on this model **without using the GPU at all**.
+
+That settles a question worth being precise about: matching tok/s against a
+Metal engine does *not* demonstrate that loom's Metal optimisations are
+complete. Here it demonstrates the opposite — loom's CPU path is already
+competitive with ZINC's Metal path, and loom's GPU path is not being used
+because calibration measured it and found it slower at every shape this model
+issues.
+
+It also bounds what the remaining GPU work can win. On unified memory the CPU
+and GPU share one bus; measured on this machine the GPU beats the CPU by ~1.5x
+only above 65k rows, and TinyLlama's largest tensor is the 32k-row output head.
+The prize for finishing the GPU path is real but it is not a multiple, and it
+is largest for big models and for prefill, not for small-model decode.
+
 ## What this means for the target, honestly
 
 For **decode** on unified memory, the ceiling is the memory bus and the CPU is
