@@ -30,6 +30,7 @@ pub const sigmoid = cpu.sigmoid;
 pub const MAX_BATCH = cpu.MAX_BATCH;
 
 const dmmv_q4k_src = @embedFile("../shaders/metal/dmmv_q4k.metal");
+const dmmv_q6k_src = @embedFile("../shaders/metal/dmmv_q6k.metal");
 const elementwise_src = @embedFile("../shaders/metal/elementwise.metal");
 
 /// Below this many rows the CPU path wins outright, so the GPU is not used.
@@ -88,6 +89,11 @@ var gpu_worthwhile: bool = true;
 /// Whether the fused FFN block beat the CPU sequence on this model's shape.
 var ffn_worthwhile: bool = false;
 var calibrated: bool = false;
+/// True only while `calibrate` is running. Without it the gate below refuses
+/// the very call that is supposed to measure the block: `calibrate` marks
+/// itself done on entry, and `ffn_worthwhile` starts false, so the probe was
+/// declined and the block reported "cpu" without ever having been timed.
+var calibrating: bool = false;
 
 /// How much faster the GPU must be before it is chosen. 1.25 = 25%.
 ///
@@ -135,6 +141,8 @@ pub const Shape = struct {
 pub fn calibrate(gpa: std.mem.Allocator, dim: usize, ffn: usize, shapes: []const Shape, triple: ?[3]Shape) void {
     if (calibrated) return;
     calibrated = true;
+    calibrating = true;
+    defer calibrating = false;
     const cx = &(ctx orelse {
         gpu_worthwhile = false;
         return;
@@ -284,6 +292,7 @@ const SIMDGROUPS_PER_GROUP = 4;
 const Ctx = struct {
     dev: mtl.Device,
     q4k: mtl.Pipeline,
+    q6k: mtl.Pipeline,
     rmsnorm_p: mtl.Pipeline,
     swiglu_p: mtl.Pipeline,
     add_p: mtl.Pipeline,
@@ -323,6 +332,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const p6 = dev.pipeline(dmmv_q6k_src, "dmmv_q6k") catch {
+        dev.deinit();
+        return;
+    };
     const pn = dev.pipeline(elementwise_src, "rmsnorm") catch {
         dev.deinit();
         return;
@@ -350,7 +363,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -397,9 +410,20 @@ fn wrapFor(cx: *Ctx, data: []const u8) ?struct { buf: mtl.Buffer, off: usize } {
 
 const Dims = extern struct { rows: u32, cols: u32 };
 
+/// The dmmv pipeline for a quantization, or null when there is no kernel for
+/// it and the caller must fall back to the CPU.
+fn pipelineFor(cx: *Ctx, t: ggml.Type) ?mtl.Pipeline {
+    return switch (t) {
+        .q4_k => cx.q4k,
+        .q6_k => cx.q6k,
+        else => null,
+    };
+}
+
 pub fn matvec(t: ggml.Type, out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
     const cx = &(ctx orelse return cpu.matvec(t, out, data, x, rows, cols));
-    if (!gpu_worthwhile or t != .q4_k or rows < min_rows or cols % 256 != 0) {
+    const pipe = pipelineFor(cx, t);
+    if (!gpu_worthwhile or pipe == null or rows < min_rows or cols % 256 != 0) {
         return cpu.matvec(t, out, data, x, rows, cols);
     }
     if (x.len * 4 > cx.scratch_x.len or out.len * 4 > cx.scratch_out.len) {
@@ -414,7 +438,7 @@ pub fn matvec(t: ggml.Type, out: []f32, data: []const u8, x: []const f32, rows: 
     const group = SIMD_W * SIMDGROUPS_PER_GROUP;
     const cb = cx.dev.commandBuffer();
     cb.dispatch(
-        cx.q4k,
+        pipe.?,
         &.{ w.buf, cx.scratch_x, cx.scratch_out },
         &.{ w.off, 0, 0 },
         std.mem.asBytes(&dims),
@@ -478,6 +502,68 @@ test "metal q4_k matvec agrees with the exact cpu reference" {
         const tol = mass * 1e-5;
         std.testing.expectApproxEqAbs(want, got[r], tol) catch |e| {
             std.debug.print("metal q4_k row {d}: reference {d} vs gpu {d} (tol {d})\n", .{ r, want, got[r], tol });
+            return e;
+        };
+    }
+}
+
+test "metal q6_k matvec agrees with the exact cpu reference" {
+    // Same oracle discipline as the Q4_K test above: dequantize-then-dot in
+    // f32, tolerance against the summed mass rather than the result.
+    //
+    // What this specifically has to catch is the scale split. Q6_K scales are
+    // per 16 values while a run is 32 wide, so lanes below and above position
+    // 16 in a run use different scales. Folding a run under one scale produces
+    // output that still looks like output -- the CPU kernel carries the same
+    // warning because it is not a mistake you notice by reading the result.
+    const gpa = std.testing.allocator;
+    const cols = 2048;
+    const rows = 512;
+
+    var prng = std.Random.DefaultPrng.init(0x6C0FFEE);
+    const rnd = prng.random();
+
+    const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q6_k, cols, rows));
+    defer gpa.free(data);
+    rnd.bytes(data);
+    for (0..data.len / 2) |i| data[i * 2 + 1] &= 0xFB; // finite f16 scales
+
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+
+    // Force the GPU path regardless of what calibration would have decided.
+    const saved_min = min_rows;
+    const saved_ok = gpu_worthwhile;
+    min_rows = 0;
+    gpu_worthwhile = true;
+    defer {
+        min_rows = saved_min;
+        gpu_worthwhile = saved_ok;
+    }
+
+    const got = try gpa.alloc(f32, rows);
+    defer gpa.free(got);
+    @memset(got, std.math.nan(f32));
+    matvec(.q6_k, got, data, x, rows, cols);
+
+    const row = try gpa.alloc(f32, cols);
+    defer gpa.free(row);
+    for (0..rows) |r| {
+        cpu.dequantRow(.q6_k, row, data, r, cols);
+        var want: f32 = 0;
+        var mass: f32 = 0;
+        for (row, x) |wv, xv| {
+            want += wv * xv;
+            mass += @abs(wv * xv);
+        }
+        const tol = mass * 1e-5;
+        std.testing.expectApproxEqAbs(want, got[r], tol) catch |e| {
+            std.debug.print("metal q6_k row {d}: reference {d} vs gpu {d} (tol {d})\n", .{ r, want, got[r], tol });
             return e;
         };
     }
@@ -654,8 +740,15 @@ pub fn ffnBlock(
 ) bool {
     const cx = &(ctx orelse return false);
     const dim = x.len;
-    if (!ffn_worthwhile and calibrated) return false;
-    if (gate_w.ty != .q4_k or up_w.ty != .q4_k or down_w.ty != .q4_k) return false;
+    if (!ffn_worthwhile and calibrated and !calibrating) return false;
+    // Per tensor, not one type for all three. A `Q4_K_M` checkpoint is a
+    // mixture: llama.cpp puts gate and up in Q4_K and `ffn_down` in Q6_K (or
+    // Q5_1, on DeepSeek). Requiring a single type meant this block declined
+    // every real model while accepting synthetic ones, so it looked
+    // implemented and never ran.
+    const gp = pipelineFor(cx, gate_w.ty) orelse return false;
+    const up = pipelineFor(cx, up_w.ty) orelse return false;
+    const dp = pipelineFor(cx, down_w.ty) orelse return false;
     if (dim % 256 != 0 or ffn % 256 != 0) return false;
     if (ffn * 4 > cx.act[0].len or dim * 4 > cx.act[0].len) return false;
 
@@ -684,14 +777,14 @@ pub fn ffnBlock(
     e.dispatch(cx.rmsnorm_p, &.{ cx.act[0], cx.scratch_x, cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&nd), SIMD_W, SIMD_W);
     e.barrier();
     // gate = Wg . normed ; up = Wu . normed  — independent, no barrier between
-    e.dispatch(cx.q4k, &.{ gw.buf, cx.act[1], cx.act[2] }, &.{ gw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ffn * SIMD_W, group);
-    e.dispatch(cx.q4k, &.{ uw.buf, cx.act[1], cx.act[3] }, &.{ uw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ffn * SIMD_W, group);
+    e.dispatch(gp, &.{ gw.buf, cx.act[1], cx.act[2] }, &.{ gw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ffn * SIMD_W, group);
+    e.dispatch(up, &.{ uw.buf, cx.act[1], cx.act[3] }, &.{ uw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ffn * SIMD_W, group);
     e.barrier();
     // act = silu(gate) * up, in place over act[2]
     e.dispatch(cx.swiglu_p, &.{ cx.act[2], cx.act[3], cx.act[2] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_ffn), ffn, 64);
     e.barrier();
     // ffn_out = Wd . act
-    e.dispatch(cx.q4k, &.{ dw.buf, cx.act[2], cx.act[3] }, &.{ dw.off, 0, 0 }, std.mem.asBytes(&dims_down), dim * SIMD_W, group);
+    e.dispatch(dp, &.{ dw.buf, cx.act[2], cx.act[3] }, &.{ dw.off, 0, 0 }, std.mem.asBytes(&dims_down), dim * SIMD_W, group);
     e.barrier();
     // x += ffn_out
     e.dispatch(cx.add_p, &.{ cx.act[0], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), dim, 64);
