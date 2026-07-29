@@ -1495,7 +1495,7 @@ test "metal scaling: where does the gpu actually win" {
     }.f;
 
     const cols = 2048;
-    std.debug.print("\n  rows      gpu(1 cb)      cpu(8t)   ratio\n", .{});
+    std.debug.print("\n  rows      gpu(1 cb)   gpu(amort)      cpu(8t)   GB/s(a)   ratio\n", .{});
     for ([_]usize{ 2048, 5632, 16384, 32000, 65536, 131072 }) |rows| {
         const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, cols, rows));
         defer gpa.free(data);
@@ -1523,17 +1523,35 @@ test "metal scaling: where does the gpu actually win" {
         // Best-of rather than mean. This machine shares its GPU with the
         // window server, so a mean over 20 runs measures whatever else was
         // drawing at the time -- repeated runs of an unchanged kernel varied
-        // by 50%, which is wider than most of the effects being measured. The
-        // fastest run is the one least contended, and it is the statistic
-        // that stays comparable across sessions.
+        // by 50%, which is wider than most of the effects being measured.
         var gpu: i128 = std.math.maxInt(i64);
         for (0..N) |_| {
             const t0 = now(io);
             const cb = cx.dev.commandBuffer();
-            cb.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), rows * SIMD_W, group);
+            cb.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), ((rows + 1) / 2) * SIMD_W, group);
             cb.commitAndWait();
             const dt = now(io) - t0;
             if (dt < gpu) gpu = dt;
+        }
+
+        // The same kernel with submission amortized: D dispatches in one
+        // command buffer. This is the number to compare against another
+        // engine's kernel microbenchmark, which will also have amortized it --
+        // ZINC reports 259.81 us for a 27 MB shape, less than the ~262 us a
+        // single command buffer costs here, so its figures cannot include one.
+        // Comparing a per-dispatch number against an amortized one made this
+        // kernel look ~3x slower than it is.
+        const D = 20;
+        var gpu_amort: i128 = std.math.maxInt(i64);
+        for (0..N / 2) |_| {
+            const t0 = now(io);
+            const cb = cx.dev.commandBuffer();
+            const e = cb.encoder();
+            for (0..D) |_| e.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), ((rows + 1) / 2) * SIMD_W, group);
+            e.end();
+            cb.commitAndWait();
+            const dt = @divTrunc(now(io) - t0, D);
+            if (dt < gpu_amort) gpu_amort = dt;
         }
 
         cpu.matvec(.q4_k, dst, data, x, rows, cols);
@@ -1546,8 +1564,10 @@ test "metal scaling: where does the gpu actually win" {
         }
 
         const g: f64 = @as(f64, @floatFromInt(gpu)) / 1e6;
+        const ga: f64 = @as(f64, @floatFromInt(gpu_amort)) / 1e6;
         const c2: f64 = @as(f64, @floatFromInt(cpu_ns)) / 1e6;
-        std.debug.print("  {d:>7}   {d:>8.3} ms   {d:>8.3} ms   {d:>5.2}x\n", .{ rows, g, c2, c2 / g });
+        const bytes: f64 = @floatFromInt(ggml.tensorBytes(.q4_k, cols, rows));
+        std.debug.print("  {d:>7}   {d:>8.3} ms   {d:>8.3} ms   {d:>8.3} ms   {d:>6.1}   {d:>5.2}x\n", .{ rows, g, ga, c2, bytes / @as(f64, @floatFromInt(gpu_amort)), c2 / g });
     }
 }
 
