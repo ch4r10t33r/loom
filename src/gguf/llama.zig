@@ -722,6 +722,68 @@ pub fn gpuLayersSupported(m: *const Model) bool {
     return true;
 }
 
+/// Decide whether the recorded path is worth using, by running the real
+/// forward pass both ways and timing it.
+///
+/// Earlier calibration timed one operation in a tight loop, where successive
+/// `commitAndWait` calls pipeline and per-submission latency is largely
+/// hidden. In the engine each operation is separated by other work and pays it
+/// in full, so that measurement reported the fused FFN block at 1.107 ms
+/// against a CPU 9.837 ms -- when the same CPU block measured 0.489 ms
+/// elsewhere -- and enabling every GPU path on its advice took decode from 56
+/// to 9.1 tok/s. The only measurement that cannot lie about submission cost is
+/// the whole token, issued exactly as generation issues it.
+pub fn calibrateGpuLayers(m: *Model, gpa: std.mem.Allocator) bool {
+    if (!gpuLayersSupported(m)) return false;
+
+    var st = State.init(gpa, m.cfg) catch return false;
+    defer st.deinit(gpa);
+
+    const now = struct {
+        fn f() i128 {
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(.MONOTONIC, &ts);
+            return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+        }
+    }.f;
+
+    const REPS = 6;
+
+    const timeSteps = struct {
+        fn f(mm: *Model, ss: *State, recorded: bool, reps: usize, clock: *const fn () i128) ?i128 {
+            const saved = mm.gpu_layers;
+            mm.gpu_layers = recorded;
+            defer mm.gpu_layers = saved;
+            // Warm: first token pays shader warm-up and page faults either way.
+            step(mm, ss, 1, 0) catch return null;
+            var best: i128 = std.math.maxInt(i64);
+            for (0..reps) |i| {
+                const t0 = clock();
+                step(mm, ss, 1, i + 1) catch return null;
+                const dt = clock() - t0;
+                if (dt < best) best = dt;
+            }
+            return best;
+        }
+    }.f;
+
+    // The recorded path first: it is the one that has to justify itself, and
+    // running it against a cold cache would flatter the CPU.
+    const g = timeSteps(m, &st, true, REPS, &now) orelse return false;
+    const c = timeSteps(m, &st, false, REPS, &now) orelse return false;
+
+    // The same 25% margin the other verdicts use: a wrong choice costs every
+    // token of the run, a tie resolved to the CPU costs nothing.
+    const win = @as(f64, @floatFromInt(g)) * 1.25 < @as(f64, @floatFromInt(c));
+    last_layer_gpu_ns = g;
+    last_layer_cpu_ns = c;
+    return win;
+}
+
+/// Last calibration timings, for the startup banner. Nanoseconds per token.
+pub var last_layer_gpu_ns: i128 = 0;
+pub var last_layer_cpu_ns: i128 = 0;
+
 /// Record every layer of one token into a single command buffer. Returns false
 /// before anything is recorded if the backend declines, so the caller can use
 /// its own path; once it returns true, `st.x` holds the result.
