@@ -239,6 +239,56 @@ Porting the first three of those gave loom nothing at DRAM-bound sizes, which
 is consistent — there is no headroom left there — and they are the right thing
 to revisit for models whose tensors sit in cache.
 
+## One command buffer per token: 1.9x, measured
+
+TinyLlama-1.1B Q4_K_M on an M5, 128 tokens, decode only:
+
+| path | tok/s | output |
+|---|---|---|
+| CPU (default) | 57.7 | correct |
+| `--gpu-ops` (per-operation GPU) | 52.9 | correct |
+| `--gpu-layers` (whole layer per command buffer) | **110.3** | correct |
+
+For reference, ZINC's Metal path on the same model measures 52.9-56.1 tok/s.
+
+The per-operation GPU path is not faster than the CPU and the recorded path is
+1.9x faster, with the same kernels behind both. That is the submission cost
+made visible: ~150 command buffers per token against one.
+
+`--gpu-layers` records a whole GQA layer -- norm, q/k/v, RoPE, KV append,
+attention, output projection, residual, FFN, residual -- into a shared command
+buffer, with barriers between dependent dispatches and none between independent
+ones. The residual stream stays in device memory for the entire token.
+
+### Three bugs this shape introduces, all of which produce fluent nonsense
+
+Worth listing because none of them fails loudly, and the first two got past a
+unit test that passed.
+
+**Host writes to shared buffers are no longer ordered with the reads.** Each
+layer copied its norm weights into a scratch buffer and recorded a dispatch
+reading it. With immediate submission that is correct. With recording, the
+dispatches do not run until the frame closes, so all twenty-two layers read
+whatever the *last* layer wrote. Fixed by giving each layer its own slot.
+
+**A fixture can switch off the thing it is meant to test.** The first
+layer-block test ran only `pos=0`, where the RoPE angle is zero -- the rotation
+is the identity -- and softmax over a single score is 1, so attention is a
+passthrough. It passed while the engine produced garbage. The test now sweeps
+positions and records several layers per frame.
+
+**Dispatch grids must follow each kernel's rows-per-SIMD-group.** `dmmv_q4k`
+takes two rows per group (NR0=2); `dmmv_q6k` takes one. Dispatching Q6_K with
+the Q4_K group count launches half the groups, and the tail of the output
+vector simply keeps its previous contents. TinyLlama's `ffn_down` is Q6_K, so
+every layer's FFN output was half stale. There is now a `rowsPerGroup` /
+`groupsFor` pair and a test that pins the arithmetic.
+
+A fourth was a measurement error rather than a bug: a plain `zig build` is a
+Debug build and overwrites `zig-out/bin/loom`, and a benchmark run against it
+reported 3.2 tok/s where ReleaseFast gives 57.7. Always rebuild with
+`-Doptimize=ReleaseFast` before measuring.
+
 ## Against ZINC, measured
 
 TinyLlama-1.1B Q4_K_M, 128 tokens, same prompt, M5, decode only (both engines

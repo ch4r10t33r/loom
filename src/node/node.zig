@@ -51,6 +51,11 @@ pub const Options = struct {
     /// Act on the compute backend's calibration verdict. Off by default; see
     /// the backend for the measurement problem that makes it unsafe.
     gpu_ops: bool = false,
+    /// Record whole layers into one command buffer per token. Separate from
+    /// `gpu_ops` so the per-operation GPU paths and the recorded path can be
+    /// bisected against each other -- they are different mechanisms and can
+    /// fail independently.
+    gpu_layers: bool = false,
     prefill_batch: usize = 0, // 0 = kernel max; 1 disables batched prefill
     p2p_addr: []const u8,
     p2p_port: u16,
@@ -278,7 +283,11 @@ fn openaiThread(ctx: *openai.Ctx) void {
 
 /// Load a GGUF through whichever engine its `general.architecture` selects.
 /// deepseek2 is MLA; everything else supported is GQA (llama.zig).
-fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8, gpu_ops: bool) !generator.GgufModel {
+/// Set by `loadGgufEngine` so the banner can report whether the whole layer
+/// stack records into one command buffer.
+var gguf_layers_gpu: bool = false;
+
+fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8, gpu_ops: bool, gpu_layers: bool) !generator.GgufModel {
     var peek = try gguf_mod.parse(gpa, io, path);
     const arch_src = peek.getString("general.architecture") orelse "?";
     var arch_buf: [64]u8 = undefined;
@@ -293,13 +302,18 @@ fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8, gpu_ops: boo
         return .{ .deepseek = m };
     }
     var m = try llama.load(gpa, io, path);
+    m.gpu_layers = gpu_layers and llama.gpuLayersSupported(&m);
+    gguf_layers_gpu = m.gpu_layers;
+    // The recorded path reads the device KV cache, so prefill (which runs on
+    // the host through stepBatch) has to keep mirroring into it.
+    if (m.gpu_layers) backend.enableKvMirror();
     calibrateFor(gpa, gpu_ops, m.cfg.dim, m.cfg.ffn, m.cfg.n_layers, m.cfg.ctx_len, m.cfg.kvDim(), m.cfg.n_heads, m.cfg.n_kv_heads, m.cfg.head_dim, &m.layers[0], m.output);
     return .{ .gqa = m };
 }
 
 /// Report what calibration decided. Printed after the model is loaded, since
 /// before that there is nothing measured to report.
-fn printCompute(out: *Io.Writer) !void {
+fn printCompute(out: *Io.Writer, gpu_layers: bool) !void {
     const v = backend.lastVerdict();
     if (!v.ran) return out.print("  compute    backend {s}\n", .{backend.name});
     try out.print("  compute    backend {s}; measured on this model: matvec {s}", .{
@@ -311,6 +325,7 @@ fn printCompute(out: *Io.Writer) !void {
     if (v.ffn_gpu_ms > 0) try out.print(" (gpu {d:.3} ms vs cpu {d:.3} ms)", .{ v.ffn_gpu_ms, v.ffn_cpu_ms });
     try out.print(", prefill {s}", .{if (v.prefill_used) "gpu" else "cpu"});
     try out.print(", attn {s}", .{if (v.attn_used) "gpu" else "cpu"});
+    if (gpu_layers) try out.print(", layers gpu (1 cmd buffer/token)", .{});
     if (v.attn_gpu_ms > 0) try out.print(" (gpu {d:.3} ms vs cpu {d:.3} ms)", .{ v.attn_gpu_ms, v.attn_cpu_ms });
     try out.print("\n", .{});
 }
@@ -683,7 +698,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                 // Pick the engine from the file's own architecture: MLA
                 // (deepseek2) or the GQA family (llama/Mixtral, qwen2moe,
                 // qwen3moe, glm4moe). Both attach to the same expert source.
-                if (loadGgufEngine(gpa, io, mpath, opts.gpu_ops)) |mdl| {
+                if (loadGgufEngine(gpa, io, mpath, opts.gpu_ops, opts.gpu_layers)) |mdl| {
                     gguf_gen = .{ .m = mdl, .src = &gguf_src, .ctx_cap = opts.ctx_cap };
                     gguf_gen.m.setCtxLen(@min(gguf_gen.m.ctxLen(), opts.ctx_cap));
                     const arch_name = gguf_gen.m.archName();
@@ -698,7 +713,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                         // `loom gguf gen` stamps its fixtures "loom <arch> fixture".
                         const gname = gguf_gen.m.generalName() orelse "";
                         synthetic = std.mem.startsWith(u8, gname, "loom ") and std.mem.endsWith(u8, gname, "fixture");
-                        try printCompute(out);
+                        try printCompute(out, gguf_layers_gpu);
                         try out.print("  serving    distributed GGUF ({s}): ctx={d} chat={s}\n", .{
                             arch_name, gguf_gen.m.ctxLen(), @tagName(gguf_gen.chat_format),
                         });
@@ -727,7 +742,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     var local_gguf = false;
     if (!serve_gguf) {
         if (opts.gguf_path) |gp| {
-            if (loadGgufEngine(gpa, io, gp, opts.gpu_ops)) |mdl| {
+            if (loadGgufEngine(gpa, io, gp, opts.gpu_ops, opts.gpu_layers)) |mdl| {
                 gguf_gen = .{ .m = mdl, .src = null, .ctx_cap = opts.ctx_cap };
                 gguf_gen.m.setCtxLen(@min(gguf_gen.m.ctxLen(), opts.ctx_cap));
                 const arch_name = gguf_gen.m.archName();
@@ -740,7 +755,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                 served_model_id = std.fs.path.basename(gp);
                 const gname = gguf_gen.m.generalName() orelse "";
                 synthetic = std.mem.startsWith(u8, gname, "loom ") and std.mem.endsWith(u8, gname, "fixture");
-                try printCompute(out);
+                try printCompute(out, gguf_layers_gpu);
                 try out.print("  serving    local GGUF ({s}): ctx={d} chat={s}  (not expert-sharded: no distributed fetch)\n", .{
                     arch_name, gguf_gen.m.ctxLen(), @tagName(gguf_gen.chat_format),
                 });

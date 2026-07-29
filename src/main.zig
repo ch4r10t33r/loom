@@ -399,6 +399,7 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .kernel_threads = try flagUsize(args, "--threads", 0),
         .mmap_weights = hasFlag(args, "--mmap-weights"),
         .gpu_ops = hasFlag(args, "--gpu-ops"),
+        .gpu_layers = hasFlag(args, "--gpu-layers"),
         .prefill_batch = try flagUsize(args, "--batch", 0),
         .chat_format = flagStr(args, "--chat-format"),
     });

@@ -27,6 +27,7 @@ pub fn attnInit(layers: usize, ctx_len: usize, kvd: usize) bool {
     return false;
 }
 pub fn disableAttn() void {}
+pub fn enableKvMirror() void {}
 
 pub const LayerSpec = struct {
     li: usize,

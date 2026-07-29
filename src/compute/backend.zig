@@ -90,6 +90,8 @@ pub const attnInit = impl.attnInit;
 /// wherever the engine writes its own cache, prefill and decode alike.
 pub const kvAppend = impl.kvAppend;
 pub const disableAttn = impl.disableAttn;
+/// Declare a reader for the device KV cache so appends start mirroring.
+pub const enableKvMirror = impl.enableKvMirror;
 
 // ---- frames ------------------------------------------------------------------
 //

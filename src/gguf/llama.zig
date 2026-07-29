@@ -178,6 +178,9 @@ pub const Model = struct {
     /// come through Source.get() — local tier or peer fetch — instead of the
     /// (possibly sparse) memory map.
     dist: ?*expert_fetch.Source = null,
+    /// Set at load when every layer can be recorded into one command buffer.
+    /// See gpuLayersSupported.
+    gpu_layers: bool = false,
     /// (layer * n_expert + e) -> manifest shard id; built by attachDist.
     expert_shard: []usize = &.{},
 
@@ -688,6 +691,84 @@ fn denseFFN(st: *State, gate_w: Tensor, up_w: Tensor, down_w: Tensor) void {
 
 /// One token step; logits land in `st.logits`. Errors only when a distributed
 /// expert shard has no reachable holder (fail loud, not silently degraded).
+/// Whether every layer can be recorded into one command buffer.
+///
+/// Decided once, at load, rather than per layer -- and that is a correctness
+/// requirement, not a convenience. Once recording starts the residual lives
+/// only in device memory and the KV cache rows for the layers already recorded
+/// have been written on the device; a mid-token fall back to the host path
+/// would leave the two caches disagreeing and produce fluent, wrong output.
+/// So the whole stack qualifies or none of it does.
+pub fn gpuLayersSupported(m: *const Model) bool {
+    const c = m.cfg;
+    if (c.dim % 256 != 0) return false;
+    if (c.n_kv_heads == 0 or c.n_heads % c.n_kv_heads != 0) return false;
+    for (m.layers) |l| {
+        if (l.is_moe) return false;
+        // Bias and per-head q/k norm have no kernel; either would need a host
+        // step in the middle of the layer.
+        if (l.attn_q_bias != null or l.attn_k_bias != null or l.attn_v_bias != null) return false;
+        if (l.attn_q_norm != null or l.attn_k_norm != null) return false;
+        const g = l.ffn_gate orelse return false;
+        const u = l.ffn_up orelse return false;
+        const d = l.ffn_down orelse return false;
+        if (g.ne1 % 256 != 0) return false;
+        for ([_]ggml.Type{ l.attn_q.ty, l.attn_k.ty, l.attn_v.ty, l.attn_output.ty, g.ty, u.ty, d.ty }) |t| {
+            // Matches pipelineFor in the Metal backend. A type without a kernel
+            // does not merely run slower, it splits the command buffer.
+            if (t != .q4_k and t != .q6_k) return false;
+        }
+    }
+    return true;
+}
+
+/// Record every layer of one token into a single command buffer. Returns false
+/// before anything is recorded if the backend declines, so the caller can use
+/// its own path; once it returns true, `st.x` holds the result.
+fn stepRecorded(m: *const Model, st: *State, pos: usize) bool {
+    const cfg = m.cfg;
+    const hd = cfg.head_dim;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    if (!backend.beginFrame()) return false;
+    if (!backend.frameLoadX(st.x)) {
+        backend.endFrame();
+        return false;
+    }
+    for (m.layers, 0..) |l, li| {
+        const ok = backend.layerBlock(.{
+            .li = li,
+            .pos = pos,
+            .attn_norm = tensorAsF32(l.attn_norm),
+            .ffn_norm = tensorAsF32(l.ffn_norm),
+            .eps = cfg.eps,
+            .wq = .{ .ty = l.attn_q.ty, .data = l.attn_q.data },
+            .wk = .{ .ty = l.attn_k.ty, .data = l.attn_k.data },
+            .wv = .{ .ty = l.attn_v.ty, .data = l.attn_v.data },
+            .wo = .{ .ty = l.attn_output.ty, .data = l.attn_output.data },
+            .gate = .{ .ty = l.ffn_gate.?.ty, .data = l.ffn_gate.?.data },
+            .up = .{ .ty = l.ffn_up.?.ty, .data = l.ffn_up.?.data },
+            .down = .{ .ty = l.ffn_down.?.ty, .data = l.ffn_down.?.data },
+            .dim = cfg.dim,
+            .ffn = l.ffn_gate.?.ne1,
+            .n_heads = cfg.n_heads,
+            .n_kv_heads = cfg.n_kv_heads,
+            .hd = hd,
+            .rope_dim = cfg.rope_dim,
+            .rope_base = cfg.rope_base,
+            .rope_neox = cfg.arch.rope == .neox,
+            .attn_scale = scale,
+        });
+        if (!ok) {
+            // Nothing has been committed, so the device KV cache has not been
+            // written and st.x is untouched: dropping the frame is clean.
+            backend.endFrame();
+            return false;
+        }
+    }
+    backend.endFrame();
+    return backend.frameStoreX(st.x);
+}
+
 pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     const cfg = m.cfg;
     const hd = cfg.head_dim;
@@ -700,6 +781,14 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     // here rather than trusting the two to agree (security issue #29).
     if (token >= cfg.vocab) return error.TokenOutOfRange;
     backend.dequantRow(m.token_embd.ty, st.x, m.token_embd.data, token, cfg.dim);
+
+    // The whole layer stack in one command buffer, when the backend can take
+    // it. Everything after this point is the per-operation path.
+    if (m.gpu_layers and stepRecorded(m, st, pos)) {
+        backend.rmsnorm(st.normed, st.x, tensorAsF32(m.output_norm), cfg.eps);
+        mv(m.output, st.logits, st.normed);
+        return;
+    }
 
     for (m.layers, 0..) |l, li| {
         // ---- attention ----
