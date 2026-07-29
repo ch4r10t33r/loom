@@ -50,6 +50,9 @@ pub fn matmul(t: ggml.Type, out: []f32, data: []const u8, xs: []const f32, n: us
         &.{ w.buf, cx.scratch_x, cx.scratch_out },
         &.{ w.off, 0, 0 },
         std.mem.asBytes(&dims),
+        // gemm_q4k is one row per SIMD group -- it spends its register budget
+        // on MAX_BATCH accumulators rather than a second row, so `groupsFor`,
+        // which describes the dmmv kernels, does not apply here.
         rows * SIMD_W,
         group,
     );
@@ -136,6 +139,14 @@ var gemm_worthwhile: bool = false;
 /// measured: one command buffer per layer is a real cost, and at short
 /// sequences the CPU loop is trivial.
 var attn_worthwhile: bool = false;
+/// Whether the device KV cache has a reader, and so must be kept in step with
+/// the engine's own. Fused attention is one reader; the recorded layer path is
+/// another, and it does not imply the first -- calibration can decline fused
+/// attention as a standalone operation while the layer path still uses it
+/// inside a frame. Gating the mirror on the wrong one leaves the device cache
+/// holding zeros for every prefilled position, which produces fluent, wrong
+/// output rather than an error.
+var kv_mirror: bool = false;
 var calibrated: bool = false;
 /// True only while `calibrate` is running. Without it the gate below refuses
 /// the very call that is supposed to measure the block: `calibrate` marks
@@ -413,6 +424,16 @@ const Ctx = struct {
     /// step, O(seq*kvd).
     kv_k: ?mtl.Buffer = null,
     kv_v: ?mtl.Buffer = null,
+    /// Per-layer norm weights, all layers resident at once.
+    ///
+    /// Recording makes host writes to a *shared* scratch buffer wrong in a way
+    /// immediate submission never was: `layerBlock` used to copy each layer's
+    /// norms into `scratch_x` and record dispatches reading it, but the
+    /// dispatches do not run until `endFrame`, by which point every layer's
+    /// dispatch reads whatever the *last* layer wrote. Twenty-two layers all
+    /// used layer 21's norms, and the model produced confident nonsense. Each
+    /// layer owning a slot removes the aliasing entirely.
+    norms: mtl.Buffer,
     kv_ctx: usize = 0,
     kv_kvd: usize = 0,
     rmsnorm_p: mtl.Pipeline,
@@ -502,11 +523,15 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const nb = dev.alloc(1 << 22) catch {
+        dev.deinit();
+        return;
+    };
     const so = dev.alloc(1 << 22) catch {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .gemm_q4k = pg, .attn_p = pattn, .rope_p = prope, .kvw_p = pkvw, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .gemm_q4k = pg, .attn_p = pattn, .rope_p = prope, .kvw_p = pkvw, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -582,7 +607,19 @@ const ATTN_MAX_SEQ: usize = 2048;
 /// no device, in which case the engine keeps its own cache and the CPU path.
 pub fn attnInit(layers: usize, ctx_len: usize, kvd: usize) bool {
     const cx = &(ctx orelse return false);
-    if (cx.kv_k != null) return true;
+    // Reallocate when the shape differs rather than keeping whatever was
+    // allocated first. Returning the existing cache unconditionally is right
+    // for a second call with the same model and silently wrong for a different
+    // one: the consumer's `kvd != cx.kv_kvd` check then declines forever, or
+    // worse, matches by coincidence and indexes a cache laid out for another
+    // geometry.
+    if (cx.kv_k != null) {
+        if (cx.kv_ctx == ctx_len and cx.kv_kvd == kvd) return true;
+        if (cx.kv_k) |*b| b.deinit();
+        if (cx.kv_v) |*b| b.deinit();
+        cx.kv_k = null;
+        cx.kv_v = null;
+    }
     if (ctx_len > ATTN_MAX_SEQ) return false;
     const bytes = layers * ctx_len * kvd * @sizeOf(f32);
     if (bytes == 0) return false;
@@ -715,6 +752,12 @@ pub fn frameOpen() bool {
     return frame != null;
 }
 
+/// Declare that something will read the device KV cache, so `kvAppend` starts
+/// mirroring. Called when the recorded layer path is enabled.
+pub fn enableKvMirror() void {
+    kv_mirror = true;
+}
+
 /// Force fused attention off, whatever calibration concluded.
 pub fn disableAttn() void {
     attn_worthwhile = false;
@@ -730,11 +773,11 @@ pub fn disableAttn() void {
 /// available. Appending wherever the host cache is written, independently of
 /// who later reads it, is what makes the two impossible to desynchronise.
 pub fn kvAppend(li: usize, pos: usize, k_new: []const f32, v_new: []const f32) bool {
-    // No reader, no mirror. When fused attention is off the device cache is
-    // dead weight, and writing it is not free: keeping it updated through a
-    // 576-token prefill is 12,672 writes into device memory and took decode
-    // from 56 to 3 tok/s with the GPU otherwise unused.
-    if (!attn_worthwhile) return false;
+    // No reader, no mirror. An unread device cache is dead weight and writing
+    // it is not free: keeping it updated through a 576-token prefill is 12,672
+    // device writes, which took decode from 56 to 3 tok/s with the GPU
+    // otherwise unused.
+    if (!kv_mirror and !attn_worthwhile) return false;
     const cx = &(ctx orelse return false);
     const kb = cx.kv_k orelse return false;
     const vb = cx.kv_v orelse return false;
@@ -856,12 +899,16 @@ pub fn layerBlock(s: LayerSpec) bool {
     const uw = wrapFor(cx, s.up.data) orelse return false;
     const dw = wrapFor(cx, s.down.data) orelse return false;
 
-    // Norm weights are small and change per layer; they ride in scratch_x,
-    // which nothing else holds across a dispatch.
-    if ((s.dim * 2) * 4 > cx.scratch_x.len) return false;
-    const sx = cx.scratch_x.slice(f32);
-    @memcpy(sx[0..s.dim], s.attn_norm);
-    @memcpy(sx[s.dim..][0..s.dim], s.ffn_norm);
+    // Each layer writes its own slot. See Ctx.norms: a shared scratch buffer
+    // is correct only when the dispatch runs before the next host write, which
+    // recording breaks.
+    const norm_off = s.li * 2 * s.dim;
+    if ((norm_off + 2 * s.dim) * 4 > cx.norms.len) return false;
+    const nrm = cx.norms.slice(f32);
+    @memcpy(nrm[norm_off..][0..s.dim], s.attn_norm);
+    @memcpy(nrm[norm_off + s.dim ..][0..s.dim], s.ffn_norm);
+    const attn_norm_off = norm_off * @sizeOf(f32);
+    const ffn_norm_off = (norm_off + s.dim) * @sizeOf(f32);
 
     const group = SIMD_W * SIMDGROUPS_PER_GROUP;
     const nd_attn = extern struct { n: u32, eps: f32 }{ .n = @intCast(s.dim), .eps = s.eps };
@@ -906,12 +953,12 @@ pub fn layerBlock(s: LayerSpec) bool {
     // 2 = q, 3 = k, 4 = v, 5 = attn_out, 6 = gate, 7 = up.
     const e = f.enc;
     // normed = rmsnorm(x) * attn_norm
-    e.dispatch(cx.rmsnorm_p, &.{ cx.act[0], cx.scratch_x, cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&nd_attn), SIMD_W, SIMD_W);
+    e.dispatch(cx.rmsnorm_p, &.{ cx.act[0], cx.norms, cx.act[1] }, &.{ 0, attn_norm_off, 0 }, std.mem.asBytes(&nd_attn), SIMD_W, SIMD_W);
     e.barrier();
     // q, k, v — mutually independent, so no barrier between them
-    e.dispatch(qp, &.{ qw.buf, cx.act[1], cx.act[2] }, &.{ qw.off, 0, 0 }, std.mem.asBytes(&dims_q), ((qd + 1) / 2) * SIMD_W, group);
-    e.dispatch(kp, &.{ kw.buf, cx.act[1], cx.act[3] }, &.{ kw.off, 0, 0 }, std.mem.asBytes(&dims_kv), ((kvd + 1) / 2) * SIMD_W, group);
-    e.dispatch(vp, &.{ vw.buf, cx.act[1], cx.act[4] }, &.{ vw.off, 0, 0 }, std.mem.asBytes(&dims_kv), ((kvd + 1) / 2) * SIMD_W, group);
+    e.dispatch(qp, &.{ qw.buf, cx.act[1], cx.act[2] }, &.{ qw.off, 0, 0 }, std.mem.asBytes(&dims_q), groupsFor(s.wq.ty, qd), group);
+    e.dispatch(kp, &.{ kw.buf, cx.act[1], cx.act[3] }, &.{ kw.off, 0, 0 }, std.mem.asBytes(&dims_kv), groupsFor(s.wk.ty, kvd), group);
+    e.dispatch(vp, &.{ vw.buf, cx.act[1], cx.act[4] }, &.{ vw.off, 0, 0 }, std.mem.asBytes(&dims_kv), groupsFor(s.wv.ty, kvd), group);
     e.barrier();
     // RoPE q and k in place; v is not rotated
     e.dispatch(cx.rope_p, &.{cx.act[2]}, &.{0}, std.mem.asBytes(&rope_q), s.n_heads * (s.rope_dim / 2), 64);
@@ -924,20 +971,20 @@ pub fn layerBlock(s: LayerSpec) bool {
     e.dispatch(cx.attn_p, &.{ cx.act[2], kb, vb, cx.act[5] }, &.{ 0, layer_off, layer_off, 0 }, std.mem.asBytes(&attn), s.n_heads * 64, 64);
     e.barrier();
     // x += Wo . attn_out   (into act[1], then added)
-    e.dispatch(op, &.{ ow.buf, cx.act[5], cx.act[1] }, &.{ ow.off, 0, 0 }, std.mem.asBytes(&dims_o), ((s.dim + 1) / 2) * SIMD_W, group);
+    e.dispatch(op, &.{ ow.buf, cx.act[5], cx.act[1] }, &.{ ow.off, 0, 0 }, std.mem.asBytes(&dims_o), groupsFor(s.wo.ty, s.dim), group);
     e.barrier();
     e.dispatch(cx.add_p, &.{ cx.act[0], cx.act[1] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), s.dim, 64);
     e.barrier();
     // ---- FFN ----
     const nd_ffn = extern struct { n: u32, eps: f32 }{ .n = @intCast(s.dim), .eps = s.eps };
-    e.dispatch(cx.rmsnorm_p, &.{ cx.act[0], cx.scratch_x, cx.act[1] }, &.{ 0, s.dim * @sizeOf(f32), 0 }, std.mem.asBytes(&nd_ffn), SIMD_W, SIMD_W);
+    e.dispatch(cx.rmsnorm_p, &.{ cx.act[0], cx.norms, cx.act[1] }, &.{ 0, ffn_norm_off, 0 }, std.mem.asBytes(&nd_ffn), SIMD_W, SIMD_W);
     e.barrier();
-    e.dispatch(gp, &.{ gw.buf, cx.act[1], cx.act[6] }, &.{ gw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ((s.ffn + 1) / 2) * SIMD_W, group);
-    e.dispatch(upp, &.{ uw.buf, cx.act[1], cx.act[7] }, &.{ uw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ((s.ffn + 1) / 2) * SIMD_W, group);
+    e.dispatch(gp, &.{ gw.buf, cx.act[1], cx.act[6] }, &.{ gw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), groupsFor(s.gate.ty, s.ffn), group);
+    e.dispatch(upp, &.{ uw.buf, cx.act[1], cx.act[7] }, &.{ uw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), groupsFor(s.up.ty, s.ffn), group);
     e.barrier();
     e.dispatch(cx.swiglu_p, &.{ cx.act[6], cx.act[7], cx.act[6] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_ffn), s.ffn, 64);
     e.barrier();
-    e.dispatch(dp, &.{ dw.buf, cx.act[6], cx.act[1] }, &.{ dw.off, 0, 0 }, std.mem.asBytes(&dims_down), ((s.dim + 1) / 2) * SIMD_W, group);
+    e.dispatch(dp, &.{ dw.buf, cx.act[6], cx.act[1] }, &.{ dw.off, 0, 0 }, std.mem.asBytes(&dims_down), groupsFor(s.down.ty, s.dim), group);
     e.barrier();
     e.dispatch(cx.add_p, &.{ cx.act[0], cx.act[1] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), s.dim, 64);
     e.barrier();
@@ -959,6 +1006,27 @@ pub fn frameStoreX(x: []f32) bool {
     if (x.len * 4 > cx.act[0].len) return false;
     @memcpy(x, cx.act[0].slice(f32)[0..x.len]);
     return true;
+}
+
+/// How many output rows one SIMD group of a type's dmmv kernel produces.
+///
+/// Not a detail the caller can guess: `dmmv_q4k` takes two rows per group
+/// (NR0=2, so one activation load feeds both) while `dmmv_q6k` takes one. A
+/// dispatch that assumes the wrong number launches too few groups and simply
+/// leaves the tail of the output vector holding whatever was there before --
+/// no error, no NaN, just half a projection. That is what shipped: TinyLlama's
+/// `ffn_down` is Q6_K, dispatched with the Q4_K group count, so every layer's
+/// FFN output was half stale and the model produced confident nonsense.
+fn rowsPerGroup(t: ggml.Type) usize {
+    return switch (t) {
+        .q4_k => 2, // NR0 in dmmv_q4k.metal
+        else => 1,
+    };
+}
+
+fn groupsFor(t: ggml.Type, rows: usize) usize {
+    const per = rowsPerGroup(t);
+    return ((rows + per - 1) / per) * SIMD_W;
 }
 
 /// The dmmv pipeline for a quantization, or null when there is no kernel for
@@ -993,7 +1061,7 @@ pub fn matvec(t: ggml.Type, out: []f32, data: []const u8, x: []const f32, rows: 
         &.{ w.buf, cx.scratch_x, cx.scratch_out },
         &.{ w.off, 0, 0 },
         std.mem.asBytes(&dims),
-        rows * SIMD_W,
+        groupsFor(t, rows),
         group,
     );
     cb.commitAndWait();
@@ -1125,6 +1193,21 @@ test "metal q6_k matvec agrees with the exact cpu reference" {
             return e;
         };
     }
+}
+
+test "dispatch grids match each kernel's rows per SIMD group" {
+    // Pins the arithmetic that produced the worst bug in this work. The dmmv
+    // kernels do not agree on how many rows a SIMD group covers -- Q4_K takes
+    // two, Q6_K one -- and a dispatch that assumes the wrong number silently
+    // computes only part of the output vector. There is no error and no NaN;
+    // the tail simply keeps its previous contents, which for a residual stream
+    // is a plausible-looking number.
+    try std.testing.expectEqual(@as(usize, 2), rowsPerGroup(.q4_k));
+    try std.testing.expectEqual(@as(usize, 1), rowsPerGroup(.q6_k));
+    // Odd row counts must round up, not down: 65 rows of Q4_K need 33 groups.
+    try std.testing.expectEqual(33 * SIMD_W, groupsFor(.q4_k, 65));
+    try std.testing.expectEqual(64 * SIMD_W, groupsFor(.q4_k, 128));
+    try std.testing.expectEqual(65 * SIMD_W, groupsFor(.q6_k, 65));
 }
 
 test "metal batched matmul agrees with the exact cpu reference" {
@@ -1266,23 +1349,35 @@ test "metal fused attention matches the cpu head loop" {
 
 test "metal layer block matches the cpu layer, end to end" {
     // A whole layer recorded into one command buffer, against the same
-    // sequence run on the host. This has to exist before the engine is wired
-    // to it: the failure mode of a wrong RoPE pairing, a wrong KV row offset
-    // or a dropped residual is output that still reads fluently, and this
-    // session has already shipped that once.
+    // sequence run on the host, **over several positions**.
+    //
+    // The position sweep is the point. An earlier version of this test ran
+    // only pos=0 and passed while the engine produced garbage, because at
+    // pos=0 the rotation angle is zero -- RoPE is the identity -- and softmax
+    // over a single score is 1, so attention is a passthrough. The two things
+    // most likely to be wrong were both switched off by the fixture.
     //
     // RoPE is reimplemented here rather than called, so the test is an
     // independent statement of the rotation, not the same code twice.
     const gpa = std.testing.allocator;
-    const dim = 256;
-    const ffn = 512;
-    const n_heads = 4;
-    const n_kv_heads = 2;
+    // TinyLlama-1.1B's actual geometry. Small synthetic dims passed while the
+    // engine produced nonsense, so the fixture has to match a real model:
+    // GQA with 8 query heads per KV head, and a 2048-wide residual that the
+    // rmsnorm kernel covers with a single 32-thread group.
+    const dim = 2048;
+    const ffn = 5632;
+    const n_heads = 32;
+    const n_kv_heads = 4;
     const hd = 64;
     const rope_dim = 64;
     const rope_base: f32 = 10000.0;
     const eps: f32 = 1e-5;
-    const li = 1;
+    // Two layers recorded into ONE frame, with different weights. Recording
+    // several layers before submitting is its own failure surface: every
+    // buffer they share is written by the host at record time but read by the
+    // GPU at submit time, so the last writer wins. That is how all 22 layers
+    // ended up using layer 21's norm weights.
+    const nlayers_test = 2;
     const layers = 3;
     const ctx_len = 64;
     const qd = n_heads * hd;
@@ -1326,71 +1421,77 @@ test "metal layer block matches the cpu layer, end to end" {
         }
     }.f;
 
-    const wq = try mk(gpa, rnd, qd, dim);
-    defer gpa.free(wq);
-    const wk = try mk(gpa, rnd, kvd, dim);
-    defer gpa.free(wk);
-    const wv = try mk(gpa, rnd, kvd, dim);
-    defer gpa.free(wv);
-    const wo = try mk(gpa, rnd, dim, qd);
-    defer gpa.free(wo);
-    const wg = try mk(gpa, rnd, ffn, dim);
-    defer gpa.free(wg);
-    const wu = try mk(gpa, rnd, ffn, dim);
-    defer gpa.free(wu);
-    const wd = try mk(gpa, rnd, dim, ffn);
-    defer gpa.free(wd);
-
-    const an = try gpa.alloc(f32, dim);
-    defer gpa.free(an);
-    const fn_ = try gpa.alloc(f32, dim);
-    defer gpa.free(fn_);
-    for (an) |*v| v.* = 0.5 + rnd.float(f32);
-    for (fn_) |*v| v.* = 0.5 + rnd.float(f32);
+    var wq: [nlayers_test][]align(16384) u8 = undefined;
+    var wk: [nlayers_test][]align(16384) u8 = undefined;
+    var wv: [nlayers_test][]align(16384) u8 = undefined;
+    var wo: [nlayers_test][]align(16384) u8 = undefined;
+    var wg: [nlayers_test][]align(16384) u8 = undefined;
+    var wu: [nlayers_test][]align(16384) u8 = undefined;
+    var wd: [nlayers_test][]align(16384) u8 = undefined;
+    var an: [nlayers_test][]f32 = undefined;
+    var fn_: [nlayers_test][]f32 = undefined;
+    for (0..nlayers_test) |L| {
+        wq[L] = try mk(gpa, rnd, qd, dim);
+        wk[L] = try mk(gpa, rnd, kvd, dim);
+        wv[L] = try mk(gpa, rnd, kvd, dim);
+        wo[L] = try mk(gpa, rnd, dim, qd);
+        wg[L] = try mk(gpa, rnd, ffn, dim);
+        wu[L] = try mk(gpa, rnd, ffn, dim);
+        wd[L] = try mk(gpa, rnd, dim, ffn);
+        an[L] = try gpa.alloc(f32, dim);
+        fn_[L] = try gpa.alloc(f32, dim);
+        for (an[L]) |*v| v.* = 0.5 + rnd.float(f32);
+        for (fn_[L]) |*v| v.* = 0.5 + rnd.float(f32);
+    }
+    defer for (0..nlayers_test) |L| {
+        gpa.free(wq[L]);
+        gpa.free(wk[L]);
+        gpa.free(wv[L]);
+        gpa.free(wo[L]);
+        gpa.free(wg[L]);
+        gpa.free(wu[L]);
+        gpa.free(wd[L]);
+        gpa.free(an[L]);
+        gpa.free(fn_[L]);
+    };
 
     const x0 = try gpa.alloc(f32, dim);
     defer gpa.free(x0);
     for (x0) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
 
-    const spec = LayerSpec{
-        .li = li,
-        .pos = 0,
-        .attn_norm = an,
-        .ffn_norm = fn_,
-        .eps = eps,
-        .wq = .{ .ty = .q4_k, .data = wq },
-        .wk = .{ .ty = .q4_k, .data = wk },
-        .wv = .{ .ty = .q4_k, .data = wv },
-        .wo = .{ .ty = .q4_k, .data = wo },
-        .gate = .{ .ty = .q4_k, .data = wg },
-        .up = .{ .ty = .q4_k, .data = wu },
-        .down = .{ .ty = .q4_k, .data = wd },
-        .dim = dim,
-        .ffn = ffn,
-        .n_heads = n_heads,
-        .n_kv_heads = n_kv_heads,
-        .hd = hd,
-        .rope_dim = rope_dim,
-        .rope_base = rope_base,
-        .rope_neox = false,
-        .attn_scale = scale,
-    };
+    const nsteps = 5;
+    const specFor = struct {
+        fn f(L: usize, pos: usize, a: []const f32, fnm: []const f32, q_: []const u8, k_: []const u8, v_: []const u8, o_: []const u8, g_: []const u8, u_: []const u8, d_: []const u8) LayerSpec {
+            return .{
+                .li = L,
+                .pos = pos,
+                .attn_norm = a,
+                .ffn_norm = fnm,
+                .eps = eps,
+                .wq = .{ .ty = .q4_k, .data = q_ },
+                .wk = .{ .ty = .q4_k, .data = k_ },
+                .wv = .{ .ty = .q4_k, .data = v_ },
+                .wo = .{ .ty = .q4_k, .data = o_ },
+                .gate = .{ .ty = .q4_k, .data = g_ },
+                .up = .{ .ty = .q4_k, .data = u_ },
+                .down = .{ .ty = .q4_k, .data = d_ },
+                .dim = dim,
+                .ffn = ffn,
+                .n_heads = n_heads,
+                .n_kv_heads = n_kv_heads,
+                .hd = hd,
+                .rope_dim = rope_dim,
+                .rope_base = rope_base,
+                .rope_neox = false,
+                .attn_scale = scale,
+            };
+        }
+    }.f;
 
     const got = try gpa.alloc(f32, dim);
     defer gpa.free(got);
-    if (!beginFrame()) return error.SkipZigTest;
-    if (!frameLoadX(x0)) return error.SkipZigTest;
-    if (!layerBlock(spec)) {
-        endFrame();
-        return error.SkipZigTest;
-    }
-    endFrame();
-    if (!frameStoreX(got)) return error.SkipZigTest;
-
-    // ---- host reference ----
     const want = try gpa.alloc(f32, dim);
     defer gpa.free(want);
-    @memcpy(want, x0);
     const normed = try gpa.alloc(f32, dim);
     defer gpa.free(normed);
     const q = try gpa.alloc(f32, qd);
@@ -1407,12 +1508,15 @@ test "metal layer block matches the cpu layer, end to end" {
     defer gpa.free(gbuf);
     const ubuf = try gpa.alloc(f32, ffn);
     defer gpa.free(ubuf);
+    // The host keeps its own cache, so the comparison covers the KV row
+    // offsets as well as the arithmetic.
+    const kc = try gpa.alloc(f32, nlayers_test * nsteps * kvd);
+    defer gpa.free(kc);
+    const vc = try gpa.alloc(f32, nlayers_test * nsteps * kvd);
+    defer gpa.free(vc);
+    const scores = try gpa.alloc(f32, nsteps);
+    defer gpa.free(scores);
 
-    // Exact dequantize-then-dot, not cpu.matvec: the CPU Q4_K kernel quantizes
-    // activations to int8 and is approximate by design (~0.4% per element).
-    // Chained across seven matvecs that compounds into percent-level drift and
-    // would be reported here as a GPU bug -- which is exactly what the first
-    // version of this test did.
     const exact = struct {
         fn f(g: std.mem.Allocator, o: []f32, data: []const u8, xv: []const f32, rows: usize, cols: usize) !void {
             const rowbuf = try g.alloc(f32, cols);
@@ -1425,17 +1529,11 @@ test "metal layer block matches the cpu layer, end to end" {
             }
         }
     }.f;
-
-    cpu.rmsnorm(normed, want, an, eps);
-    try exact(gpa, q, wq, normed, qd, dim);
-    try exact(gpa, k, wk, normed, kvd, dim);
-    try exact(gpa, v, wv, normed, kvd, dim);
-
     // NORM RoPE, stated independently of the engine's implementation.
     const rope = struct {
         fn f(vec: []f32, nh: usize, head_dim: usize, rd: usize, pos: usize, base: f32) void {
-            for (0..nh) |h| {
-                const head = vec[h * head_dim ..][0..head_dim];
+            for (0..nh) |hh| {
+                const head = vec[hh * head_dim ..][0..head_dim];
                 var i: usize = 0;
                 while (i + 1 < rd) : (i += 2) {
                     const fr = std.math.pow(f32, base, -@as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(rd)));
@@ -1450,35 +1548,70 @@ test "metal layer block matches the cpu layer, end to end" {
             }
         }
     }.f;
-    rope(q, n_heads, hd, rope_dim, 0, rope_base);
-    rope(k, n_kv_heads, hd, rope_dim, 0, rope_base);
-
-    // seq == 1, so softmax over one score is exactly 1 and attn_out == v.
     const q_per_kv = n_heads / n_kv_heads;
-    for (0..n_heads) |h| {
-        const kvh = h / q_per_kv;
-        @memcpy(ao[h * hd ..][0..hd], v[kvh * hd ..][0..hd]);
-    }
-    try exact(gpa, tmp[0..dim], wo, ao, dim, qd);
-    cpu.add(want, tmp[0..dim]);
 
-    cpu.rmsnorm(normed, want, fn_, eps);
-    try exact(gpa, gbuf, wg, normed, ffn, dim);
-    try exact(gpa, ubuf, wu, normed, ffn, dim);
-    cpu.swiglu(gbuf, gbuf, ubuf);
-    try exact(gpa, tmp[0..dim], wd, gbuf, dim, ffn);
-    cpu.add(want, tmp[0..dim]);
+    for (0..nsteps) |pos| {
+        // Same input at every position, so any difference between the two is
+        // the position-dependent machinery and nothing else.
+        if (!beginFrame()) return error.SkipZigTest;
+        if (!frameLoadX(x0)) return error.SkipZigTest;
+        for (0..nlayers_test) |L| {
+            if (!layerBlock(specFor(L, pos, an[L], fn_[L], wq[L], wk[L], wv[L], wo[L], wg[L], wu[L], wd[L]))) {
+                endFrame();
+                return error.SkipZigTest;
+            }
+        }
+        endFrame();
+        if (!frameStoreX(got)) return error.SkipZigTest;
 
-    var mass: f32 = 0;
-    for (want) |wv2| mass += @abs(wv2);
-    // Against the mean magnitude of the result, not each element: a residual
-    // stream has elements near zero where a relative bound is meaningless.
-    const tol = (mass / @as(f32, @floatFromInt(dim))) * 1e-3;
-    for (0..dim) |i| {
-        std.testing.expectApproxEqAbs(want[i], got[i], tol) catch |e| {
-            std.debug.print("layer block dim {d}: cpu {d} vs gpu {d} (tol {d})\n", .{ i, want[i], got[i], tol });
-            return e;
-        };
+        // ---- host reference: the same two layers, in the same order ----
+        @memcpy(want, x0);
+        for (0..nlayers_test) |L| {
+            cpu.rmsnorm(normed, want, an[L], eps);
+            try exact(gpa, q, wq[L], normed, qd, dim);
+            try exact(gpa, k, wk[L], normed, kvd, dim);
+            try exact(gpa, v, wv[L], normed, kvd, dim);
+            rope(q, n_heads, hd, rope_dim, pos, rope_base);
+            rope(k, n_kv_heads, hd, rope_dim, pos, rope_base);
+            const cbase = (L * nsteps + pos) * kvd;
+            @memcpy(kc[cbase..][0..kvd], k);
+            @memcpy(vc[cbase..][0..kvd], v);
+
+            const seq = pos + 1;
+            for (0..n_heads) |hh| {
+                const kvh = hh / q_per_kv;
+                const qh = q[hh * hd ..][0..hd];
+                for (0..seq) |t| {
+                    scores[t] = cpu.dotF32(qh, kc[(L * nsteps + t) * kvd + kvh * hd ..][0..hd]) * scale;
+                }
+                cpu.softmax(scores[0..seq]);
+                const oh = ao[hh * hd ..][0..hd];
+                @memset(oh, 0);
+                for (0..seq) |t| cpu.axpy(oh, vc[(L * nsteps + t) * kvd + kvh * hd ..][0..hd], scores[t]);
+            }
+            try exact(gpa, tmp[0..dim], wo[L], ao, dim, qd);
+            cpu.add(want, tmp[0..dim]);
+
+            cpu.rmsnorm(normed, want, fn_[L], eps);
+            try exact(gpa, gbuf, wg[L], normed, ffn, dim);
+            try exact(gpa, ubuf, wu[L], normed, ffn, dim);
+            cpu.swiglu(gbuf, gbuf, ubuf);
+            try exact(gpa, tmp[0..dim], wd[L], gbuf, dim, ffn);
+            cpu.add(want, tmp[0..dim]);
+        }
+
+        var mass: f32 = 0;
+        for (want) |wv2| mass += @abs(wv2);
+        // Against the mean magnitude of the result, not each element: a
+        // residual stream has elements near zero where a relative bound is
+        // meaningless.
+        const tol = (mass / @as(f32, @floatFromInt(dim))) * 2e-3;
+        for (0..dim) |i| {
+            std.testing.expectApproxEqAbs(want[i], got[i], tol) catch |e| {
+                std.debug.print("layer block pos {d} dim {d}: cpu {d} vs gpu {d} (tol {d})\n", .{ pos, i, want[i], got[i], tol });
+                return e;
+            };
+        }
     }
 }
 
