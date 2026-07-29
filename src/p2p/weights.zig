@@ -536,6 +536,11 @@ pub const Holdings = struct {
 
     // set/has are atomic: the eager repair thread mutates holdings while P2P
     // connection threads read them concurrently.
+    /// Drop every bit, keeping the allocation.
+    pub fn clearAll(self: *Holdings) void {
+        @memset(self.bits, 0);
+    }
+
     pub fn set(self: *Holdings, i: usize) void {
         _ = @atomicRmw(u8, &self.bits[i / 8], .Or, @as(u8, 1) << @intCast(i % 8), .monotonic);
     }
@@ -612,6 +617,99 @@ pub const Store = struct {
     seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Guards `saveSidecars` only (see there). Never held across network I/O.
     sidecar_mutex: Io.Mutex = .init,
+    /// Read-only mapping of `file`, when one could be made. The token path
+    /// reads weights straight out of this instead of copying them into a heap
+    /// cache, which is both a copy and a second resident copy of bytes the
+    /// page cache already holds. Measured on a 16 GB machine serving an 8.9 GB
+    /// model, an 8 GB heap cache made the expert matmuls 2.8x slower (65 ->
+    /// 180 ms/token) purely through memory pressure, while making the reads
+    /// look fast -- the cost moved from the read to whoever next touched the
+    /// pages.
+    map: ?[]align(std.heap.page_size_min) const u8 = null,
+    /// Shards whose digest has been checked against this mapping. Verifying on
+    /// first use still catches a poisoned block (audit #5 P0-2); re-hashing
+    /// ~950 MB per token to re-confirm bytes we already vouched for does not.
+    /// Reset wholesale whenever `seq` moves, i.e. whenever a shard is written.
+    verified: ?Holdings = null,
+    verified_seq: u64 = 0,
+
+    /// Map the backing file read-only. Best-effort: a store that cannot be
+    /// mapped simply keeps using pread, so callers need no fallback of their
+    /// own.
+    pub fn mapReadOnly(self: *Store) void {
+        if (self.map != null) return;
+        const len = self.manifest.file_size;
+        if (len == 0) return;
+        const m = std.posix.mmap(
+            null,
+            @intCast(len),
+            .{ .READ = true },
+            .{ .TYPE = .SHARED },
+            self.file.handle,
+            0,
+        ) catch return;
+        self.map = m;
+        self.verified = Holdings.initEmpty(self.gpa, self.manifest.nRanges()) catch {
+            std.posix.munmap(m);
+            self.map = null;
+            return;
+        };
+        self.verified_seq = self.holdingsSeq();
+    }
+
+    /// Extent `k` of shard `i` as a slice of the mapping, or null when the
+    /// store is not mapped, the shard is not held, or it has not verified.
+    ///
+    /// The caller gets a pointer into the page cache: no copy, and the pages
+    /// are shared with every other reader of the file rather than duplicated.
+    pub fn extentSlice(self: *Store, i: usize, k: usize) ?[]const u8 {
+        const map = self.map orelse return null;
+        if (!self.holdings.has(i)) return null;
+        if (!self.ensureVerified(i)) return null;
+        const ex = self.manifest.shardExtents(i);
+        if (k >= ex.len) return null;
+        const off: usize = @intCast(ex[k].offset);
+        const len: usize = @intCast(ex[k].len);
+        if (off + len > map.len) return null;
+        return map[off..][0..len];
+    }
+
+    /// Number of extents shard `i` has, so a caller can check the layout it
+    /// expects before taking the zero-copy path.
+    pub fn extentCount(self: *const Store, i: usize) usize {
+        return self.manifest.shardExtents(i).len;
+    }
+
+    /// Hash shard `i` out of the mapping once, remembering the result. A
+    /// mismatch clears the holdings bit exactly as `readRangeVerified` does,
+    /// so eager repair re-fetches.
+    fn ensureVerified(self: *Store, i: usize) bool {
+        var v = &(self.verified orelse return false);
+        const seq = self.holdingsSeq();
+        if (seq != self.verified_seq) {
+            v.clearAll();
+            self.verified_seq = seq;
+        }
+        if (v.has(i)) return true;
+
+        const map = self.map orelse return false;
+        var h = hashmod.blockHasher();
+        for (self.manifest.shardExtents(i)) |e| {
+            const off: usize = @intCast(e.offset);
+            const len: usize = @intCast(e.len);
+            if (off + len > map.len) return false;
+            h.update(map[off..][0..len]);
+        }
+        var got: [32]u8 = undefined;
+        h.final(&got);
+        if (!hashmod.eql(got, self.manifest.digests[i])) {
+            self.holdings.clear(i);
+            _ = self.seq.fetchAdd(1, .monotonic);
+            return false;
+        }
+        v.set(i);
+        return true;
+    }
 
     pub fn holdingsSeq(self: *Store) u64 {
         return self.seq.load(.monotonic);

@@ -43,6 +43,10 @@ pub const Options = struct {
     ui_port: u16 = 8555, // 0 = UI disabled
     status_secs: u32 = 30, // periodic console status; 0 = off
     kernel_threads: usize = 0, // 0 = auto (cpu count - 2)
+    /// Serve routed experts zero-copy from a read-only mapping of the store
+    /// rather than copying them into the RAM cache. See node.zig for why this
+    /// is off by default.
+    mmap_weights: bool = false,
     prefill_batch: usize = 0, // 0 = kernel max; 1 disables batched prefill
     p2p_addr: []const u8,
     p2p_port: u16,
@@ -566,9 +570,27 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                     committee_peers.append(gpa, a) catch {};
                 } else |_| {}
             }
-            // The RAM tier, sized by the node's declared budget (--ram-gb).
-            // Without it every routed expert is re-read from disk and
-            // re-hashed on every token.
+            // Read weights straight out of a read-only mapping instead of
+            // copying them into the heap cache. Off by default, because on the
+            // one machine this has been measured -- 16 GB serving an 8.9 GB
+            // model -- it is slower, and the reason is worth recording.
+            //
+            //   config              get     ffn    total ms/token
+            //   no cache          375.9    64.8    480.0
+            //   2 GB heap cache   269.0    73.7    409.7
+            //   8 GB heap cache    87.9   179.6    362.4
+            //   mmap, zero-copy    34.5   369.7    484.9
+            //
+            // Zero-copy does exactly what it claims: `get` falls to a pointer
+            // return. But the model does not fit in this machine's page cache,
+            // so ~1.16 GB of expert weights per token is faulted from disk
+            // either way, and reading them through the mapping moves that cost
+            // into whoever touches the pages -- the matmul. The heap cache
+            // wins here only because it keeps a bounded set in anonymous
+            // memory the LRU controls rather than leaving residency to the
+            // kernel. On a node whose expert corpus fits in RAM the ordering
+            // should reverse, which is what this flag is for.
+            if (opts.mmap_weights) st.mapReadOnly();
             gguf_src = try expert_fetch.Source.initCached(gpa, io, st, peer_list.items, opts.ram_bytes);
             gguf_src.committee = committee_peers.items;
             // resident gate (audit #5 P0-4): the mmap'd resident bundle must be

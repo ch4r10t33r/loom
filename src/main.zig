@@ -397,6 +397,7 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .ui_port = try flagU16(args, "--ui-port", @intCast(try envU64(env, "UI_PORT", 8555))),
         .status_secs = @intCast(try flagUsize(args, "--status-secs", 30)),
         .kernel_threads = try flagUsize(args, "--threads", 0),
+        .mmap_weights = hasFlag(args, "--mmap-weights"),
         .prefill_batch = try flagUsize(args, "--batch", 0),
         .chat_format = flagStr(args, "--chat-format"),
     });
