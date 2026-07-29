@@ -67,6 +67,35 @@ pub const dequantRow = impl.dequantRow;
 pub const dotF32 = impl.dotF32;
 pub const axpy = impl.axpy;
 
+// ---- fused blocks ------------------------------------------------------------
+
+/// Weight tensor as the fused entry points take it.
+pub const WeightRef = impl.WeightRef;
+
+/// A whole FFN block submitted as one unit. Returns false when the backend
+/// declines the shape or type, in which case the caller runs the pieces.
+///
+/// This is on the seam because the unit of work a GPU cares about is not the
+/// kernel. Measured on an M5, a command buffer costs ~262 us fixed no matter
+/// how many dispatches it holds while a matvec kernel is ~18 us, so an engine
+/// that only ever hands the backend individual matvecs forces one command
+/// buffer per matvec and can never be fast, whatever the kernels do.
+pub const ffnBlock = impl.ffnBlock;
+
+/// One shape the engine will issue, for calibration.
+pub const Shape = impl.Shape;
+
+/// Measure this backend against the CPU on the loaded model's own shapes and
+/// decide, per operation, which to use. Called once at model load.
+///
+/// The alternative -- a compiled-in row threshold -- cannot be right: the
+/// crossover depends on the ratio between a machine's GPU and its CPU cores,
+/// so a constant measured on one laptop is wrong on the next, and it is
+/// per-shape besides. This is the same argument the fetch path already makes
+/// for probing disk against network rather than assuming an order.
+pub const calibrate = impl.calibrate;
+pub const lastVerdict = impl.lastVerdict;
+
 // ---- elementwise -------------------------------------------------------------
 
 pub const rmsnorm = impl.rmsnorm;

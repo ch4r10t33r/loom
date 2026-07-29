@@ -71,6 +71,210 @@ const elementwise_src = @embedFile("../shaders/metal/elementwise.metal");
 ///     131,072   2.381   1.609   2.57    -- 1.5-1.6x
 const MIN_GPU_ROWS = 65_536;
 
+/// The decision actually consulted at run time. `MIN_GPU_ROWS` above is only
+/// the starting guess; `calibrate` replaces it with a measurement taken on the
+/// loaded model's own shapes.
+///
+/// A static threshold cannot be right for two reasons. It was measured on one
+/// machine, and the crossover is a property of the ratio between that
+/// machine's GPU and its CPU cores -- an 8-core laptop and a 40-core Mac Pro
+/// do not share one. And it is per-shape: the same GPU that loses on a 2,048
+/// row matvec wins on a 131,072 row one. Measuring beats believing, which is
+/// the same argument the fetch path already makes for its tier order.
+var min_rows: usize = MIN_GPU_ROWS;
+/// Set false when calibration finds the GPU loses at every shape this model
+/// uses, so nothing pays the dispatch check.
+var gpu_worthwhile: bool = true;
+/// Whether the fused FFN block beat the CPU sequence on this model's shape.
+var ffn_worthwhile: bool = false;
+var calibrated: bool = false;
+
+/// How much faster the GPU must be before it is chosen. 1.25 = 25%.
+///
+/// Set from observed flapping rather than taste: at 15% the verdict for
+/// TinyLlama still changed between identical runs, and an A/B of the two
+/// verdicts showed no throughput difference at all (45.1 vs 44.8 tok/s) --
+/// i.e. the paths really are tied there and the measurement was resolving
+/// noise. A wrong verdict costs every token of the run; a tie resolved to CPU
+/// costs nothing.
+const MARGIN: f64 = 1.25;
+/// Timed repetitions per path. Higher than a microbenchmark would need,
+/// because this runs once at load and a wrong verdict costs every token.
+const REPS: usize = 24;
+
+/// What calibration concluded, for the startup banner.
+pub const Verdict = struct {
+    ran: bool,
+    matvec_min_rows: usize,
+    matvec_used: bool,
+    ffn_used: bool,
+    ffn_gpu_ms: f64 = 0,
+    ffn_cpu_ms: f64 = 0,
+};
+var verdict: Verdict = .{ .ran = false, .matvec_min_rows = MIN_GPU_ROWS, .matvec_used = false, .ffn_used = false };
+
+pub fn lastVerdict() Verdict {
+    return verdict;
+}
+
+/// Time the GPU against the CPU on this model's own shapes and record which
+/// wins. Called once at model load, before any token is generated.
+///
+/// `Shape` describes work the engine will actually issue. Calibrating on
+/// synthetic sizes would reproduce the problem it is meant to solve: the
+/// static threshold was itself a measurement, just one taken on a different
+/// machine and a different tensor.
+pub const Shape = struct {
+    /// Sample weight bytes laid out as the real tensor is. Borrowed.
+    data: []const u8,
+    ty: ggml.Type,
+    rows: usize,
+    cols: usize,
+};
+
+pub fn calibrate(gpa: std.mem.Allocator, dim: usize, ffn: usize, shapes: []const Shape, triple: ?[3]Shape) void {
+    if (calibrated) return;
+    calibrated = true;
+    const cx = &(ctx orelse {
+        gpu_worthwhile = false;
+        return;
+    });
+    _ = cx;
+
+    var thr: std.Io.Threaded = .init(gpa, .{});
+    defer thr.deinit();
+    const tio = thr.io();
+
+    const x = gpa.alloc(f32, @max(dim, ffn)) catch return;
+    defer gpa.free(x);
+    for (x, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 17)) * 0.01 - 0.08;
+
+    // matvec: the smallest row count at which the GPU actually won. Shapes the
+    // model never issues are not consulted, so a model whose largest tensor
+    // loses simply turns the GPU off for matvec.
+    var best_win: usize = std.math.maxInt(usize);
+    for (shapes) |sh| {
+        if (sh.ty != .q4_k or sh.cols % 256 != 0) continue;
+        const out = gpa.alloc(f32, sh.rows) catch continue;
+        defer gpa.free(out);
+        if (sh.rows * 4 > cx_scratchOutLen()) continue;
+
+        // `min_rows` is what matvec consults, so moving it is how the same
+        // call is steered down each path in turn.
+        min_rows = 0;
+        const g = timeMatvec(tio, sh, out, x);
+        min_rows = std.math.maxInt(usize);
+        const c = timeMatvec(tio, sh, out, x);
+
+        // Require a real margin, not a win. The two paths are within noise of
+        // each other around the crossover, and best-of-8 on a machine sharing
+        // its GPU with the window server flipped this verdict between
+        // otherwise identical runs. A tie should resolve to the CPU: it is the
+        // path with no dispatch risk, and choosing it costs nothing when the
+        // two are equal.
+        if (@as(f64, @floatFromInt(g)) * MARGIN < @as(f64, @floatFromInt(c)) and sh.rows < best_win) best_win = sh.rows;
+    }
+    if (best_win == std.math.maxInt(usize)) {
+        gpu_worthwhile = false;
+        min_rows = std.math.maxInt(usize);
+    } else {
+        min_rows = best_win;
+    }
+
+    // The fused block is the decision that matters most: it is the only thing
+    // that changes how many command buffers a token costs, and on this
+    // hardware that dominates every kernel in them.
+    if (triple) |tr| blk: {
+        const nw = gpa.alloc(f32, dim) catch break :blk;
+        defer gpa.free(nw);
+        @memset(nw, 1.0);
+        const xs = gpa.alloc(f32, dim) catch break :blk;
+        defer gpa.free(xs);
+        const g = gpa.alloc(f32, ffn) catch break :blk;
+        defer gpa.free(g);
+        const u = gpa.alloc(f32, ffn) catch break :blk;
+        defer gpa.free(u);
+        const a = gpa.alloc(f32, ffn) catch break :blk;
+        defer gpa.free(a);
+        const o = gpa.alloc(f32, dim) catch break :blk;
+        defer gpa.free(o);
+        const nm = gpa.alloc(f32, dim) catch break :blk;
+        defer gpa.free(nm);
+
+        const gw = WeightRef{ .ty = tr[0].ty, .data = tr[0].data };
+        const uw = WeightRef{ .ty = tr[1].ty, .data = tr[1].data };
+        const dw = WeightRef{ .ty = tr[2].ty, .data = tr[2].data };
+
+        const now = struct {
+            fn f(i: std.Io) i128 {
+                return std.Io.Clock.Timestamp.now(i, .awake).raw.toNanoseconds();
+            }
+        }.f;
+
+        for (xs, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 13)) * 0.01;
+        if (!ffnBlock(xs, nw, 1e-5, gw, uw, dw, ffn)) break :blk; // declined outright
+
+        var gms: i128 = std.math.maxInt(i64);
+        for (0..8) |_| {
+            const t0 = now(tio);
+            _ = ffnBlock(xs, nw, 1e-5, gw, uw, dw, ffn);
+            const dt = now(tio) - t0;
+            if (dt < gms) gms = dt;
+        }
+        var cms: i128 = std.math.maxInt(i64);
+        for (0..8) |_| {
+            const t0 = now(tio);
+            cpu.rmsnorm(nm, xs, nw, 1e-5);
+            cpu.matvec(gw.ty, g, gw.data, nm, ffn, dim);
+            cpu.matvec(uw.ty, u, uw.data, nm, ffn, dim);
+            cpu.swiglu(a, g, u);
+            cpu.matvec(dw.ty, o, dw.data, a, dim, ffn);
+            cpu.add(xs, o);
+            const dt = now(tio) - t0;
+            if (dt < cms) cms = dt;
+        }
+        ffn_worthwhile = @as(f64, @floatFromInt(gms)) * MARGIN < @as(f64, @floatFromInt(cms));
+        verdict.ffn_gpu_ms = @as(f64, @floatFromInt(gms)) / 1e6;
+        verdict.ffn_cpu_ms = @as(f64, @floatFromInt(cms)) / 1e6;
+    }
+
+    const gms_keep = verdict.ffn_gpu_ms;
+    const cms_keep = verdict.ffn_cpu_ms;
+    verdict = .{
+        .ran = true,
+        .matvec_min_rows = min_rows,
+        .matvec_used = gpu_worthwhile,
+        .ffn_used = ffn_worthwhile,
+        .ffn_gpu_ms = gms_keep,
+        .ffn_cpu_ms = cms_keep,
+    };
+}
+
+fn cx_scratchOutLen() usize {
+    const cx = &(ctx orelse return 0);
+    return cx.scratch_out.len;
+}
+
+fn timeMatvec(io: std.Io, sh: Shape, out: []f32, x: []const f32) i128 {
+    const now = struct {
+        fn f(i: std.Io) i128 {
+            return std.Io.Clock.Timestamp.now(i, .awake).raw.toNanoseconds();
+        }
+    }.f;
+    // Warm properly: the first dispatch on a pipeline pays costs no later one
+    // does, and one warm call left enough of that in the first measurement to
+    // change the verdict.
+    for (0..4) |_| matvec(sh.ty, out, sh.data, x[0..sh.cols], sh.rows, sh.cols);
+    var best: i128 = std.math.maxInt(i64);
+    for (0..REPS) |_| {
+        const t0 = now(io);
+        matvec(sh.ty, out, sh.data, x[0..sh.cols], sh.rows, sh.cols);
+        const dt = now(io) - t0;
+        if (dt < best) best = dt;
+    }
+    return best;
+}
+
 /// Apple GPUs execute in 32-lane SIMD groups; the kernel assigns one per row.
 const SIMD_W = 32;
 /// SIMD groups per threadgroup. Four gives 128 threads, enough to keep the
@@ -195,7 +399,7 @@ const Dims = extern struct { rows: u32, cols: u32 };
 
 pub fn matvec(t: ggml.Type, out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
     const cx = &(ctx orelse return cpu.matvec(t, out, data, x, rows, cols));
-    if (t != .q4_k or rows < MIN_GPU_ROWS or cols % 256 != 0) {
+    if (!gpu_worthwhile or t != .q4_k or rows < min_rows or cols % 256 != 0) {
         return cpu.matvec(t, out, data, x, rows, cols);
     }
     if (x.len * 4 > cx.scratch_x.len or out.len * 4 > cx.scratch_out.len) {
@@ -450,6 +654,7 @@ pub fn ffnBlock(
 ) bool {
     const cx = &(ctx orelse return false);
     const dim = x.len;
+    if (!ffn_worthwhile and calibrated) return false;
     if (gate_w.ty != .q4_k or up_w.ty != .q4_k or down_w.ty != .q4_k) return false;
     if (dim % 256 != 0 or ffn % 256 != 0) return false;
     if (ffn * 4 > cx.act[0].len or dim * 4 > cx.act[0].len) return false;
