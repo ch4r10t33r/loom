@@ -313,6 +313,9 @@ fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8, gpu_ops: boo
         backend.parallelBegin(generator.threads());
         m.gpu_layers = llama.calibrateGpuLayers(&m, gpa);
         backend.parallelEnd();
+        // Nothing reads the device cache if both the recorded path and fused
+        // attention lost, and it is hundreds of megabytes on a 7B model.
+        if (!m.gpu_layers and !backend.lastVerdict().attn_used) backend.releaseKvCache();
     }
     gguf_layers_gpu = m.gpu_layers;
     return .{ .gqa = m };

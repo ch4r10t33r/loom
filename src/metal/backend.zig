@@ -601,7 +601,7 @@ const AttnDims = extern struct {
 /// Threadgroup `scores[]` bounds the context this kernel can serve; see
 /// attn.metal. Declining beyond it is the only safe option — silently
 /// truncating attention produces text that still reads fluently.
-const ATTN_MAX_SEQ: usize = 2048;
+const ATTN_MAX_SEQ: usize = 4096;
 
 /// Allocate the device KV cache. Returns false if it will not fit or there is
 /// no device, in which case the engine keeps its own cache and the CPU path.
@@ -750,6 +750,25 @@ pub fn endFrame() void {
 
 pub fn frameOpen() bool {
     return frame != null;
+}
+
+/// Free the device KV cache. Called when calibration decides against every
+/// path that would read it.
+///
+/// Not tidiness: the cache is sized layers x ctx x kvd and reaches hundreds of
+/// megabytes on a 7B model. Allocating it, measuring, declining and then
+/// holding it adds exactly that much pressure to a machine whose verdict was
+/// most likely "no win" *because* it is short of memory.
+pub fn releaseKvCache() void {
+    const cx = &(ctx orelse return);
+    if (cx.kv_k) |*b| b.deinit();
+    if (cx.kv_v) |*b| b.deinit();
+    cx.kv_k = null;
+    cx.kv_v = null;
+    cx.kv_ctx = 0;
+    cx.kv_kvd = 0;
+    kv_mirror = false;
+    attn_worthwhile = false;
 }
 
 /// Declare that something will read the device KV cache, so `kvAppend` starts

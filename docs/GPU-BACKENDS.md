@@ -263,6 +263,28 @@ default needs.
 A build without a GPU backend never reaches this: `layerBlock` declines, both
 timings come out equal, and the 25% margin is not met.
 
+### Validated on TinyLlama only, and why
+
+The same comparison on Mistral-7B Q4_K_M does not test what it looks like it
+tests. On this machine (M5, 16 GB) it runs at 0.27 tok/s, with the process at
+116% CPU and 2.75 GB resident against a 4.37 GB model: it is stalling on page
+faults, not computing. Calibration measured gpu 3442 ms/tok against cpu
+3414 ms/tok and correctly declined -- both paths are bound by paging, and a
+~262 us command buffer is invisible against 3.4 seconds.
+
+That is the right verdict and a useless benchmark. A 7B model plus its KV
+caches does not fit this box alongside anything else, so the 1.9x result stands
+only for TinyLlama-1.1B, whose tensors are 6.5 MB -- the cache-resident regime
+where ZINC's kernel is also 3.5x ahead of loom's. Confirming the win at
+DRAM-bound tensor sizes needs either a machine with more memory or a model
+around 2 GB.
+
+The measurement did produce one fix: the device KV cache is now released when
+calibration declines every path that would read it. It is hundreds of megabytes
+on a 7B model, and holding it after deciding not to use it adds exactly that
+much pressure to a machine whose verdict was "no win" *because* it is short of
+memory.
+
 ## One command buffer per token: 1.9x, measured
 
 TinyLlama-1.1B Q4_K_M on an M5, 128 tokens, decode only:
