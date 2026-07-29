@@ -145,6 +145,12 @@ pub fn fetchFromPeer(gpa: std.mem.Allocator, io: Io, store: *weights.Store, addr
         try store.writeRange(i, buf[0..len]);
         stats.fetched += 1;
         stats.bytes += len;
+        // A shard arrived, so this connection is not idle. `PEER_TIMEOUT_S` is
+        // ten seconds and a full sync is thousands of shards over one
+        // connection: without this the reaper shut the socket down mid-transfer
+        // and the caller reported `synced 0/1571 ranges` as though nothing had
+        // gone wrong.
+        sockopt.refresh(io, peer.deadline, sockopt.PEER_TIMEOUT_S);
     }
     return stats;
 }
@@ -230,13 +236,40 @@ pub fn bootstrapWithWanted(
     progress: ?*Io.Writer,
 ) !Result {
     const wanted = wanted_bits.count();
-    var store = try weights.createFromManifest(gpa, io, store_dir, manifest, wanted_bits);
+    // Resume if this directory already holds a store for the same manifest.
+    //
+    // `createFromManifest` opens the model file with `.truncate = true` and
+    // starts holdings from empty, which is right for a first sync and
+    // catastrophic for a restart: a node that had already fetched 9.4 GB threw
+    // all of it away and began again. The manifest version is the identity
+    // check -- a store for a different model must not be adopted.
+    var store = reopen: {
+        var existing = weights.openDir(gpa, io, store_dir) catch break :reopen null;
+        if (!hashmod.eql(existing.manifest.version, manifest.version)) {
+            existing.deinit();
+            break :reopen null;
+        }
+        // Keep the caller's want-set; the on-disk one may be from a run with a
+        // different --hold-fraction.
+        existing.wanted.deinit(gpa);
+        existing.wanted = wanted_bits;
+        break :reopen existing;
+    } orelse try weights.createFromManifest(gpa, io, store_dir, manifest, wanted_bits);
     errdefer store.deinit();
 
     var stats = FetchStats{};
     for (peers) |addr| {
         if (store.missingCount() == 0) break;
-        const s = fetchFromPeer(gpa, io, &store, addr) catch continue;
+        const s = fetchFromPeer(gpa, io, &store, addr) catch |e| {
+            // Silence here is what made the sync failure invisible: the node
+            // printed "synced 0/N" and served anyway, and the only clue was
+            // that inference was inexplicably slow.
+            if (progress) |pw| {
+                pw.print("  sync from {s}:{d} failed: {t}\n", .{ addr.host, addr.port, e }) catch {};
+                pw.flush() catch {};
+            }
+            continue;
+        };
         stats.fetched += s.fetched;
         stats.bytes += s.bytes;
         if (progress) |pw| {
