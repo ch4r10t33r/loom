@@ -94,6 +94,8 @@ pub const disableAttn = impl.disableAttn;
 pub const enableKvMirror = impl.enableKvMirror;
 /// Free the device KV cache when nothing will read it.
 pub const releaseKvCache = impl.releaseKvCache;
+/// Whether a device KV cache exists; without one the recorded path cannot run.
+pub const hasKvCache = impl.hasKvCache;
 
 // ---- frames ------------------------------------------------------------------
 //

@@ -308,7 +308,12 @@ fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8, gpu_ops: boo
     // to be on *before* the timing run or the recorded path reads a cache the
     // host path never filled and the comparison is between a correct forward
     // pass and a broken one.
-    if (!no_gpu_layers and llama.gpuLayersSupported(&m)) {
+    // `hasKvCache` gates this because calibration builds a scratch `State`,
+    // and that is sized by the model's context: 8 GB for a 7B advertising
+    // 32768. Measuring a path that cannot run -- attnInit declines any context
+    // past what the attention kernel's threadgroup memory serves -- would
+    // allocate all of it to learn nothing.
+    if (!no_gpu_layers and backend.hasKvCache() and llama.gpuLayersSupported(&m)) {
         backend.enableKvMirror();
         backend.parallelBegin(generator.threads());
         m.gpu_layers = llama.calibrateGpuLayers(&m, gpa);

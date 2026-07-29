@@ -29,6 +29,9 @@ pub fn attnInit(layers: usize, ctx_len: usize, kvd: usize) bool {
 pub fn disableAttn() void {}
 pub fn enableKvMirror() void {}
 pub fn releaseKvCache() void {}
+pub fn hasKvCache() bool {
+    return false;
+}
 
 pub const LayerSpec = struct {
     li: usize,
