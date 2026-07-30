@@ -573,6 +573,33 @@ fn denseFFN(st: *State, gate_w: Tensor, up_w: Tensor, down_w: Tensor) void {
     mv(down_w, st.ffn_out, st.act[0..f]);
 }
 
+/// One expert's FFN applied to `n` activation vectors in a single pass over its
+/// weights.
+///
+/// This is the whole point of batching a MoE model. Calling `denseFFN` once per
+/// sequence walks the expert's ~5.7 MB again for each one; `matmul` walks it
+/// once and produces `n` outputs, so a layer costs its *union* of experts
+/// rather than the sum over sequences. With several sequences in flight the
+/// unions overlap heavily -- that is the "throughput hides latency" argument
+/// the design rests on, and it only holds if the read is shared.
+fn expertFfnBatched(
+    gate_w: Tensor,
+    up_w: Tensor,
+    down_w: Tensor,
+    xs: []const f32, // n * dim
+    n: usize,
+    dim: usize,
+    scratch_gate: []f32, // n * ffn
+    scratch_up: []f32, // n * ffn
+    out: []f32, // n * dim
+) void {
+    const f = gate_w.ne1;
+    backend.matmul(gate_w.ty, scratch_gate[0 .. n * f], gate_w.data, xs, n, f, dim);
+    backend.matmul(up_w.ty, scratch_up[0 .. n * f], up_w.data, xs, n, f, dim);
+    for (0..n) |k| backend.swiglu(scratch_gate[k * f ..][0..f], scratch_gate[k * f ..][0..f], scratch_up[k * f ..][0..f]);
+    backend.matmul(down_w.ty, out[0 .. n * dim], down_w.data, scratch_gate[0 .. n * f], n, dim, f);
+}
+
 const Selected = moe.Selected;
 
 /// One expert's gate/up/down bytes, from the distributed store when there is
@@ -742,6 +769,253 @@ pub const Profile = struct {
     }
 };
 
+/// One layer's MLA attention for one sequence, including the residual add.
+///
+/// Extracted so the batched decode path cannot drift from the single-sequence
+/// one. Attention is the part a batch cannot share -- every sequence has its
+/// own KV cache and its own position -- so it stays per sequence either way,
+/// and only the FFN below it gets to amortize a weight read across the batch.
+fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_attn: *i128) void {
+    const prof = Profile.enabled();
+    const cfg = m.cfg;
+    const kd = cfg.keyDim();
+    const nope = cfg.nope_dim;
+    const rope = cfg.rope_dim;
+    const kvr = cfg.kv_lora_rank;
+    const vd = cfg.v_head_dim;
+    const scale = cfg.attn_scale;
+    backend.rmsnorm(st.normed, st.x, asF32(l.attn_norm), cfg.eps);
+
+    if (cfg.q_lora_rank > 0) {
+        mv(l.attn_q_a.?, st.q_a, st.normed);
+        backend.rmsnorm(st.q_a, st.q_a, asF32(l.attn_q_a_norm.?), cfg.eps);
+        mv(l.attn_q_b.?, st.q, st.q_a);
+    } else {
+        mv(l.attn_q.?, st.q, st.normed);
+    }
+
+    mv(l.attn_kv_a_mqa, st.kv_a, st.normed);
+    const c_kv = st.c_kv_cache[(li * cfg.ctx_len + pos) * kvr ..][0..kvr];
+    backend.rmsnorm(c_kv, st.kv_a[0..kvr], asF32(l.attn_kv_a_norm), cfg.eps);
+    const k_rope = st.k_rope_cache[(li * cfg.ctx_len + pos) * rope ..][0..rope];
+    @memcpy(k_rope, st.kv_a[kvr .. kvr + rope]);
+    ropeApply(cfg, k_rope, pos);
+
+    var h: usize = 0;
+    while (h < cfg.n_heads) : (h += 1) {
+        ropeApply(cfg, st.q[h * kd + nope ..][0..rope], pos);
+    }
+
+    // MLA attention, in compressed space.
+    //
+    // The obvious way to write this is to decompress the cache: for every
+    // head, at every cached position, run W_k over c_t to rebuild that
+    // position's key, and W_v to rebuild its value. That is what this did,
+    // and it is O(seq) matvecs of (nope x kvr) and (vd x kvr) per head per
+    // layer -- at seq=100, 16 heads and 27 layers, about 86,000 matvecs
+    // per token. It also throws away the reason MLA exists: the whole
+    // point of a compressed KV cache is that K and V are never
+    // materialized.
+    //
+    // Both projections commute with the sum over positions, so both move
+    // out of the loop:
+    //
+    //   score_t = q_nope . (W_k c_t)  =  (W_k^T q_nope) . c_t  =  q_abs . c_t
+    //   o       = sum_t p_t (W_v c_t) =  W_v (sum_t p_t c_t)   =  W_v c_acc
+    //
+    // So W_k is absorbed into q once per head, and the value side
+    // accumulates in compressed space and decompresses once. Per head the
+    // per-position work drops from two matvecs (~131k MACs) to two dot
+    // products (kvr + rope = 576 MACs), against a fixed cost of one
+    // absorb and one matvec.
+    const seq = pos + 1;
+    const t_a0 = if (prof) Profile.now() else 0;
+    h = 0;
+    while (h < cfg.n_heads) : (h += 1) {
+        const q_nope = st.q[h * kd ..][0..nope];
+        const q_rope = st.q[h * kd + nope ..][0..rope];
+        // kv_b rows for this head: [nope rows of k][vd rows of v], each over kvr
+        const kb_base = h * (nope + vd);
+        const k_rows = l.attn_kv_b.data[kb_base * ggml.rowBytes(l.attn_kv_b.ty, kvr) ..];
+        const v_rows = l.attn_kv_b.data[(kb_base + nope) * ggml.rowBytes(l.attn_kv_b.ty, kvr) ..];
+
+        // q_abs = W_k^T q_nope, i.e. the rows of W_k weighted by q_nope.
+        // Row-at-a-time because the quantized layout is row-major: there
+        // is no column access without dequantizing anyway.
+        @memset(st.q_abs, 0);
+        for (q_nope, 0..) |qr, r| {
+            backend.dequantRow(l.attn_kv_b.ty, st.row_tmp, k_rows, r, kvr);
+            backend.axpy(st.q_abs, st.row_tmp, qr);
+        }
+
+        var t_i: usize = 0;
+        while (t_i < seq) : (t_i += 1) {
+            const c_t = st.c_kv_cache[(li * cfg.ctx_len + t_i) * kvr ..][0..kvr];
+            const kr_t = st.k_rope_cache[(li * cfg.ctx_len + t_i) * rope ..][0..rope];
+            st.scores[t_i] = (backend.dotF32(st.q_abs, c_t) + backend.dotF32(q_rope, kr_t)) * scale;
+        }
+        backend.softmax(st.scores[0..seq]);
+
+        @memset(st.c_acc, 0);
+        t_i = 0;
+        while (t_i < seq) : (t_i += 1) {
+            const c_t = st.c_kv_cache[(li * cfg.ctx_len + t_i) * kvr ..][0..kvr];
+            backend.axpy(st.c_acc, c_t, st.scores[t_i]);
+        }
+        backend.matvec(l.attn_kv_b.ty, st.head_out[h * vd ..][0..vd], v_rows, st.c_acc, vd, kvr);
+    }
+    if (prof) t_attn.* += Profile.now() - t_a0;
+    mv(l.attn_output, st.proj_out, st.head_out);
+    backend.add(st.x, st.proj_out);
+}
+
+/// Largest batch a decode step will take. Bounded by `backend.MAX_BATCH`,
+/// which is what the batched kernels are written for.
+pub const MAX_DECODE_BATCH = backend.MAX_BATCH;
+
+/// Decode one token for each of several sequences at once.
+///
+/// Attention stays per sequence -- each has its own KV cache and its own
+/// position, so there is nothing to share -- and the FFN is where the batch
+/// pays: a MoE layer costs the *union* of the sequences' experts rather than
+/// the sum, because `expertFfnBatched` walks each expert's weights once for
+/// every sequence that routed to it.
+///
+/// Falls back to `step` for a single sequence, which keeps the recorded
+/// whole-layer GPU path in use where it is the faster one.
+///
+/// Deliberately *not* named `stepBatch`: that name already means batched
+/// prefill of one sequence over consecutive positions, and the engine
+/// dispatches on `@hasDecl(E, "stepBatch")`. Reusing it made the prefill path
+/// call this with a single state where a slice was wanted -- caught only by
+/// the Linux cross-build, since the two differ in which engines they
+/// instantiate.
+pub fn decodeBatch(
+    m: *const Model,
+    states: []const *State,
+    tokens: []const u32,
+    positions: []const usize,
+) !void {
+    const n = states.len;
+    std.debug.assert(n == tokens.len and n == positions.len);
+    if (n == 0) return;
+    if (n == 1) return step(m, states[0], tokens[0], positions[0]);
+    if (n > MAX_DECODE_BATCH) return error.BatchTooLarge;
+
+    const cfg = m.cfg;
+    var t_attn: i128 = 0;
+
+    for (states, tokens) |st, token| {
+        if (token >= cfg.vocab) return error.TokenOutOfRange;
+        backend.dequantRow(m.token_embd.ty, st.x, m.token_embd.data, token, cfg.dim);
+    }
+
+    // Per-batch scratch. Sized for the widest FFN any expert in this model has,
+    // which is the shared expert where there is one.
+    var xs: [MAX_DECODE_BATCH * 8192]f32 = undefined;
+    var og: [MAX_DECODE_BATCH * 8192]f32 = undefined;
+    var ou: [MAX_DECODE_BATCH * 8192]f32 = undefined;
+    var od: [MAX_DECODE_BATCH * 8192]f32 = undefined;
+    var acc: [MAX_DECODE_BATCH * 8192]f32 = undefined;
+    const widest = @max(cfg.ffn, cfg.moe_ffn * @max(@as(usize, 1), cfg.n_shared));
+    if (cfg.dim > 8192 or widest > 8192) return error.ModelTooWideForBatch;
+
+    for (m.layers, 0..) |l, li| {
+        for (states, positions) |st, pos| attnLayer(m, l, li, st, pos, &t_attn);
+        for (states) |st| backend.rmsnorm(st.normed, st.x, asF32(l.ffn_norm), cfg.eps);
+
+        if (l.ffn_gate_exps == null) {
+            // Dense prefix layer: one FFN, every sequence through it at once.
+            for (states, 0..) |st, k| @memcpy(xs[k * cfg.dim ..][0..cfg.dim], st.normed);
+            expertFfnBatched(l.ffn_gate.?, l.ffn_up.?, l.ffn_down.?, xs[0 .. n * cfg.dim], n, cfg.dim, &og, &ou, &od);
+            for (states, 0..) |st, k| backend.add(st.x, od[k * cfg.dim ..][0..cfg.dim]);
+            continue;
+        }
+
+        @memset(acc[0 .. n * cfg.dim], 0);
+
+        // Route every sequence, then invert: expert -> the sequences that
+        // chose it. The inversion is the batching; without it each expert is
+        // read once per sequence.
+        var picks: [MAX_DECODE_BATCH][moe.MAX_SELECTED]Selected = undefined;
+        for (states, 0..) |st, k| {
+            mv(l.ffn_gate_inp.?, st.router[0..cfg.n_expert], st.normed);
+            const bias: ?[]const f32 = if (l.exp_probs_b) |b| asF32(b) else null;
+            moe.route(cfg.routeCfg(), st.router[0..cfg.n_expert], bias, picks[k][0..cfg.n_used]);
+        }
+
+        var seen: [MAX_DECODE_BATCH * moe.MAX_SELECTED]usize = undefined;
+        var n_seen: usize = 0;
+        for (0..n) |k| {
+            for (picks[k][0..cfg.n_used]) |sel| {
+                var dup = false;
+                for (seen[0..n_seen]) |e| {
+                    if (e == sel.expert) dup = true;
+                }
+                if (!dup) {
+                    seen[n_seen] = sel.expert;
+                    n_seen += 1;
+                }
+            }
+        }
+
+        for (seen[0..n_seen]) |expert| {
+            // The sequences that picked this expert, and with what weight.
+            var rows: [MAX_DECODE_BATCH]usize = undefined;
+            var gates: [MAX_DECODE_BATCH]f32 = undefined;
+            var nr: usize = 0;
+            for (0..n) |k| {
+                for (picks[k][0..cfg.n_used]) |sel| {
+                    if (sel.expert == expert) {
+                        rows[nr] = k;
+                        gates[nr] = sel.gate;
+                        nr += 1;
+                        break;
+                    }
+                }
+            }
+            for (rows[0..nr], 0..) |k, r| @memcpy(xs[r * cfg.dim ..][0..cfg.dim], states[k].normed);
+
+            const parts = try expertParts(m, l, li, expert);
+            const gt = l.ffn_gate_exps.?;
+            const ut = l.ffn_up_exps.?;
+            const dt = l.ffn_down_exps.?;
+            expertFfnBatched(
+                .{ .ty = gt.ty, .data = parts.gate, .ne0 = gt.ne0, .ne1 = gt.ne1, .ne2 = 1 },
+                .{ .ty = ut.ty, .data = parts.up, .ne0 = ut.ne0, .ne1 = ut.ne1, .ne2 = 1 },
+                .{ .ty = dt.ty, .data = parts.down, .ne0 = dt.ne0, .ne1 = dt.ne1, .ne2 = 1 },
+                xs[0 .. nr * cfg.dim],
+                nr,
+                cfg.dim,
+                &og,
+                &ou,
+                &od,
+            );
+            for (rows[0..nr], gates[0..nr], 0..) |k, g, r| {
+                const dst = acc[k * cfg.dim ..][0..cfg.dim];
+                for (dst, od[r * cfg.dim ..][0..cfg.dim]) |*a, v| a.* += g * v;
+            }
+        }
+
+        if (l.ffn_gate_shexp) |gs| {
+            // Always on for every sequence, so the whole batch goes through it.
+            for (states, 0..) |st, k| @memcpy(xs[k * cfg.dim ..][0..cfg.dim], st.normed);
+            expertFfnBatched(gs, l.ffn_up_shexp.?, l.ffn_down_shexp.?, xs[0 .. n * cfg.dim], n, cfg.dim, &og, &ou, &od);
+            for (0..n) |k| {
+                const dst = acc[k * cfg.dim ..][0..cfg.dim];
+                for (dst, od[k * cfg.dim ..][0..cfg.dim]) |*a, v| a.* += v;
+            }
+        }
+
+        for (states, 0..) |st, k| backend.add(st.x, acc[k * cfg.dim ..][0..cfg.dim]);
+    }
+
+    for (states) |st| {
+        backend.rmsnorm(st.normed, st.x, asF32(m.output_norm), cfg.eps);
+        mv(m.output, st.logits, st.normed);
+    }
+}
+
 pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     const prof = Profile.enabled();
     const t_step = if (prof) Profile.now() else 0;
@@ -754,12 +1028,6 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     var t_route: i128 = 0;
     var t_acc: i128 = 0;
     const cfg = m.cfg;
-    const kd = cfg.keyDim();
-    const nope = cfg.nope_dim;
-    const rope = cfg.rope_dim;
-    const kvr = cfg.kv_lora_rank;
-    const vd = cfg.v_head_dim;
-    const scale = cfg.attn_scale;
 
     // A token id indexes token_embd rows directly. Ids come from the
     // tokenizer, whose ceiling is an independent metadata array, so bound it
@@ -769,89 +1037,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
 
     for (m.layers, 0..) |l, li| {
         // ---- MLA attention ----
-        backend.rmsnorm(st.normed, st.x, asF32(l.attn_norm), cfg.eps);
-
-        if (cfg.q_lora_rank > 0) {
-            mv(l.attn_q_a.?, st.q_a, st.normed);
-            backend.rmsnorm(st.q_a, st.q_a, asF32(l.attn_q_a_norm.?), cfg.eps);
-            mv(l.attn_q_b.?, st.q, st.q_a);
-        } else {
-            mv(l.attn_q.?, st.q, st.normed);
-        }
-
-        mv(l.attn_kv_a_mqa, st.kv_a, st.normed);
-        const c_kv = st.c_kv_cache[(li * cfg.ctx_len + pos) * kvr ..][0..kvr];
-        backend.rmsnorm(c_kv, st.kv_a[0..kvr], asF32(l.attn_kv_a_norm), cfg.eps);
-        const k_rope = st.k_rope_cache[(li * cfg.ctx_len + pos) * rope ..][0..rope];
-        @memcpy(k_rope, st.kv_a[kvr .. kvr + rope]);
-        ropeApply(cfg, k_rope, pos);
-
-        var h: usize = 0;
-        while (h < cfg.n_heads) : (h += 1) {
-            ropeApply(cfg, st.q[h * kd + nope ..][0..rope], pos);
-        }
-
-        // MLA attention, in compressed space.
-        //
-        // The obvious way to write this is to decompress the cache: for every
-        // head, at every cached position, run W_k over c_t to rebuild that
-        // position's key, and W_v to rebuild its value. That is what this did,
-        // and it is O(seq) matvecs of (nope x kvr) and (vd x kvr) per head per
-        // layer -- at seq=100, 16 heads and 27 layers, about 86,000 matvecs
-        // per token. It also throws away the reason MLA exists: the whole
-        // point of a compressed KV cache is that K and V are never
-        // materialized.
-        //
-        // Both projections commute with the sum over positions, so both move
-        // out of the loop:
-        //
-        //   score_t = q_nope . (W_k c_t)  =  (W_k^T q_nope) . c_t  =  q_abs . c_t
-        //   o       = sum_t p_t (W_v c_t) =  W_v (sum_t p_t c_t)   =  W_v c_acc
-        //
-        // So W_k is absorbed into q once per head, and the value side
-        // accumulates in compressed space and decompresses once. Per head the
-        // per-position work drops from two matvecs (~131k MACs) to two dot
-        // products (kvr + rope = 576 MACs), against a fixed cost of one
-        // absorb and one matvec.
-        const seq = pos + 1;
-        const t_a0 = if (prof) Profile.now() else 0;
-        h = 0;
-        while (h < cfg.n_heads) : (h += 1) {
-            const q_nope = st.q[h * kd ..][0..nope];
-            const q_rope = st.q[h * kd + nope ..][0..rope];
-            // kv_b rows for this head: [nope rows of k][vd rows of v], each over kvr
-            const kb_base = h * (nope + vd);
-            const k_rows = l.attn_kv_b.data[kb_base * ggml.rowBytes(l.attn_kv_b.ty, kvr) ..];
-            const v_rows = l.attn_kv_b.data[(kb_base + nope) * ggml.rowBytes(l.attn_kv_b.ty, kvr) ..];
-
-            // q_abs = W_k^T q_nope, i.e. the rows of W_k weighted by q_nope.
-            // Row-at-a-time because the quantized layout is row-major: there
-            // is no column access without dequantizing anyway.
-            @memset(st.q_abs, 0);
-            for (q_nope, 0..) |qr, r| {
-                backend.dequantRow(l.attn_kv_b.ty, st.row_tmp, k_rows, r, kvr);
-                backend.axpy(st.q_abs, st.row_tmp, qr);
-            }
-
-            var t_i: usize = 0;
-            while (t_i < seq) : (t_i += 1) {
-                const c_t = st.c_kv_cache[(li * cfg.ctx_len + t_i) * kvr ..][0..kvr];
-                const kr_t = st.k_rope_cache[(li * cfg.ctx_len + t_i) * rope ..][0..rope];
-                st.scores[t_i] = (backend.dotF32(st.q_abs, c_t) + backend.dotF32(q_rope, kr_t)) * scale;
-            }
-            backend.softmax(st.scores[0..seq]);
-
-            @memset(st.c_acc, 0);
-            t_i = 0;
-            while (t_i < seq) : (t_i += 1) {
-                const c_t = st.c_kv_cache[(li * cfg.ctx_len + t_i) * kvr ..][0..kvr];
-                backend.axpy(st.c_acc, c_t, st.scores[t_i]);
-            }
-            backend.matvec(l.attn_kv_b.ty, st.head_out[h * vd ..][0..vd], v_rows, st.c_acc, vd, kvr);
-        }
-        if (prof) t_attn += Profile.now() - t_a0;
-        mv(l.attn_output, st.proj_out, st.head_out);
-        backend.add(st.x, st.proj_out);
+        attnLayer(m, l, li, st, pos, &t_attn);
 
         // ---- FFN ----
         backend.rmsnorm(st.normed, st.x, asF32(l.ffn_norm), cfg.eps);
