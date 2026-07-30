@@ -627,6 +627,11 @@ pub const Profile = struct {
     /// block per layer, the shared expert does not, and the bucket was 5x what
     /// the block measures in isolation.
     var shexp_ns: i128 = 0;
+    /// MoE layers that took the backend block, and that fell back to the host
+    /// loop. A path that is declining silently has cost this project two long
+    /// detours already.
+    var moe_block: u64 = 0;
+    var moe_host: u64 = 0;
 
     fn reset() void {
         attn_ns = 0;
@@ -639,6 +644,8 @@ pub const Profile = struct {
         tokens = 0;
         cmdbufs = 0;
         shexp_ns = 0;
+        moe_block = 0;
+        moe_host = 0;
     }
 
     pub fn enabled() bool {
@@ -721,6 +728,10 @@ pub const Profile = struct {
         try w.print("    of which: router {d:8.1}  expert-accum {d:8.1}  norm+lmhead {d:8.1}  shared-expert {d:8.1}\n", .{
             ms(route_ns, tokens), ms(acc_ns, tokens), ms(head_ns, tokens), ms(shexp_ns, tokens),
         });
+        try w.print("  moe layers/token: {d:.1} on the backend block, {d:.1} on the host loop\n", .{
+            @as(f64, @floatFromInt(moe_block)) / @as(f64, @floatFromInt(tokens)),
+            @as(f64, @floatFromInt(moe_host)) / @as(f64, @floatFromInt(tokens)),
+        });
         if (src_stats) |g| {
             const acc = g.mapped + g.ram + g.local + g.fetched;
             if (acc > 0) try w.print(
@@ -738,6 +749,8 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     var t_get: i128 = 0;
     var t_ffn: i128 = 0;
     var t_shexp: i128 = 0;
+    var n_block: u64 = 0;
+    var n_host: u64 = 0;
     var t_route: i128 = 0;
     var t_acc: i128 = 0;
     const cfg = m.cfg;
@@ -915,6 +928,9 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
                 break :blk_b ok;
             };
 
+            if (prof) {
+                if (batched) n_block += 1 else n_host += 1;
+            }
             if (!batched) for (sel) |s| {
                 if (m.dist) |src| {
                     const sid = m.expert_shard[li * cfg.n_expert + s.expert];
@@ -996,6 +1012,8 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
         Profile.expert_get_ns += t_get;
         Profile.expert_ffn_ns += t_ffn;
         Profile.shexp_ns += t_shexp;
+        Profile.moe_block += n_block;
+        Profile.moe_host += n_host;
         Profile.route_ns += t_route;
         Profile.acc_ns += t_acc;
         Profile.head_ns += t_head;
