@@ -876,13 +876,13 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
                 const gt = l.ffn_gate_exps orelse break :blk_b false;
                 var refs: [moe.MAX_SELECTED]backend.ExpertRef = undefined;
                 const t_g1 = if (prof) Profile.now() else 0;
-                for (sel, 0..) |s, k| {
-                    const parts = expertParts(m, l, li, s.expert) catch break :blk_b false;
+                for (sel, 0..) |s2, k| {
+                    const parts = expertParts(m, l, li, s2.expert) catch break :blk_b false;
                     refs[k] = .{
                         .gate = .{ .ty = l.ffn_gate_exps.?.ty, .data = parts.gate },
                         .up = .{ .ty = l.ffn_up_exps.?.ty, .data = parts.up },
                         .down = .{ .ty = l.ffn_down_exps.?.ty, .data = parts.down },
-                        .weight = s.gate,
+                        .weight = s2.gate,
                     };
                 }
                 if (prof) t_get += Profile.now() - t_g1;
@@ -930,9 +930,22 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
                 for (acc, st.ffn_out) |*a, v| a.* += s.gate * v;
                 if (prof) t_acc += Profile.now() - t_ac0;
             };
+            // Timed, not merely run: this is a 2816-wide dense FFN on every
+            // layer -- ~225 MB/token, a third of what the routed experts move
+            // -- and leaving it outside `t_ffn` put it in "everything else",
+            // which was 30% of a token and the largest unexplained bucket.
+            //
+            // It deliberately stays on the host path. Folding it into
+            // `moeFfnBlock` was tried and is 6% *slower* (95.0 against 89.5
+            // ms/token, A/B'd in one binary): it moves the work onto a Metal
+            // matvec that loses to the CPU at these row counts, which is the
+            // same verdict calibration reaches unprompted. Worth revisiting
+            // once the kernel wins at 1408-2816 rows, not before.
             if (l.ffn_gate_shexp) |gs| {
+                const t_s0 = if (prof) Profile.now() else 0;
                 denseFFN(st, gs, l.ffn_up_shexp.?, l.ffn_down_shexp.?);
                 backend.add(acc, st.ffn_out);
+                if (prof) t_ffn += Profile.now() - t_s0;
             }
             backend.add(st.x, acc);
         }
