@@ -489,6 +489,7 @@ const Ctx = struct {
     rmsnorm_p: mtl.Pipeline,
     swiglu_p: mtl.Pipeline,
     add_p: mtl.Pipeline,
+    copy_p: mtl.Pipeline,
     /// Device-resident activation scratch. The whole point of keeping these
     /// on the GPU is that a block of work can be encoded into one command
     /// buffer without the host reading anything in between.
@@ -622,6 +623,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const pcp = dev.pipeline(elementwise_src, "copy_f32") catch {
+        dev.deinit();
+        return;
+    };
     const pa = dev.pipeline(elementwise_src, "add_inplace") catch {
         dev.deinit();
         return;
@@ -645,7 +650,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0_id = p50id, .q8_0_id = p80id, .q5_0 = p50, .q8_0 = p80, .f32p = pf32, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .mla_rope_p = pmrope, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .reduce_dev_p = predd, .route_p = proute, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0_id = p50id, .q8_0_id = p80id, .q5_0 = p50, .q8_0 = p80, .f32p = pf32, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .mla_rope_p = pmrope, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .reduce_dev_p = predd, .route_p = proute, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .copy_p = pcp, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -1267,6 +1272,8 @@ pub fn mlaAttnHeads(
         .nope = @intCast(nope),
         .kvr = @intCast(kvr),
         .stride = @intCast(nope + v_head_dim),
+        .q_stride = @intCast(nope),
+        .q_off = 0,
     };
 
     const dims = MlaDims{
@@ -1274,6 +1281,8 @@ pub fn mlaAttnHeads(
         .kvr = @intCast(cx.mla_kvr),
         .rope = @intCast(cx.mla_rope),
         .seq = @intCast(seq),
+        .qr_stride = @intCast(cx.mla_rope),
+        .qr_off = 0,
         .scale = scale,
     };
     const c_off = li * cx.mla_ctx * cx.mla_kvr * @sizeOf(f32);
@@ -1729,8 +1738,8 @@ pub fn mlaLayerTail(
     @memcpy(cx.scratch_x.slice(f32)[off_x..][0..dim], x);
     if (router_bias) |b| @memcpy(cx.scratch_x.slice(f32)[off_bias..][0..cfg.n_expert], b);
 
-    const ad = AbsorbDims{ .n_heads = @intCast(n_heads), .nope = @intCast(nope), .kvr = @intCast(kvr), .stride = @intCast(nope + v_head_dim) };
-    const dims = MlaDims{ .n_heads = @intCast(n_heads), .kvr = @intCast(kvr), .rope = @intCast(cx.mla_rope), .seq = @intCast(seq), .scale = scale };
+    const ad = AbsorbDims{ .n_heads = @intCast(n_heads), .nope = @intCast(nope), .kvr = @intCast(kvr), .stride = @intCast(nope + v_head_dim), .q_stride = @intCast(nope), .q_off = 0 };
+    const dims = MlaDims{ .n_heads = @intCast(n_heads), .kvr = @intCast(kvr), .rope = @intCast(cx.mla_rope), .seq = @intCast(seq), .qr_stride = @intCast(cx.mla_rope), .qr_off = 0, .scale = scale };
     const c_off = li * cx.mla_ctx * kvr * @sizeOf(f32);
     const r_off = li * cx.mla_ctx * cx.mla_rope * @sizeOf(f32);
     const vd_dims = IdDims{ .rows = @intCast(v_head_dim), .cols = @intCast(kvr), .n_used = @intCast(n_heads), .plane_stride = @intCast((nope + v_head_dim) * row_bytes), .x_stride = @intCast(kvr) };
@@ -1946,9 +1955,9 @@ const IdDims = extern struct { rows: u32, cols: u32, n_used: u32, plane_stride: 
 
 const MlaRopeDims = extern struct { n_vec: u32, rope: u32, stride: u32, offset: u32, pos: u32, base: f32, yarn_factor: f32, yarn_orig_ctx: f32 };
 
-const AbsorbDims = extern struct { n_heads: u32, nope: u32, kvr: u32, stride: u32 };
+const AbsorbDims = extern struct { n_heads: u32, nope: u32, kvr: u32, stride: u32, q_stride: u32, q_off: u32 };
 
-const MlaDims = extern struct { n_heads: u32, kvr: u32, rope: u32, seq: u32, scale: f32 };
+const MlaDims = extern struct { n_heads: u32, kvr: u32, rope: u32, seq: u32, qr_stride: u32, qr_off: u32, scale: f32 };
 const MAX_MOE_REDUCE = 16;
 const ReduceDims = extern struct { n: u32, dim: u32, w: [MAX_MOE_REDUCE]f32 };
 

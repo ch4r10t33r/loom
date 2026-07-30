@@ -33,6 +33,10 @@ struct MlaDims {
     uint kvr;   // kv_lora_rank: width of a compressed cache row
     uint rope;  // rope_dim: width of a shared rope key
     uint seq;   // positions 0..seq-1 are valid
+    // q_rope layout: floats between heads and floats before each head's rope
+    // section. Gathered layout is (rope, 0); in-place device q is (kd, nope).
+    uint qr_stride;
+    uint qr_off;
     float scale;
 };
 
@@ -59,7 +63,7 @@ kernel void mla_attn_head(
     const uint h = hg;
     if (h >= d.n_heads) return;
     device const float *qa = q_absorbed + (ulong)h * d.kvr;
-    device const float *qr = q_rope + (ulong)h * d.rope;
+    device const float *qr = q_rope + (ulong)h * d.qr_stride + d.qr_off;
 
     // ---- scores --------------------------------------------------------------
     // Both halves of the MLA score, against one cache row each.
