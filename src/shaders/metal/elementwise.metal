@@ -50,3 +50,15 @@ kernel void add_inplace(
     if (i >= d.n) return;
     acc[i] += v[i];
 }
+
+// out = in, n floats. Exists for cache writes inside a recorded frame: the
+// k_rope section of kv_a has to land in the device cache before the rope
+// kernel rotates it there, and a host memcpy mid-frame is a synchronization.
+kernel void copy_f32(
+    device const float *in  [[buffer(0)]],
+    device float       *out [[buffer(1)]],
+    constant uint      &n   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid < n) out[gid] = in[gid];
+}
