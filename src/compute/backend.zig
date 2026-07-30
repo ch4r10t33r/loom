@@ -173,7 +173,6 @@ pub const mlaAttnHeads = impl.mlaAttnHeads;
 /// an MLA layer, so it forced a synchronization mid-layer however much of the
 /// rest was recorded.
 pub const mlaSetWk = impl.mlaSetWk;
-pub const mlaAbsorb = impl.mlaAbsorb;
 
 /// One shape the engine will issue, for calibration.
 pub const Shape = impl.Shape;

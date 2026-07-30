@@ -858,7 +858,10 @@ fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_a
         @memcpy(st.q_nope_all[h * nope ..][0..nope], st.q[h * kd ..][0..nope]);
         @memcpy(st.mla_qr[h * rope ..][0..rope], st.q[h * kd + nope ..][0..rope]);
     }
-    if (!backend.mlaAbsorb(li, st.q_nope_all, st.mla_qa, cfg.n_heads, nope, kvr, nope + vd)) {
+    // One call, two dispatches, one command buffer: absorption then attention,
+    // with q_abs staying on the device between them.
+    const on_device = backend.mlaAttnHeads(li, pos, st.q_nope_all, st.mla_qr, st.mla_ol, cfg.n_heads, nope, vd, scale);
+    if (!on_device) {
         h = 0;
         while (h < cfg.n_heads) : (h += 1) {
             const q_nope = st.q[h * kd ..][0..nope];
@@ -872,9 +875,6 @@ fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_a
             }
         }
     }
-
-    // Every head in one dispatch, over the device-resident compressed cache.
-    const on_device = backend.mlaAttnHeads(li, pos, st.mla_qa, st.mla_qr, st.mla_ol, cfg.n_heads, scale);
 
     h = 0;
     while (h < cfg.n_heads) : (h += 1) {

@@ -1141,41 +1141,6 @@ pub fn mlaSetWk(li: usize, wk_f32: []const f32) bool {
 
 /// q_abs = W_k^T q_nope for every head of one layer, in one dispatch. False
 /// when this layer's W_k was never uploaded, so the caller runs its host loop.
-pub fn mlaAbsorb(
-    li: usize,
-    q_nope: []const f32,
-    out: []f32,
-    n_heads: usize,
-    nope: usize,
-    kvr: usize,
-    stride: usize,
-) bool {
-    const cx = &(ctx orelse return false);
-    if (!use_gpu_ops and !attn_worthwhile) return false;
-    if (li >= cx.mla_wk.items.len) return false;
-    if (q_nope.len * 4 > cx.scratch_x.len or out.len * 4 > cx.scratch_out.len) return false;
-    @memcpy(cx.scratch_x.slice(f32)[0..q_nope.len], q_nope);
-    const dims = AbsorbDims{
-        .n_heads = @intCast(n_heads),
-        .nope = @intCast(nope),
-        .kvr = @intCast(kvr),
-        .stride = @intCast(stride),
-    };
-    const group: usize = 64;
-    const cb = cx.dev.commandBuffer();
-    cb.dispatch(
-        cx.mla_absorb_p,
-        &.{ cx.mla_wk.items[li], cx.scratch_x, cx.scratch_out },
-        &.{ 0, 0, 0 },
-        std.mem.asBytes(&dims),
-        n_heads * group,
-        group,
-    );
-    cb.commitAndWait();
-    @memcpy(out, cx.scratch_out.slice(f32)[0..out.len]);
-    return true;
-}
-
 /// Every head's MLA attention for one layer, over the compressed cache.
 ///
 /// `q_absorbed` is W_k^T q_nope per head -- the absorption identity, so the
@@ -1184,10 +1149,12 @@ pub fn mlaAbsorb(
 pub fn mlaAttnHeads(
     li: usize,
     pos: usize,
-    q_absorbed: []const f32,
+    q_nope: []const f32,
     q_rope: []const f32,
     out: []f32,
     n_heads: usize,
+    nope: usize,
+    v_head_dim: usize,
     scale: f32,
 ) bool {
     const cx = &(ctx orelse return false);
@@ -1202,14 +1169,26 @@ pub fn mlaAttnHeads(
     if (!use_gpu_ops and !attn_worthwhile) return false;
     const seq = pos + 1;
     if (seq > cx.mla_ctx) return false;
-    const qa_bytes = q_absorbed.len * 4;
-    const qr_bytes = q_rope.len * 4;
-    if (qa_bytes + qr_bytes > cx.scratch_x.len) return false;
+    // The absorption runs here too, in the same command buffer, and its result
+    // never comes back to the host. Two dispatches sharing one buffer rather
+    // than two buffers each waited on: 26 ops a layer is not the problem,
+    // 26 *submissions* is -- ggml encodes an entire graph into about two
+    // command buffers and waits once, where each of these was one and a wait.
+    if (li >= cx.mla_wk.items.len) return false;
+    const kvr = cx.mla_kvr;
+    if ((q_nope.len + q_rope.len) * 4 > cx.scratch_x.len) return false;
     if (out.len * 4 > cx.scratch_out.len) return false;
+    if (n_heads * kvr * 4 > cx.act[1].len) return false;
 
-    // Both query halves share the one staging buffer, absorbed first.
-    @memcpy(cx.scratch_x.slice(f32)[0..q_absorbed.len], q_absorbed);
-    @memcpy(cx.scratch_x.slice(f32)[q_absorbed.len..][0..q_rope.len], q_rope);
+    @memcpy(cx.scratch_x.slice(f32)[0..q_nope.len], q_nope);
+    @memcpy(cx.scratch_x.slice(f32)[q_nope.len..][0..q_rope.len], q_rope);
+
+    const ad = AbsorbDims{
+        .n_heads = @intCast(n_heads),
+        .nope = @intCast(nope),
+        .kvr = @intCast(kvr),
+        .stride = @intCast(nope + v_head_dim),
+    };
 
     const dims = MlaDims{
         .n_heads = @intCast(n_heads),
@@ -1222,14 +1201,26 @@ pub fn mlaAttnHeads(
     const r_off = li * cx.mla_ctx * cx.mla_rope * @sizeOf(f32);
     const group: usize = 64;
     const cb = cx.dev.commandBuffer();
-    cb.dispatch(
+    const e = cb.encoder();
+    // q_abs = W_k^T q_nope, into act[1], staying on the device.
+    e.dispatch(
+        cx.mla_absorb_p,
+        &.{ cx.mla_wk.items[li], cx.scratch_x, cx.act[1] },
+        &.{ 0, 0, 0 },
+        std.mem.asBytes(&ad),
+        n_heads * group,
+        group,
+    );
+    e.barrier();
+    e.dispatch(
         cx.mla_attn_p,
-        &.{ cx.scratch_x, cx.scratch_x, cbuf, rbuf, cx.scratch_out },
-        &.{ 0, q_absorbed.len * 4, c_off, r_off, 0 },
+        &.{ cx.act[1], cx.scratch_x, cbuf, rbuf, cx.scratch_out },
+        &.{ 0, q_nope.len * 4, c_off, r_off, 0 },
         std.mem.asBytes(&dims),
         n_heads * group,
         group,
     );
+    e.end();
     cb.commitAndWait();
     @memcpy(out, cx.scratch_out.slice(f32)[0..out.len]);
     return true;
@@ -3676,9 +3667,35 @@ test "mla attention matches an exact cpu reference" {
         if (!mlaAppend(li, t, c_rows[t * kvr ..][0..kvr], r_rows[t * rope ..][0..rope])) return error.SkipZigTest;
     }
 
+    // The absorption is now inside `mlaAttnHeads`, so the test drives it the
+    // way the engine does: hand it q_nope and an identity W_k, which makes
+    // q_abs == q_nope and leaves the attention arithmetic the thing under test.
+    const nope = 8;
+    const vd = 8;
+    const stride = nope + vd;
+    const wk = try gpa.alloc(f32, n_heads * stride * kvr);
+    defer gpa.free(wk);
+    @memset(wk, 0);
+    const q_nope = try gpa.alloc(f32, n_heads * nope);
+    defer gpa.free(q_nope);
+    for (q_nope) |*v| v.* = 0;
+    // Row r of head h contributes q_nope[h][r] * wk[h][r][:] to q_abs[h][:].
+    // One row carrying the whole absorbed query reproduces `qa` exactly.
+    for (0..n_heads) |hh| {
+        q_nope[hh * nope] = 1.0;
+        @memcpy(wk[(hh * stride) * kvr ..][0..kvr], qa[hh * kvr ..][0..kvr]);
+    }
+    // Layers arrive in order, so layer 0 goes first even though the test uses
+    // layer 1 -- which is the point: a missing layer stride would show.
+    const zero = try gpa.alloc(f32, n_heads * stride * kvr);
+    defer gpa.free(zero);
+    @memset(zero, 0);
+    if (!mlaSetWk(0, zero)) return error.SkipZigTest;
+    if (!mlaSetWk(li, wk)) return error.SkipZigTest;
+
     const got = try gpa.alloc(f32, n_heads * kvr);
     defer gpa.free(got);
-    if (!mlaAttnHeads(li, seq - 1, qa, qr, got, n_heads, scale)) return error.SkipZigTest;
+    if (!mlaAttnHeads(li, seq - 1, q_nope, qr, got, n_heads, nope, vd, scale)) return error.SkipZigTest;
 
     // Reference in f64: softmax over 37 terms then a weighted sum is exactly
     // the kind of reduction where an f32 oracle reports its own drift.
