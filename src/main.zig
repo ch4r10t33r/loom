@@ -633,6 +633,10 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
 }
 
 fn cmdGgufRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8, args: [][]const u8) !void {
+    // Same opt-in as the node: the measured-slower GPU paths run only when
+    // asked, and this command is where the *local* fused MoE path is
+    // exercised, since a model file loaded here has no distributed source.
+    if (hasFlag(args, "--gpu-ops")) backend.useGpuOps.* = true;
     // a store directory (partial, expert-sharded) runs distributed
     {
         var pbuf: [4096]u8 = undefined;

@@ -300,6 +300,8 @@ fn genGgufInner(
     // sitting idle overnight must not peg every core.
     backend.parallelBegin(threads());
     defer backend.parallelEnd();
+    // The device exists now; wire any weight mappings registered at load.
+    _ = backend.materializeArenas();
 
     const toks = try m.encodePrompt(gpa, prompt_text, parse_special);
     defer gpa.free(toks);
