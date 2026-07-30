@@ -1822,6 +1822,324 @@ pub fn mlaLayerTail(
     return true;
 }
 
+/// Everything one MLA layer needs, resolved once at load so the per-token
+/// frame is emission only.
+pub const MlaLayerDesc = struct {
+    attn_norm: []const f32,
+    wq: WeightRef, // n_heads*kd rows over dim
+    kv_a: WeightRef, // kvr+rope rows over dim
+    kv_a_norm: []const f32,
+    kv_b: WeightRef,
+    attn_out: WeightRef,
+    ffn_norm: []const f32,
+    is_moe: bool,
+    // MoE layers:
+    router: WeightRef = .{ .ty = .f32, .data = &.{} },
+    gate: WeightRef = .{ .ty = .f32, .data = &.{} },
+    up: WeightRef = .{ .ty = .f32, .data = &.{} },
+    down: WeightRef = .{ .ty = .f32, .data = &.{} },
+    shexp: ?[3]WeightRef = null,
+    ffn: usize = 0,
+    shexp_ffn: usize = 0,
+    // Dense layers:
+    dgate: WeightRef = .{ .ty = .f32, .data = &.{} },
+    dup: WeightRef = .{ .ty = .f32, .data = &.{} },
+    ddown: WeightRef = .{ .ty = .f32, .data = &.{} },
+    dffn: usize = 0,
+};
+
+pub const MlaFrameCfg = struct {
+    dim: usize,
+    n_heads: usize,
+    nope: usize,
+    rope: usize,
+    kvr: usize,
+    v_head_dim: usize,
+    eps: f32,
+    scale: f32,
+    rope_base: f32,
+    yarn_factor: f32,
+    yarn_orig_ctx: f32,
+    routed: RoutedCfg,
+};
+
+/// A whole token -- every layer's attention head, attention, and FFN, then the
+/// final norm and the lm_head -- as **one** command buffer.
+///
+/// This is `ggml_metal_graph_compute`'s shape: the residual stream lives in a
+/// device slot for the entire token and only the logits come back. Slot plan
+/// per layer: 4 = x (persistent), 5 = normed, 6 = q then router logits (q is
+/// consumed by attention before the router writes), 7 = kv_a then the
+/// projected attention output, 1/2/3/0 = the FFN's working set, exactly as the
+/// layer tail uses them.
+///
+/// Declines -- engine falls back to the per-layer path -- on anything it
+/// cannot express: a router bias (not yet staged per layer), a type without a
+/// kernel, widths off the kernels' grids.
+pub fn mlaTokenFrame(
+    descs: []const MlaLayerDesc,
+    fc: MlaFrameCfg,
+    x: []f32,
+    pos: usize,
+    out_norm: []const f32,
+    lm_head: WeightRef,
+    logits: []f32,
+) bool {
+    const cx = &(ctx orelse return false);
+    if (!use_gpu_ops) return false;
+    // LOOM_NO_FRAME bisects against the per-layer tail. The first frame
+    // measurement said slower and was wrong -- it was the cold run, paying
+    // pipeline compiles and the wrap of every tensor. Warm and alternating:
+    // 27.9-30.4 ms/token against the tail's 38.7-47.6, at 1.8 command buffers
+    // per token against 28.
+    if (std.c.getenv("LOOM_NO_FRAME") != null) return false;
+    const cbuf = cx.mla_c orelse return false;
+    const rbuf = cx.mla_krope orelse return false;
+    if (pos + 1 > cx.mla_ctx or descs.len > cx.mla_wk.items.len) return false;
+    const dim = fc.dim;
+    const kd = fc.nope + fc.rope;
+    const seq = pos + 1;
+    if (dim * 4 > cx.scratch_x.len or logits.len * 4 > cx.scratch_out.len) return false;
+    const vocab = logits.len;
+
+    // Resolve everything for every layer before a single dispatch is encoded.
+    const P = struct {
+        anw: Wrapped,
+        qsel: @TypeOf(dmmvFor(undefined, .q4_k, 0).?),
+        qw: Wrapped,
+        kasel: @TypeOf(dmmvFor(undefined, .q4_k, 0).?),
+        kaw: Wrapped,
+        kanw: Wrapped,
+        vsel: @TypeOf(dmmvIdFor(undefined, .q4_k).?),
+        vw: Wrapped,
+        row_bytes: usize,
+        psel: @TypeOf(dmmvFor(undefined, .q4_k, 0).?),
+        pw: Wrapped,
+        fnw: Wrapped,
+        rsel: @TypeOf(dmmvFor(undefined, .q4_k, 0).?),
+        rw: Wrapped,
+        gsel: @TypeOf(dmmvIdFor(undefined, .q4_k).?),
+        gw: Wrapped,
+        usel: @TypeOf(dmmvIdFor(undefined, .q4_k).?),
+        uw: Wrapped,
+        dsel: @TypeOf(dmmvIdFor(undefined, .q4_k).?),
+        dw: Wrapped,
+        sh_pipes: [3]@TypeOf(dmmvFor(undefined, .q4_k, 0).?),
+        sh_wraps: [3]Wrapped,
+        dq: [3]@TypeOf(dmmvFor(undefined, .q4_k, 0).?),
+        dqw: [3]Wrapped,
+    };
+    var plans_buf: [64]P = undefined;
+    if (descs.len > plans_buf.len) return false;
+    for (descs, 0..) |d, i| {
+        var p: P = undefined;
+        p.anw = wrapFor(cx, std.mem.sliceAsBytes(d.attn_norm)) orelse return false;
+        p.qsel = dmmvFor(cx, d.wq.ty, fc.n_heads * kd) orelse return false;
+        if (dim % colsMultiple(d.wq.ty) != 0) return false;
+        p.qw = wrapFor(cx, d.wq.data) orelse return false;
+        p.kasel = dmmvFor(cx, d.kv_a.ty, fc.kvr + fc.rope) orelse return false;
+        if (dim % colsMultiple(d.kv_a.ty) != 0) return false;
+        p.kaw = wrapFor(cx, d.kv_a.data) orelse return false;
+        p.kanw = wrapFor(cx, std.mem.sliceAsBytes(d.kv_a_norm)) orelse return false;
+        p.vsel = dmmvIdFor(cx, d.kv_b.ty) orelse return false;
+        if (fc.kvr % colsMultiple(d.kv_b.ty) != 0 or fc.v_head_dim % p.vsel.per != 0) return false;
+        p.vw = wrapFor(cx, d.kv_b.data) orelse return false;
+        p.row_bytes = d.kv_b.data.len / (fc.n_heads * (fc.nope + fc.v_head_dim));
+        p.psel = dmmvFor(cx, d.attn_out.ty, dim) orelse return false;
+        if ((fc.n_heads * fc.v_head_dim) % colsMultiple(d.attn_out.ty) != 0) return false;
+        p.pw = wrapFor(cx, d.attn_out.data) orelse return false;
+        p.fnw = wrapFor(cx, std.mem.sliceAsBytes(d.ffn_norm)) orelse return false;
+        if (d.is_moe) {
+            p.rsel = dmmvFor(cx, d.router.ty, fc.routed.n_expert) orelse return false;
+            if (dim % colsMultiple(d.router.ty) != 0) return false;
+            p.rw = wrapFor(cx, d.router.data) orelse return false;
+            p.gsel = dmmvIdFor(cx, d.gate.ty) orelse return false;
+            p.usel = dmmvIdFor(cx, d.up.ty) orelse return false;
+            p.dsel = dmmvIdFor(cx, d.down.ty) orelse return false;
+            if (dim % colsMultiple(d.gate.ty) != 0 or dim % colsMultiple(d.up.ty) != 0) return false;
+            if (d.ffn % colsMultiple(d.down.ty) != 0) return false;
+            p.gw = wrapFor(cx, d.gate.data) orelse return false;
+            p.uw = wrapFor(cx, d.up.data) orelse return false;
+            p.dw = wrapFor(cx, d.down.data) orelse return false;
+            if (d.shexp) |sw| {
+                p.sh_pipes[0] = dmmvFor(cx, sw[0].ty, d.shexp_ffn) orelse return false;
+                p.sh_pipes[1] = dmmvFor(cx, sw[1].ty, d.shexp_ffn) orelse return false;
+                p.sh_pipes[2] = dmmvFor(cx, sw[2].ty, dim) orelse return false;
+                if (d.shexp_ffn % colsMultiple(sw[2].ty) != 0) return false;
+                for (sw, 0..) |w, k| p.sh_wraps[k] = wrapFor(cx, w.data) orelse return false;
+            }
+            if (cfgSlotsShort(cx, d.ffn, d.shexp_ffn, dim, fc.routed.n_used)) return false;
+        } else {
+            p.dq[0] = dmmvFor(cx, d.dgate.ty, d.dffn) orelse return false;
+            p.dq[1] = dmmvFor(cx, d.dup.ty, d.dffn) orelse return false;
+            p.dq[2] = dmmvFor(cx, d.ddown.ty, dim) orelse return false;
+            if (dim % colsMultiple(d.dgate.ty) != 0 or d.dffn % colsMultiple(d.ddown.ty) != 0) return false;
+            p.dqw[0] = wrapFor(cx, d.dgate.data) orelse return false;
+            p.dqw[1] = wrapFor(cx, d.dup.data) orelse return false;
+            p.dqw[2] = wrapFor(cx, d.ddown.data) orelse return false;
+            if (d.dffn * 4 > cx.act[1].len) return false;
+        }
+        plans_buf[i] = p;
+    }
+    const onw = wrapFor(cx, std.mem.sliceAsBytes(out_norm)) orelse return false;
+    const lmsel = dmmvFor(cx, lm_head.ty, vocab) orelse return false;
+    if (dim % colsMultiple(lm_head.ty) != 0) return false;
+    const lmw = wrapFor(cx, lm_head.data) orelse return false;
+    if (cx.mla_vids == null) {
+        const b = cx.dev.alloc(64 * @sizeOf(u32)) catch return false;
+        for (0..64) |k| b.slice(u32)[k] = @intCast(k);
+        cx.mla_vids = b;
+    }
+    if (cx.route_ids == null) {
+        cx.route_ids = cx.dev.alloc(MAX_MOE_EXPERTS * @sizeOf(u32)) catch return false;
+        cx.route_gates = cx.dev.alloc(MAX_MOE_EXPERTS * @sizeOf(f32)) catch return false;
+    }
+
+    @memcpy(cx.act[4].slice(f32)[0..dim], x);
+
+    const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+    const grid = struct {
+        fn f(rows: usize, per: usize, n: usize) usize {
+            const threads = ((n * rows + per - 1) / per) * SIMD_W;
+            return ((threads + group - 1) / group) * group;
+        }
+    }.f;
+    const nd = extern struct { n: u32, eps: f32 }{ .n = @intCast(dim), .eps = fc.eps };
+    const nd_kv = extern struct { n: u32, eps: f32 }{ .n = @intCast(fc.kvr), .eps = fc.eps };
+    const len_dim = extern struct { n: u32 }{ .n = @intCast(dim) };
+    const rope_n: u32 = @intCast(fc.rope);
+    const ad = AbsorbDims{ .n_heads = @intCast(fc.n_heads), .nope = @intCast(fc.nope), .kvr = @intCast(fc.kvr), .stride = @intCast(fc.nope + fc.v_head_dim), .q_stride = @intCast(kd), .q_off = 0 };
+    const at = MlaDims{ .n_heads = @intCast(fc.n_heads), .kvr = @intCast(fc.kvr), .rope = @intCast(fc.rope), .seq = @intCast(seq), .qr_stride = @intCast(kd), .qr_off = @intCast(fc.nope), .scale = fc.scale };
+    const qd = Dims{ .rows = @intCast(fc.n_heads * kd), .cols = @intCast(dim) };
+    const kad = Dims{ .rows = @intCast(fc.kvr + fc.rope), .cols = @intCast(dim) };
+    const pd = Dims{ .rows = @intCast(dim), .cols = @intCast(fc.n_heads * fc.v_head_dim) };
+    const q_rope_d = MlaRopeDims{ .n_vec = @intCast(fc.n_heads), .rope = rope_n, .stride = @intCast(kd), .offset = @intCast(fc.nope), .pos = @intCast(pos), .base = fc.rope_base, .yarn_factor = fc.yarn_factor, .yarn_orig_ctx = fc.yarn_orig_ctx };
+    const k_rope_d = MlaRopeDims{ .n_vec = 1, .rope = rope_n, .stride = 0, .offset = 0, .pos = @intCast(pos), .base = fc.rope_base, .yarn_factor = fc.yarn_factor, .yarn_orig_ctx = fc.yarn_orig_ctx };
+    const rdim = ReduceDims{ .n = @intCast(fc.routed.n_used), .dim = @intCast(dim), .w = @splat(0) };
+    const route_d = RouteDims{ .n_expert = @intCast(fc.routed.n_expert), .n_used = @intCast(fc.routed.n_used), .gating = if (fc.routed.gating_sigmoid) 1 else 0, .weights_norm = if (fc.routed.weights_norm) 1 else 0, .has_bias = 0, .weights_scale = fc.routed.weights_scale };
+    const rdd = Dims{ .rows = @intCast(fc.routed.n_expert), .cols = @intCast(dim) };
+
+    const cb = cx.dev.commandBuffer();
+    const e = cb.encoder();
+    for (descs, 0..) |d, li| {
+        const p = &plans_buf[li];
+        const c_pos = (li * cx.mla_ctx + pos) * fc.kvr * 4;
+        const r_pos = (li * cx.mla_ctx + pos) * fc.rope * 4;
+        // ---- head ----
+        e.dispatch(cx.rmsnorm_p, &.{ cx.act[4], p.anw.buf, cx.act[5] }, &.{ 0, p.anw.off, 0 }, std.mem.asBytes(&nd), SIMD_W, SIMD_W);
+        e.barrier();
+        e.dispatch(p.qsel.pipe, &.{ p.qw.buf, cx.act[5], cx.act[6] }, &.{ p.qw.off, 0, 0 }, std.mem.asBytes(&qd), p.qsel.groups, group);
+        e.dispatch(p.kasel.pipe, &.{ p.kaw.buf, cx.act[5], cx.act[7] }, &.{ p.kaw.off, 0, 0 }, std.mem.asBytes(&kad), p.kasel.groups, group);
+        e.barrier();
+        // c_kv: norm straight into the cache row; k_rope: copy then rotate there.
+        e.dispatch(cx.rmsnorm_p, &.{ cx.act[7], p.kanw.buf, cbuf }, &.{ 0, p.kanw.off, c_pos }, std.mem.asBytes(&nd_kv), SIMD_W, SIMD_W);
+        e.dispatch(cx.copy_p, &.{ cx.act[7], rbuf }, &.{ fc.kvr * 4, r_pos }, std.mem.asBytes(&rope_n), fc.rope, 32);
+        e.dispatch(cx.mla_rope_p, &.{cx.act[6]}, &.{0}, std.mem.asBytes(&q_rope_d), fc.n_heads * fc.rope / 2, 32);
+        e.barrier();
+        e.dispatch(cx.mla_rope_p, &.{rbuf}, &.{r_pos}, std.mem.asBytes(&k_rope_d), fc.rope / 2, 32);
+        e.barrier();
+        // ---- attention ----
+        e.dispatch(cx.mla_absorb_p, &.{ cx.mla_wk.items[li], cx.act[6], cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&ad), fc.n_heads * group, group);
+        e.barrier();
+        e.dispatch(cx.mla_attn_p, &.{ cx.act[1], cx.act[6], cbuf, rbuf, cx.act[2] }, &.{ 0, 0, li * cx.mla_ctx * fc.kvr * 4, li * cx.mla_ctx * fc.rope * 4, 0 }, std.mem.asBytes(&at), fc.n_heads * group, group);
+        e.barrier();
+        const vd_dims = IdDims{ .rows = @intCast(fc.v_head_dim), .cols = @intCast(fc.kvr), .n_used = @intCast(fc.n_heads), .plane_stride = @intCast((fc.nope + fc.v_head_dim) * p.row_bytes), .x_stride = @intCast(fc.kvr) };
+        e.dispatch(p.vsel.pipe, &.{ p.vw.buf, cx.act[2], cx.act[3], cx.mla_vids.? }, &.{ p.vw.off + fc.nope * p.row_bytes, 0, 0, 0 }, std.mem.asBytes(&vd_dims), grid(fc.v_head_dim, p.vsel.per, fc.n_heads), group);
+        e.barrier();
+        e.dispatch(p.psel.pipe, &.{ p.pw.buf, cx.act[3], cx.act[7] }, &.{ p.pw.off, 0, 0 }, std.mem.asBytes(&pd), p.psel.groups, group);
+        e.barrier();
+        e.dispatch(cx.add_p, &.{ cx.act[4], cx.act[7] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), dim, 64);
+        e.barrier();
+        e.dispatch(cx.rmsnorm_p, &.{ cx.act[4], p.fnw.buf, cx.act[5] }, &.{ 0, p.fnw.off, 0 }, std.mem.asBytes(&nd), SIMD_W, SIMD_W);
+        e.barrier();
+        if (d.is_moe) {
+            e.dispatch(p.rsel.pipe, &.{ p.rw.buf, cx.act[5], cx.act[6] }, &.{ p.rw.off, 0, 0 }, std.mem.asBytes(&rdd), p.rsel.groups, group);
+            e.barrier();
+            e.dispatch(cx.route_p, &.{ cx.act[6], cx.act[6], cx.route_ids.?, cx.route_gates.? }, &.{ 0, 0, 0, 0 }, std.mem.asBytes(&route_d), 32, 32);
+            e.barrier();
+            const gate_plane: u32 = @intCast(d.gate.data.len / fc.routed.n_expert);
+            const up_plane: u32 = @intCast(d.up.data.len / fc.routed.n_expert);
+            const down_plane: u32 = @intCast(d.down.data.len / fc.routed.n_expert);
+            const d_gate = IdDims{ .rows = @intCast(d.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = gate_plane, .x_stride = 0 };
+            const d_up = IdDims{ .rows = @intCast(d.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = up_plane, .x_stride = 0 };
+            const d_down = IdDims{ .rows = @intCast(dim), .cols = @intCast(d.ffn), .n_used = @intCast(fc.routed.n_used), .plane_stride = down_plane, .x_stride = @intCast(d.ffn) };
+            const len_ffn = extern struct { n: u32 }{ .n = @intCast(d.ffn) };
+            e.dispatch(p.gsel.pipe, &.{ p.gw.buf, cx.act[5], cx.act[1], cx.route_ids.? }, &.{ p.gw.off, 0, 0, 0 }, std.mem.asBytes(&d_gate), grid(d.ffn, p.gsel.per, fc.routed.n_used), group);
+            e.dispatch(p.usel.pipe, &.{ p.uw.buf, cx.act[5], cx.act[2], cx.route_ids.? }, &.{ p.uw.off, 0, 0, 0 }, std.mem.asBytes(&d_up), grid(d.ffn, p.usel.per, fc.routed.n_used), group);
+            e.barrier();
+            for (0..fc.routed.n_used) |k| {
+                e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ k * d.ffn * 4, k * d.ffn * 4, k * d.ffn * 4 }, std.mem.asBytes(&len_ffn), d.ffn, 64);
+            }
+            e.barrier();
+            e.dispatch(p.dsel.pipe, &.{ p.dw.buf, cx.act[1], cx.act[3], cx.route_ids.? }, &.{ p.dw.off, 0, 0, 0 }, std.mem.asBytes(&d_down), grid(dim, p.dsel.per, fc.routed.n_used), group);
+            e.barrier();
+            e.dispatch(cx.reduce_dev_p, &.{ cx.act[0], cx.act[3], cx.route_gates.? }, &.{ 0, 0, 0 }, std.mem.asBytes(&rdim), dim, 64);
+            e.barrier();
+            if (d.shexp != null) {
+                const d_sh = Dims{ .rows = @intCast(d.shexp_ffn), .cols = @intCast(dim) };
+                const d_shd = Dims{ .rows = @intCast(dim), .cols = @intCast(d.shexp_ffn) };
+                const len_sh = extern struct { n: u32 }{ .n = @intCast(d.shexp_ffn) };
+                e.dispatch(p.sh_pipes[0].pipe, &.{ p.sh_wraps[0].buf, cx.act[5], cx.act[1] }, &.{ p.sh_wraps[0].off, 0, 0 }, std.mem.asBytes(&d_sh), p.sh_pipes[0].groups, group);
+                e.dispatch(p.sh_pipes[1].pipe, &.{ p.sh_wraps[1].buf, cx.act[5], cx.act[2] }, &.{ p.sh_wraps[1].off, 0, 0 }, std.mem.asBytes(&d_sh), p.sh_pipes[1].groups, group);
+                e.barrier();
+                e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_sh), d.shexp_ffn, 64);
+                e.barrier();
+                e.dispatch(p.sh_pipes[2].pipe, &.{ p.sh_wraps[2].buf, cx.act[1], cx.act[3] }, &.{ p.sh_wraps[2].off, 0, 0 }, std.mem.asBytes(&d_shd), p.sh_pipes[2].groups, group);
+                e.barrier();
+                const acc_d = AccDims{ .n = @intCast(dim), .alpha = 1.0 };
+                e.dispatch(cx.sadd_p, &.{ cx.act[0], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&acc_d), dim, 64);
+                e.barrier();
+            }
+            e.dispatch(cx.add_p, &.{ cx.act[4], cx.act[0] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), dim, 64);
+        } else {
+            const d_f = Dims{ .rows = @intCast(d.dffn), .cols = @intCast(dim) };
+            const d_fd = Dims{ .rows = @intCast(dim), .cols = @intCast(d.dffn) };
+            const len_f = extern struct { n: u32 }{ .n = @intCast(d.dffn) };
+            e.dispatch(p.dq[0].pipe, &.{ p.dqw[0].buf, cx.act[5], cx.act[1] }, &.{ p.dqw[0].off, 0, 0 }, std.mem.asBytes(&d_f), p.dq[0].groups, group);
+            e.dispatch(p.dq[1].pipe, &.{ p.dqw[1].buf, cx.act[5], cx.act[2] }, &.{ p.dqw[1].off, 0, 0 }, std.mem.asBytes(&d_f), p.dq[1].groups, group);
+            e.barrier();
+            e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_f), d.dffn, 64);
+            e.barrier();
+            e.dispatch(p.dq[2].pipe, &.{ p.dqw[2].buf, cx.act[1], cx.act[3] }, &.{ p.dqw[2].off, 0, 0 }, std.mem.asBytes(&d_fd), p.dq[2].groups, group);
+            e.barrier();
+            e.dispatch(cx.add_p, &.{ cx.act[4], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), dim, 64);
+        }
+        e.barrier();
+    }
+    // ---- final norm and lm_head ----
+    e.dispatch(cx.rmsnorm_p, &.{ cx.act[4], onw.buf, cx.act[5] }, &.{ 0, onw.off, 0 }, std.mem.asBytes(&nd), SIMD_W, SIMD_W);
+    e.barrier();
+    const lmd = Dims{ .rows = @intCast(vocab), .cols = @intCast(dim) };
+    e.dispatch(lmsel.pipe, &.{ lmw.buf, cx.act[5], cx.scratch_out }, &.{ lmw.off, 0, 0 }, std.mem.asBytes(&lmd), lmsel.groups, group);
+    e.end();
+    cb.commitAndWait();
+    @memcpy(x, cx.act[4].slice(f32)[0..dim]);
+    @memcpy(logits, cx.scratch_out.slice(f32)[0..vocab]);
+    return true;
+}
+
+/// Read one position's cache rows back to the host. The frame writes the
+/// compressed cache on the device only; the host copy stays authoritative for
+/// any later fallback, so the engine mirrors these rows after each frame
+/// token -- ~62 KB, against the alternative of a fallback attending over
+/// stale rows and producing plausible text.
+pub fn mlaReadCache(li: usize, pos: usize, c_kv: []f32, k_rope: []f32) bool {
+    const cx = &(ctx orelse return false);
+    const cbuf = cx.mla_c orelse return false;
+    const rbuf = cx.mla_krope orelse return false;
+    if (pos >= cx.mla_ctx or c_kv.len != cx.mla_kvr or k_rope.len != cx.mla_rope) return false;
+    @memcpy(c_kv, cbuf.slice(f32)[(li * cx.mla_ctx + pos) * cx.mla_kvr ..][0..c_kv.len]);
+    @memcpy(k_rope, rbuf.slice(f32)[(li * cx.mla_ctx + pos) * cx.mla_rope ..][0..k_rope.len]);
+    return true;
+}
+
+fn cfgSlotsShort(cx: *Ctx, ffn: usize, shexp_ffn: usize, dim: usize, n_used: usize) bool {
+    const widest = @max(ffn, shexp_ffn);
+    if (n_used * ffn * 4 > cx.act[1].len or widest * 4 > cx.act[1].len) return true;
+    if (n_used * dim * 4 > cx.act[3].len) return true;
+    return false;
+}
+
 /// One selected expert: its three weight tensors and its routing gate.
 pub const ExpertRef = struct {
     gate: WeightRef,

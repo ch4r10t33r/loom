@@ -70,6 +70,19 @@ pub fn moeFfnBlockRouted(normed: []const f32, logits: []const f32, bias: ?[]cons
     return false;
 }
 
+pub const MlaLayerDesc = struct { attn_norm: []const f32, wq: WeightRef, kv_a: WeightRef, kv_a_norm: []const f32, kv_b: WeightRef, attn_out: WeightRef, ffn_norm: []const f32, is_moe: bool, router: WeightRef = .{ .ty = .f32, .data = &.{} }, gate: WeightRef = .{ .ty = .f32, .data = &.{} }, up: WeightRef = .{ .ty = .f32, .data = &.{} }, down: WeightRef = .{ .ty = .f32, .data = &.{} }, shexp: ?[3]WeightRef = null, ffn: usize = 0, shexp_ffn: usize = 0, dgate: WeightRef = .{ .ty = .f32, .data = &.{} }, dup: WeightRef = .{ .ty = .f32, .data = &.{} }, ddown: WeightRef = .{ .ty = .f32, .data = &.{} }, dffn: usize = 0 };
+pub const MlaFrameCfg = struct { dim: usize, n_heads: usize, nope: usize, rope: usize, kvr: usize, v_head_dim: usize, eps: f32, scale: f32, rope_base: f32, yarn_factor: f32, yarn_orig_ctx: f32, routed: RoutedCfg };
+
+pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos: usize, out_norm: []const f32, lm_head: WeightRef, logits: []f32) bool {
+    _ = .{ descs, fc, x, pos, out_norm, lm_head, logits };
+    return false;
+}
+
+pub fn mlaReadCache(li: usize, pos: usize, c_kv: []f32, k_rope: []f32) bool {
+    _ = .{ li, pos, c_kv, k_rope };
+    return false;
+}
+
 pub fn moeRoute(logits: []const f32, bias: ?[]const f32, ids_out: []u32, gates_out: []f32, gating_sigmoid: bool, weights_norm: bool, weights_scale: f32) bool {
     _ = .{ logits, bias, ids_out, gates_out, gating_sigmoid, weights_norm, weights_scale };
     return false;
