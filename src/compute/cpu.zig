@@ -20,12 +20,12 @@ pub const dequantRow = ggml.dequantRow;
 
 pub const WeightRef = struct { ty: ggml.Type, data: []const u8 };
 
-pub const ExpertRef = struct { gate: WeightRef, up: WeightRef, down: WeightRef, weight: f32 };
+pub const ExpertRef = struct { gate: WeightRef, up: WeightRef, down: WeightRef, weight: f32, ffn: usize };
 
 /// Declined: the CPU path has no command buffer to amortize, so grouping a
 /// layer's experts would buy nothing the caller's own loop does not already do.
-pub fn moeFfnBlock(normed: []const f32, experts: []const ExpertRef, ffn: usize, out: []f32) bool {
-    _ = .{ normed, experts, ffn, out };
+pub fn moeFfnBlock(normed: []const f32, experts: []const ExpertRef, out: []f32) bool {
+    _ = .{ normed, experts, out };
     return false;
 }
 
