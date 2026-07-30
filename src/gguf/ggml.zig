@@ -452,6 +452,16 @@ pub fn matmul(t: Type, out: []f32, data: []const u8, xs: []const f32, n: usize, 
     // memory corruption in ReleaseFast, where unreachable is undefined
     // behaviour rather than a panic.
     const batched = switch (t) {
+        // q5_0 is deliberately absent. A batched kernel for it is written
+        // below but cannot join this set: `matvecQ50` dequantizes exactly in
+        // f32 while every batched kernel here quantizes activations to int8,
+        // so the two disagree in the last bits and `matmul` must equal `n`
+        // matvecs exactly. Closing that needs either an f32-exact batched path
+        // -- which wants the raw activations that `matmulRows` is not given --
+        // or moving single-vector q5_0 onto int8 activations, which changes
+        // decode numerics for every model that uses it. Until then q5_0 falls
+        // back to one matvec per row, so a MoE layer whose `ffn_down_exps` is
+        // q5_0 gets no amortization from batching.
         .q4_k, .q6_k, .q8_0 => true,
         else => false,
     };
