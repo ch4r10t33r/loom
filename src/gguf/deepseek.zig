@@ -623,6 +623,10 @@ pub const Profile = struct {
     pub var cache_slots: usize = 0;
     /// Command buffers the backend submitted, summed over the profiled tokens.
     pub var cmdbufs: u64 = 0;
+    /// Split out of `expert ffn`: the routed experts go to the backend as one
+    /// block per layer, the shared expert does not, and the bucket was 5x what
+    /// the block measures in isolation.
+    var shexp_ns: i128 = 0;
 
     fn reset() void {
         attn_ns = 0;
@@ -634,6 +638,7 @@ pub const Profile = struct {
         other_ns = 0;
         tokens = 0;
         cmdbufs = 0;
+        shexp_ns = 0;
     }
 
     pub fn enabled() bool {
@@ -713,8 +718,8 @@ pub const Profile = struct {
         // The "everything else" bucket was 17.5% and unattributed, which is
         // exactly the size at which it stops being a rounding error and starts
         // being the next thing to fix. Split into the three candidates.
-        try w.print("    of which: router {d:8.1}  expert-accum {d:8.1}  norm+lmhead {d:8.1}\n", .{
-            ms(route_ns, tokens), ms(acc_ns, tokens), ms(head_ns, tokens),
+        try w.print("    of which: router {d:8.1}  expert-accum {d:8.1}  norm+lmhead {d:8.1}  shared-expert {d:8.1}\n", .{
+            ms(route_ns, tokens), ms(acc_ns, tokens), ms(head_ns, tokens), ms(shexp_ns, tokens),
         });
         if (src_stats) |g| {
             const acc = g.mapped + g.ram + g.local + g.fetched;
@@ -732,6 +737,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     var t_attn: i128 = 0;
     var t_get: i128 = 0;
     var t_ffn: i128 = 0;
+    var t_shexp: i128 = 0;
     var t_route: i128 = 0;
     var t_acc: i128 = 0;
     const cfg = m.cfg;
@@ -945,7 +951,11 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
                 const t_s0 = if (prof) Profile.now() else 0;
                 denseFFN(st, gs, l.ffn_up_shexp.?, l.ffn_down_shexp.?);
                 backend.add(acc, st.ffn_out);
-                if (prof) t_ffn += Profile.now() - t_s0;
+                if (prof) {
+                    const d = Profile.now() - t_s0;
+                    t_ffn += d;
+                    t_shexp += d;
+                }
             }
             backend.add(st.x, acc);
         }
@@ -966,6 +976,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
         Profile.attn_ns += t_attn;
         Profile.expert_get_ns += t_get;
         Profile.expert_ffn_ns += t_ffn;
+        Profile.shexp_ns += t_shexp;
         Profile.route_ns += t_route;
         Profile.acc_ns += t_acc;
         Profile.head_ns += t_head;
