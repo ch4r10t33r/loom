@@ -797,6 +797,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                 if (loadGgufEngine(gpa, io, mpath, opts.gpu_ops, opts.no_gpu_layers)) |mdl| {
                     gguf_gen = .{ .m = mdl, .src = &gguf_src, .ctx_cap = opts.ctx_cap };
                     gguf_gen.m.setCtxLen(@min(gguf_gen.m.ctxLen(), opts.ctx_cap));
+                    gguf_gen.m.initDeviceAttn();
                     const arch_name = gguf_gen.m.archName();
                     if (attachGgufDist(&gguf_gen.m, gpa, &gguf_src)) |_| {
                         gguf_gen.chat_format = if (opts.chat_format) |cf|
@@ -841,6 +842,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             if (loadGgufEngine(gpa, io, gp, opts.gpu_ops, opts.no_gpu_layers)) |mdl| {
                 gguf_gen = .{ .m = mdl, .src = null, .ctx_cap = opts.ctx_cap };
                 gguf_gen.m.setCtxLen(@min(gguf_gen.m.ctxLen(), opts.ctx_cap));
+                gguf_gen.m.initDeviceAttn();
                 const arch_name = gguf_gen.m.archName();
                 gguf_gen.chat_format = if (opts.chat_format) |cf|
                     chat_template.parse(cf) orelse chat_template.detect(gguf_gen.m.chatTemplate(), arch_name)

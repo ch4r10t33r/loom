@@ -452,6 +452,13 @@ pub const State = struct {
     q_abs: []f32, // W_k^T q_nope, kv_lora_rank
     c_acc: []f32, // sum_t p_t c_t, kv_lora_rank
     row_tmp: []f32, // one dequantized kv_b row, kv_lora_rank
+    // Every head's absorbed query, rope query and compressed output laid out
+    // contiguously, which is what the Metal kernel takes: it does all heads in
+    // one dispatch, so a per-head buffer would mean a dispatch per head.
+    mla_qa: []f32, // n_heads * kv_lora_rank
+    mla_qr: []f32, // n_heads * rope_dim
+    mla_ol: []f32, // n_heads * kv_lora_rank
+    q_nope_all: []f32, // n_heads * nope_dim, gathered for the absorb kernel
     head_out: []f32, // n_heads * v_head_dim
     proj_out: []f32,
     gate: []f32, // max(ffn, moe_ffn * max(1, n_shared))
@@ -476,6 +483,10 @@ pub const State = struct {
             .q_abs = try gpa.alloc(f32, cfg.kv_lora_rank),
             .c_acc = try gpa.alloc(f32, cfg.kv_lora_rank),
             .row_tmp = try gpa.alloc(f32, cfg.kv_lora_rank),
+            .mla_qa = try gpa.alloc(f32, cfg.n_heads * cfg.kv_lora_rank),
+            .mla_qr = try gpa.alloc(f32, cfg.n_heads * cfg.rope_dim),
+            .mla_ol = try gpa.alloc(f32, cfg.n_heads * cfg.kv_lora_rank),
+            .q_nope_all = try gpa.alloc(f32, cfg.n_heads * cfg.nope_dim),
             .head_out = try gpa.alloc(f32, cfg.n_heads * cfg.v_head_dim),
             .proj_out = try gpa.alloc(f32, cfg.dim),
             .gate = try gpa.alloc(f32, ffn_max),
@@ -495,7 +506,8 @@ pub const State = struct {
             self.x,      self.normed, self.q_a,        self.q,            self.kv_a,
             self.q_abs,  self.c_acc,  self.row_tmp,    self.head_out,     self.proj_out,
             self.gate,   self.up,     self.act,        self.ffn_out,      self.router,
-            self.scores, self.logits, self.c_kv_cache, self.k_rope_cache,
+            self.scores, self.logits, self.c_kv_cache, self.k_rope_cache, self.mla_qa,
+            self.mla_qr, self.mla_ol, self.q_nope_all,
         }) |sl| gpa.free(sl);
     }
 };
@@ -800,6 +812,10 @@ fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_a
     const k_rope = st.k_rope_cache[(li * cfg.ctx_len + pos) * rope ..][0..rope];
     @memcpy(k_rope, st.kv_a[kvr .. kvr + rope]);
     ropeApply(cfg, k_rope, pos);
+    // Mirror onto the device if there is one. The host copy above stays
+    // authoritative: this can decline at any point and the fallback below must
+    // still be correct.
+    _ = backend.mlaAppend(li, pos, c_kv, k_rope);
 
     var h: usize = 0;
     while (h < cfg.n_heads) : (h += 1) {
@@ -830,39 +846,62 @@ fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_a
     // absorb and one matvec.
     const seq = pos + 1;
     const t_a0 = if (prof) Profile.now() else 0;
+
+    // Absorb W_k into q for every head. Both paths need it, and both need
+    // every head's laid out together.
+    //
+    // The host form dequantizes one kv_b row at a time, which is a
+    // synchronization point in the middle of the layer -- the last one, once
+    // attention itself moved to the device.
     h = 0;
     while (h < cfg.n_heads) : (h += 1) {
-        const q_nope = st.q[h * kd ..][0..nope];
-        const q_rope = st.q[h * kd + nope ..][0..rope];
-        // kv_b rows for this head: [nope rows of k][vd rows of v], each over kvr
+        @memcpy(st.q_nope_all[h * nope ..][0..nope], st.q[h * kd ..][0..nope]);
+        @memcpy(st.mla_qr[h * rope ..][0..rope], st.q[h * kd + nope ..][0..rope]);
+    }
+    // One call, two dispatches, one command buffer: absorption then attention,
+    // with q_abs staying on the device between them.
+    const on_device = backend.mlaAttnHeads(li, pos, st.q_nope_all, st.mla_qr, st.mla_ol, cfg.n_heads, nope, vd, scale);
+    if (!on_device) {
+        h = 0;
+        while (h < cfg.n_heads) : (h += 1) {
+            const q_nope = st.q[h * kd ..][0..nope];
+            const kb_base = h * (nope + vd);
+            const k_rows = l.attn_kv_b.data[kb_base * ggml.rowBytes(l.attn_kv_b.ty, kvr) ..];
+            const qa = st.mla_qa[h * kvr ..][0..kvr];
+            @memset(qa, 0);
+            for (q_nope, 0..) |qr, r| {
+                backend.dequantRow(l.attn_kv_b.ty, st.row_tmp, k_rows, r, kvr);
+                backend.axpy(qa, st.row_tmp, qr);
+            }
+        }
+    }
+
+    h = 0;
+    while (h < cfg.n_heads) : (h += 1) {
         const kb_base = h * (nope + vd);
-        const k_rows = l.attn_kv_b.data[kb_base * ggml.rowBytes(l.attn_kv_b.ty, kvr) ..];
         const v_rows = l.attn_kv_b.data[(kb_base + nope) * ggml.rowBytes(l.attn_kv_b.ty, kvr) ..];
-
-        // q_abs = W_k^T q_nope, i.e. the rows of W_k weighted by q_nope.
-        // Row-at-a-time because the quantized layout is row-major: there
-        // is no column access without dequantizing anyway.
-        @memset(st.q_abs, 0);
-        for (q_nope, 0..) |qr, r| {
-            backend.dequantRow(l.attn_kv_b.ty, st.row_tmp, k_rows, r, kvr);
-            backend.axpy(st.q_abs, st.row_tmp, qr);
-        }
-
-        var t_i: usize = 0;
-        while (t_i < seq) : (t_i += 1) {
-            const c_t = st.c_kv_cache[(li * cfg.ctx_len + t_i) * kvr ..][0..kvr];
-            const kr_t = st.k_rope_cache[(li * cfg.ctx_len + t_i) * rope ..][0..rope];
-            st.scores[t_i] = (backend.dotF32(st.q_abs, c_t) + backend.dotF32(q_rope, kr_t)) * scale;
-        }
-        backend.softmax(st.scores[0..seq]);
-
-        @memset(st.c_acc, 0);
-        t_i = 0;
-        while (t_i < seq) : (t_i += 1) {
-            const c_t = st.c_kv_cache[(li * cfg.ctx_len + t_i) * kvr ..][0..kvr];
-            backend.axpy(st.c_acc, c_t, st.scores[t_i]);
-        }
-        backend.matvec(l.attn_kv_b.ty, st.head_out[h * vd ..][0..vd], v_rows, st.c_acc, vd, kvr);
+        const o_lat = if (on_device) st.mla_ol[h * kvr ..][0..kvr] else blk: {
+            // Host fallback: scores, softmax and the weighted sum, all in
+            // compressed space.
+            const qa = st.mla_qa[h * kvr ..][0..kvr];
+            const q_rope = st.mla_qr[h * rope ..][0..rope];
+            var t_i: usize = 0;
+            while (t_i < seq) : (t_i += 1) {
+                const c_t = st.c_kv_cache[(li * cfg.ctx_len + t_i) * kvr ..][0..kvr];
+                const kr_t = st.k_rope_cache[(li * cfg.ctx_len + t_i) * rope ..][0..rope];
+                st.scores[t_i] = (backend.dotF32(qa, c_t) + backend.dotF32(q_rope, kr_t)) * scale;
+            }
+            backend.softmax(st.scores[0..seq]);
+            @memset(st.c_acc, 0);
+            t_i = 0;
+            while (t_i < seq) : (t_i += 1) {
+                const c_t = st.c_kv_cache[(li * cfg.ctx_len + t_i) * kvr ..][0..kvr];
+                backend.axpy(st.c_acc, c_t, st.scores[t_i]);
+            }
+            break :blk st.c_acc;
+        };
+        // W_v applied to the compressed result, once per head either way.
+        backend.matvec(l.attn_kv_b.ty, st.head_out[h * vd ..][0..vd], v_rows, o_lat, vd, kvr);
     }
     if (prof) t_attn.* += Profile.now() - t_a0;
     mv(l.attn_output, st.proj_out, st.head_out);
@@ -1252,6 +1291,31 @@ test "route: sigmoid gating with selection bias picks by biased score, gates fro
     var sel2: [2]Selected = undefined;
     moe.route(cfg.routeCfg(), &logits, null, &sel2);
     for (sel2) |s| try std.testing.expect(s.expert == 0 or s.expert == 1);
+}
+
+/// Dequantize each layer's W_k rows and hand them to the compute backend.
+///
+/// Best-effort and all-or-nothing per layer: `mlaAbsorb` declines any layer it
+/// was not given, and the host loop covers those, so a partial upload is
+/// correct if slower. Called after the context is capped, with the rest of the
+/// device-side attention setup.
+pub fn uploadAbsorbWeights(m: *const Model, gpa: std.mem.Allocator) void {
+    const cfg = m.cfg;
+    const kvr = cfg.kv_lora_rank;
+    const stride = cfg.nope_dim + cfg.v_head_dim;
+    const per_layer = cfg.n_heads * stride * kvr;
+    const buf = gpa.alloc(f32, per_layer) catch return;
+    defer gpa.free(buf);
+    for (m.layers, 0..) |l, li| {
+        // Every row of the head's slice, W_k and W_v alike: the kernel strides
+        // past W_v rather than expecting them removed, so the layout on the
+        // device matches the tensor exactly.
+        var r: usize = 0;
+        while (r < cfg.n_heads * stride) : (r += 1) {
+            backend.dequantRow(l.attn_kv_b.ty, buf[r * kvr ..][0..kvr], l.attn_kv_b.data, r, kvr);
+        }
+        if (!backend.mlaSetWk(li, buf)) return;
+    }
 }
 
 /// A small MLA model with f32 weights, built in memory.

@@ -43,6 +43,31 @@ pub fn takeCmdBufCount() usize {
     return 0;
 }
 
+/// The CPU engine keeps its own compressed cache and needs no device mirror.
+pub fn mlaInit(layers: usize, ctx_len: usize, kvr: usize, rope: usize) bool {
+    _ = .{ layers, ctx_len, kvr, rope };
+    return false;
+}
+
+pub fn mlaAppend(li: usize, pos: usize, c_kv: []const f32, k_rope: []const f32) bool {
+    _ = .{ li, pos, c_kv, k_rope };
+    return false;
+}
+
+pub fn hasMlaCache() bool {
+    return false;
+}
+
+pub fn mlaSetWk(li: usize, wk_f32: []const f32) bool {
+    _ = .{ li, wk_f32 };
+    return false;
+}
+
+pub fn mlaAttnHeads(li: usize, pos: usize, q_nope: []const f32, q_rope: []const f32, out: []f32, n_heads: usize, nope: usize, v_head_dim: usize, scale: f32) bool {
+    _ = .{ li, pos, q_nope, q_rope, out, n_heads, nope, v_head_dim, scale };
+    return false;
+}
+
 pub var arena_error: ?[]const u8 = null;
 
 /// The CPU has no device cache to set up and no fused attention to offer; the

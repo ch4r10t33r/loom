@@ -73,6 +73,8 @@ const dmmv_q4k_src = @embedFile("../shaders/metal/dmmv_q4k.metal");
 const dmmv_q6k_src = @embedFile("../shaders/metal/dmmv_q6k.metal");
 const gemm_q4k_src = @embedFile("../shaders/metal/gemm_q4k.metal");
 const attn_src = @embedFile("../shaders/metal/attn.metal");
+const mla_attn_src = @embedFile("../shaders/metal/mla_attn.metal");
+const mla_absorb_src = @embedFile("../shaders/metal/mla_absorb.metal");
 const rope_src = @embedFile("../shaders/metal/rope.metal");
 const moe_acc_src = @embedFile("../shaders/metal/moe_acc.metal");
 const dmmv_q5_1_src = @embedFile("../shaders/metal/dmmv_q5_1.metal");
@@ -425,6 +427,10 @@ const Ctx = struct {
     q8_0: mtl.Pipeline,
     gemm_q4k: mtl.Pipeline,
     attn_p: mtl.Pipeline,
+    mla_attn_p: mtl.Pipeline,
+    mla_absorb_p: mtl.Pipeline,
+    /// Per layer: `kv_b` dequantized to f32, device-resident.
+    mla_wk: std.ArrayListUnmanaged(mtl.Buffer) = .empty,
     rope_p: mtl.Pipeline,
     kvw_p: mtl.Pipeline,
     sadd_p: mtl.Pipeline,
@@ -435,6 +441,15 @@ const Ctx = struct {
     /// is that it never crosses the bus: only the one new row per layer per
     /// token is written, O(kvd), instead of the whole cache being staged every
     /// step, O(seq*kvd).
+    /// Compressed MLA cache: one c_kv row and one rope key per position, shared
+    /// by every head. Separate from `kv_k`/`kv_v` because MLA never
+    /// materializes keys or values -- these are ~576 floats per position where
+    /// a dense cache would be n_heads * (nope + v_head_dim).
+    mla_c: ?mtl.Buffer = null,
+    mla_krope: ?mtl.Buffer = null,
+    mla_ctx: usize = 0,
+    mla_kvr: usize = 0,
+    mla_rope: usize = 0,
     kv_k: ?mtl.Buffer = null,
     kv_v: ?mtl.Buffer = null,
     /// Per-layer norm weights, all layers resident at once.
@@ -529,6 +544,14 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const pmla = dev.pipeline(mla_attn_src, "mla_attn_head") catch {
+        dev.deinit();
+        return;
+    };
+    const pabs = dev.pipeline(mla_absorb_src, "mla_absorb") catch {
+        dev.deinit();
+        return;
+    };
     const psadd = dev.pipeline(moe_acc_src, "scaled_add") catch {
         dev.deinit();
         return;
@@ -572,7 +595,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -1044,6 +1067,165 @@ pub fn attnHeads(
     return true;
 }
 
+/// Size the device-resident compressed MLA cache. False when it will not fit
+/// the kernel's bounds, in which case the engine keeps its host cache and this
+/// path is simply not used.
+pub fn mlaInit(layers: usize, ctx_len: usize, kvr: usize, rope: usize) bool {
+    // Records the shape; the buffers are made when there is a device to make
+    // them on. The model loads before the Metal context is brought up, so
+    // allocating here returned false and every attention call then declined --
+    // silently, because declining is also what an unsupported shape does. That
+    // is exactly what `registerArena` got wrong first, and this is its shape.
+    if (ctx_len > ATTN_MAX_SEQ) {
+        mla_want = null;
+        return false;
+    }
+    mla_want = .{ .layers = layers, .ctx_len = ctx_len, .kvr = kvr, .rope = rope };
+    return true;
+}
+
+/// Allocate the recorded cache, once. False when nothing was recorded or the
+/// device will not give the memory.
+fn ensureMla(cx: *Ctx) bool {
+    if (cx.mla_c != null) return true;
+    const w = mla_want orelse return false;
+    const c_len = w.layers * w.ctx_len * w.kvr * @sizeOf(f32);
+    const r_len = w.layers * w.ctx_len * w.rope * @sizeOf(f32);
+    var cb = cx.dev.alloc(c_len) catch return false;
+    const rb = cx.dev.alloc(r_len) catch {
+        cb.deinit();
+        return false;
+    };
+    cx.mla_c = cb;
+    cx.mla_krope = rb;
+    cx.mla_ctx = w.ctx_len;
+    cx.mla_kvr = w.kvr;
+    cx.mla_rope = w.rope;
+    return true;
+}
+
+/// Append one position's compressed cache row. The host keeps its own copy:
+/// this path can decline at any point and the engine's cache has to be the
+/// authoritative one when it does -- a device mirror written by one path and
+/// not another is how the GQA cache once served zeros at prefilled positions,
+/// which reads as fluent, wrong text.
+pub fn mlaAppend(li: usize, pos: usize, c_kv: []const f32, k_rope: []const f32) bool {
+    const cx = &(ctx orelse return false);
+    if (!ensureMla(cx)) return false;
+    const cb = cx.mla_c orelse return false;
+    const rb = cx.mla_krope orelse return false;
+    if (pos >= cx.mla_ctx or c_kv.len != cx.mla_kvr or k_rope.len != cx.mla_rope) return false;
+    const ci = (li * cx.mla_ctx + pos) * cx.mla_kvr;
+    const ri = (li * cx.mla_ctx + pos) * cx.mla_rope;
+    @memcpy(cb.slice(f32)[ci..][0..c_kv.len], c_kv);
+    @memcpy(rb.slice(f32)[ri..][0..k_rope.len], k_rope);
+    return true;
+}
+
+pub fn hasMlaCache() bool {
+    const cx = &(ctx orelse return false);
+    return ensureMla(cx);
+}
+
+/// Hand one layer's `kv_b`, already dequantized to f32, to the device. Layers
+/// must arrive in order; returns false if the device will not take it, in
+/// which case the host absorption stays in use for every layer.
+pub fn mlaSetWk(li: usize, wk_f32: []const f32) bool {
+    const cx = &(ctx orelse return false);
+    if (li != cx.mla_wk.items.len) return false;
+    const b = cx.dev.alloc(wk_f32.len * @sizeOf(f32)) catch return false;
+    @memcpy(b.slice(f32)[0..wk_f32.len], wk_f32);
+    cx.mla_wk.append(cx.gpa, b) catch return false;
+    return true;
+}
+
+/// q_abs = W_k^T q_nope for every head of one layer, in one dispatch. False
+/// when this layer's W_k was never uploaded, so the caller runs its host loop.
+/// Every head's MLA attention for one layer, over the compressed cache.
+///
+/// `q_absorbed` is W_k^T q_nope per head -- the absorption identity, so the
+/// kernel dots against the cache directly instead of rebuilding keys. `out` is
+/// o_latent per head, still compressed; W_v is applied to it by the caller.
+pub fn mlaAttnHeads(
+    li: usize,
+    pos: usize,
+    q_nope: []const f32,
+    q_rope: []const f32,
+    out: []f32,
+    n_heads: usize,
+    nope: usize,
+    v_head_dim: usize,
+    scale: f32,
+) bool {
+    const cx = &(ctx orelse return false);
+    if (!ensureMla(cx)) return false;
+    const cbuf = cx.mla_c orelse return false;
+    const rbuf = cx.mla_krope orelse return false;
+    // `attn_worthwhile` is set by the GQA attention calibration, which never
+    // runs for an MLA model -- deepseek passes zeros for the attention shapes.
+    // Until this path has a calibration of its own it is opt-in via --gpu-ops,
+    // rather than silently off (which is what it was) or silently on (which
+    // would be a speed claim nobody measured).
+    if (!use_gpu_ops and !attn_worthwhile) return false;
+    const seq = pos + 1;
+    if (seq > cx.mla_ctx) return false;
+    // The absorption runs here too, in the same command buffer, and its result
+    // never comes back to the host. Two dispatches sharing one buffer rather
+    // than two buffers each waited on: 26 ops a layer is not the problem,
+    // 26 *submissions* is -- ggml encodes an entire graph into about two
+    // command buffers and waits once, where each of these was one and a wait.
+    if (li >= cx.mla_wk.items.len) return false;
+    const kvr = cx.mla_kvr;
+    if ((q_nope.len + q_rope.len) * 4 > cx.scratch_x.len) return false;
+    if (out.len * 4 > cx.scratch_out.len) return false;
+    if (n_heads * kvr * 4 > cx.act[1].len) return false;
+
+    @memcpy(cx.scratch_x.slice(f32)[0..q_nope.len], q_nope);
+    @memcpy(cx.scratch_x.slice(f32)[q_nope.len..][0..q_rope.len], q_rope);
+
+    const ad = AbsorbDims{
+        .n_heads = @intCast(n_heads),
+        .nope = @intCast(nope),
+        .kvr = @intCast(kvr),
+        .stride = @intCast(nope + v_head_dim),
+    };
+
+    const dims = MlaDims{
+        .n_heads = @intCast(n_heads),
+        .kvr = @intCast(cx.mla_kvr),
+        .rope = @intCast(cx.mla_rope),
+        .seq = @intCast(seq),
+        .scale = scale,
+    };
+    const c_off = li * cx.mla_ctx * cx.mla_kvr * @sizeOf(f32);
+    const r_off = li * cx.mla_ctx * cx.mla_rope * @sizeOf(f32);
+    const group: usize = 64;
+    const cb = cx.dev.commandBuffer();
+    const e = cb.encoder();
+    // q_abs = W_k^T q_nope, into act[1], staying on the device.
+    e.dispatch(
+        cx.mla_absorb_p,
+        &.{ cx.mla_wk.items[li], cx.scratch_x, cx.act[1] },
+        &.{ 0, 0, 0 },
+        std.mem.asBytes(&ad),
+        n_heads * group,
+        group,
+    );
+    e.barrier();
+    e.dispatch(
+        cx.mla_attn_p,
+        &.{ cx.act[1], cx.scratch_x, cbuf, rbuf, cx.scratch_out },
+        &.{ 0, q_nope.len * 4, c_off, r_off, 0 },
+        std.mem.asBytes(&dims),
+        n_heads * group,
+        group,
+    );
+    e.end();
+    cb.commitAndWait();
+    @memcpy(out, cx.scratch_out.slice(f32)[0..out.len]);
+    return true;
+}
+
 /// One selected expert: its three weight tensors and its routing gate.
 pub const ExpertRef = struct {
     gate: WeightRef,
@@ -1161,6 +1343,12 @@ pub fn moeFfnBlock(
 const MAX_MOE_EXPERTS = 16;
 
 const AccDims = extern struct { n: u32, alpha: f32 };
+/// The MLA cache shape asked for at model load, before there is a device.
+var mla_want: ?struct { layers: usize, ctx_len: usize, kvr: usize, rope: usize } = null;
+
+const AbsorbDims = extern struct { n_heads: u32, nope: u32, kvr: u32, stride: u32 };
+
+const MlaDims = extern struct { n_heads: u32, kvr: u32, rope: u32, seq: u32, scale: f32 };
 const MAX_MOE_REDUCE = 16;
 const ReduceDims = extern struct { n: u32, dim: u32, w: [MAX_MOE_REDUCE]f32 };
 
@@ -3425,5 +3613,124 @@ test "moe block: back to back against a host gap between calls" {
         });
     } else {
         std.debug.print("    inside a 2 GB arena  did not run\n", .{});
+    }
+}
+
+fn backend_ctx_absent() bool {
+    return ctx == null;
+}
+
+test "mla attention matches an exact cpu reference" {
+    // The identity being tested is the absorption one: scores are
+    // q_absorbed . c_t + q_rope . k_rope_t, and the weighted sum stays in
+    // compressed space. Getting either half wrong still produces a normalized,
+    // plausible output vector -- dropping the rope term entirely just makes
+    // attention position-blind, which reads as slightly worse text rather than
+    // as a failure.
+    const gpa = std.testing.allocator;
+    const n_heads = 4;
+    const kvr = 64;
+    const rope = 16;
+    const seq = 37; // not a multiple of the threadgroup size, on purpose
+    const layers = 2;
+    const ctx_len = 64;
+    const scale: f32 = 0.3;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (backend_ctx_absent()) return error.SkipZigTest;
+    const saved_attn = attn_worthwhile;
+    attn_worthwhile = true;
+    defer attn_worthwhile = saved_attn;
+
+    if (!mlaInit(layers, ctx_len, kvr, rope)) return error.SkipZigTest;
+    if (!hasMlaCache()) return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(0x11A);
+    const rnd = prng.random();
+    const qa = try gpa.alloc(f32, n_heads * kvr);
+    defer gpa.free(qa);
+    const qr = try gpa.alloc(f32, n_heads * rope);
+    defer gpa.free(qr);
+    for (qa) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    for (qr) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    const c_rows = try gpa.alloc(f32, seq * kvr);
+    defer gpa.free(c_rows);
+    const r_rows = try gpa.alloc(f32, seq * rope);
+    defer gpa.free(r_rows);
+    for (c_rows) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    for (r_rows) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    const li = 1; // not layer zero, so a missing layer stride shows
+    for (0..seq) |t| {
+        if (!mlaAppend(li, t, c_rows[t * kvr ..][0..kvr], r_rows[t * rope ..][0..rope])) return error.SkipZigTest;
+    }
+
+    // The absorption is now inside `mlaAttnHeads`, so the test drives it the
+    // way the engine does: hand it q_nope and an identity W_k, which makes
+    // q_abs == q_nope and leaves the attention arithmetic the thing under test.
+    const nope = 8;
+    const vd = 8;
+    const stride = nope + vd;
+    const wk = try gpa.alloc(f32, n_heads * stride * kvr);
+    defer gpa.free(wk);
+    @memset(wk, 0);
+    const q_nope = try gpa.alloc(f32, n_heads * nope);
+    defer gpa.free(q_nope);
+    for (q_nope) |*v| v.* = 0;
+    // Row r of head h contributes q_nope[h][r] * wk[h][r][:] to q_abs[h][:].
+    // One row carrying the whole absorbed query reproduces `qa` exactly.
+    for (0..n_heads) |hh| {
+        q_nope[hh * nope] = 1.0;
+        @memcpy(wk[(hh * stride) * kvr ..][0..kvr], qa[hh * kvr ..][0..kvr]);
+    }
+    // Layers arrive in order, so layer 0 goes first even though the test uses
+    // layer 1 -- which is the point: a missing layer stride would show.
+    const zero = try gpa.alloc(f32, n_heads * stride * kvr);
+    defer gpa.free(zero);
+    @memset(zero, 0);
+    if (!mlaSetWk(0, zero)) return error.SkipZigTest;
+    if (!mlaSetWk(li, wk)) return error.SkipZigTest;
+
+    const got = try gpa.alloc(f32, n_heads * kvr);
+    defer gpa.free(got);
+    if (!mlaAttnHeads(li, seq - 1, q_nope, qr, got, n_heads, nope, vd, scale)) return error.SkipZigTest;
+
+    // Reference in f64: softmax over 37 terms then a weighted sum is exactly
+    // the kind of reduction where an f32 oracle reports its own drift.
+    const want = try gpa.alloc(f32, n_heads * kvr);
+    defer gpa.free(want);
+    const sc = try gpa.alloc(f64, seq);
+    defer gpa.free(sc);
+    for (0..n_heads) |h| {
+        var mx: f64 = -std.math.inf(f64);
+        for (0..seq) |t| {
+            var s: f64 = 0;
+            for (0..kvr) |i| s += @as(f64, qa[h * kvr + i]) * @as(f64, c_rows[t * kvr + i]);
+            for (0..rope) |i| s += @as(f64, qr[h * rope + i]) * @as(f64, r_rows[t * rope + i]);
+            sc[t] = s * scale;
+            mx = @max(mx, sc[t]);
+        }
+        var sum: f64 = 0;
+        for (sc) |*v| {
+            v.* = @exp(v.* - mx);
+            sum += v.*;
+        }
+        for (0..kvr) |i| {
+            var acc: f64 = 0;
+            for (0..seq) |t| acc += sc[t] * @as(f64, c_rows[t * kvr + i]);
+            want[h * kvr + i] = @floatCast(acc / sum);
+        }
+    }
+
+    var mass: f32 = 0;
+    for (want) |v| mass += @abs(v);
+    const tol = (mass / @as(f32, @floatFromInt(want.len))) * 2e-3;
+    for (want, got, 0..) |a, b, k| {
+        std.testing.expectApproxEqAbs(a, b, tol) catch |e| {
+            std.debug.print("mla head {d} dim {d}: cpu {d} vs gpu {d}\n", .{ k / kvr, k % kvr, a, b });
+            return e;
+        };
     }
 }
