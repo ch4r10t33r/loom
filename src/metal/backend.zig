@@ -3347,6 +3347,51 @@ test "moe block: back to back against a host gap between calls" {
         }
     }
 
+    // Does the *size of the buffer* cost anything, independent of how much of
+    // it is touched? The engine reads every expert as an offset into one
+    // multi-gigabyte allocation over the store mapping; this benchmark gives
+    // each expert its own small one. Same 35 MB of weights either way, placed
+    // deep inside a 2 GB anonymous mapping registered as an arena.
+    //
+    // Anonymous rather than heap because the allocator will not hand out a
+    // slab this size on this machine, and the pages are only touched where the
+    // weights are copied, so the mapping costs address space and not memory.
+    var big_ms: f64 = 0;
+    big: {
+        const span: usize = 2 << 30;
+        const slab = std.posix.mmap(null, span, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch break :big;
+        defer std.posix.munmap(slab);
+        var off: usize = 1 << 30; // deep in, so it is not the first page either
+        var big_refs: [n_exp]ExpertRef = undefined;
+        for (0..n_exp) |i| {
+            var parts: [3][]u8 = undefined;
+            inline for (.{ wg[i], wu[i], wd[i] }, 0..) |src, q| {
+                off = std.mem.alignForward(usize, off, 16384);
+                @memcpy(slab[off..][0..src.len], src);
+                parts[q] = slab[off..][0..src.len];
+                off += src.len;
+            }
+            big_refs[i] = .{
+                .gate = .{ .ty = .q4_k, .data = parts[0] },
+                .up = .{ .ty = .q4_k, .data = parts[1] },
+                .down = .{ .ty = .q5_0, .data = parts[2] },
+                .weight = 1.0 / @as(f32, n_exp),
+                .ffn = ffn,
+            };
+        }
+        if (!registerArena(slab)) break :big;
+        if (materializeArenas() == 0) break :big;
+        _ = moeFfnBlock(normed, &big_refs, out);
+        var best_b: i128 = std.math.maxInt(i64);
+        for (0..30) |_| {
+            const t0 = now(io);
+            _ = moeFfnBlock(normed, &big_refs, out);
+            const dt = now(io) - t0;
+            if (dt < best_b) best_b = dt;
+        }
+        big_ms = @as(f64, @floatFromInt(best_b)) / 1e6;
+    }
+
     var gapped: i128 = std.math.maxInt(i64);
     var sink: f64 = 0;
     for (0..30) |_| {
@@ -3374,4 +3419,11 @@ test "moe block: back to back against a host gap between calls" {
         r_ms,                                    bytes / @as(f64, @floatFromInt(rotating)),
         r_ms * 26,
     });
+    if (big_ms > 0) {
+        std.debug.print("    inside a 2 GB arena  {d:.3} ms  {d:5.1} GB/s   x26 = {d:.1} ms/token\n", .{
+            big_ms, bytes / (big_ms * 1e6), big_ms * 26,
+        });
+    } else {
+        std.debug.print("    inside a 2 GB arena  did not run\n", .{});
+    }
 }
