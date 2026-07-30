@@ -51,6 +51,21 @@ kernel void add_inplace(
     acc[i] += v[i];
 }
 
+// silu(a) * b over `slots` consecutive vectors of `n` floats each -- the MoE
+// block's per-slot SwiGLU as one dispatch instead of one per expert. The
+// slices are disjoint, so the only thing the split dispatches bought was
+// encode time and a longer serial chain.
+kernel void swiglu_slots(
+    device float       *a [[buffer(0)]],
+    device const float *b [[buffer(1)]],
+    constant uint2     &d [[buffer(2)]], // .x = n per slot, .y = slots
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= d.x * d.y) return;
+    const float g = a[gid];
+    a[gid] = (g / (1.0f + exp(-g))) * b[gid];
+}
+
 // out = in, n floats. Exists for cache writes inside a recorded frame: the
 // k_rope section of kv_a has to land in the device cache before the rope
 // kernel rotates it there, and a host memcpy mid-frame is a synchronization.

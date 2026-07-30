@@ -45,7 +45,7 @@ kernel void mla_attn_head(
     device const float *q_rope     [[buffer(1)]], // n_heads * rope
     device const float *c_cache    [[buffer(2)]], // [seq][kvr] for this layer
     device const float *krope_cache[[buffer(3)]], // [seq][rope] for this layer
-    device float       *out        [[buffer(4)]], // n_heads * kvr, compressed
+    device float       *probs      [[buffer(4)]], // [n_heads][seq], normalized
     constant MlaDims   &d          [[buffer(5)]],
     uint  hg   [[threadgroup_position_in_grid]],
     uint  tid  [[thread_position_in_threadgroup]],
@@ -101,13 +101,34 @@ kernel void mla_attn_head(
     for (uint i = 0; i < nsg; i++) sum += red[i];
     const float inv = 1.0f / sum;
 
-    // ---- weighted sum, in compressed space ----------------------------------
-    // One thread per compressed dimension, each walking the whole sequence, so
-    // the cache reads are contiguous across the threadgroup at every step. The
-    // result is o_latent; W_v is applied to it outside this kernel.
-    for (uint i = tid; i < d.kvr; i += nt) {
-        float acc = 0.0f;
-        for (uint t = 0; t < d.seq; t++) acc += scores[t] * c_cache[(ulong)t * d.kvr + i];
-        out[(ulong)h * d.kvr + i] = acc * inv;
-    }
+    // Probabilities out; the weighted sum runs as its own kernel with one
+    // SIMD group per output element. Same reasoning as the absorb re-grid:
+    // this kernel launches n_heads threadgroups -- sixteen -- which is fine
+    // for the O(seq) score work but starves the device on the O(seq * kvr)
+    // sum, which is the bandwidth half.
+    for (uint t = tid; t < d.seq; t += nt) probs[(ulong)hg * d.seq + t] = scores[t] * inv;
+}
+
+// o_latent[h][i] = sum_t probs[h][t] * c[t][i] -- one SIMD group per (h, i),
+// the seq-sum split across lanes. 8,192 groups on the real model where the
+// fused form had sixteen threadgroups.
+kernel void mla_attn_wsum(
+    device const float *probs   [[buffer(0)]], // [n_heads][seq]
+    device const float *c_cache [[buffer(1)]],
+    device float       *out     [[buffer(2)]], // n_heads * kvr
+    constant MlaDims   &d       [[buffer(3)]],
+    uint  tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]],
+    uint  nsg  [[simdgroups_per_threadgroup]])
+{
+    const uint g = tgid * nsg + sgid;
+    const uint h = g / d.kvr;
+    if (h >= d.n_heads) return;
+    const uint i = g - h * d.kvr;
+    device const float *ph = probs + (ulong)h * d.seq;
+    float acc = 0.0f;
+    for (uint t = lane; t < d.seq; t += 32) acc += ph[t] * c_cache[(ulong)t * d.kvr + i];
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)h * d.kvr + i] = acc;
 }
