@@ -1063,14 +1063,26 @@ pub fn attnHeads(
 /// the kernel's bounds, in which case the engine keeps its host cache and this
 /// path is simply not used.
 pub fn mlaInit(layers: usize, ctx_len: usize, kvr: usize, rope: usize) bool {
-    const cx = &(ctx orelse return false);
+    // Records the shape; the buffers are made when there is a device to make
+    // them on. The model loads before the Metal context is brought up, so
+    // allocating here returned false and every attention call then declined --
+    // silently, because declining is also what an unsupported shape does. That
+    // is exactly what `registerArena` got wrong first, and this is its shape.
+    if (ctx_len > ATTN_MAX_SEQ) {
+        mla_want = null;
+        return false;
+    }
+    mla_want = .{ .layers = layers, .ctx_len = ctx_len, .kvr = kvr, .rope = rope };
+    return true;
+}
+
+/// Allocate the recorded cache, once. False when nothing was recorded or the
+/// device will not give the memory.
+fn ensureMla(cx: *Ctx) bool {
     if (cx.mla_c != null) return true;
-    // The kernel holds scores in threadgroup memory, so a context past its
-    // bound cannot be served. Declining is the whole point -- truncating would
-    // silently attend to a prefix.
-    if (ctx_len > ATTN_MAX_SEQ) return false;
-    const c_len = layers * ctx_len * kvr * @sizeOf(f32);
-    const r_len = layers * ctx_len * rope * @sizeOf(f32);
+    const w = mla_want orelse return false;
+    const c_len = w.layers * w.ctx_len * w.kvr * @sizeOf(f32);
+    const r_len = w.layers * w.ctx_len * w.rope * @sizeOf(f32);
     var cb = cx.dev.alloc(c_len) catch return false;
     const rb = cx.dev.alloc(r_len) catch {
         cb.deinit();
@@ -1078,9 +1090,9 @@ pub fn mlaInit(layers: usize, ctx_len: usize, kvr: usize, rope: usize) bool {
     };
     cx.mla_c = cb;
     cx.mla_krope = rb;
-    cx.mla_ctx = ctx_len;
-    cx.mla_kvr = kvr;
-    cx.mla_rope = rope;
+    cx.mla_ctx = w.ctx_len;
+    cx.mla_kvr = w.kvr;
+    cx.mla_rope = w.rope;
     return true;
 }
 
@@ -1091,6 +1103,7 @@ pub fn mlaInit(layers: usize, ctx_len: usize, kvr: usize, rope: usize) bool {
 /// which reads as fluent, wrong text.
 pub fn mlaAppend(li: usize, pos: usize, c_kv: []const f32, k_rope: []const f32) bool {
     const cx = &(ctx orelse return false);
+    if (!ensureMla(cx)) return false;
     const cb = cx.mla_c orelse return false;
     const rb = cx.mla_krope orelse return false;
     if (pos >= cx.mla_ctx or c_kv.len != cx.mla_kvr or k_rope.len != cx.mla_rope) return false;
@@ -1103,7 +1116,7 @@ pub fn mlaAppend(li: usize, pos: usize, c_kv: []const f32, k_rope: []const f32) 
 
 pub fn hasMlaCache() bool {
     const cx = &(ctx orelse return false);
-    return cx.mla_c != null;
+    return ensureMla(cx);
 }
 
 /// Every head's MLA attention for one layer, over the compressed cache.
@@ -1121,6 +1134,7 @@ pub fn mlaAttnHeads(
     scale: f32,
 ) bool {
     const cx = &(ctx orelse return false);
+    if (!ensureMla(cx)) return false;
     const cbuf = cx.mla_c orelse return false;
     const rbuf = cx.mla_krope orelse return false;
     // `attn_worthwhile` is set by the GQA attention calibration, which never
@@ -1281,6 +1295,9 @@ pub fn moeFfnBlock(
 const MAX_MOE_EXPERTS = 16;
 
 const AccDims = extern struct { n: u32, alpha: f32 };
+/// The MLA cache shape asked for at model load, before there is a device.
+var mla_want: ?struct { layers: usize, ctx_len: usize, kvr: usize, rope: usize } = null;
+
 const MlaDims = extern struct { n_heads: u32, kvr: u32, rope: u32, seq: u32, scale: f32 };
 const MAX_MOE_REDUCE = 16;
 const ReduceDims = extern struct { n: u32, dim: u32, w: [MAX_MOE_REDUCE]f32 };
@@ -3577,6 +3594,7 @@ test "mla attention matches an exact cpu reference" {
     defer attn_worthwhile = saved_attn;
 
     if (!mlaInit(layers, ctx_len, kvr, rope)) return error.SkipZigTest;
+    if (!hasMlaCache()) return error.SkipZigTest;
 
     var prng = std.Random.DefaultPrng.init(0x11A);
     const rnd = prng.random();

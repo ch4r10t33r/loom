@@ -60,6 +60,19 @@ pub const GgufModel = union(enum) {
             inline else => |*m| m.cfg.ctx_len,
         };
     }
+    /// Size any device-resident attention cache, now that the context is
+    /// capped. Deliberately after `setCtxLen`: the model's own ctx_len is its
+    /// native one -- 163,840 for DeepSeek-V2-Lite -- which is far past what the
+    /// attention kernel's threadgroup memory serves, so asking at load time
+    /// declines and the device path then never runs. Best-effort; the engine
+    /// keeps its host cache and the host attention path either way.
+    pub fn initDeviceAttn(self: *GgufModel) void {
+        switch (self.*) {
+            .deepseek => |*m| _ = backend.mlaInit(m.cfg.n_layers, m.cfg.ctx_len, m.cfg.kv_lora_rank, m.cfg.rope_dim),
+            .gqa => {},
+        }
+    }
+
     pub fn setCtxLen(self: *GgufModel, n: usize) void {
         switch (self.*) {
             inline else => |*m| m.cfg.ctx_len = n,
