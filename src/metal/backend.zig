@@ -70,6 +70,7 @@ pub const sigmoid = cpu.sigmoid;
 pub const MAX_BATCH = cpu.MAX_BATCH;
 
 const dmmv_q4k_src = @embedFile("../shaders/metal/dmmv_q4k.metal");
+const dmmv_q4k_id_src = @embedFile("../shaders/metal/dmmv_q4k_id.metal");
 const dmmv_q6k_src = @embedFile("../shaders/metal/dmmv_q6k.metal");
 const gemm_q4k_src = @embedFile("../shaders/metal/gemm_q4k.metal");
 const attn_src = @embedFile("../shaders/metal/attn.metal");
@@ -423,6 +424,8 @@ const Ctx = struct {
     /// Q4_K with two rows per SIMD group, for matrices large enough that group
     /// count matters more than activation reuse. See `dmmvFor`.
     q4k_wide: mtl.Pipeline,
+    /// Q4_K reading its expert plane from a device-side id buffer.
+    q4k_id: mtl.Pipeline,
     q5_0: mtl.Pipeline,
     q8_0: mtl.Pipeline,
     gemm_q4k: mtl.Pipeline,
@@ -528,6 +531,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const p4id = dev.pipeline(dmmv_q4k_id_src, "dmmv_q4k_id") catch {
+        dev.deinit();
+        return;
+    };
     const p4w = dev.pipeline("#define NR0 2\n" ++ dmmv_q4k_src, "dmmv_q4k") catch {
         dev.deinit();
         return;
@@ -595,7 +602,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -1345,6 +1352,8 @@ const MAX_MOE_EXPERTS = 16;
 const AccDims = extern struct { n: u32, alpha: f32 };
 /// The MLA cache shape asked for at model load, before there is a device.
 var mla_want: ?struct { layers: usize, ctx_len: usize, kvr: usize, rope: usize } = null;
+
+const IdDims = extern struct { rows: u32, cols: u32, n_used: u32, plane_stride: u32 };
 
 const AbsorbDims = extern struct { n_heads: u32, nope: u32, kvr: u32, stride: u32 };
 
@@ -3730,6 +3739,97 @@ test "mla attention matches an exact cpu reference" {
     for (want, got, 0..) |a, b, k| {
         std.testing.expectApproxEqAbs(a, b, tol) catch |e| {
             std.debug.print("mla head {d} dim {d}: cpu {d} vs gpu {d}\n", .{ k / kvr, k % kvr, a, b });
+            return e;
+        };
+    }
+}
+
+test "q4_k id-indexed matvec equals the plain kernel, plane for plane" {
+    // The `ggml_mul_mat_id` shape: one dispatch over several selected experts,
+    // each picking its plane from a device-side id buffer. The thing to get
+    // wrong is the plane stride, and a wrong one produces a correct first
+    // expert and garbage for the rest -- which in a MoE layer is a plausible
+    // output vector, since the first expert usually carries the largest gate.
+    //
+    // So the ids are deliberately not 0,1,2: they are out of order and skip
+    // planes, which a stride bug cannot survive and an off-by-one in the slot
+    // arithmetic cannot either.
+    const gpa = std.testing.allocator;
+    const cols = 2048;
+    const rows = 1408; // DeepSeek's expert width; a multiple of NR0
+    const n_exp = 6;
+    const ids = [_]u32{ 3, 0, 5, 1, 4, 2 };
+
+    parallelBegin(1);
+    defer parallelEnd();
+    const cx = &(ctx orelse return error.SkipZigTest);
+    const saved_min = min_rows;
+    const saved_ok = gpu_worthwhile;
+    const saved_use = use_gpu_ops;
+    min_rows = 0;
+    gpu_worthwhile = true;
+    use_gpu_ops = true;
+    defer {
+        min_rows = saved_min;
+        gpu_worthwhile = saved_ok;
+        use_gpu_ops = saved_use;
+    }
+
+    var prng = std.Random.DefaultPrng.init(0x1D5);
+    const rnd = prng.random();
+    const plane_bytes = ggml.tensorBytes(.q4_k, cols, rows);
+    const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), plane_bytes * n_exp);
+    defer gpa.free(data);
+    rnd.bytes(data);
+    var b: usize = 0;
+    while (b + 144 <= data.len) : (b += 144) {
+        std.mem.writeInt(u16, data[b..][0..2], 0x2C00, .little);
+        std.mem.writeInt(u16, data[b + 2 ..][0..2], 0x2800, .little);
+    }
+
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    // Reference: the plain kernel, once per plane. Same kernel arithmetic, so
+    // this must agree bit for bit -- a tolerance would hide a stride bug that
+    // lands on a neighbouring plane.
+    const want = try gpa.alloc(f32, ids.len * rows);
+    defer gpa.free(want);
+    for (ids, 0..) |id, slot| {
+        matvec(.q4_k, want[slot * rows ..][0..rows], data[id * plane_bytes ..][0..plane_bytes], x, rows, cols);
+    }
+
+    const idbuf = cx.dev.alloc(ids.len * @sizeOf(u32)) catch return error.SkipZigTest;
+    @memcpy(idbuf.slice(u32)[0..ids.len], &ids);
+    const outbuf = cx.dev.alloc(ids.len * rows * @sizeOf(f32)) catch return error.SkipZigTest;
+    const w = wrapFor(cx, data) orelse return error.SkipZigTest;
+    @memcpy(cx.scratch_x.slice(f32)[0..cols], x);
+
+    const dims = IdDims{
+        .rows = @intCast(rows),
+        .cols = @intCast(cols),
+        .n_used = @intCast(ids.len),
+        .plane_stride = @intCast(plane_bytes),
+    };
+    const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+    const threads = ((ids.len * rows + 3) / 4) * SIMD_W;
+    const grid = ((threads + group - 1) / group) * group;
+    const cb = cx.dev.commandBuffer();
+    cb.dispatch(
+        cx.q4k_id,
+        &.{ w.buf, cx.scratch_x, outbuf, idbuf },
+        &.{ w.off, 0, 0, 0 },
+        std.mem.asBytes(&dims),
+        grid,
+        group,
+    );
+    cb.commitAndWait();
+
+    const got = outbuf.slice(f32)[0 .. ids.len * rows];
+    for (want, got, 0..) |a, c, k| {
+        std.testing.expectEqual(a, c) catch |e| {
+            std.debug.print("id matvec slot {d} (expert {d}) row {d}: plain {d} vs id {d}\n", .{ k / rows, ids[k / rows], k % rows, a, c });
             return e;
         };
     }
