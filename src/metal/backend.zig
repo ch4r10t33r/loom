@@ -71,6 +71,8 @@ pub const MAX_BATCH = cpu.MAX_BATCH;
 
 const dmmv_q4k_src = @embedFile("../shaders/metal/dmmv_q4k.metal");
 const dmmv_q4k_id_src = @embedFile("../shaders/metal/dmmv_q4k_id.metal");
+const dmmv_q5_0_id_src = @embedFile("../shaders/metal/dmmv_q5_0_id.metal");
+const dmmv_q8_0_id_src = @embedFile("../shaders/metal/dmmv_q8_0_id.metal");
 const dmmv_q6k_src = @embedFile("../shaders/metal/dmmv_q6k.metal");
 const gemm_q4k_src = @embedFile("../shaders/metal/gemm_q4k.metal");
 const attn_src = @embedFile("../shaders/metal/attn.metal");
@@ -427,6 +429,8 @@ const Ctx = struct {
     q4k_wide: mtl.Pipeline,
     /// Q4_K reading its expert plane from a device-side id buffer.
     q4k_id: mtl.Pipeline,
+    q5_0_id: mtl.Pipeline,
+    q8_0_id: mtl.Pipeline,
     route_p: mtl.Pipeline,
     /// ids and gates the routing kernel writes; the expert kernels read them
     /// without either ever reaching the host.
@@ -541,6 +545,14 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const p50id = dev.pipeline(dmmv_q5_0_id_src, "dmmv_q5_0_id") catch {
+        dev.deinit();
+        return;
+    };
+    const p80id = dev.pipeline(dmmv_q8_0_id_src, "dmmv_q8_0_id") catch {
+        dev.deinit();
+        return;
+    };
     const p4w = dev.pipeline("#define NR0 2\n" ++ dmmv_q4k_src, "dmmv_q4k") catch {
         dev.deinit();
         return;
@@ -612,7 +624,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .route_p = proute, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0_id = p50id, .q8_0_id = p80id, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .route_p = proute, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -770,13 +782,24 @@ fn wrapFor(cx: *Ctx, data: []const u8) ?Wrapped {
     const gop = cx.wrapped.getOrPut(cx.gpa, base) catch return null;
     const off = @intFromPtr(data.ptr) - base;
 
-    // A cached entry can be stale in two ways, and both are real rather than
-    // theoretical: a later tensor in the same mapping may extend past the
-    // region that was wrapped first, and an allocation freed and replaced by
-    // a larger one can land on the same page base. Keying by address alone
-    // therefore is not enough — re-wrap whenever the cached buffer does not
-    // cover what is being asked for, rather than silently handing back a
-    // buffer that is too short.
+    // A cached entry can be stale in three ways. Two are handled below: a
+    // later tensor in the same mapping extending past the region wrapped
+    // first, and a freed allocation replaced by a *larger* one on the same
+    // page base. The third is the contract, because it cannot be detected
+    // from here: a freed allocation replaced by a smaller-or-equal one lands
+    // on the same base, the size check passes, and the cached MTLBuffer's GPU
+    // mapping may still reference the old physical pages while the CPU's
+    // virtual address maps new ones. No CPU-side read can see that -- the
+    // buffer *is* the host memory through this address, so any comparison
+    // reads the same bytes on both sides. (A content check was tried; it is
+    // vacuous for exactly this reason.)
+    //
+    // So the contract: memory handed to `wrapFor` stays alive for the life of
+    // the context. Model weights and store mappings do. A caller that frees
+    // and reallocates -- a test looping over fixtures was the one that hit it
+    // -- gets well-formed stale results with no error, which presented as an
+    // expert kernel computing slot 1 badly while slot 0 was right, and cost a
+    // debugging session before the kernel was exonerated.
     if (gop.found_existing and off + data.len > gop.value_ptr.len) {
         gop.value_ptr.deinit();
         gop.key_ptr.* = base;
@@ -1241,6 +1264,18 @@ pub fn mlaAttnHeads(
     cb.commitAndWait();
     @memcpy(out, cx.scratch_out.slice(f32)[0..out.len]);
     return true;
+}
+
+/// The id-indexed dmmv pipeline for a quantization, and the rows one SIMD
+/// group covers. Null when the type has no id variant, in which case that
+/// tensor keeps host-supplied plane pointers.
+fn dmmvIdFor(cx: *Ctx, t: ggml.Type) ?struct { pipe: mtl.Pipeline, per: usize } {
+    return switch (t) {
+        .q4_k => .{ .pipe = cx.q4k_id, .per = 4 },
+        .q5_0 => .{ .pipe = cx.q5_0_id, .per = 1 },
+        .q8_0 => .{ .pipe = cx.q8_0_id, .per = 1 },
+        else => null,
+    };
 }
 
 /// Score the router logits and pick the top `n_used` experts, on the device.
@@ -3824,21 +3859,27 @@ test "mla attention matches an exact cpu reference" {
     }
 }
 
-test "q4_k id-indexed matvec equals the plain kernel, plane for plane" {
-    // The `ggml_mul_mat_id` shape: one dispatch over several selected experts,
-    // each picking its plane from a device-side id buffer. The thing to get
-    // wrong is the plane stride, and a wrong one produces a correct first
-    // expert and garbage for the rest -- which in a MoE layer is a plausible
-    // output vector, since the first expert usually carries the largest gate.
+test "id-indexed matvec equals the plain kernel, for every expert type" {
+    // Same assertion for all three: an id-indexed dispatch over several planes
+    // must equal the plain kernel run once per plane, bit for bit -- same
+    // arithmetic in both, so a tolerance would only hide a stride bug landing
+    // on a neighbouring plane. Q4_K covers gate and up; ffn_down_exps is Q5_0
+    // in half of DeepSeek-V2-Lite's layers and Q8_0 in the rest, so all three
+    // are needed before a layer can route on the device.
     //
-    // So the ids are deliberately not 0,1,2: they are out of order and skip
-    // planes, which a stride bug cannot survive and an off-by-one in the slot
-    // arithmetic cannot either.
+    // Every type's data is allocated up front and freed only at the end,
+    // deliberately. The first version allocated and freed per type in a loop,
+    // and the q5_0 pass reused the q4_k pass's freed address: `wrapFor` keys
+    // its MTLBuffer cache by page base and only re-wraps when the region
+    // *grew*, so the q5_0 dispatch read a stale wrapping of freed memory. It
+    // presented as slot 1 wrong with slot 0 right -- exactly like a kernel
+    // stride bug -- and the kernel was fine.
     const gpa = std.testing.allocator;
-    const cols = 2048;
-    const rows = 1408; // DeepSeek's expert width; a multiple of NR0
-    const n_exp = 6;
+    const cols = 2048; // multiple of 256 and of 32: legal for all three types
+    const rows = 1408;
+    const n_planes = 6;
     const ids = [_]u32{ 3, 0, 5, 1, 4, 2 };
+    const types = [_]ggml.Type{ .q4_k, .q5_0, .q8_0 };
 
     parallelBegin(1);
     defer parallelEnd();
@@ -3857,61 +3898,83 @@ test "q4_k id-indexed matvec equals the plain kernel, plane for plane" {
 
     var prng = std.Random.DefaultPrng.init(0x1D5);
     const rnd = prng.random();
-    const plane_bytes = ggml.tensorBytes(.q4_k, cols, rows);
-    const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), plane_bytes * n_exp);
-    defer gpa.free(data);
-    rnd.bytes(data);
-    var b: usize = 0;
-    while (b + 144 <= data.len) : (b += 144) {
-        std.mem.writeInt(u16, data[b..][0..2], 0x2C00, .little);
-        std.mem.writeInt(u16, data[b + 2 ..][0..2], 0x2800, .little);
+
+    var datas: [types.len][]align(16384) u8 = undefined;
+    var n_alloc: usize = 0;
+    for (types, 0..) |ty, i| {
+        const plane_bytes = ggml.tensorBytes(ty, cols, rows);
+        datas[i] = try gpa.alignedAlloc(u8, .fromByteUnits(16384), plane_bytes * n_planes);
+        n_alloc = i + 1;
+        rnd.bytes(datas[i]);
+        // Pin every block scale: a random f16 can be inf, and both sides then
+        // produce NaN, which compares unequal to itself and reads as a kernel
+        // bug.
+        const bs: usize = switch (ty) {
+            .q4_k => 144,
+            .q5_0 => 22,
+            .q8_0 => 34,
+            else => unreachable,
+        };
+        var b: usize = 0;
+        while (b + bs <= datas[i].len) : (b += bs) {
+            std.mem.writeInt(u16, datas[i][b..][0..2], 0x2C00, .little); // d
+            if (ty == .q4_k) std.mem.writeInt(u16, datas[i][b + 2 ..][0..2], 0x2800, .little); // dmin
+        }
     }
+    defer for (datas[0..n_alloc]) |d| gpa.free(d);
 
     const x = try gpa.alloc(f32, cols);
     defer gpa.free(x);
     for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
 
-    // Reference: the plain kernel, once per plane. Same kernel arithmetic, so
-    // this must agree bit for bit -- a tolerance would hide a stride bug that
-    // lands on a neighbouring plane.
-    const want = try gpa.alloc(f32, ids.len * rows);
-    defer gpa.free(want);
-    for (ids, 0..) |id, slot| {
-        matvec(.q4_k, want[slot * rows ..][0..rows], data[id * plane_bytes ..][0..plane_bytes], x, rows, cols);
-    }
+    for (types, 0..) |ty, i| {
+        const data = datas[i];
+        const plane_bytes = ggml.tensorBytes(ty, cols, rows);
 
-    const idbuf = cx.dev.alloc(ids.len * @sizeOf(u32)) catch return error.SkipZigTest;
-    @memcpy(idbuf.slice(u32)[0..ids.len], &ids);
-    const outbuf = cx.dev.alloc(ids.len * rows * @sizeOf(f32)) catch return error.SkipZigTest;
-    const w = wrapFor(cx, data) orelse return error.SkipZigTest;
-    @memcpy(cx.scratch_x.slice(f32)[0..cols], x);
+        // Reference: the plain kernel, once per plane, ids out of order --
+        // 3,0,5,1,4,2 -- because a stride bug gives a correct first expert and
+        // garbage after it, which in a MoE layer is a plausible output vector:
+        // the first expert usually carries the largest gate.
+        const want = try gpa.alloc(f32, ids.len * rows);
+        defer gpa.free(want);
+        for (ids, 0..) |id, slot| {
+            matvec(ty, want[slot * rows ..][0..rows], data[id * plane_bytes ..][0..plane_bytes], x, rows, cols);
+        }
 
-    const dims = IdDims{
-        .rows = @intCast(rows),
-        .cols = @intCast(cols),
-        .n_used = @intCast(ids.len),
-        .plane_stride = @intCast(plane_bytes),
-    };
-    const group = SIMD_W * SIMDGROUPS_PER_GROUP;
-    const threads = ((ids.len * rows + 3) / 4) * SIMD_W;
-    const grid = ((threads + group - 1) / group) * group;
-    const cb = cx.dev.commandBuffer();
-    cb.dispatch(
-        cx.q4k_id,
-        &.{ w.buf, cx.scratch_x, outbuf, idbuf },
-        &.{ w.off, 0, 0, 0 },
-        std.mem.asBytes(&dims),
-        grid,
-        group,
-    );
-    cb.commitAndWait();
+        const sel = dmmvIdFor(cx, ty) orelse return error.SkipZigTest;
+        const idbuf = cx.dev.alloc(ids.len * @sizeOf(u32)) catch return error.SkipZigTest;
+        @memcpy(idbuf.slice(u32)[0..ids.len], &ids);
+        const outbuf = cx.dev.alloc(ids.len * rows * @sizeOf(f32)) catch return error.SkipZigTest;
+        const w = wrapFor(cx, data) orelse return error.SkipZigTest;
+        @memcpy(cx.scratch_x.slice(f32)[0..cols], x);
 
-    const got = outbuf.slice(f32)[0 .. ids.len * rows];
-    for (want, got, 0..) |a, c, k| {
-        std.testing.expectEqual(a, c) catch |e| {
-            std.debug.print("id matvec slot {d} (expert {d}) row {d}: plain {d} vs id {d}\n", .{ k / rows, ids[k / rows], k % rows, a, c });
-            return e;
+        const dims = IdDims{
+            .rows = @intCast(rows),
+            .cols = @intCast(cols),
+            .n_used = @intCast(ids.len),
+            .plane_stride = @intCast(plane_bytes),
         };
+        const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+        const threads = ((ids.len * rows + sel.per - 1) / sel.per) * SIMD_W;
+        const grid = ((threads + group - 1) / group) * group;
+        const cb = cx.dev.commandBuffer();
+        cb.dispatch(
+            sel.pipe,
+            &.{ w.buf, cx.scratch_x, outbuf, idbuf },
+            &.{ w.off, 0, 0, 0 },
+            std.mem.asBytes(&dims),
+            grid,
+            group,
+        );
+        cb.commitAndWait();
+
+        const got = outbuf.slice(f32)[0 .. ids.len * rows];
+        for (want, got, 0..) |a, c, k| {
+            std.testing.expectEqual(a, c) catch |e| {
+                std.debug.print("{t} id matvec slot {d} (expert {d}) row {d}: plain {d} vs id {d}\n", .{ ty, k / rows, ids[k / rows], k % rows, a, c });
+                return e;
+            };
+        }
     }
 }
 
