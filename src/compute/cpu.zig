@@ -58,6 +58,11 @@ pub fn hasMlaCache() bool {
     return false;
 }
 
+pub fn moeRoute(logits: []const f32, bias: ?[]const f32, ids_out: []u32, gates_out: []f32, gating_sigmoid: bool, weights_norm: bool, weights_scale: f32) bool {
+    _ = .{ logits, bias, ids_out, gates_out, gating_sigmoid, weights_norm, weights_scale };
+    return false;
+}
+
 pub fn mlaSetWk(li: usize, wk_f32: []const f32) bool {
     _ = .{ li, wk_f32 };
     return false;

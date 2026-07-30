@@ -168,6 +168,11 @@ pub const mlaAppend = impl.mlaAppend;
 pub const hasMlaCache = impl.hasMlaCache;
 pub const mlaAttnHeads = impl.mlaAttnHeads;
 
+/// Router scoring and top-k on the device. The ids stay in device memory for
+/// the expert kernels to read, which is what lets a layer's attention and its
+/// FFN share a command buffer.
+pub const moeRoute = impl.moeRoute;
+
 /// W_k dequantized to f32 and held on the device, and the absorption
 /// (W_k^T q_nope) that reads it. The absorption was the last host step inside
 /// an MLA layer, so it forced a synchronization mid-layer however much of the
