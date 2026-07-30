@@ -418,6 +418,9 @@ const Ctx = struct {
     q4k: mtl.Pipeline,
     q6k: mtl.Pipeline,
     q5_1: mtl.Pipeline,
+    /// Q4_K with two rows per SIMD group, for matrices large enough that group
+    /// count matters more than activation reuse. See `dmmvFor`.
+    q4k_wide: mtl.Pipeline,
     q5_0: mtl.Pipeline,
     q8_0: mtl.Pipeline,
     gemm_q4k: mtl.Pipeline,
@@ -509,6 +512,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const p4w = dev.pipeline("#define NR0 2\n" ++ dmmv_q4k_src, "dmmv_q4k") catch {
+        dev.deinit();
+        return;
+    };
     const p51 = dev.pipeline(dmmv_q5_1_src, "dmmv_q5_1") catch {
         dev.deinit();
         return;
@@ -560,7 +567,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -1069,13 +1076,13 @@ pub fn moeFfnBlock(
 
     // Resolve everything before recording: a decline halfway through would
     // leave a partially-built command buffer.
-    var pipes: [MAX_MOE_EXPERTS][3]mtl.Pipeline = undefined;
+    var pipes: [MAX_MOE_EXPERTS][3]@TypeOf(dmmvFor(undefined, .q4_k, 0).?) = undefined;
     var wraps: [MAX_MOE_EXPERTS][3]Wrapped = undefined;
     if (experts.len > MAX_MOE_EXPERTS) return false;
     for (experts, 0..) |e, i| {
-        pipes[i][0] = pipelineFor(cx, e.gate.ty) orelse return false;
-        pipes[i][1] = pipelineFor(cx, e.up.ty) orelse return false;
-        pipes[i][2] = pipelineFor(cx, e.down.ty) orelse return false;
+        pipes[i][0] = dmmvFor(cx, e.gate.ty, ffn) orelse return false;
+        pipes[i][1] = dmmvFor(cx, e.up.ty, ffn) orelse return false;
+        pipes[i][2] = dmmvFor(cx, e.down.ty, dim) orelse return false;
         // Per tensor, not one rule for the layer: gate and up read `dim`
         // columns, down reads `ffn`, and each type has its own block width.
         if (dim % colsMultiple(e.gate.ty) != 0 or dim % colsMultiple(e.up.ty) != 0) return false;
@@ -1099,12 +1106,12 @@ pub fn moeFfnBlock(
     e.dispatch(cx.zero_p, &.{cx.act[0]}, &.{0}, std.mem.asBytes(&zero_d), dim, 64);
     e.barrier();
     for (experts, 0..) |ex, i| {
-        e.dispatch(pipes[i][0], &.{ wraps[i][0].buf, cx.scratch_x, cx.act[1] }, &.{ wraps[i][0].off, 0, 0 }, std.mem.asBytes(&dims_ffn), groupsFor(ex.gate.ty, ffn), group);
-        e.dispatch(pipes[i][1], &.{ wraps[i][1].buf, cx.scratch_x, cx.act[2] }, &.{ wraps[i][1].off, 0, 0 }, std.mem.asBytes(&dims_ffn), groupsFor(ex.up.ty, ffn), group);
+        e.dispatch(pipes[i][0].pipe, &.{ wraps[i][0].buf, cx.scratch_x, cx.act[1] }, &.{ wraps[i][0].off, 0, 0 }, std.mem.asBytes(&dims_ffn), pipes[i][0].groups, group);
+        e.dispatch(pipes[i][1].pipe, &.{ wraps[i][1].buf, cx.scratch_x, cx.act[2] }, &.{ wraps[i][1].off, 0, 0 }, std.mem.asBytes(&dims_ffn), pipes[i][1].groups, group);
         e.barrier();
         e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_ffn), ffn, 64);
         e.barrier();
-        e.dispatch(pipes[i][2], &.{ wraps[i][2].buf, cx.act[1], cx.act[3] }, &.{ wraps[i][2].off, 0, 0 }, std.mem.asBytes(&dims_down), groupsFor(ex.down.ty, dim), group);
+        e.dispatch(pipes[i][2].pipe, &.{ wraps[i][2].buf, cx.act[1], cx.act[3] }, &.{ wraps[i][2].off, 0, 0 }, std.mem.asBytes(&dims_down), pipes[i][2].groups, group);
         e.barrier();
         const acc_d = AccDims{ .n = @intCast(dim), .alpha = ex.weight };
         e.dispatch(cx.sadd_p, &.{ cx.act[0], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&acc_d), dim, 64);
@@ -1161,16 +1168,16 @@ pub fn layerBlock(s: LayerSpec) bool {
     const kb = cx.kv_k orelse return false;
     const vb = cx.kv_v orelse return false;
 
-    const gp = pipelineFor(cx, s.gate.ty) orelse return false;
-    const upp = pipelineFor(cx, s.up.ty) orelse return false;
-    const dp = pipelineFor(cx, s.down.ty) orelse return false;
-    const qp = pipelineFor(cx, s.wq.ty) orelse return false;
-    const kp = pipelineFor(cx, s.wk.ty) orelse return false;
-    const vp = pipelineFor(cx, s.wv.ty) orelse return false;
-    const op = pipelineFor(cx, s.wo.ty) orelse return false;
-
-    const kvd = s.n_kv_heads * s.hd;
     const qd = s.n_heads * s.hd;
+    const kvd = s.n_kv_heads * s.hd;
+    const gp = dmmvFor(cx, s.gate.ty, s.ffn) orelse return false;
+    const upp = dmmvFor(cx, s.up.ty, s.ffn) orelse return false;
+    const dp = dmmvFor(cx, s.down.ty, s.dim) orelse return false;
+    const qp = dmmvFor(cx, s.wq.ty, qd) orelse return false;
+    const kp = dmmvFor(cx, s.wk.ty, kvd) orelse return false;
+    const vp = dmmvFor(cx, s.wv.ty, kvd) orelse return false;
+    const op = dmmvFor(cx, s.wo.ty, s.dim) orelse return false;
+
     if (kvd != cx.kv_kvd or s.pos >= cx.kv_ctx) return false;
     if (s.dim % 256 != 0 or s.ffn % 256 != 0) return false;
     if (@max(s.ffn, qd) * 4 > cx.act[0].len) return false;
@@ -1240,9 +1247,9 @@ pub fn layerBlock(s: LayerSpec) bool {
     e.dispatch(cx.rmsnorm_p, &.{ cx.act[0], cx.norms, cx.act[1] }, &.{ 0, attn_norm_off, 0 }, std.mem.asBytes(&nd_attn), SIMD_W, SIMD_W);
     e.barrier();
     // q, k, v — mutually independent, so no barrier between them
-    e.dispatch(qp, &.{ qw.buf, cx.act[1], cx.act[2] }, &.{ qw.off, 0, 0 }, std.mem.asBytes(&dims_q), groupsFor(s.wq.ty, qd), group);
-    e.dispatch(kp, &.{ kw.buf, cx.act[1], cx.act[3] }, &.{ kw.off, 0, 0 }, std.mem.asBytes(&dims_kv), groupsFor(s.wk.ty, kvd), group);
-    e.dispatch(vp, &.{ vw.buf, cx.act[1], cx.act[4] }, &.{ vw.off, 0, 0 }, std.mem.asBytes(&dims_kv), groupsFor(s.wv.ty, kvd), group);
+    e.dispatch(qp.pipe, &.{ qw.buf, cx.act[1], cx.act[2] }, &.{ qw.off, 0, 0 }, std.mem.asBytes(&dims_q), qp.groups, group);
+    e.dispatch(kp.pipe, &.{ kw.buf, cx.act[1], cx.act[3] }, &.{ kw.off, 0, 0 }, std.mem.asBytes(&dims_kv), kp.groups, group);
+    e.dispatch(vp.pipe, &.{ vw.buf, cx.act[1], cx.act[4] }, &.{ vw.off, 0, 0 }, std.mem.asBytes(&dims_kv), vp.groups, group);
     e.barrier();
     // RoPE q and k in place; v is not rotated
     e.dispatch(cx.rope_p, &.{cx.act[2]}, &.{0}, std.mem.asBytes(&rope_q), s.n_heads * (s.rope_dim / 2), 64);
@@ -1255,7 +1262,7 @@ pub fn layerBlock(s: LayerSpec) bool {
     e.dispatch(cx.attn_p, &.{ cx.act[2], kb, vb, cx.act[5] }, &.{ 0, layer_off, layer_off, 0 }, std.mem.asBytes(&attn), s.n_heads * 64, 64);
     e.barrier();
     // x += Wo . attn_out   (into act[1], then added)
-    e.dispatch(op, &.{ ow.buf, cx.act[5], cx.act[1] }, &.{ ow.off, 0, 0 }, std.mem.asBytes(&dims_o), groupsFor(s.wo.ty, s.dim), group);
+    e.dispatch(op.pipe, &.{ ow.buf, cx.act[5], cx.act[1] }, &.{ ow.off, 0, 0 }, std.mem.asBytes(&dims_o), op.groups, group);
     e.barrier();
     e.dispatch(cx.add_p, &.{ cx.act[0], cx.act[1] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), s.dim, 64);
     e.barrier();
@@ -1263,12 +1270,12 @@ pub fn layerBlock(s: LayerSpec) bool {
     const nd_ffn = extern struct { n: u32, eps: f32 }{ .n = @intCast(s.dim), .eps = s.eps };
     e.dispatch(cx.rmsnorm_p, &.{ cx.act[0], cx.norms, cx.act[1] }, &.{ 0, ffn_norm_off, 0 }, std.mem.asBytes(&nd_ffn), SIMD_W, SIMD_W);
     e.barrier();
-    e.dispatch(gp, &.{ gw.buf, cx.act[1], cx.act[6] }, &.{ gw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), groupsFor(s.gate.ty, s.ffn), group);
-    e.dispatch(upp, &.{ uw.buf, cx.act[1], cx.act[7] }, &.{ uw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), groupsFor(s.up.ty, s.ffn), group);
+    e.dispatch(gp.pipe, &.{ gw.buf, cx.act[1], cx.act[6] }, &.{ gw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), gp.groups, group);
+    e.dispatch(upp.pipe, &.{ uw.buf, cx.act[1], cx.act[7] }, &.{ uw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), upp.groups, group);
     e.barrier();
     e.dispatch(cx.swiglu_p, &.{ cx.act[6], cx.act[7], cx.act[6] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_ffn), s.ffn, 64);
     e.barrier();
-    e.dispatch(dp, &.{ dw.buf, cx.act[6], cx.act[1] }, &.{ dw.off, 0, 0 }, std.mem.asBytes(&dims_down), groupsFor(s.down.ty, s.dim), group);
+    e.dispatch(dp.pipe, &.{ dw.buf, cx.act[6], cx.act[1] }, &.{ dw.off, 0, 0 }, std.mem.asBytes(&dims_down), dp.groups, group);
     e.barrier();
     e.dispatch(cx.add_p, &.{ cx.act[0], cx.act[1] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), s.dim, 64);
     e.barrier();
@@ -1312,34 +1319,61 @@ fn colsMultiple(t: ggml.Type) usize {
     };
 }
 
-fn rowsPerGroup(t: ggml.Type) usize {
+fn rowsPerGroup(t: ggml.Type, rows: usize) usize {
     return switch (t) {
-        .q4_k => 2, // NR0 in dmmv_q4k.metal
+        // NR0 in dmmv_q4k.metal, and the wide variant compiled from the same
+        // source with NR0 forced to 2.
+        .q4_k => if (rows >= Q4K_WIDE_ROWS) 2 else 4,
         else => 1,
     };
 }
 
 fn groupsFor(t: ggml.Type, rows: usize) usize {
-    const per = rowsPerGroup(t);
-    return ((rows + per - 1) / per) * SIMD_W;
+    const per = rowsPerGroup(t, rows);
+    const threads = ((rows + per - 1) / per) * SIMD_W;
+    // Round up to a whole threadgroup. `dispatchThreads` permits a smaller
+    // final threadgroup, and in one the kernel's `simdgroups_per_threadgroup`
+    // is less than the full count -- so `tgid * nsg + sgid` addresses the wrong
+    // rows and the real tail is never written. `matvec` then copies whatever
+    // the scratch output buffer held from a previous dispatch, so the symptom
+    // is a plausible-looking number rather than a NaN.
+    //
+    // Every shape this had been run on divided evenly (65,536 rows at two per
+    // group, 1408 at four), so it never fired; 1409 does. The extra threads
+    // return immediately on the row bound.
+    const per_group = SIMD_W * SIMDGROUPS_PER_GROUP;
+    return ((threads + per_group - 1) / per_group) * per_group;
 }
 
-/// The dmmv pipeline for a quantization, or null when there is no kernel for
-/// it and the caller must fall back to the CPU.
-fn pipelineFor(cx: *Ctx, t: ggml.Type) ?mtl.Pipeline {
-    return switch (t) {
-        .q4_k => cx.q4k,
+/// Above this many rows, Q4_K uses the two-row kernel. Below it, the weights
+/// are small enough to sit in cache and re-reading the activation vector once
+/// per group is what costs, so four rows per group wins; above it, more groups
+/// in flight matters more. 4096 is between the measured crossover points
+/// (2816 still wins at four rows, 5632 loses).
+const Q4K_WIDE_ROWS = 4096;
+
+/// The dmmv pipeline for a shape *and* the grid it must be dispatched with.
+///
+/// One function because these two must agree and nothing else enforces it:
+/// Q4_K now has two kernels covering different numbers of rows per SIMD group,
+/// and dispatching one with the other's grid silently computes part of the
+/// output vector -- no error, no NaN, just a tail holding whatever it held
+/// before. That is the worst bug in this work and it has happened twice.
+fn dmmvFor(cx: *Ctx, t: ggml.Type, rows: usize) ?struct { pipe: mtl.Pipeline, groups: usize } {
+    const pipe = switch (t) {
+        .q4_k => if (rows >= Q4K_WIDE_ROWS) cx.q4k_wide else cx.q4k,
         .q6_k => cx.q6k,
         .q5_1 => cx.q5_1,
         .q5_0 => cx.q5_0,
         .q8_0 => cx.q8_0,
-        else => null,
+        else => return null,
     };
+    return .{ .pipe = pipe, .groups = groupsFor(t, rows) };
 }
 
 pub fn matvec(t: ggml.Type, out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
     const cx = &(ctx orelse return cpu.matvec(t, out, data, x, rows, cols));
-    const pipe = pipelineFor(cx, t);
+    const sel = dmmvFor(cx, t, rows);
     // `colsMultiple`, not a hardcoded 256: Q4_K and Q6_K are 256-value
     // super-blocks but Q5_1 is a 32-value block, and a stale 256 here sent
     // every Q5_1 matvec to the CPU. That fallback is silent and the CPU Q5_1
@@ -1347,7 +1381,7 @@ pub fn matvec(t: ggml.Type, out: []f32, data: []const u8, x: []const f32, rows: 
     // wrong GPU kernel rather than as an unused one -- which cost a long
     // detour through bit-extraction and summation order before the test was
     // taught to detect a fallback directly.
-    if (!use_gpu_ops or !gpu_worthwhile or pipe == null or rows < min_rows or cols % colsMultiple(t) != 0) {
+    if (!use_gpu_ops or !gpu_worthwhile or sel == null or rows < min_rows or cols % colsMultiple(t) != 0) {
         return cpu.matvec(t, out, data, x, rows, cols);
     }
     if (x.len * 4 > cx.scratch_x.len or out.len * 4 > cx.scratch_out.len) {
@@ -1362,11 +1396,11 @@ pub fn matvec(t: ggml.Type, out: []f32, data: []const u8, x: []const f32, rows: 
     const group = SIMD_W * SIMDGROUPS_PER_GROUP;
     const cb = cx.dev.commandBuffer();
     cb.dispatch(
-        pipe.?,
+        sel.?.pipe,
         &.{ w.buf, cx.scratch_x, cx.scratch_out },
         &.{ w.off, 0, 0 },
         std.mem.asBytes(&dims),
-        groupsFor(t, rows),
+        sel.?.groups,
         group,
     );
     cb.commitAndWait();
@@ -1503,16 +1537,35 @@ test "metal q6_k matvec agrees with the exact cpu reference" {
 test "dispatch grids match each kernel's rows per SIMD group" {
     // Pins the arithmetic that produced the worst bug in this work. The dmmv
     // kernels do not agree on how many rows a SIMD group covers -- Q4_K takes
-    // two, Q6_K one -- and a dispatch that assumes the wrong number silently
+    // four, Q6_K one -- and a dispatch that assumes the wrong number silently
     // computes only part of the output vector. There is no error and no NaN;
     // the tail simply keeps its previous contents, which for a residual stream
     // is a plausible-looking number.
-    try std.testing.expectEqual(@as(usize, 2), rowsPerGroup(.q4_k));
-    try std.testing.expectEqual(@as(usize, 1), rowsPerGroup(.q6_k));
-    // Odd row counts must round up, not down: 65 rows of Q4_K need 33 groups.
-    try std.testing.expectEqual(33 * SIMD_W, groupsFor(.q4_k, 65));
-    try std.testing.expectEqual(64 * SIMD_W, groupsFor(.q4_k, 128));
-    try std.testing.expectEqual(65 * SIMD_W, groupsFor(.q6_k, 65));
+    //
+    // This must track `NR0` in dmmv_q4k.metal, and it caught the change that
+    // took NR0 from two to four -- which is the whole reason it exists. Q4_K
+    // now depends on the row count as well: the two variants are compiled from
+    // one source and picked by shape, so the grid has to follow the pick.
+    try std.testing.expectEqual(@as(usize, 4), rowsPerGroup(.q4_k, 1408));
+    try std.testing.expectEqual(@as(usize, 4), rowsPerGroup(.q4_k, Q4K_WIDE_ROWS - 1));
+    try std.testing.expectEqual(@as(usize, 2), rowsPerGroup(.q4_k, Q4K_WIDE_ROWS));
+    try std.testing.expectEqual(@as(usize, 2), rowsPerGroup(.q4_k, 102400));
+    try std.testing.expectEqual(@as(usize, 1), rowsPerGroup(.q6_k, 4096));
+    // Row counts that do not divide must round up, not down -- and then round
+    // again to a whole threadgroup, or the final partial threadgroup reports a
+    // smaller `simdgroups_per_threadgroup` and addresses the wrong rows.
+    const per_group = SIMD_W * SIMDGROUPS_PER_GROUP;
+    for ([_]usize{ 65, 128, 1408, 1409, 2048, 8193, 65536 }) |rows| {
+        const g = groupsFor(.q4_k, rows);
+        try std.testing.expectEqual(@as(usize, 0), g % per_group);
+        // and still covers every row
+        try std.testing.expect(g / SIMD_W * rowsPerGroup(.q4_k, rows) >= rows);
+    }
+    for ([_]usize{ 65, 2048, 8193 }) |rows| {
+        const g = groupsFor(.q6_k, rows);
+        try std.testing.expectEqual(@as(usize, 0), g % per_group);
+        try std.testing.expect(g / SIMD_W * rowsPerGroup(.q6_k, rows) >= rows);
+    }
 }
 
 test "metal batched matmul agrees with the exact cpu reference" {
@@ -2312,9 +2365,9 @@ pub fn ffnBlock(
     // Q5_1, on DeepSeek). Requiring a single type meant this block declined
     // every real model while accepting synthetic ones, so it looked
     // implemented and never ran.
-    const gp = pipelineFor(cx, gate_w.ty) orelse return false;
-    const up = pipelineFor(cx, up_w.ty) orelse return false;
-    const dp = pipelineFor(cx, down_w.ty) orelse return false;
+    const gp = dmmvFor(cx, gate_w.ty, ffn) orelse return false;
+    const up = dmmvFor(cx, up_w.ty, ffn) orelse return false;
+    const dp = dmmvFor(cx, down_w.ty, dim) orelse return false;
     if (dim % 256 != 0 or ffn % 256 != 0) return false;
     if (ffn * 4 > cx.act[0].len or dim * 4 > cx.act[0].len) return false;
 
@@ -2343,14 +2396,17 @@ pub fn ffnBlock(
     e.dispatch(cx.rmsnorm_p, &.{ cx.act[0], cx.scratch_x, cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&nd), SIMD_W, SIMD_W);
     e.barrier();
     // gate = Wg . normed ; up = Wu . normed  — independent, no barrier between
-    e.dispatch(gp, &.{ gw.buf, cx.act[1], cx.act[2] }, &.{ gw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ffn * SIMD_W, group);
-    e.dispatch(up, &.{ uw.buf, cx.act[1], cx.act[3] }, &.{ uw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), ffn * SIMD_W, group);
+    // `ffn * SIMD_W` here assumed one row per SIMD group whatever the kernel,
+    // which over-dispatched by the Q4_K factor -- harmless only because a
+    // group past the last row returns immediately.
+    e.dispatch(gp.pipe, &.{ gw.buf, cx.act[1], cx.act[2] }, &.{ gw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), gp.groups, group);
+    e.dispatch(up.pipe, &.{ uw.buf, cx.act[1], cx.act[3] }, &.{ uw.off, 0, 0 }, std.mem.asBytes(&dims_ffn), up.groups, group);
     e.barrier();
     // act = silu(gate) * up, in place over act[2]
     e.dispatch(cx.swiglu_p, &.{ cx.act[2], cx.act[3], cx.act[2] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_ffn), ffn, 64);
     e.barrier();
     // ffn_out = Wd . act
-    e.dispatch(dp, &.{ dw.buf, cx.act[2], cx.act[3] }, &.{ dw.off, 0, 0 }, std.mem.asBytes(&dims_down), dim * SIMD_W, group);
+    e.dispatch(dp.pipe, &.{ dw.buf, cx.act[2], cx.act[3] }, &.{ dw.off, 0, 0 }, std.mem.asBytes(&dims_down), dp.groups, group);
     e.barrier();
     // x += ffn_out
     e.dispatch(cx.add_p, &.{ cx.act[0], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), dim, 64);
@@ -2608,7 +2664,11 @@ test "metal scaling: where does the gpu actually win" {
 
     const cols = 2048;
     std.debug.print("\n  rows      gpu(1 cb)   gpu(amort)      cpu(8t)   GB/s(a)   ratio\n", .{});
-    for ([_]usize{ 2048, 5632, 16384, 32000, 65536, 131072 }) |rows| {
+    // 1408 and 2816 are DeepSeek-V2-Lite's routed and shared expert widths,
+    // and 2048 its model dim -- the shapes an expert FFN actually issues. The
+    // sweep used to start at 2048 and so never covered the regime the engine
+    // spends half a token in.
+    for ([_]usize{ 1408, 2048, 2816, 5632, 16384, 32000, 65536, 131072 }) |rows| {
         const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, cols, rows));
         defer gpa.free(data);
         var prng = std.Random.DefaultPrng.init(7);
@@ -2981,6 +3041,74 @@ test "moe block accepts every down-projection type real checkpoints use" {
         if (!moeFfnBlock(normed, &refs, ffn, got)) {
             std.debug.print("moe block declined a {t} down-projection: every MoE layer of such a checkpoint falls back to the host\n", .{down_ty});
             return error.MoeBlockDeclinedARealType;
+        }
+    }
+}
+
+test "both q4_k kernels agree with the oracle, on each side of the threshold" {
+    // Q4_K is two pipelines compiled from one source with different NR0, chosen
+    // by row count. The existing matvec test runs at MIN_GPU_ROWS (65,536) and
+    // so only ever exercises the wide one; the narrow one is covered only
+    // incidentally, by the MoE block tests at 1408 rows. Cover both on purpose,
+    // because a variant that is never run under an oracle is a variant nobody
+    // knows is correct.
+    const gpa = std.testing.allocator;
+    const cols = 2048;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+    const saved_min = min_rows;
+    const saved_ok = gpu_worthwhile;
+    const saved_use = use_gpu_ops;
+    min_rows = 0;
+    gpu_worthwhile = true;
+    use_gpu_ops = true;
+    defer {
+        min_rows = saved_min;
+        gpu_worthwhile = saved_ok;
+        use_gpu_ops = saved_use;
+    }
+
+    // 1408 picks NR0=4; 8192 picks NR0=2. 1409 and 8193 additionally leave a
+    // partial group at the end, which is where a rows-per-group mistake shows.
+    for ([_]usize{ 1408, 1409, 8192, 8193 }) |rows| {
+        var prng = std.Random.DefaultPrng.init(0xC0FFEE + rows);
+        const rnd = prng.random();
+        const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, cols, rows));
+        defer gpa.free(data);
+        rnd.bytes(data);
+        var b: usize = 0;
+        while (b + 144 <= data.len) : (b += 144) {
+            std.mem.writeInt(u16, data[b..][0..2], 0x2C00, .little); // d
+            std.mem.writeInt(u16, data[b + 2 ..][0..2], 0x2800, .little); // dmin
+        }
+        const x = try gpa.alloc(f32, cols);
+        defer gpa.free(x);
+        for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+        const got = try gpa.alloc(f32, rows);
+        defer gpa.free(got);
+        @memset(got, std.math.nan(f32));
+        if (rows * 4 > ctx.?.scratch_out.len) continue;
+        matvec(.q4_k, got, data, x, rows, cols);
+
+        const row = try gpa.alloc(f32, cols);
+        defer gpa.free(row);
+        for (0..rows) |r| {
+            cpu.dequantRow(.q4_k, row, data, r, cols);
+            var acc64: f64 = 0;
+            var mass64: f64 = 0;
+            for (row, x) |wv, xv| {
+                acc64 += @as(f64, wv) * @as(f64, xv);
+                mass64 += @abs(@as(f64, wv) * @as(f64, xv));
+            }
+            const want: f32 = @floatCast(acc64);
+            const tol: f32 = @floatCast(mass64 * 1e-5);
+            std.testing.expectApproxEqAbs(want, got[r], tol) catch |e| {
+                std.debug.print("q4_k rows={d} row {d}: reference {d} vs gpu {d}\n", .{ rows, r, want, got[r] });
+                return e;
+            };
         }
     }
 }
