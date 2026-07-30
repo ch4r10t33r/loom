@@ -1051,6 +1051,9 @@ pub const ExpertRef = struct {
     down: WeightRef,
     /// Router weight this expert's output is scaled by before accumulation.
     weight: f32,
+    /// This expert's hidden width, per expert because the shared expert is
+    /// wider than a routed one.
+    ffn: usize,
 };
 
 /// A whole MoE layer's experts in one command buffer.
@@ -1068,7 +1071,6 @@ pub const ExpertRef = struct {
 pub fn moeFfnBlock(
     normed: []const f32,
     experts: []const ExpertRef,
-    ffn: usize,
     out: []f32,
 ) bool {
     const cx = &(ctx orelse return false);
@@ -1076,8 +1078,10 @@ pub fn moeFfnBlock(
     const dim = normed.len;
     if (experts.len == 0) return false;
     if (out.len != dim) return false;
-    if (@max(ffn, dim) * 4 > cx.act[0].len) return false;
     if (dim * 4 > cx.scratch_x.len) return false;
+    var widest: usize = dim;
+    for (experts) |e| widest = @max(widest, e.ffn);
+    if (widest * 4 > cx.act[0].len) return false;
 
     // Resolve everything before recording: a decline halfway through would
     // leave a partially-built command buffer.
@@ -1085,13 +1089,13 @@ pub fn moeFfnBlock(
     var wraps: [MAX_MOE_EXPERTS][3]Wrapped = undefined;
     if (experts.len > MAX_MOE_EXPERTS) return false;
     for (experts, 0..) |e, i| {
-        pipes[i][0] = dmmvFor(cx, e.gate.ty, ffn) orelse return false;
-        pipes[i][1] = dmmvFor(cx, e.up.ty, ffn) orelse return false;
+        pipes[i][0] = dmmvFor(cx, e.gate.ty, e.ffn) orelse return false;
+        pipes[i][1] = dmmvFor(cx, e.up.ty, e.ffn) orelse return false;
         pipes[i][2] = dmmvFor(cx, e.down.ty, dim) orelse return false;
         // Per tensor, not one rule for the layer: gate and up read `dim`
         // columns, down reads `ffn`, and each type has its own block width.
         if (dim % colsMultiple(e.gate.ty) != 0 or dim % colsMultiple(e.up.ty) != 0) return false;
-        if (ffn % colsMultiple(e.down.ty) != 0) return false;
+        if (e.ffn % colsMultiple(e.down.ty) != 0) return false;
         wraps[i][0] = wrapFor(cx, e.gate.data) orelse return false;
         wraps[i][1] = wrapFor(cx, e.up.data) orelse return false;
         wraps[i][2] = wrapFor(cx, e.down.data) orelse return false;
@@ -1100,9 +1104,14 @@ pub fn moeFfnBlock(
     @memcpy(cx.scratch_x.slice(f32)[0..dim], normed);
 
     const group = SIMD_W * SIMDGROUPS_PER_GROUP;
-    const dims_ffn = Dims{ .rows = @intCast(ffn), .cols = @intCast(dim) };
-    const dims_down = Dims{ .rows = @intCast(dim), .cols = @intCast(ffn) };
-    const len_ffn = extern struct { n: u32 }{ .n = @intCast(ffn) };
+    var dims_ffn: [MAX_MOE_EXPERTS]Dims = undefined;
+    var dims_down: [MAX_MOE_EXPERTS]Dims = undefined;
+    var len_ffn: [MAX_MOE_EXPERTS]extern struct { n: u32 } = undefined;
+    for (experts, 0..) |ex, k| {
+        dims_ffn[k] = .{ .rows = @intCast(ex.ffn), .cols = @intCast(dim) };
+        dims_down[k] = .{ .rows = @intCast(dim), .cols = @intCast(ex.ffn) };
+        len_ffn[k] = .{ .n = @intCast(ex.ffn) };
+    }
 
     // Phase-parallel across experts, not expert-by-expert.
     //
@@ -1116,7 +1125,7 @@ pub fn moeFfnBlock(
     // Slot 0 is the accumulator; 1 and 2 hold every expert's gate and up,
     // 3 every expert's output, each strided by expert. `ffn * 4` and `dim * 4`
     // are multiples of 256 for every real width, so the offsets are aligned.
-    const gate_stride = ffn * 4;
+    const gate_stride = widest * 4;
     const out_stride = dim * 4;
     if (experts.len * gate_stride > cx.act[1].len) return false;
     if (experts.len * gate_stride > cx.act[2].len) return false;
@@ -1125,16 +1134,16 @@ pub fn moeFfnBlock(
     const cb = cx.dev.commandBuffer();
     const e = cb.encoder();
     for (experts, 0..) |_, i| {
-        e.dispatch(pipes[i][0].pipe, &.{ wraps[i][0].buf, cx.scratch_x, cx.act[1] }, &.{ wraps[i][0].off, 0, i * gate_stride }, std.mem.asBytes(&dims_ffn), pipes[i][0].groups, group);
-        e.dispatch(pipes[i][1].pipe, &.{ wraps[i][1].buf, cx.scratch_x, cx.act[2] }, &.{ wraps[i][1].off, 0, i * gate_stride }, std.mem.asBytes(&dims_ffn), pipes[i][1].groups, group);
+        e.dispatch(pipes[i][0].pipe, &.{ wraps[i][0].buf, cx.scratch_x, cx.act[1] }, &.{ wraps[i][0].off, 0, i * gate_stride }, std.mem.asBytes(&dims_ffn[i]), pipes[i][0].groups, group);
+        e.dispatch(pipes[i][1].pipe, &.{ wraps[i][1].buf, cx.scratch_x, cx.act[2] }, &.{ wraps[i][1].off, 0, i * gate_stride }, std.mem.asBytes(&dims_ffn[i]), pipes[i][1].groups, group);
     }
     e.barrier();
     for (experts, 0..) |_, i| {
-        e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ i * gate_stride, i * gate_stride, i * gate_stride }, std.mem.asBytes(&len_ffn), ffn, 64);
+        e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ i * gate_stride, i * gate_stride, i * gate_stride }, std.mem.asBytes(&len_ffn[i]), experts[i].ffn, 64);
     }
     e.barrier();
     for (experts, 0..) |_, i| {
-        e.dispatch(pipes[i][2].pipe, &.{ wraps[i][2].buf, cx.act[1], cx.act[3] }, &.{ wraps[i][2].off, i * gate_stride, i * out_stride }, std.mem.asBytes(&dims_down), pipes[i][2].groups, group);
+        e.dispatch(pipes[i][2].pipe, &.{ wraps[i][2].buf, cx.act[1], cx.act[3] }, &.{ wraps[i][2].off, i * gate_stride, i * out_stride }, std.mem.asBytes(&dims_down[i]), pipes[i][2].groups, group);
     }
     e.barrier();
     // One dispatch for the weighted sum: a `scaled_add` per expert all write
@@ -2165,11 +2174,12 @@ test "metal moe block matches the cpu expert loop" {
         .up = .{ .ty = .q4_k, .data = wu[i] },
         .down = .{ .ty = .q5_1, .data = wd[i] },
         .weight = gates[i],
+        .ffn = ffn,
     };
 
     const got = try gpa.alloc(f32, dim);
     defer gpa.free(got);
-    if (!moeFfnBlock(normed, &refs, ffn, got)) return error.SkipZigTest;
+    if (!moeFfnBlock(normed, &refs, got)) return error.SkipZigTest;
 
     // Reference: exact dequantize-then-dot, not cpu.matvec — the CPU kernel
     // quantizes activations and chaining four of them per expert compounds
@@ -3071,8 +3081,9 @@ test "moe block accepts every down-projection type real checkpoints use" {
             .up = .{ .ty = .q4_k, .data = wu },
             .down = .{ .ty = down_ty, .data = wd },
             .weight = 1.0,
+            .ffn = ffn,
         }};
-        if (!moeFfnBlock(normed, &refs, ffn, got)) {
+        if (!moeFfnBlock(normed, &refs, got)) {
             std.debug.print("moe block declined a {t} down-projection: every MoE layer of such a checkpoint falls back to the host\n", .{down_ty});
             return error.MoeBlockDeclinedARealType;
         }
@@ -3218,4 +3229,149 @@ test "q4_k variants, interleaved so drift cannot favour one" {
         for (best, 0..) |b, i| gbs[i] = bytes / @as(f64, @floatFromInt(b));
         std.debug.print("  {d:>5}   {d:>14.1} {d:>14.1}\n", .{ rows, gbs[0], gbs[1] });
     }
+}
+
+test "moe block: back to back against a host gap between calls" {
+    // The block measures ~11 ms/token over 26 layers in isolation; the engine
+    // spends far more. The difference in how it is called is that the engine
+    // does attention, norms and routing between layers, leaving the GPU idle
+    // for around a millisecond each time. If the device clocks down across
+    // those gaps, it shows here and nowhere else.
+    //
+    // The gap is spun on the CPU rather than slept, because that is what the
+    // engine does -- host work, not a wait.
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    const dim = 2048;
+    const ffn = 1408;
+    const n_exp = 7; // six routed plus the shared one, as a layer now issues
+
+    parallelBegin(8);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+    const saved_use = use_gpu_ops;
+    use_gpu_ops = true;
+    defer use_gpu_ops = saved_use;
+    var t: std.Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+    const now = struct {
+        fn f(i: std.Io) i128 {
+            return std.Io.Clock.Timestamp.now(i, .awake).raw.toNanoseconds();
+        }
+    }.f;
+
+    var prng = std.Random.DefaultPrng.init(0xB10C);
+    const rnd = prng.random();
+    var wg: [n_exp][]align(16384) u8 = undefined;
+    var wu: [n_exp][]align(16384) u8 = undefined;
+    var wd: [n_exp][]align(16384) u8 = undefined;
+    for (0..n_exp) |i| {
+        wg[i] = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, dim, ffn));
+        wu[i] = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, dim, ffn));
+        wd[i] = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q5_0, ffn, dim));
+        rnd.bytes(wg[i]);
+        rnd.bytes(wu[i]);
+        rnd.bytes(wd[i]);
+        for (0..wg[i].len / 2) |k| wg[i][k * 2 + 1] &= 0xFB;
+        for (0..wu[i].len / 2) |k| wu[i][k * 2 + 1] &= 0xFB;
+    }
+    defer for (0..n_exp) |i| {
+        gpa.free(wg[i]);
+        gpa.free(wu[i]);
+        gpa.free(wd[i]);
+    };
+
+    const normed = try gpa.alloc(f32, dim);
+    defer gpa.free(normed);
+    for (normed) |*v| v.* = 0.1;
+    const out = try gpa.alloc(f32, dim);
+    defer gpa.free(out);
+
+    var refs: [n_exp]ExpertRef = undefined;
+    for (0..n_exp) |i| refs[i] = .{
+        .gate = .{ .ty = .q4_k, .data = wg[i] },
+        .up = .{ .ty = .q4_k, .data = wu[i] },
+        .down = .{ .ty = .q5_0, .data = wd[i] },
+        .weight = 1.0 / @as(f32, n_exp),
+        .ffn = ffn,
+    };
+    if (!moeFfnBlock(normed, &refs, out)) return error.SkipZigTest;
+
+    var tight: i128 = std.math.maxInt(i64);
+    for (0..30) |_| {
+        const t0 = now(io);
+        _ = moeFfnBlock(normed, &refs, out);
+        const dt = now(io) - t0;
+        if (dt < tight) tight = dt;
+    }
+    // A rotating working set, which is what the engine actually has: every
+    // layer of every token reads a different set of experts, ~1.1 GB per
+    // token, where the loop above reads the same 35 MB thirty times over.
+    const SETS = 20;
+    var many: [SETS][n_exp]ExpertRef = undefined;
+    var pool: [SETS][n_exp][3][]align(16384) u8 = undefined;
+    var built: usize = 0;
+    outer: for (0..SETS) |sx| {
+        for (0..n_exp) |i| {
+            pool[sx][i][0] = gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, dim, ffn)) catch break :outer;
+            pool[sx][i][1] = gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, dim, ffn)) catch break :outer;
+            pool[sx][i][2] = gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q5_0, ffn, dim)) catch break :outer;
+            for (pool[sx][i]) |b| rnd.bytes(b);
+            for (0..2) |q| {
+                const b = pool[sx][i][q];
+                for (0..b.len / 2) |k| b[k * 2 + 1] &= 0xFB;
+            }
+            many[sx][i] = .{
+                .gate = .{ .ty = .q4_k, .data = pool[sx][i][0] },
+                .up = .{ .ty = .q4_k, .data = pool[sx][i][1] },
+                .down = .{ .ty = .q5_0, .data = pool[sx][i][2] },
+                .weight = 1.0 / @as(f32, n_exp),
+                .ffn = ffn,
+            };
+        }
+        built = sx + 1;
+    }
+    defer for (0..built) |sx| {
+        for (0..n_exp) |i| for (pool[sx][i]) |b| gpa.free(b);
+    };
+    var rotating: i128 = std.math.maxInt(i64);
+    if (built > 1) {
+        for (many[0..built]) |*r| _ = moeFfnBlock(normed, r, out); // wrap + resident
+        for (0..30) |round| {
+            const r = &many[round % built];
+            const t0 = now(io);
+            _ = moeFfnBlock(normed, r, out);
+            const dt = now(io) - t0;
+            if (dt < rotating) rotating = dt;
+        }
+    }
+
+    var gapped: i128 = std.math.maxInt(i64);
+    var sink: f64 = 0;
+    for (0..30) |_| {
+        const until = now(io) + 1_000_000; // ~1 ms of host work
+        while (now(io) < until) sink += 1.0;
+        const t0 = now(io);
+        _ = moeFfnBlock(normed, &refs, out);
+        const dt = now(io) - t0;
+        if (dt < gapped) gapped = dt;
+    }
+    std.testing.expect(sink > 0) catch {};
+
+    var bytes: f64 = 0;
+    for (0..n_exp) |i| bytes += @floatFromInt(wg[i].len + wu[i].len + wd[i].len);
+    const mb = bytes / (1024 * 1024);
+    const t_ms = @as(f64, @floatFromInt(tight)) / 1e6;
+    const g_ms = @as(f64, @floatFromInt(gapped)) / 1e6;
+    const r_ms = @as(f64, @floatFromInt(rotating)) / 1e6;
+    std.debug.print("\n  moe block, {d} experts, {d:.1} MB per call\n    same weights   {d:.3} ms  {d:5.1} GB/s   x26 = {d:.1} ms/token\n    1 ms cpu gap   {d:.3} ms  {d:5.1} GB/s   x26 = {d:.1} ms/token\n    {d} sets, {d:.0} MB working set  {d:.3} ms  {d:5.1} GB/s   x26 = {d:.1} ms/token\n", .{
+        n_exp,                                   mb,
+        t_ms,                                    bytes / @as(f64, @floatFromInt(tight)),
+        t_ms * 26,                               g_ms,
+        bytes / @as(f64, @floatFromInt(gapped)), g_ms * 26,
+        built,                                   mb * @as(f64, @floatFromInt(built)),
+        r_ms,                                    bytes / @as(f64, @floatFromInt(rotating)),
+        r_ms * 26,
+    });
 }
