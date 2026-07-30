@@ -146,6 +146,7 @@ pub const Source = struct {
         const u = self.store.extentSlice(id, 1) orelse return null;
         const d = self.store.extentSlice(id, 2) orelse return null;
         self.stats.mapped += 1;
+        self.store.touch(id);
         return .{ .gate = g, .up = u, .down = d };
     }
 
@@ -165,6 +166,7 @@ pub const Source = struct {
                 self.cache_seq = seq;
             } else if (c.find(id)) |blk| {
                 self.stats.ram += 1;
+                self.store.touch(id);
                 return blk[0..@intCast(self.store.manifest.rangeLen(id))];
             }
             const want: usize = @intCast(self.store.manifest.rangeLen(id));
@@ -172,6 +174,7 @@ pub const Source = struct {
                 const slot = try c.reserve(id);
                 if (self.store.readRangeVerified(id, slot[1][0..want])) |data| {
                     self.stats.local += 1;
+                    self.store.touch(id);
                     return data;
                 } else |_| {
                     // publish-after-verify: a poisoned block must not become a
@@ -189,6 +192,7 @@ pub const Source = struct {
             // fall through to a peer fetch (the bit was cleared by the verify)
             if (self.store.readRangeVerified(id, self.scratch)) |data| {
                 self.stats.local += 1;
+                self.store.touch(id);
                 return data;
             } else |_| {}
         }

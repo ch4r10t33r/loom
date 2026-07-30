@@ -755,6 +755,21 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                 });
                 try out.flush();
             }
+            // --hold-fraction is a cap, not just a bootstrap target. Without
+            // this it bounded only the initial sync: a shard fetched from a
+            // peer at token time was persisted and marked held with nothing to
+            // evict it, so a node measured across two machines went from 3.6%
+            // to 93.1% of the corpus while generating 24 tokens -- every
+            // serving node converging on a full replica, which is the opposite
+            // of storing the corpus once across a swarm.
+            if (opts.hold_fraction < 1.0) {
+                const experts = st.manifest.nRanges() - st.manifest.n_resident;
+                const cap: usize = @intFromFloat(@floor(@as(f64, @floatFromInt(experts)) * opts.hold_fraction));
+                st.setCap(cap);
+                try out.print("  capacity   holding at most {d} of {d} expert shards ({d:.0}%), coldest evicted\n", .{
+                    cap, experts, opts.hold_fraction * 100.0,
+                });
+            }
             gguf_src = try expert_fetch.Source.initCached(gpa, io, st, peer_list.items, opts.ram_bytes);
             gguf_src.committee = committee_peers.items;
             // resident gate (audit #5 P0-4): the mmap'd resident bundle must be

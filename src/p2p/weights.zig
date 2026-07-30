@@ -19,6 +19,7 @@
 //! exactly the block a MoE matmul consumes (CLAUDE principle 7).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 const hashmod = @import("../core/hash.zig");
 const gguf = @import("../gguf/gguf.zig");
@@ -465,6 +466,57 @@ pub fn buildExpertManifest(gpa: std.mem.Allocator, io: Io, path: []const u8) !Ma
 
 // ---- holdings bitmap ---------------------------------------------------------
 
+/// Release a byte range's blocks back to the filesystem, leaving a hole that
+/// reads back as zeros without changing the file's length.
+///
+/// Best-effort by design: this is what turns "the node no longer holds this
+/// shard" from a bit in a bitmap into free space on the disk, but a filesystem
+/// that cannot punch holes is not an error -- the node is still correct, it
+/// just does not get the space back. Nothing reads an evicted range: the
+/// holdings bit is cleared first, and every read path checks it.
+fn punchHole(fd: std.posix.fd_t, offset: u64, len: u64) void {
+    if (len == 0) return;
+    // Align inward to whole filesystem blocks. Shard extents start and end at
+    // arbitrary byte offsets, and a partially-covered block cannot be freed --
+    // some of it belongs to the neighbouring shard, which is very likely still
+    // held. APFS rejects an unaligned range outright (EINVAL), so the first
+    // version of this punched nothing at all and the store kept growing while
+    // the holdings count stayed flat, which is exactly as confusing as it
+    // sounds. Losing up to one block at each end is the whole cost.
+    const block: u64 = 4096;
+    const start = std.mem.alignForward(u64, offset, block);
+    const end = std.mem.alignBackward(u64, offset + len, block);
+    if (end <= start) return; // shard smaller than a block, or spanning none
+    const off = start;
+    const n = end - start;
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos => {
+            // Not in std.c: fpunchhole_t from <sys/fcntl.h>. The two leading
+            // u32s are a flags word and explicit padding to keep fp_offset
+            // 8-aligned, so they cannot be collapsed.
+            const punchhole = extern struct {
+                fp_flags: u32,
+                reserved: u32,
+                fp_offset: i64,
+                fp_length: i64,
+            };
+            var arg = punchhole{
+                .fp_flags = 0,
+                .reserved = 0,
+                .fp_offset = @intCast(off),
+                .fp_length = @intCast(n),
+            };
+            _ = std.c.fcntl(fd, std.c.F.PUNCHHOLE, &arg);
+        },
+        .linux => {
+            const PUNCH_HOLE = 0x02;
+            const KEEP_SIZE = 0x01;
+            _ = std.os.linux.fallocate(fd, PUNCH_HOLE | KEEP_SIZE, @intCast(off), @intCast(n));
+        },
+        else => {},
+    }
+}
+
 pub const Holdings = struct {
     bits: []u8, // owned; ceil(n/8) bytes
     n: usize,
@@ -617,6 +669,26 @@ pub const Store = struct {
     seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Guards `saveSidecars` only (see there). Never held across network I/O.
     sidecar_mutex: Io.Mutex = .init,
+    /// Serializes cap enforcement. Shard *writes* need no lock -- they touch
+    /// disjoint extents and flip one bit -- but choosing a victim reads the
+    /// whole bitmap and then clears a bit, and two fetchers doing that at once
+    /// can evict twice or pick the same victim.
+    evict_mutex: Io.Mutex = .init,
+    /// Most expert shards this store will hold. Resident chunks are mandatory,
+    /// so they are neither counted nor evictable. Null means uncapped, which
+    /// is what an origin holding a complete copy wants.
+    ///
+    /// Without this `--hold-fraction` bounded only the bootstrap fetch: a shard
+    /// pulled from a peer at token time was persisted and marked held, nothing
+    /// evicted it, and a node measured on a two-machine run went from 3.6% to
+    /// 93.1% of the corpus while generating 24 tokens. That makes every serving
+    /// node converge on a full replica and removes the reason to distribute the
+    /// corpus at all.
+    cap_experts: ?usize = null,
+    /// Use counter per shard, for picking the coldest victim. Lazily allocated
+    /// because an uncapped store never needs it.
+    last_use: ?[]u32 = null,
+    use_clock: u32 = 0,
     /// Read-only mapping of `file`, when one could be made. The token path
     /// reads weights straight out of this instead of copying them into a heap
     /// cache, which is both a copy and a second resident copy of bytes the
@@ -746,6 +818,7 @@ pub const Store = struct {
 
     pub fn deinit(self: *Store) void {
         self.file.close(self.io);
+        if (self.last_use) |lu| self.gpa.free(lu);
         // Allocated lazily on the first verify, not only by `mapReadOnly`.
         if (self.verified) |*v| v.deinit(self.gpa);
         self.manifest.deinit(self.gpa);
@@ -833,6 +906,86 @@ pub const Store = struct {
         }
         self.holdings.set(i);
         _ = self.seq.fetchAdd(1, .monotonic);
+        self.touch(i);
+        self.enforceCap();
+    }
+
+    /// Cap this store to `n` expert shards, or uncap it with null.
+    pub fn setCap(self: *Store, n: ?usize) void {
+        self.cap_experts = n;
+    }
+
+    /// Note that shard `i` was used, so eviction can prefer colder ones.
+    pub fn touch(self: *Store, i: usize) void {
+        if (self.cap_experts == null) return;
+        const lu = self.last_use orelse blk: {
+            const b = self.gpa.alloc(u32, self.manifest.nRanges()) catch return;
+            @memset(b, 0);
+            self.last_use = b;
+            break :blk b;
+        };
+        if (i >= lu.len) return;
+        self.use_clock +%= 1;
+        lu[i] = self.use_clock;
+    }
+
+    /// Expert shards currently held. Resident chunks are excluded: they are
+    /// mandatory, so counting them would make the cap mean different things on
+    /// models with different dense prefixes.
+    pub fn heldExperts(self: *const Store) usize {
+        var c: usize = 0;
+        var i: usize = self.manifest.n_resident;
+        while (i < self.manifest.nRanges()) : (i += 1) {
+            if (self.holdings.has(i)) c += 1;
+        }
+        return c;
+    }
+
+    /// Stop holding shard `i`: clear the bit so it is neither read nor
+    /// advertised, and release its blocks back to the filesystem.
+    ///
+    /// Clearing the bit is what makes the cap real; punching the hole is what
+    /// makes it visible in `df`. The second is best-effort -- a filesystem
+    /// without hole punching leaves the blocks allocated, and the node still
+    /// behaves as though it does not hold the shard.
+    pub fn evictRange(self: *Store, i: usize) void {
+        if (i < self.manifest.n_resident) return; // mandatory
+        if (!self.holdings.has(i)) return;
+        self.holdings.clear(i);
+        _ = self.seq.fetchAdd(1, .monotonic);
+        for (self.manifest.shardExtents(i)) |e| punchHole(self.file.handle, e.offset, e.len);
+        if (self.last_use) |lu| {
+            if (i < lu.len) lu[i] = 0;
+        }
+    }
+
+    /// Evict coldest-first until the cap is met. No-op when uncapped.
+    pub fn enforceCap(self: *Store) void {
+        const cap = self.cap_experts orelse return;
+        self.evict_mutex.lockUncancelable(self.io);
+        defer self.evict_mutex.unlock(self.io);
+        while (self.heldExperts() > cap) {
+            const victim = self.coldestHeld() orelse return;
+            self.evictRange(victim);
+        }
+    }
+
+    fn coldestHeld(self: *const Store) ?usize {
+        var best: ?usize = null;
+        var best_use: u32 = std.math.maxInt(u32);
+        var i: usize = self.manifest.n_resident;
+        while (i < self.manifest.nRanges()) : (i += 1) {
+            if (!self.holdings.has(i)) continue;
+            // Never used this session sorts coldest, which is what we want: a
+            // shard fetched at bootstrap and never routed to is exactly the
+            // one worth giving up.
+            const u = if (self.last_use) |lu| (if (i < lu.len) lu[i] else 0) else 0;
+            if (u < best_use) {
+                best_use = u;
+                best = i;
+            }
+        }
+        return best;
     }
 
     /// Persist the manifest + bitmaps. Self-serializing (security issue #25):
@@ -1172,4 +1325,111 @@ test "initWanted picks an exact count, not a binomial draw" {
     var h5 = try Holdings.initWanted(gpa, 8, 0, 0.0, 42);
     defer h5.deinit(gpa);
     try std.testing.expectEqual(@as(usize, 0), h5.count());
+}
+
+test "hold cap: holdings never exceed it, resident chunks survive, coldest goes first" {
+    // The invariant the two-machine run showed missing. Without a cap,
+    // --hold-fraction bounded the bootstrap fetch only and a node grew from
+    // 3.6% to 93.1% of the corpus while serving 24 tokens, because every shard
+    // fetched at token time was persisted and nothing evicted it.
+    const gpa = std.testing.allocator;
+    var thr: std.Io.Threaded = .init(gpa, .{});
+    defer thr.deinit();
+    const io = thr.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    const n_resident = 2;
+    const n_expert = 40; // >> cap, so the disk bound below discriminates
+    const n = n_resident + n_expert;
+    const each: u64 = 64 * 1024; // > one filesystem block, or nothing is punched
+
+    var blob = try gpa.alloc(u8, @intCast(each * n));
+    defer gpa.free(blob);
+    for (blob, 0..) |*b, k| b.* = @truncate(k *% 31);
+
+    const digests = try gpa.alloc(hashmod.Digest, n);
+    const extents = try gpa.alloc(Extent, n);
+    const starts = try gpa.alloc(u32, n + 1);
+    for (0..n) |i| {
+        const off = each * @as(u64, i);
+        digests[i] = hashmod.hashBlock(blob[@intCast(off)..][0..@intCast(each)]);
+        extents[i] = .{ .offset = off, .len = each };
+        starts[i] = @intCast(i);
+    }
+    starts[n] = @intCast(n);
+    const total = each * n;
+    const version = try computeVersion(gpa, .expert, total, 0, digests, extents, starts);
+    const manifest = Manifest{
+        .mode = .expert,
+        .version = version,
+        .file_size = total,
+        .range_size = 0,
+        .n_resident = n_resident,
+        .digests = digests,
+        .extents = extents,
+        .extent_start = starts,
+    };
+    const wanted = try Holdings.initFull(gpa, n);
+    var store = try createFromManifest(gpa, io, dir, manifest, wanted);
+    defer store.deinit();
+
+    const cap = 3;
+    store.setCap(cap);
+
+    // Resident chunks first, as a real store writes them.
+    for (0..n_resident) |i| try store.writeRange(i, blob[@intCast(each * i)..][0..@intCast(each)]);
+
+    // Then every expert, as fetch-on-demand would. The cap has to hold across
+    // all of them, not just at the end.
+    for (n_resident..n) |i| {
+        try store.writeRange(i, blob[@intCast(each * @as(u64, i))..][0..@intCast(each)]);
+        try std.testing.expect(store.heldExperts() <= cap);
+    }
+
+    try std.testing.expectEqual(@as(usize, cap), store.heldExperts());
+    // Mandatory chunks are never victims: evicting one makes the node unable to
+    // run a forward pass at all.
+    for (0..n_resident) |i| try std.testing.expect(store.holdings.has(i));
+
+    // Coldest-first, where cold means least *recently* used: a shard that keeps
+    // being routed to must survive an arbitrary number of arrivals. Touching it
+    // once up front would not show this -- the arrivals are all more recent
+    // than that touch, so it would be the correct victim.
+    var keep: usize = 0;
+    for (n_resident..n) |i| {
+        if (store.holdings.has(i)) {
+            keep = i;
+            break;
+        }
+    }
+    for (n_resident..n) |i| {
+        if (i == keep) continue;
+        // Before the arrival, not after: eviction happens inside writeRange, so
+        // a touch afterwards is too late to save it -- which is also true of a
+        // real router, where the shard is read to compute the token that then
+        // triggers the next fetch.
+        store.touch(keep);
+        try store.writeRange(i, blob[@intCast(each * @as(u64, i))..][0..@intCast(each)]);
+        try std.testing.expect(store.heldExperts() <= cap);
+    }
+    try std.testing.expect(store.holdings.has(keep));
+
+    // The cap has to be visible on the disk, not only in the bitmap. Evicted
+    // ranges are hole-punched, so the file's *allocated* blocks stay near what
+    // is held rather than near what has ever passed through. The first version
+    // punched unaligned ranges, which APFS rejects outright: holdings stayed
+    // flat at 28.2% on a real node while the store grew 1.8 -> 7.6 GB.
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(store.file.handle, &st) == 0) {
+        const allocated: u64 = @as(u64, @intCast(st.blocks)) * 512;
+        const held_bytes = each * (n_resident + cap);
+        // The whole corpus is 42 ranges and the cap is 3, so an unpunched file
+        // is ~8x this bound while a punched one is the held bytes plus a
+        // partial block at each end of every hole. Checked by reverting the
+        // alignment: without it the punch is refused and this fails.
+        try std.testing.expect(allocated < held_bytes * 3);
+    }
 }
