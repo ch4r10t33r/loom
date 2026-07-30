@@ -70,6 +70,7 @@ pub const sigmoid = cpu.sigmoid;
 pub const MAX_BATCH = cpu.MAX_BATCH;
 
 const dmmv_q4k_src = @embedFile("../shaders/metal/dmmv_q4k.metal");
+const dmmv_q4k_id_src = @embedFile("../shaders/metal/dmmv_q4k_id.metal");
 const dmmv_q6k_src = @embedFile("../shaders/metal/dmmv_q6k.metal");
 const gemm_q4k_src = @embedFile("../shaders/metal/gemm_q4k.metal");
 const attn_src = @embedFile("../shaders/metal/attn.metal");
@@ -77,6 +78,7 @@ const mla_attn_src = @embedFile("../shaders/metal/mla_attn.metal");
 const mla_absorb_src = @embedFile("../shaders/metal/mla_absorb.metal");
 const rope_src = @embedFile("../shaders/metal/rope.metal");
 const moe_acc_src = @embedFile("../shaders/metal/moe_acc.metal");
+const moe_route_src = @embedFile("../shaders/metal/moe_route.metal");
 const dmmv_q5_1_src = @embedFile("../shaders/metal/dmmv_q5_1.metal");
 const dmmv_q5_0_src = @embedFile("../shaders/metal/dmmv_q5_0.metal");
 const dmmv_q8_0_src = @embedFile("../shaders/metal/dmmv_q8_0.metal");
@@ -423,6 +425,13 @@ const Ctx = struct {
     /// Q4_K with two rows per SIMD group, for matrices large enough that group
     /// count matters more than activation reuse. See `dmmvFor`.
     q4k_wide: mtl.Pipeline,
+    /// Q4_K reading its expert plane from a device-side id buffer.
+    q4k_id: mtl.Pipeline,
+    route_p: mtl.Pipeline,
+    /// ids and gates the routing kernel writes; the expert kernels read them
+    /// without either ever reaching the host.
+    route_ids: ?mtl.Buffer = null,
+    route_gates: ?mtl.Buffer = null,
     q5_0: mtl.Pipeline,
     q8_0: mtl.Pipeline,
     gemm_q4k: mtl.Pipeline,
@@ -528,6 +537,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const p4id = dev.pipeline(dmmv_q4k_id_src, "dmmv_q4k_id") catch {
+        dev.deinit();
+        return;
+    };
     const p4w = dev.pipeline("#define NR0 2\n" ++ dmmv_q4k_src, "dmmv_q4k") catch {
         dev.deinit();
         return;
@@ -553,6 +566,10 @@ pub fn parallelBegin(n: usize) void {
         return;
     };
     const psadd = dev.pipeline(moe_acc_src, "scaled_add") catch {
+        dev.deinit();
+        return;
+    };
+    const proute = dev.pipeline(moe_route_src, "moe_route") catch {
         dev.deinit();
         return;
     };
@@ -595,7 +612,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .route_p = proute, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -1226,6 +1243,67 @@ pub fn mlaAttnHeads(
     return true;
 }
 
+/// Score the router logits and pick the top `n_used` experts, on the device.
+///
+/// `ids_out`/`gates_out` are filled for the caller's benefit -- correctness
+/// checks and the host expert path -- but the point is that the device buffers
+/// keep their own copies, so the expert kernels can read them without a
+/// read-back. That read-back is the only thing preventing a layer's attention
+/// and its FFN sharing a command buffer.
+pub fn moeRoute(
+    logits: []const f32,
+    bias: ?[]const f32,
+    ids_out: []u32,
+    gates_out: []f32,
+    gating_sigmoid: bool,
+    weights_norm: bool,
+    weights_scale: f32,
+) bool {
+    const cx = &(ctx orelse return false);
+    if (!use_gpu_ops) return false;
+    const n_expert = logits.len;
+    const n_used = ids_out.len;
+    if (n_used != gates_out.len or n_used == 0) return false;
+    if (logits.len * 4 > cx.scratch_x.len) return false;
+    if (cx.route_ids == null) {
+        cx.route_ids = cx.dev.alloc(MAX_MOE_EXPERTS * @sizeOf(u32)) catch return false;
+        cx.route_gates = cx.dev.alloc(MAX_MOE_EXPERTS * @sizeOf(f32)) catch return false;
+    }
+    if (n_used > MAX_MOE_EXPERTS) return false;
+    const idb = cx.route_ids.?;
+    const gb = cx.route_gates.?;
+
+    @memcpy(cx.scratch_x.slice(f32)[0..n_expert], logits);
+    // The bias, when there is one, follows the logits in the same staging
+    // buffer rather than needing a second.
+    if (bias) |b| {
+        if ((n_expert * 2) * 4 > cx.scratch_x.len) return false;
+        @memcpy(cx.scratch_x.slice(f32)[n_expert..][0..n_expert], b);
+    }
+
+    const d = RouteDims{
+        .n_expert = @intCast(n_expert),
+        .n_used = @intCast(n_used),
+        .gating = if (gating_sigmoid) 1 else 0,
+        .weights_norm = if (weights_norm) 1 else 0,
+        .has_bias = if (bias != null) 1 else 0,
+        .weights_scale = weights_scale,
+    };
+    const cb = cx.dev.commandBuffer();
+    cb.dispatch(
+        cx.route_p,
+        &.{ cx.scratch_x, cx.scratch_x, idb, gb },
+        &.{ 0, n_expert * 4, 0, 0 },
+        std.mem.asBytes(&d),
+        32,
+        32,
+    );
+    cb.commitAndWait();
+    @memcpy(ids_out, idb.slice(u32)[0..n_used]);
+    @memcpy(gates_out, gb.slice(f32)[0..n_used]);
+    return true;
+}
+
 /// One selected expert: its three weight tensors and its routing gate.
 pub const ExpertRef = struct {
     gate: WeightRef,
@@ -1345,6 +1423,17 @@ const MAX_MOE_EXPERTS = 16;
 const AccDims = extern struct { n: u32, alpha: f32 };
 /// The MLA cache shape asked for at model load, before there is a device.
 var mla_want: ?struct { layers: usize, ctx_len: usize, kvr: usize, rope: usize } = null;
+
+const RouteDims = extern struct {
+    n_expert: u32,
+    n_used: u32,
+    gating: u32,
+    weights_norm: u32,
+    has_bias: u32,
+    weights_scale: f32,
+};
+
+const IdDims = extern struct { rows: u32, cols: u32, n_used: u32, plane_stride: u32 };
 
 const AbsorbDims = extern struct { n_heads: u32, nope: u32, kvr: u32, stride: u32 };
 
@@ -3732,5 +3821,164 @@ test "mla attention matches an exact cpu reference" {
             std.debug.print("mla head {d} dim {d}: cpu {d} vs gpu {d}\n", .{ k / kvr, k % kvr, a, b });
             return e;
         };
+    }
+}
+
+test "q4_k id-indexed matvec equals the plain kernel, plane for plane" {
+    // The `ggml_mul_mat_id` shape: one dispatch over several selected experts,
+    // each picking its plane from a device-side id buffer. The thing to get
+    // wrong is the plane stride, and a wrong one produces a correct first
+    // expert and garbage for the rest -- which in a MoE layer is a plausible
+    // output vector, since the first expert usually carries the largest gate.
+    //
+    // So the ids are deliberately not 0,1,2: they are out of order and skip
+    // planes, which a stride bug cannot survive and an off-by-one in the slot
+    // arithmetic cannot either.
+    const gpa = std.testing.allocator;
+    const cols = 2048;
+    const rows = 1408; // DeepSeek's expert width; a multiple of NR0
+    const n_exp = 6;
+    const ids = [_]u32{ 3, 0, 5, 1, 4, 2 };
+
+    parallelBegin(1);
+    defer parallelEnd();
+    const cx = &(ctx orelse return error.SkipZigTest);
+    const saved_min = min_rows;
+    const saved_ok = gpu_worthwhile;
+    const saved_use = use_gpu_ops;
+    min_rows = 0;
+    gpu_worthwhile = true;
+    use_gpu_ops = true;
+    defer {
+        min_rows = saved_min;
+        gpu_worthwhile = saved_ok;
+        use_gpu_ops = saved_use;
+    }
+
+    var prng = std.Random.DefaultPrng.init(0x1D5);
+    const rnd = prng.random();
+    const plane_bytes = ggml.tensorBytes(.q4_k, cols, rows);
+    const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), plane_bytes * n_exp);
+    defer gpa.free(data);
+    rnd.bytes(data);
+    var b: usize = 0;
+    while (b + 144 <= data.len) : (b += 144) {
+        std.mem.writeInt(u16, data[b..][0..2], 0x2C00, .little);
+        std.mem.writeInt(u16, data[b + 2 ..][0..2], 0x2800, .little);
+    }
+
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    // Reference: the plain kernel, once per plane. Same kernel arithmetic, so
+    // this must agree bit for bit -- a tolerance would hide a stride bug that
+    // lands on a neighbouring plane.
+    const want = try gpa.alloc(f32, ids.len * rows);
+    defer gpa.free(want);
+    for (ids, 0..) |id, slot| {
+        matvec(.q4_k, want[slot * rows ..][0..rows], data[id * plane_bytes ..][0..plane_bytes], x, rows, cols);
+    }
+
+    const idbuf = cx.dev.alloc(ids.len * @sizeOf(u32)) catch return error.SkipZigTest;
+    @memcpy(idbuf.slice(u32)[0..ids.len], &ids);
+    const outbuf = cx.dev.alloc(ids.len * rows * @sizeOf(f32)) catch return error.SkipZigTest;
+    const w = wrapFor(cx, data) orelse return error.SkipZigTest;
+    @memcpy(cx.scratch_x.slice(f32)[0..cols], x);
+
+    const dims = IdDims{
+        .rows = @intCast(rows),
+        .cols = @intCast(cols),
+        .n_used = @intCast(ids.len),
+        .plane_stride = @intCast(plane_bytes),
+    };
+    const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+    const threads = ((ids.len * rows + 3) / 4) * SIMD_W;
+    const grid = ((threads + group - 1) / group) * group;
+    const cb = cx.dev.commandBuffer();
+    cb.dispatch(
+        cx.q4k_id,
+        &.{ w.buf, cx.scratch_x, outbuf, idbuf },
+        &.{ w.off, 0, 0, 0 },
+        std.mem.asBytes(&dims),
+        grid,
+        group,
+    );
+    cb.commitAndWait();
+
+    const got = outbuf.slice(f32)[0 .. ids.len * rows];
+    for (want, got, 0..) |a, c, k| {
+        std.testing.expectEqual(a, c) catch |e| {
+            std.debug.print("id matvec slot {d} (expert {d}) row {d}: plain {d} vs id {d}\n", .{ k / rows, ids[k / rows], k % rows, a, c });
+            return e;
+        };
+    }
+}
+
+test "device routing agrees with moe.route, bias and all" {
+    // Must match the host router exactly, because the two coexist: the
+    // distributed path stays host-routed for now, so a divergence would make
+    // the same model route differently depending on how its weights arrived.
+    //
+    // Bias is the case worth the test. It shifts the *selection* scores only,
+    // and the emitted gate comes from the unbiased probability -- reverse that
+    // and the model still produces text, just worse. So the bias here is large
+    // enough to change which experts win.
+    const gpa = std.testing.allocator;
+    const moe = @import("../gguf/moe.zig");
+    const n_expert = 64;
+    const n_used = 6;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+    const saved_use = use_gpu_ops;
+    use_gpu_ops = true;
+    defer use_gpu_ops = saved_use;
+
+    var prng = std.Random.DefaultPrng.init(0x120117);
+    const rnd = prng.random();
+    const logits = try gpa.alloc(f32, n_expert);
+    defer gpa.free(logits);
+    const bias = try gpa.alloc(f32, n_expert);
+    defer gpa.free(bias);
+    for (logits) |*v| v.* = (rnd.float(f32) - 0.5) * 6.0;
+    for (bias) |*v| v.* = (rnd.float(f32) - 0.5) * 4.0;
+
+    inline for (.{ true, false }) |sig| {
+        inline for (.{ true, false }) |with_bias| {
+            inline for (.{ true, false }) |norm| {
+                const cfg = moe.RouteCfg{
+                    .n_expert = n_expert,
+                    .n_used = n_used,
+                    .gating = if (sig) .sigmoid else .softmax,
+                    .weights_norm = norm,
+                    .weights_scale = 2.5,
+                };
+                var want: [n_used]moe.Selected = undefined;
+                moe.route(cfg, logits, if (with_bias) bias else null, &want);
+
+                var ids: [n_used]u32 = undefined;
+                var gates: [n_used]f32 = undefined;
+                if (!moeRoute(logits, if (with_bias) bias else null, &ids, &gates, sig, norm, 2.5)) return error.SkipZigTest;
+
+                for (want, 0..) |w, k| {
+                    std.testing.expectEqual(@as(u32, @intCast(w.expert)), ids[k]) catch |e| {
+                        std.debug.print("route sigmoid={} bias={} norm={}: slot {d} host expert {d} vs device {d}\n", .{ sig, with_bias, norm, k, w.expert, ids[k] });
+                        return e;
+                    };
+                    // exp() differs in the last bits between the two, so the
+                    // gates are compared against the mass they carry rather
+                    // than exactly; the *choice* above is exact.
+                    //
+                    // Not covered: the renormalization divisor's clamp to the
+                    // smallest normal f16. Random logits never drive the gate
+                    // sum near zero, so removing the clamp still passes this.
+                    // Covering it needs logits contrived to make every
+                    // selected gate underflow.
+                    try std.testing.expectApproxEqAbs(w.gate, gates[k], @abs(w.gate) * 1e-5 + 1e-7);
+                }
+            }
+        }
     }
 }
