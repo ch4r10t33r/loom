@@ -75,8 +75,8 @@ pub fn mlaSetWk(li: usize, wk_f32: []const f32) bool {
     return false;
 }
 
-pub fn mlaAttnHeads(li: usize, pos: usize, q_nope: []const f32, q_rope: []const f32, out: []f32, n_heads: usize, nope: usize, v_head_dim: usize, scale: f32) bool {
-    _ = .{ li, pos, q_nope, q_rope, out, n_heads, nope, v_head_dim, scale };
+pub fn mlaAttnHeads(li: usize, pos: usize, q_nope: []const f32, q_rope: []const f32, kv_b: WeightRef, out: []f32, n_heads: usize, nope: usize, v_head_dim: usize, scale: f32) bool {
+    _ = .{ li, pos, q_nope, q_rope, kv_b, out, n_heads, nope, v_head_dim, scale };
     return false;
 }
 
