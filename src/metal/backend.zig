@@ -1449,6 +1449,94 @@ pub fn moeFfnBlockRouted(
         }
     }.f;
 
+    // LOOM_FUSED_DEBUG splits the one buffer into per-phase submissions and
+    // prints each phase's wall time -- the only way to see inside a command
+    // buffer without a Metal capture. Diagnostic only: the whole point of the
+    // fused path is that these are one submission.
+    const debug_split = std.c.getenv("LOOM_FUSED_DEBUG") != null;
+    if (debug_split) {
+        var t = [_]i128{0} ** 6;
+        const now = struct {
+            fn f() i128 {
+                var ts: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.MONOTONIC, &ts);
+                return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+            }
+        }.f;
+        const phase = struct {
+            fn go(cx2: *Ctx, comptime f: anytype, args: anytype) void {
+                const cb2 = cx2.dev.commandBuffer();
+                const e2 = cb2.encoder();
+                @call(.auto, f, .{e2} ++ args);
+                e2.end();
+                cb2.commitAndWait();
+            }
+        };
+        _ = phase;
+        var t0 = now();
+        {
+            const cb2 = cx.dev.commandBuffer();
+            const e2 = cb2.encoder();
+            e2.dispatch(cx.route_p, &.{ cx.scratch_x, cx.scratch_x, cx.route_ids.?, cx.route_gates.? }, &.{ dim * 4, (dim + cfg.n_expert) * 4, 0, 0 }, std.mem.asBytes(&rd), 32, 32);
+            e2.end();
+            cb2.commitAndWait();
+        }
+        t[0] = now() - t0;
+        t0 = now();
+        {
+            const cb2 = cx.dev.commandBuffer();
+            const e2 = cb2.encoder();
+            e2.dispatch(gsel.pipe, &.{ gw.buf, cx.scratch_x, cx.act[1], cx.route_ids.? }, &.{ gw.off, 0, 0, 0 }, std.mem.asBytes(&d_gate), grid(ffn, gsel.per, cfg.n_used), group);
+            e2.end();
+            cb2.commitAndWait();
+        }
+        t[1] = now() - t0;
+        t0 = now();
+        {
+            const cb2 = cx.dev.commandBuffer();
+            const e2 = cb2.encoder();
+            e2.dispatch(usel.pipe, &.{ uw.buf, cx.scratch_x, cx.act[2], cx.route_ids.? }, &.{ uw.off, 0, 0, 0 }, std.mem.asBytes(&d_up), grid(ffn, usel.per, cfg.n_used), group);
+            e2.end();
+            cb2.commitAndWait();
+        }
+        t[2] = now() - t0;
+        t0 = now();
+        {
+            const cb2 = cx.dev.commandBuffer();
+            const e2 = cb2.encoder();
+            for (0..cfg.n_used) |k| {
+                e2.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ k * ffn * 4, k * ffn * 4, k * ffn * 4 }, std.mem.asBytes(&len_ffn), ffn, 64);
+            }
+            e2.end();
+            cb2.commitAndWait();
+        }
+        t[3] = now() - t0;
+        t0 = now();
+        {
+            const cb2 = cx.dev.commandBuffer();
+            const e2 = cb2.encoder();
+            e2.dispatch(dsel.pipe, &.{ dw.buf, cx.act[1], cx.act[3], cx.route_ids.? }, &.{ dw.off, 0, 0, 0 }, std.mem.asBytes(&d_down), grid(dim, dsel.per, cfg.n_used), group);
+            e2.end();
+            cb2.commitAndWait();
+        }
+        t[4] = now() - t0;
+        t0 = now();
+        {
+            const cb2 = cx.dev.commandBuffer();
+            const e2 = cb2.encoder();
+            e2.dispatch(cx.reduce_dev_p, &.{ cx.act[0], cx.act[3], cx.route_gates.? }, &.{ 0, 0, 0 }, std.mem.asBytes(&rdim), dim, 64);
+            e2.end();
+            cb2.commitAndWait();
+        }
+        t[5] = now() - t0;
+        std.debug.print("fused phases us: route {d} gate {d} up {d} swiglu {d} down {d} reduce {d}\n", .{
+            @divTrunc(t[0], 1000), @divTrunc(t[1], 1000), @divTrunc(t[2], 1000),
+            @divTrunc(t[3], 1000), @divTrunc(t[4], 1000), @divTrunc(t[5], 1000),
+        });
+        @memcpy(out, cx.act[0].slice(f32)[0..dim]);
+        return true;
+    }
+
     const cb = cx.dev.commandBuffer();
     const e = cb.encoder();
     e.dispatch(cx.route_p, &.{ cx.scratch_x, cx.scratch_x, cx.route_ids.?, cx.route_gates.? }, &.{ dim * 4, (dim + cfg.n_expert) * 4, 0, 0 }, std.mem.asBytes(&rd), 32, 32);

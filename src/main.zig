@@ -780,6 +780,12 @@ fn runStoreWith(
     try out.flush();
 
     backend.parallelBegin(generator.threads());
+    // The device exists now; make any weight mappings registered at load
+    // device-resident. Without this the GPU paths read the mmap through bare
+    // per-tensor wrappings and fault file-backed pages per access -- measured
+    // at ~285 MB/s inside the fused MoE block, 30-100 ms per matvec dispatch
+    // that costs under a millisecond resident.
+    _ = backend.materializeArenas();
     defer backend.parallelEnd();
 
     var st = try E.State.init(gpa, c);
@@ -872,6 +878,12 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
     try out.flush();
 
     backend.parallelBegin(generator.threads());
+    // The device exists now; make any weight mappings registered at load
+    // device-resident. Without this the GPU paths read the mmap through bare
+    // per-tensor wrappings and fault file-backed pages per access -- measured
+    // at ~285 MB/s inside the fused MoE block, 30-100 ms per matvec dispatch
+    // that costs under a millisecond resident.
+    _ = backend.materializeArenas();
     defer backend.parallelEnd();
 
     var st = try eng.State.init(gpa, c);
