@@ -1253,3 +1253,187 @@ test "route: sigmoid gating with selection bias picks by biased score, gates fro
     moe.route(cfg.routeCfg(), &logits, null, &sel2);
     for (sel2) |s| try std.testing.expect(s.expert == 0 or s.expert == 1);
 }
+
+/// A small MLA model with f32 weights, built in memory.
+///
+/// `parsed`, `file` and `mm` are left undefined: nothing in the forward path
+/// reads them, and the caller must not call `deinit`. That is the price of
+/// testing the engine without a checkpoint on disk, and it is worth paying --
+/// the alternative is that the batched decode path has no test at all, which
+/// is how three of this session's bugs survived long enough to matter.
+const Fixture = struct {
+    m: Model,
+    bufs: std.ArrayListUnmanaged([]f32),
+    gpa: std.mem.Allocator,
+
+    fn t2(self: *Fixture, rnd: std.Random, ne0: usize, ne1: usize) !Tensor {
+        const b = try self.gpa.alloc(f32, ne0 * ne1);
+        for (b) |*v| v.* = (rnd.float(f32) - 0.5) * 0.2;
+        try self.bufs.append(self.gpa, b);
+        return .{ .ty = .f32, .data = std.mem.sliceAsBytes(b), .ne0 = ne0, .ne1 = ne1, .ne2 = 1 };
+    }
+
+    fn t3(self: *Fixture, rnd: std.Random, ne0: usize, ne1: usize, ne2: usize) !Tensor {
+        const b = try self.gpa.alloc(f32, ne0 * ne1 * ne2);
+        for (b) |*v| v.* = (rnd.float(f32) - 0.5) * 0.2;
+        try self.bufs.append(self.gpa, b);
+        return .{ .ty = .f32, .data = std.mem.sliceAsBytes(b), .ne0 = ne0, .ne1 = ne1, .ne2 = ne2 };
+    }
+
+    fn norm(self: *Fixture, n: usize) !Tensor {
+        const b = try self.gpa.alloc(f32, n);
+        for (b) |*v| v.* = 1.0;
+        try self.bufs.append(self.gpa, b);
+        return .{ .ty = .f32, .data = std.mem.sliceAsBytes(b), .ne0 = n, .ne1 = 1, .ne2 = 1 };
+    }
+
+    fn deinit(self: *Fixture) void {
+        for (self.bufs.items) |b| self.gpa.free(b);
+        self.bufs.deinit(self.gpa);
+        self.gpa.free(self.m.layers);
+    }
+};
+
+fn buildFixture(gpa: std.mem.Allocator, seed: u64) !Fixture {
+    var prng = std.Random.DefaultPrng.init(seed);
+    const rnd = prng.random();
+    const cfg = Config{
+        .dim = 64,
+        .n_layers = 3,
+        .n_dense_layers = 1, // exercises both the dense prefix and MoE layers
+        .n_heads = 2,
+        .q_lora_rank = 0, // V2-Lite's direct q projection
+        .kv_lora_rank = 16,
+        .rope_dim = 8,
+        .nope_dim = 8,
+        .v_head_dim = 16,
+        .ffn = 128,
+        .moe_ffn = 32,
+        .n_expert = 8,
+        .n_used = 3,
+        .n_shared = 1,
+        .gating = .sigmoid,
+        .weights_norm = true,
+        .weights_scale = 1.0,
+        .vocab = 32,
+        .ctx_len = 16,
+        .rope_base = 10000.0,
+        .eps = 1e-6,
+        .yarn_factor = 0,
+        .yarn_orig_ctx = 0,
+        .yarn_log_mul = 0,
+        .attn_scale = 0.25,
+    };
+    var f = Fixture{ .m = undefined, .bufs = .empty, .gpa = gpa };
+    errdefer f.deinit();
+
+    const kd = cfg.keyDim();
+    const layers = try gpa.alloc(LayerT, cfg.n_layers);
+    for (layers, 0..) |*l, i| {
+        const moe_layer = i >= cfg.n_dense_layers;
+        l.* = .{
+            .attn_norm = try f.norm(cfg.dim),
+            .attn_q = try f.t2(rnd, cfg.dim, cfg.n_heads * kd),
+            .attn_q_a = null,
+            .attn_q_a_norm = null,
+            .attn_q_b = null,
+            .attn_kv_a_mqa = try f.t2(rnd, cfg.dim, cfg.kv_lora_rank + cfg.rope_dim),
+            .attn_kv_a_norm = try f.norm(cfg.kv_lora_rank),
+            .attn_kv_b = try f.t2(rnd, cfg.kv_lora_rank, cfg.n_heads * (cfg.nope_dim + cfg.v_head_dim)),
+            .attn_output = try f.t2(rnd, cfg.n_heads * cfg.v_head_dim, cfg.dim),
+            .ffn_norm = try f.norm(cfg.dim),
+            .ffn_gate = if (moe_layer) null else try f.t2(rnd, cfg.dim, cfg.ffn),
+            .ffn_up = if (moe_layer) null else try f.t2(rnd, cfg.dim, cfg.ffn),
+            .ffn_down = if (moe_layer) null else try f.t2(rnd, cfg.ffn, cfg.dim),
+            .ffn_gate_inp = if (moe_layer) try f.t2(rnd, cfg.dim, cfg.n_expert) else null,
+            .exp_probs_b = null,
+            .ffn_gate_exps = if (moe_layer) try f.t3(rnd, cfg.dim, cfg.moe_ffn, cfg.n_expert) else null,
+            .ffn_up_exps = if (moe_layer) try f.t3(rnd, cfg.dim, cfg.moe_ffn, cfg.n_expert) else null,
+            .ffn_down_exps = if (moe_layer) try f.t3(rnd, cfg.moe_ffn, cfg.dim, cfg.n_expert) else null,
+            .ffn_gate_shexp = if (moe_layer) try f.t2(rnd, cfg.dim, cfg.moe_ffn * cfg.n_shared) else null,
+            .ffn_up_shexp = if (moe_layer) try f.t2(rnd, cfg.dim, cfg.moe_ffn * cfg.n_shared) else null,
+            .ffn_down_shexp = if (moe_layer) try f.t2(rnd, cfg.moe_ffn * cfg.n_shared, cfg.dim) else null,
+            .is_moe = moe_layer,
+        };
+    }
+    f.m = .{
+        .gpa = gpa,
+        .io = undefined,
+        .parsed = undefined,
+        .file = undefined,
+        .mm = undefined,
+        .cfg = cfg,
+        .token_embd = try f.t2(rnd, cfg.dim, cfg.vocab),
+        .output_norm = try f.norm(cfg.dim),
+        .output = try f.t2(rnd, cfg.dim, cfg.vocab),
+        .layers = layers,
+        .tok = undefined,
+    };
+    return f;
+}
+
+test "decodeBatch agrees with sequential step, token for token" {
+    // The property continuous batching rests on: batching changes only which
+    // weight reads are shared, never the arithmetic a sequence sees. Two
+    // sequences fed different tokens must land on exactly the logits they
+    // would have had alone.
+    //
+    // Different tokens on purpose. Identical ones would pass even if the
+    // routing inversion collapsed the batch to one sequence, which is the
+    // mistake this is here to catch.
+    const gpa = std.testing.allocator;
+    var f = try buildFixture(gpa, 0xBA7C4);
+    defer f.deinit();
+    const cfg = f.m.cfg;
+
+    const seqs = [_][4]u32{ .{ 1, 5, 9, 3 }, .{ 7, 2, 4, 8 } };
+
+    // Sequential: each sequence alone, through `step`.
+    var want: [seqs.len][]f32 = undefined;
+    for (seqs, 0..) |toks, s| {
+        var st = try State.init(gpa, cfg);
+        defer st.deinit(gpa);
+        for (toks, 0..) |tk, pos| try step(&f.m, &st, tk, pos);
+        want[s] = try gpa.dupe(f32, st.logits[0..cfg.vocab]);
+    }
+    defer for (want) |w| gpa.free(w);
+
+    // Batched: both together, one position at a time.
+    var sts: [seqs.len]State = undefined;
+    for (&sts) |*st| st.* = try State.init(gpa, cfg);
+    defer for (&sts) |*st| st.deinit(gpa);
+    var ptrs: [seqs.len]*State = undefined;
+    for (&sts, 0..) |*st, i| ptrs[i] = st;
+
+    for (0..seqs[0].len) |pos| {
+        var toks: [seqs.len]u32 = undefined;
+        var poss: [seqs.len]usize = undefined;
+        for (seqs, 0..) |sq, i| {
+            toks[i] = sq[pos];
+            poss[i] = pos;
+        }
+        try decodeBatch(&f.m, &ptrs, &toks, &poss);
+    }
+
+    for (0..seqs.len) |s| {
+        var mass: f32 = 0;
+        for (want[s]) |v| mass += @abs(v);
+        const tol = (mass / @as(f32, @floatFromInt(cfg.vocab))) * 1e-4;
+        for (want[s], sts[s].logits[0..cfg.vocab], 0..) |a, b, k| {
+            std.testing.expectApproxEqAbs(a, b, tol) catch |e| {
+                std.debug.print("seq {d} logit {d}: sequential {d} vs batched {d}\n", .{ s, k, a, b });
+                return e;
+            };
+        }
+        // argmax is what actually decides the token
+        var ia: usize = 0;
+        var ib: usize = 0;
+        for (want[s], 0..) |v, k| if (v > want[s][ia]) {
+            ia = k;
+        };
+        for (sts[s].logits[0..cfg.vocab], 0..) |v, k| if (v > sts[s].logits[ib]) {
+            ib = k;
+        };
+        try std.testing.expectEqual(ia, ib);
+    }
+}
