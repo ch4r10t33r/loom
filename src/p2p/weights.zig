@@ -466,6 +466,29 @@ pub fn buildExpertManifest(gpa: std.mem.Allocator, io: Io, path: []const u8) !Ma
 
 // ---- holdings bitmap ---------------------------------------------------------
 
+/// Blocks actually allocated to `fd`, in bytes, or null where the platform is
+/// not covered. Distinct from the file's length: a hole-punched file keeps its
+/// length and gives up its blocks, and that difference is the only way to see
+/// whether eviction reached the disk.
+fn allocatedBytes(fd: std.posix.fd_t) ?u64 {
+    switch (builtin.os.tag) {
+        .macos, .ios, .tvos, .watchos => {
+            var st: std.c.Stat = undefined;
+            if (std.c.fstat(fd, &st) != 0) return null;
+            return @as(u64, @intCast(st.blocks)) * 512;
+        },
+        .linux => {
+            // `std.c.Stat` is libc's layout and this binary may be musl or
+            // glibc; statx is the kernel interface and is stable across both.
+            var stx: std.os.linux.Statx = undefined;
+            const rc = std.os.linux.statx(fd, "", std.os.linux.AT.EMPTY_PATH, .{ .BLOCKS = true }, &stx);
+            if (std.os.linux.errno(rc) != .SUCCESS) return null;
+            return @as(u64, stx.blocks) * 512;
+        },
+        else => return null,
+    }
+}
+
 /// Release a byte range's blocks back to the filesystem, leaving a hole that
 /// reads back as zeros without changing the file's length.
 ///
@@ -1422,9 +1445,7 @@ test "hold cap: holdings never exceed it, resident chunks survive, coldest goes 
     // is held rather than near what has ever passed through. The first version
     // punched unaligned ranges, which APFS rejects outright: holdings stayed
     // flat at 28.2% on a real node while the store grew 1.8 -> 7.6 GB.
-    var st: std.c.Stat = undefined;
-    if (std.c.fstat(store.file.handle, &st) == 0) {
-        const allocated: u64 = @as(u64, @intCast(st.blocks)) * 512;
+    if (allocatedBytes(store.file.handle)) |allocated| {
         const held_bytes = each * (n_resident + cap);
         // The whole corpus is 42 ranges and the cap is 3, so an unpunched file
         // is ~8x this bound while a punched one is the held bytes plus a
