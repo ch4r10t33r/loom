@@ -34,3 +34,29 @@ kernel void zero_fill(
     if (gid >= d.n) return;
     acc[gid] = 0.0f;
 }
+
+// acc = sum_e weight[e] * out[e*dim + i], for every expert at once.
+//
+// Replaces one `scaled_add` per expert. Those all write the same accumulator,
+// so they need a barrier between each -- and a barrier is a pipeline drain, not
+// a fence on a buffer. A MoE layer ran ~30 of them; this makes the whole
+// accumulation one dispatch and no barriers.
+#define MAX_E 16
+
+struct ReduceDims {
+    uint n;      // experts
+    uint dim;
+    float w[MAX_E];
+};
+
+kernel void moe_reduce(
+    device float       *acc  [[buffer(0)]],
+    device const float *outs [[buffer(1)]],
+    constant ReduceDims &d   [[buffer(2)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= d.dim) return;
+    float a = 0.0f;
+    for (uint e = 0; e < d.n; e++) a += d.w[e] * outs[e * d.dim + gid];
+    acc[gid] = a;
+}

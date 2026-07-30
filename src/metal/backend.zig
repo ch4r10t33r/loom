@@ -428,6 +428,7 @@ const Ctx = struct {
     rope_p: mtl.Pipeline,
     kvw_p: mtl.Pipeline,
     sadd_p: mtl.Pipeline,
+    reduce_p: mtl.Pipeline,
     zero_p: mtl.Pipeline,
     /// Device-resident KV cache, [layers][ctx][kvd]. Allocated by `attnInit`.
     /// It lives here rather than in the engine's State because the whole point
@@ -532,6 +533,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const pred = dev.pipeline(moe_acc_src, "moe_reduce") catch {
+        dev.deinit();
+        return;
+    };
     const pzero = dev.pipeline(moe_acc_src, "zero_fill") catch {
         dev.deinit();
         return;
@@ -567,7 +572,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -1098,25 +1103,45 @@ pub fn moeFfnBlock(
     const dims_ffn = Dims{ .rows = @intCast(ffn), .cols = @intCast(dim) };
     const dims_down = Dims{ .rows = @intCast(dim), .cols = @intCast(ffn) };
     const len_ffn = extern struct { n: u32 }{ .n = @intCast(ffn) };
-    const zero_d = AccDims{ .n = @intCast(dim), .alpha = 0 };
 
-    // Slots: 0 = accumulator, 1 = gate, 2 = up, 3 = this expert's output.
+    // Phase-parallel across experts, not expert-by-expert.
+    //
+    // The per-expert form ran gate, up, swiglu, down and accumulate as a chain
+    // with a barrier at every step -- about thirty barriers for a layer, each a
+    // full pipeline drain, and never more than two dispatches able to run at
+    // once. Experts are independent until the final sum, so the whole layer is
+    // four phases instead: every gate and up together (twelve-way parallel for
+    // six experts), every swiglu, every down, then one fused reduce.
+    //
+    // Slot 0 is the accumulator; 1 and 2 hold every expert's gate and up,
+    // 3 every expert's output, each strided by expert. `ffn * 4` and `dim * 4`
+    // are multiples of 256 for every real width, so the offsets are aligned.
+    const gate_stride = ffn * 4;
+    const out_stride = dim * 4;
+    if (experts.len * gate_stride > cx.act[1].len) return false;
+    if (experts.len * gate_stride > cx.act[2].len) return false;
+    if (experts.len * out_stride > cx.act[3].len) return false;
+
     const cb = cx.dev.commandBuffer();
     const e = cb.encoder();
-    e.dispatch(cx.zero_p, &.{cx.act[0]}, &.{0}, std.mem.asBytes(&zero_d), dim, 64);
-    e.barrier();
-    for (experts, 0..) |ex, i| {
-        e.dispatch(pipes[i][0].pipe, &.{ wraps[i][0].buf, cx.scratch_x, cx.act[1] }, &.{ wraps[i][0].off, 0, 0 }, std.mem.asBytes(&dims_ffn), pipes[i][0].groups, group);
-        e.dispatch(pipes[i][1].pipe, &.{ wraps[i][1].buf, cx.scratch_x, cx.act[2] }, &.{ wraps[i][1].off, 0, 0 }, std.mem.asBytes(&dims_ffn), pipes[i][1].groups, group);
-        e.barrier();
-        e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_ffn), ffn, 64);
-        e.barrier();
-        e.dispatch(pipes[i][2].pipe, &.{ wraps[i][2].buf, cx.act[1], cx.act[3] }, &.{ wraps[i][2].off, 0, 0 }, std.mem.asBytes(&dims_down), pipes[i][2].groups, group);
-        e.barrier();
-        const acc_d = AccDims{ .n = @intCast(dim), .alpha = ex.weight };
-        e.dispatch(cx.sadd_p, &.{ cx.act[0], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&acc_d), dim, 64);
-        e.barrier();
+    for (experts, 0..) |_, i| {
+        e.dispatch(pipes[i][0].pipe, &.{ wraps[i][0].buf, cx.scratch_x, cx.act[1] }, &.{ wraps[i][0].off, 0, i * gate_stride }, std.mem.asBytes(&dims_ffn), pipes[i][0].groups, group);
+        e.dispatch(pipes[i][1].pipe, &.{ wraps[i][1].buf, cx.scratch_x, cx.act[2] }, &.{ wraps[i][1].off, 0, i * gate_stride }, std.mem.asBytes(&dims_ffn), pipes[i][1].groups, group);
     }
+    e.barrier();
+    for (experts, 0..) |_, i| {
+        e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ i * gate_stride, i * gate_stride, i * gate_stride }, std.mem.asBytes(&len_ffn), ffn, 64);
+    }
+    e.barrier();
+    for (experts, 0..) |_, i| {
+        e.dispatch(pipes[i][2].pipe, &.{ wraps[i][2].buf, cx.act[1], cx.act[3] }, &.{ wraps[i][2].off, i * gate_stride, i * out_stride }, std.mem.asBytes(&dims_down), pipes[i][2].groups, group);
+    }
+    e.barrier();
+    // One dispatch for the weighted sum: a `scaled_add` per expert all write
+    // the same accumulator and so needed a barrier between each.
+    var rd = ReduceDims{ .n = @intCast(experts.len), .dim = @intCast(dim), .w = @splat(0) };
+    for (experts, 0..) |ex, i| rd.w[i] = ex.weight;
+    e.dispatch(cx.reduce_p, &.{ cx.act[0], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&rd), dim, 64);
     e.end();
     cb.commitAndWait();
     @memcpy(out, cx.act[0].slice(f32)[0..dim]);
@@ -1127,6 +1152,8 @@ pub fn moeFfnBlock(
 const MAX_MOE_EXPERTS = 16;
 
 const AccDims = extern struct { n: u32, alpha: f32 };
+const MAX_MOE_REDUCE = 16;
+const ReduceDims = extern struct { n: u32, dim: u32, w: [MAX_MOE_REDUCE]f32 };
 
 /// Everything one GQA layer needs, so the whole layer is one call.
 pub const LayerSpec = struct {
