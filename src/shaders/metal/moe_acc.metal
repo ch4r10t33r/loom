@@ -60,3 +60,22 @@ kernel void moe_reduce(
     for (uint e = 0; e < d.n; e++) a += d.w[e] * outs[e * d.dim + gid];
     acc[gid] = a;
 }
+
+// acc = sum_e gates[e] * outs[e*dim + i], gates read from a device buffer.
+//
+// The constant-memory variant above takes its weights from the CPU, which is
+// fine when the host routed. Once `moe_route` picks the experts on the device,
+// the gates live in a device buffer and reading them back to pass as constants
+// would reintroduce the exact synchronization device routing removes.
+kernel void moe_reduce_dev(
+    device float       *acc   [[buffer(0)]],
+    device const float *outs  [[buffer(1)]],
+    device const float *gates [[buffer(2)]],
+    constant ReduceDims &d    [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (gid >= d.dim) return;
+    float a = 0.0f;
+    for (uint e = 0; e < d.n; e++) a += gates[e] * outs[e * d.dim + gid];
+    acc[gid] = a;
+}

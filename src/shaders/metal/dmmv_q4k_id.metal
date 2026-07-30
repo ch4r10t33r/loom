@@ -35,6 +35,12 @@ struct IdDims {
     uint cols;
     uint n_used;       // selected experts in this dispatch
     uint plane_stride; // bytes between expert planes
+    // Floats between consecutive slots' activation vectors. Zero means one
+    // vector shared by every slot -- the gate/up case, where all experts read
+    // the same normed input. The down projection cannot share: each slot's
+    // input is its own expert's SwiGLU output, so it passes the ffn width and
+    // slot s reads x + s*x_stride.
+    uint x_stride;
 };
 
 // 6-bit scale/min unpack. Branchless because `j` varies with the lane and a
@@ -75,6 +81,7 @@ kernel void dmmv_q4k_id(
     const uint blocks = dims.cols / QK_K;
     const uint row_bytes = blocks * Q4_K_BLOCK;
     device const uchar *plane = weights + (ulong)ids[slot] * dims.plane_stride;
+    device const float *xs = x + (ulong)slot * dims.x_stride;
 
     const uint h = lane >> 3;
     const uint o = (lane & 7) * 4;
@@ -86,7 +93,7 @@ kernel void dmmv_q4k_id(
     device const uchar *w3 = w2 + row_bytes;
 
     for (uint b = 0; b < blocks; b++) {
-        device const float *xb = x + b * QK_K;
+        device const float *xb = xs + b * QK_K;
         const float4 xlo = (float4)(*(device const packed_float4 *)(xb + (2 * h + 0) * 32 + o));
         const float4 xhi = (float4)(*(device const packed_float4 *)(xb + (2 * h + 1) * 32 + o));
         const float sy_lo = xlo.x + xlo.y + xlo.z + xlo.w;

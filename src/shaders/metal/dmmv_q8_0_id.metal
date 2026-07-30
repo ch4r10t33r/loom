@@ -21,6 +21,12 @@ struct IdDims {
     uint cols;
     uint n_used;
     uint plane_stride;
+    // Floats between consecutive slots' activation vectors. Zero means one
+    // vector shared by every slot, which is the gate/up case -- all experts
+    // read the same normed input. The down projection cannot share: each
+    // slot's input is its own expert's SwiGLU output, so it passes the ffn
+    // width here and slot s reads x + s*x_stride.
+    uint x_stride;
 };
 
 kernel void dmmv_q8_0_id(
@@ -41,12 +47,13 @@ kernel void dmmv_q8_0_id(
 
     const uint blocks = dims.cols / QK;
     device const uchar *plane = weights + (ulong)ids[slot] * dims.plane_stride;
+    device const float *xs = x + (ulong)slot * dims.x_stride;
     device const uchar *w = plane + (ulong)row * blocks * BLOCK;
 
     float acc = 0.0f;
     for (uint b = lane; b < blocks; b += QK) {
         device const uchar *blk = w + b * BLOCK;
-        device const float *xb = x + b * QK;
+        device const float *xb = xs + b * QK;
         const float d = (float)((device const half *)blk)[0];
         device const char *qs = (device const char *)(blk + 2);
         float sum = 0.0f;
