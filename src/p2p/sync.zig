@@ -106,6 +106,24 @@ pub const FetchStats = struct { fetched: usize = 0, bytes: u64 = 0 };
 /// against its digest before it touches disk. Used by both bootstrap and the
 /// eager repair loop.
 pub fn fetchFromPeer(gpa: std.mem.Allocator, io: Io, store: *weights.Store, addr: PeerAddr) !FetchStats {
+    var got = FetchStats{};
+    return fetchFromPeerInto(gpa, io, store, addr, &got) catch |e| {
+        // Shards already written stay written -- `writeRange` persists each one
+        // as it lands -- so losing the count on error made a mostly-successful
+        // sync report "synced 0/905 ranges (0.0 MB)" while the holdings bitmap
+        // plainly disagreed. Hand back what actually arrived.
+        if (got.fetched > 0) return got;
+        return e;
+    };
+}
+
+fn fetchFromPeerInto(
+    gpa: std.mem.Allocator,
+    io: Io,
+    store: *weights.Store,
+    addr: PeerAddr,
+    out: *FetchStats,
+) !FetchStats {
     const m = &store.manifest;
     const n_ranges = m.nRanges();
 
@@ -129,7 +147,7 @@ pub fn fetchFromPeer(gpa: std.mem.Allocator, io: Io, store: *weights.Store, addr
     const buf = try gpa.alloc(u8, @intCast(m.maxShardLen()));
     defer gpa.free(buf);
 
-    var stats = FetchStats{};
+    const stats = out;
     var i: usize = 0;
     while (i < n_ranges) : (i += 1) {
         if (!store.wanted.has(i) or store.holdings.has(i)) continue;
@@ -152,7 +170,7 @@ pub fn fetchFromPeer(gpa: std.mem.Allocator, io: Io, store: *weights.Store, addr
         // gone wrong.
         sockopt.refresh(io, peer.deadline, sockopt.PEER_TIMEOUT_S);
     }
-    return stats;
+    return stats.*;
 }
 
 /// Fetch the serialized manifest (digests + extent lists) from a peer. The

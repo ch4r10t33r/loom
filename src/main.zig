@@ -247,7 +247,7 @@ fn cmdRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, e
 
     const prompt_str = flagStr(args, "--prompt") orelse "Loom";
     const max_tokens = try flagUsize(args, "--max-tokens", try envUsize(env, "MAX_TOKENS", 32));
-    const ram_gb = try flagF64(args, "--ram-gb", try envF64(env, "RAM_BUDGET_GB", 4.0));
+    const ram_gb = try flagF64(args, "--ram-gb", try envF64(env, "RAM_BUDGET_GB", defaultRamGb()));
     const pin_gb = try flagF64(args, "--pin-gb", try envF64(env, "PIN_GB", 0.0));
     const temp = try flagF64(args, "--temp", try envF64(env, "TEMP", 0.0));
     const seed = try flagU64(args, "--seed", try envU64(env, "SEED", 42));
@@ -340,6 +340,21 @@ fn cmdRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, e
 
 // ---- node ------------------------------------------------------------------
 
+/// Default RAM budget for the expert cache: a quarter of the machine's memory,
+/// clamped to [0.5, 8] GB.
+///
+/// The old default was a flat 4 GB regardless of the machine, which OOM-killed
+/// an origin on an 8 GB box -- 7.4 GB of anonymous RSS on a 7.7 GB machine,
+/// dead before it served a request. A cache budget has to be a fraction of what
+/// exists, not a constant: on a 64 GB box 4 GB was needlessly small, and on an
+/// 8 GB box it was fatal. A quarter leaves room for the model's own mappings,
+/// the page cache the store is read through, and the rest of the system.
+fn defaultRamGb() f64 {
+    const total = std.process.totalSystemMemory() catch return 2.0;
+    const gb = @as(f64, @floatFromInt(total)) / (1024.0 * 1024.0 * 1024.0);
+    return std.math.clamp(gb / 4.0, 0.5, 8.0);
+}
+
 fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, env: *std.process.Environ.Map) !void {
     const model_spec = flagStr(args, "--model") orelse env.get("MODEL") orelse "tiny";
     const rpc_addr = flagStr(args, "--rpc-addr") orelse "127.0.0.1";
@@ -348,7 +363,7 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
     const openai_port = try flagU16(args, "--openai-port", 0); // 0 = disabled
     const p2p_addr = flagStr(args, "--p2p-addr") orelse "0.0.0.0";
     const p2p_port = try flagU16(args, "--p2p-port", 8771);
-    const ram_gb = try flagF64(args, "--ram-gb", try envF64(env, "RAM_BUDGET_GB", 4.0));
+    const ram_gb = try flagF64(args, "--ram-gb", try envF64(env, "RAM_BUDGET_GB", defaultRamGb()));
     const pin_gb = try flagF64(args, "--pin-gb", try envF64(env, "PIN_GB", 0.0));
     const seed = try flagU64(args, "--seed", try envU64(env, "SEED", 42));
     const stats_path = flagStr(args, "--stats") orelse env.get("STATS");
@@ -690,7 +705,7 @@ fn runStore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, dir: []const u8, ar
 
     // The RAM tier: without it every routed expert is re-read from disk and
     // re-hashed on every token.
-    const cache_gb = try flagF64(args, "--ram-gb", 4.0);
+    const cache_gb = try flagF64(args, "--ram-gb", defaultRamGb());
     var src = try expert_fetch.Source.initCached(gpa, io, &store, peer_list.items, @intFromFloat(cache_gb * GB));
     src.committee = committee_list.items;
 
@@ -958,4 +973,28 @@ fn envF64(env: *std.process.Environ.Map, name: []const u8, default: f64) !f64 {
 
 test {
     std.testing.refAllDecls(@This());
+}
+
+test "default RAM budget scales with the machine and stays in bounds" {
+    // The failure this replaces: a flat 4 GB default OOM-killed an origin on a
+    // 7.7 GB box (7.4 GB anon RSS, dead before serving a request). A cache
+    // budget has to be a fraction of what exists.
+    const got = defaultRamGb();
+    try std.testing.expect(got >= 0.5);
+    try std.testing.expect(got <= 8.0);
+    if (std.process.totalSystemMemory()) |total| {
+        const gb = @as(f64, @floatFromInt(total)) / (1024.0 * 1024.0 * 1024.0);
+        // A quarter of the machine, except where a clamp binds. Stated as an
+        // implication so the test says what the rule is rather than restating
+        // the arithmetic.
+        if (gb / 4.0 > 0.5 and gb / 4.0 < 8.0) {
+            try std.testing.expectApproxEqAbs(gb / 4.0, got, 1e-9);
+        }
+        // Never more than a quarter: the point is leaving room for the model's
+        // mappings, the page cache and the rest of the system.
+        try std.testing.expect(got <= @max(0.5, gb / 4.0) + 1e-9);
+    } else |_| {
+        // Unknown memory must not produce an aggressive budget.
+        try std.testing.expectEqual(@as(f64, 2.0), got);
+    }
 }
