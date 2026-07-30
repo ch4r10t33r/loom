@@ -153,6 +153,12 @@ thread", "the selected path beats the alternative") rather than on wall-clock,
 because a shared runner's absolute timings are noise while those relationships
 are properties of the code. See [`docs/BENCHMARKING.md`](docs/BENCHMARKING.md).
 
+Continuous batching — where a MoE layer costs the *union* of a batch's experts
+rather than the sum — is partly built: the batched decode step is in and
+verified, the scheduler that would use it is not. Design, remaining work and the
+measurement rules are in
+[`docs/CONTINUOUS-BATCHING.md`](docs/CONTINUOUS-BATCHING.md).
+
 ## Chat UI
 
 `loom node` serves a small chat app at **`http://127.0.0.1:8555`** (change with
