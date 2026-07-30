@@ -300,6 +300,16 @@ fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8, gpu_ops: boo
     if (std.mem.eql(u8, arch, "deepseek2")) {
         var m = try deepseek.load(gpa, io, path);
         calibrateFor(gpa, gpu_ops, m.cfg.dim, m.cfg.ffn, m.cfg.n_layers, m.cfg.ctx_len, 0, 0, 0, 0, &m.layers[0], m.output);
+        // Device-resident compressed cache for MLA attention. Best-effort: it
+        // declines a context past what the kernel's threadgroup memory serves,
+        // and the engine keeps its host cache either way, so a decline costs
+        // nothing but the host path.
+        //
+        // This is the reason a DeepSeek token had to come back to the CPU every
+        // layer -- MLA attention had no kernel, so the residual stream lived on
+        // the host and activations crossed the bus per layer, whatever the FFN
+        // did on the GPU.
+        _ = backend.mlaInit(m.cfg.n_layers, m.cfg.ctx_len, m.cfg.kv_lora_rank, m.cfg.rope_dim);
         return .{ .deepseek = m };
     }
     var m = try llama.load(gpa, io, path);

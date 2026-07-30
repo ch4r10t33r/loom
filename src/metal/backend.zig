@@ -1123,7 +1123,12 @@ pub fn mlaAttnHeads(
     const cx = &(ctx orelse return false);
     const cbuf = cx.mla_c orelse return false;
     const rbuf = cx.mla_krope orelse return false;
-    if (!attn_worthwhile) return false;
+    // `attn_worthwhile` is set by the GQA attention calibration, which never
+    // runs for an MLA model -- deepseek passes zeros for the attention shapes.
+    // Until this path has a calibration of its own it is opt-in via --gpu-ops,
+    // rather than silently off (which is what it was) or silently on (which
+    // would be a speed claim nobody measured).
+    if (!use_gpu_ops and !attn_worthwhile) return false;
     const seq = pos + 1;
     if (seq > cx.mla_ctx) return false;
     const qa_bytes = q_absorbed.len * 4;
