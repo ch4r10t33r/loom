@@ -178,6 +178,11 @@ pub const moeRoute = impl.moeRoute;
 pub const RoutedCfg = impl.RoutedCfg;
 pub const moeFfnBlockRouted = impl.moeFfnBlockRouted;
 
+/// A whole MLA layer tail -- attention through the FFN residual -- as one
+/// submission. In: the residual stream and this position's queries. Out: the
+/// stream after the layer.
+pub const mlaLayerTail = impl.mlaLayerTail;
+
 /// W_k dequantized to f32 and held on the device, and the absorption
 /// (W_k^T q_nope) that reads it. The absorption was the last host step inside
 /// an MLA layer, so it forced a synchronization mid-layer however much of the

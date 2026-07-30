@@ -786,6 +786,19 @@ fn runStoreWith(
     // at ~285 MB/s inside the fused MoE block, 30-100 ms per matvec dispatch
     // that costs under a millisecond resident.
     _ = backend.materializeArenas();
+    // Device-side MLA cache too, sized by the capped context -- the model's
+    // native ctx_len (163,840 here) is past what the attention kernel's
+    // threadgroup memory serves, so asking with it declines and every device
+    // attention call then silently falls back to the host. Fifth instance of
+    // this gate; hence a comptime check that E either has the fields or not.
+    if (@hasField(@TypeOf(m.cfg), "kv_lora_rank")) {
+        _ = backend.mlaInit(m.cfg.n_layers, m.cfg.ctx_len, m.cfg.kv_lora_rank, m.cfg.rope_dim);
+    }
+    // ...and W_k, dequantized to the device, without which every mlaAttnHeads
+    // and mlaLayerTail call declines at `li >= mla_wk.items.len`. Sixth
+    // instance of a device path silently off because its setup lived on
+    // another code path.
+    if (@hasDecl(E, "uploadAbsorbWeights")) E.uploadAbsorbWeights(&m, gpa);
     defer backend.parallelEnd();
 
     var st = try E.State.init(gpa, c);
@@ -884,6 +897,19 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
     // at ~285 MB/s inside the fused MoE block, 30-100 ms per matvec dispatch
     // that costs under a millisecond resident.
     _ = backend.materializeArenas();
+    // Device-side MLA cache too, sized by the capped context -- the model's
+    // native ctx_len (163,840 here) is past what the attention kernel's
+    // threadgroup memory serves, so asking with it declines and every device
+    // attention call then silently falls back to the host. Fifth instance of
+    // this gate; hence a comptime check that E either has the fields or not.
+    if (@hasField(@TypeOf(m.cfg), "kv_lora_rank")) {
+        _ = backend.mlaInit(m.cfg.n_layers, m.cfg.ctx_len, m.cfg.kv_lora_rank, m.cfg.rope_dim);
+    }
+    // ...and W_k, dequantized to the device, without which every mlaAttnHeads
+    // and mlaLayerTail call declines at `li >= mla_wk.items.len`. Sixth
+    // instance of a device path silently off because its setup lived on
+    // another code path.
+    if (@hasDecl(eng, "uploadAbsorbWeights")) eng.uploadAbsorbWeights(&m, gpa);
     defer backend.parallelEnd();
 
     var st = try eng.State.init(gpa, c);
