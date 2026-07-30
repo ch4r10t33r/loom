@@ -80,7 +80,7 @@ In the meantime, either:
     install it (open a WSL shell and re-run this command), or
   - build from source with Zig 0.16.0:
         git clone https://github.com/${REPO} && cd loom
-        zig build -Doptimize=ReleaseFast
+        zig build -Doptimize=ReleaseSafe
 
 EOF
         exit 1 ;;

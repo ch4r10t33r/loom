@@ -91,6 +91,12 @@ jobs:
           zig "${ZIG}" build -Doptimize=ReleaseFast -Dcommit="${GITHUB_SHA}"
           ./zig-out/bin/loom bench --check
 
+      # The suite normally runs in Debug. Run it optimized as well, because the
+      # two differ in what the optimizer is allowed to assume, and a bounds
+      # check that only Debug performs is not a check this project ships.
+      - name: Tests, optimized
+        run: zig "${ZIG}" build test -Doptimize=ReleaseSafe
+
   docker:
     name: image build, smoke test, publish on main
     runs-on: ubuntu-latest

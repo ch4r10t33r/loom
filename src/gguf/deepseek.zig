@@ -575,6 +575,28 @@ fn denseFFN(st: *State, gate_w: Tensor, up_w: Tensor, down_w: Tensor) void {
 
 const Selected = moe.Selected;
 
+/// One expert's gate/up/down bytes, from the distributed store when there is
+/// one and straight out of the model mapping otherwise.
+fn expertParts(m: *const Model, l: anytype, li: usize, expert: usize) !expert_fetch.Source.Parts {
+    const gt = l.ffn_gate_exps.?;
+    const ut = l.ffn_up_exps.?;
+    const dt = l.ffn_down_exps.?;
+    if (m.dist) |src| {
+        const sid = m.expert_shard[li * m.cfg.n_expert + expert];
+        if (src.getMapped(sid)) |p| return p;
+        const blk = try src.get(sid);
+        const gl = gt.ne1 * ggml.rowBytes(gt.ty, gt.ne0);
+        const ul = ut.ne1 * ggml.rowBytes(ut.ty, ut.ne0);
+        const dl = dt.ne1 * ggml.rowBytes(dt.ty, dt.ne0);
+        return .{ .gate = blk[0..gl], .up = blk[gl..][0..ul], .down = blk[gl + ul ..][0..dl] };
+    }
+    return .{
+        .gate = (try gt.expert(expert)).data,
+        .up = (try ut.expert(expert)).data,
+        .down = (try dt.expert(expert)).data,
+    };
+}
+
 /// One token step; logits land in st.logits. Errors only when a distributed
 /// expert shard has no reachable holder (fail loud, not silently degraded).
 /// Per-phase timing for the decode loop, enabled with LOOM_PROFILE=1.
@@ -599,6 +621,20 @@ pub const Profile = struct {
     /// timing that did not move.
     pub var src_stats: ?expert_fetch.Stats = null;
     pub var cache_slots: usize = 0;
+    /// Command buffers the backend submitted, summed over the profiled tokens.
+    pub var cmdbufs: u64 = 0;
+
+    fn reset() void {
+        attn_ns = 0;
+        route_ns = 0;
+        acc_ns = 0;
+        head_ns = 0;
+        expert_get_ns = 0;
+        expert_ffn_ns = 0;
+        other_ns = 0;
+        tokens = 0;
+        cmdbufs = 0;
+    }
 
     pub fn enabled() bool {
         if (on == null) on = std.c.getenv("LOOM_PROFILE") != null;
@@ -638,9 +674,16 @@ pub const Profile = struct {
         );
     }
 
+    /// Report the window since the last call, then reset.
+    ///
+    /// Cumulative totals hide exactly what a running node needs to show. The
+    /// first touch of an expert hashes its whole 6 MB shard to verify it, so a
+    /// short profile is mostly that transient and a long one averages it away
+    /// -- neither says what the node is doing now. A window does.
     pub fn report(w: anytype) !void {
         const tot = attn_ns + expert_get_ns + expert_ffn_ns + other_ns;
         if (tot == 0 or tokens == 0) return;
+        defer reset();
         const pct = struct {
             fn f(a: i128, b: i128) f64 {
                 return 100.0 * @as(f64, @floatFromInt(a)) / @as(f64, @floatFromInt(b));
@@ -651,12 +694,22 @@ pub const Profile = struct {
                 return @as(f64, @floatFromInt(a)) / 1e6 / @as(f64, @floatFromInt(n));
             }
         }.f;
-        try w.print("profile over {d} tokens (ms/token)\n", .{tokens});
+        try w.print("profile: last {d} tokens (ms/token)\n", .{tokens});
         try w.print("  attention       {d:8.1}  {d:5.1}%\n", .{ ms(attn_ns, tokens), pct(attn_ns, tot) });
         try w.print("  expert get      {d:8.1}  {d:5.1}%\n", .{ ms(expert_get_ns, tokens), pct(expert_get_ns, tot) });
         try w.print("  expert ffn      {d:8.1}  {d:5.1}%\n", .{ ms(expert_ffn_ns, tokens), pct(expert_ffn_ns, tot) });
         try w.print("  everything else {d:8.1}  {d:5.1}%\n", .{ ms(other_ns, tokens), pct(other_ns, tot) });
         try w.print("  total           {d:8.1}\n", .{ms(tot, tokens)});
+        if (cmdbufs > 0) {
+            // A command buffer costs ~262 us fixed on an M5 whatever it holds,
+            // so this product is a floor on the token that no kernel work can
+            // move -- only handing the backend larger units can. Printed next
+            // to the total because the comparison is the whole point.
+            const per_tok = @as(f64, @floatFromInt(cmdbufs)) / @as(f64, @floatFromInt(tokens));
+            try w.print("  gpu submissions {d:8.1} /token  (~{d:.1} ms of the above at 262 us each)\n", .{
+                per_tok, per_tok * 0.262,
+            });
+        }
         // The "everything else" bucket was 17.5% and unattributed, which is
         // exactly the size at which it stops being a rounding error and starts
         // being the next thing to fix. Split into the three candidates.
@@ -805,7 +858,41 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
                 for (sel, 0..) |s, k| ids_buf[k] = m.expert_shard[li * cfg.n_expert + s.expert];
                 src.prefetch(ids_buf[0..sel.len]);
             }
-            for (sel) |s| {
+            // Gather every selected expert first and hand the layer to the
+            // backend as one unit, when it will take it. Dispatching each
+            // expert separately costs a command buffer apiece; a MoE layer is
+            // six of them plus a shared one.
+            //
+            // Only when the source hands back pointers that survive the next
+            // `get`: with no RAM cache and no mapping every expert lands in
+            // the same scratch buffer, so collecting six of them would leave
+            // five dangling — and the resulting output is well-formed, which
+            // is the failure mode this codebase keeps meeting.
+            const batched = blk_b: {
+                if (!@hasDecl(backend, "moeFfnBlock")) break :blk_b false;
+                if (m.dist) |src| {
+                    if (!src.stablePointers(sel.len)) break :blk_b false;
+                }
+                const gt = l.ffn_gate_exps orelse break :blk_b false;
+                var refs: [moe.MAX_SELECTED]backend.ExpertRef = undefined;
+                const t_g1 = if (prof) Profile.now() else 0;
+                for (sel, 0..) |s, k| {
+                    const parts = expertParts(m, l, li, s.expert) catch break :blk_b false;
+                    refs[k] = .{
+                        .gate = .{ .ty = l.ffn_gate_exps.?.ty, .data = parts.gate },
+                        .up = .{ .ty = l.ffn_up_exps.?.ty, .data = parts.up },
+                        .down = .{ .ty = l.ffn_down_exps.?.ty, .data = parts.down },
+                        .weight = s.gate,
+                    };
+                }
+                if (prof) t_get += Profile.now() - t_g1;
+                const t_f1 = if (prof) Profile.now() else 0;
+                const ok = backend.moeFfnBlock(st.normed, refs[0..sel.len], gt.ne1, acc);
+                if (prof) t_ffn += Profile.now() - t_f1;
+                break :blk_b ok;
+            };
+
+            if (!batched) for (sel) |s| {
                 if (m.dist) |src| {
                     const sid = m.expert_shard[li * cfg.n_expert + s.expert];
                     const gt = l.ffn_gate_exps.?;
@@ -842,7 +929,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
                 const t_ac0 = if (prof) Profile.now() else 0;
                 for (acc, st.ffn_out) |*a, v| a.* += s.gate * v;
                 if (prof) t_acc += Profile.now() - t_ac0;
-            }
+            };
             if (l.ffn_gate_shexp) |gs| {
                 denseFFN(st, gs, l.ffn_up_shexp.?, l.ffn_down_shexp.?);
                 backend.add(acc, st.ffn_out);
@@ -861,6 +948,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             Profile.src_stats = src.stats;
             Profile.cache_slots = src.cacheSlots();
         }
+        Profile.cmdbufs += backend.takeCmdBufCount();
         const total = Profile.now() - t_step;
         Profile.attn_ns += t_attn;
         Profile.expert_get_ns += t_get;

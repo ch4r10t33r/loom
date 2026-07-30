@@ -20,6 +20,31 @@ pub const dequantRow = ggml.dequantRow;
 
 pub const WeightRef = struct { ty: ggml.Type, data: []const u8 };
 
+pub const ExpertRef = struct { gate: WeightRef, up: WeightRef, down: WeightRef, weight: f32 };
+
+/// Declined: the CPU path has no command buffer to amortize, so grouping a
+/// layer's experts would buy nothing the caller's own loop does not already do.
+pub fn moeFfnBlock(normed: []const f32, experts: []const ExpertRef, ffn: usize, out: []f32) bool {
+    _ = .{ normed, experts, ffn, out };
+    return false;
+}
+
+/// Declined: host memory is already addressable, so there is nothing to register.
+pub fn registerArena(mem: []const u8) bool {
+    _ = mem;
+    return false;
+}
+
+pub fn materializeArenas() usize {
+    return 0;
+}
+
+pub fn takeCmdBufCount() usize {
+    return 0;
+}
+
+pub var arena_error: ?[]const u8 = null;
+
 /// The CPU has no device cache to set up and no fused attention to offer; the
 /// engine's own path is already the implementation.
 pub fn attnInit(layers: usize, ctx_len: usize, kvd: usize) bool {

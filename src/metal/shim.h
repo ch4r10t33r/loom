@@ -29,6 +29,16 @@ size_t loom_mtl_device_max_threads_per_group(loom_mtl_device d);
 // whole point of the Apple path: an mmap'd GGUF region becomes a GPU buffer
 // without being staged or uploaded.
 loom_mtl_buffer loom_mtl_buffer_wrap(loom_mtl_device d, void *ptr, size_t len);
+
+/* Ask the OS to make `b`'s pages resident and keep them so, and attach the set
+ * to `q` so every command buffer it vends inherits the residency. Returns 0
+ * when the OS is older than residency sets, in which case the pages are still
+ * addressable -- just evictable. */
+/* Largest single allocation the device will make. Around half of physical RAM
+ * on Apple silicon, so a multi-gigabyte model has to be split across several. */
+size_t loom_mtl_max_buffer(loom_mtl_device d);
+
+int loom_mtl_resident(loom_mtl_device d, loom_mtl_queue q, loom_mtl_buffer b);
 // Ordinary shared-storage allocation, for activations.
 loom_mtl_buffer loom_mtl_buffer_alloc(loom_mtl_device d, size_t len);
 void *loom_mtl_buffer_contents(loom_mtl_buffer b);

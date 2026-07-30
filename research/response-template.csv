@@ -1,0 +1,2 @@
+interview_id,date,respondent_handle,fit_tier,fit_weight,H1_fit_pain,H2_network,H3_capacity_tradeoff,H4_workload_serving,H5_pooling,H6_economy,H7_int4_ok,H8_ops_matters,models_wanted,hardware_gpu,network_link,why_local,best_quote,surprise_or_new_pain
+EX01,2026-07-20,example_user,Core,1.0,2,-2,1,1,0,-1,2,1,"GLM-4.6; Qwen3-235B","2x 3090 + M2 Max","1GbE wired","privacy; offline tinkering","I gave up on the 200B and just run 70B quantized, it bugs me every time","wants per-project model pinning; hates re-quantizing on every update"
