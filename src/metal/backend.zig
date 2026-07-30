@@ -444,6 +444,7 @@ const Ctx = struct {
     gemm_q4k: mtl.Pipeline,
     attn_p: mtl.Pipeline,
     mla_attn_p: mtl.Pipeline,
+    mla_wsum_p: mtl.Pipeline,
     mla_absorb_p: mtl.Pipeline,
     mla_rope_p: mtl.Pipeline,
     /// Per layer: `kv_b` dequantized to f32, device-resident.
@@ -490,6 +491,7 @@ const Ctx = struct {
     swiglu_p: mtl.Pipeline,
     add_p: mtl.Pipeline,
     copy_p: mtl.Pipeline,
+    swiglu_slots_p: mtl.Pipeline,
     /// Device-resident activation scratch. The whole point of keeping these
     /// on the GPU is that a block of work can be encoded into one command
     /// buffer without the host reading anything in between.
@@ -587,6 +589,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const pwsum = dev.pipeline(mla_attn_src, "mla_attn_wsum") catch {
+        dev.deinit();
+        return;
+    };
     const pmrope = dev.pipeline(mla_rope_src, "mla_rope") catch {
         dev.deinit();
         return;
@@ -623,6 +629,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const pss = dev.pipeline(elementwise_src, "swiglu_slots") catch {
+        dev.deinit();
+        return;
+    };
     const pcp = dev.pipeline(elementwise_src, "copy_f32") catch {
         dev.deinit();
         return;
@@ -650,7 +660,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0_id = p50id, .q8_0_id = p80id, .q5_0 = p50, .q8_0 = p80, .f32p = pf32, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .mla_rope_p = pmrope, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .reduce_dev_p = predd, .route_p = proute, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .copy_p = pcp, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0_id = p50id, .q8_0_id = p80id, .q5_0 = p50, .q8_0 = p80, .f32p = pf32, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_wsum_p = pwsum, .mla_absorb_p = pabs, .mla_rope_p = pmrope, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .reduce_dev_p = predd, .route_p = proute, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .copy_p = pcp, .swiglu_slots_p = pss, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -1199,8 +1209,11 @@ pub fn hasMlaCache() bool {
 pub fn mlaSetWk(li: usize, wk_f32: []const f32) bool {
     const cx = &(ctx orelse return false);
     if (li != cx.mla_wk.items.len) return false;
-    const b = cx.dev.alloc(wk_f32.len * @sizeOf(f32)) catch return false;
-    @memcpy(b.slice(f32)[0..wk_f32.len], wk_f32);
+    // Stored f16: half the per-token absorb traffic, and rounding a weight
+    // that was quantized to ~4.5 bits anyway is noise against that.
+    const b = cx.dev.alloc(wk_f32.len * @sizeOf(f16)) catch return false;
+    const dst = b.slice(f16)[0..wk_f32.len];
+    for (dst, wk_f32) |*o, v| o.* = @floatCast(v);
     cx.mla_wk.append(cx.gpa, b) catch return false;
     return true;
 }
@@ -1302,12 +1315,14 @@ pub fn mlaAttnHeads(
     e.barrier();
     e.dispatch(
         cx.mla_attn_p,
-        &.{ cx.act[1], cx.scratch_x, cbuf, rbuf, cx.act[2] },
+        &.{ cx.act[1], cx.scratch_x, cbuf, rbuf, cx.act[3] },
         &.{ 0, q_nope.len * 4, c_off, r_off, 0 },
         std.mem.asBytes(&dims),
         n_heads * group,
         group,
     );
+    e.barrier();
+    e.dispatch(cx.mla_wsum_p, &.{ cx.act[3], cbuf, cx.act[2] }, &.{ 0, c_off, 0 }, std.mem.asBytes(&dims), absorbGrid(n_heads, kvr), SIMD_W * SIMDGROUPS_PER_GROUP);
     e.barrier();
     const vd_dims = IdDims{
         .rows = @intCast(v_head_dim),
@@ -1770,7 +1785,9 @@ pub fn mlaLayerTail(
     // ---- attention ----
     e.dispatch(cx.mla_absorb_p, &.{ cx.mla_wk.items[li], cx.scratch_x, cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&ad), absorbGrid(n_heads, kvr), group);
     e.barrier();
-    e.dispatch(cx.mla_attn_p, &.{ cx.act[1], cx.scratch_x, cbuf, rbuf, cx.act[2] }, &.{ 0, off_qr * 4, c_off, r_off, 0 }, std.mem.asBytes(&dims), n_heads * group, group);
+    e.dispatch(cx.mla_attn_p, &.{ cx.act[1], cx.scratch_x, cbuf, rbuf, cx.act[3] }, &.{ 0, off_qr * 4, c_off, r_off, 0 }, std.mem.asBytes(&dims), n_heads * group, group);
+    e.barrier();
+    e.dispatch(cx.mla_wsum_p, &.{ cx.act[3], cbuf, cx.act[2] }, &.{ 0, c_off, 0 }, std.mem.asBytes(&dims), absorbGrid(n_heads, kvr), group);
     e.barrier();
     e.dispatch(vsel.pipe, &.{ vw.buf, cx.act[2], cx.act[3], cx.mla_vids.? }, &.{ vw.off + nope * row_bytes, 0, 0, 0 }, std.mem.asBytes(&vd_dims), grid(v_head_dim, vsel.per, n_heads), group);
     e.barrier();
@@ -2065,7 +2082,9 @@ pub fn mlaTokenFrame(
         // ---- attention ----
         e.dispatch(cx.mla_absorb_p, &.{ cx.mla_wk.items[li], cx.act[6], cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&ad), absorbGrid(fc.n_heads, fc.kvr), group);
         e.barrier();
-        e.dispatch(cx.mla_attn_p, &.{ cx.act[1], cx.act[6], cbuf, rbuf, cx.act[2] }, &.{ 0, 0, li * cx.mla_ctx * fc.kvr * 4, li * cx.mla_ctx * fc.rope * 4, 0 }, std.mem.asBytes(&at), fc.n_heads * group, group);
+        e.dispatch(cx.mla_attn_p, &.{ cx.act[1], cx.act[6], cbuf, rbuf, cx.act[3] }, &.{ 0, 0, li * cx.mla_ctx * fc.kvr * 4, li * cx.mla_ctx * fc.rope * 4, 0 }, std.mem.asBytes(&at), fc.n_heads * group, group);
+        e.barrier();
+        e.dispatch(cx.mla_wsum_p, &.{ cx.act[3], cbuf, cx.act[2] }, &.{ 0, li * cx.mla_ctx * fc.kvr * 4, 0 }, std.mem.asBytes(&at), absorbGrid(fc.n_heads, fc.kvr), group);
         e.barrier();
         const vd_dims = IdDims{ .rows = @intCast(fc.v_head_dim), .cols = @intCast(fc.kvr), .n_used = @intCast(fc.n_heads), .plane_stride = @intCast((fc.nope + fc.v_head_dim) * p.row_bytes), .x_stride = @intCast(fc.kvr) };
         e.dispatch(p.vsel.pipe, &.{ p.vw.buf, cx.act[2], cx.act[3], cx.mla_vids.? }, &.{ p.vw.off + fc.nope * p.row_bytes, 0, 0, 0 }, std.mem.asBytes(&vd_dims), grid(fc.v_head_dim, p.vsel.per, fc.n_heads), group);
@@ -2103,18 +2122,19 @@ pub fn mlaTokenFrame(
             const d_gate = IdDims{ .rows = @intCast(d.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = gate_plane, .x_stride = 0 };
             const d_up = IdDims{ .rows = @intCast(d.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = up_plane, .x_stride = 0 };
             const d_down = IdDims{ .rows = @intCast(dim), .cols = @intCast(d.ffn), .n_used = @intCast(fc.routed.n_used), .plane_stride = down_plane, .x_stride = @intCast(d.ffn) };
-            const len_ffn = extern struct { n: u32 }{ .n = @intCast(d.ffn) };
             e.dispatch(p.gsel.pipe, &.{ p.gw.buf, cx.act[5], cx.act[1], cx.route_ids.? }, &.{ p.gw.off, 0, 0, 0 }, std.mem.asBytes(&d_gate), grid(d.ffn, p.gsel.per, fc.routed.n_used), group);
             e.dispatch(p.usel.pipe, &.{ p.uw.buf, cx.act[5], cx.act[2], cx.route_ids.? }, &.{ p.uw.off, 0, 0, 0 }, std.mem.asBytes(&d_up), grid(d.ffn, p.usel.per, fc.routed.n_used), group);
             e.barrier();
-            for (0..fc.routed.n_used) |k| {
-                e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ k * d.ffn * 4, k * d.ffn * 4, k * d.ffn * 4 }, std.mem.asBytes(&len_ffn), d.ffn, 64);
-            }
+            const sw2 = extern struct { n: u32, slots: u32 }{ .n = @intCast(d.ffn), .slots = @intCast(fc.routed.n_used) };
+            e.dispatch(cx.swiglu_slots_p, &.{ cx.act[1], cx.act[2] }, &.{ 0, 0 }, std.mem.asBytes(&sw2), d.ffn * fc.routed.n_used, 64);
             e.barrier();
             e.dispatch(p.dsel.pipe, &.{ p.dw.buf, cx.act[1], cx.act[3], cx.route_ids.? }, &.{ p.dw.off, 0, 0, 0 }, std.mem.asBytes(&d_down), grid(dim, p.dsel.per, fc.routed.n_used), group);
             e.barrier();
             e.dispatch(cx.reduce_dev_p, &.{ cx.act[0], cx.act[3], cx.route_gates.? }, &.{ 0, 0, 0 }, std.mem.asBytes(&rdim), dim, 64);
-            e.barrier();
+            // No barrier: the shared expert's gate/up read act[5] and write
+            // act[1]/act[2], all disjoint from the reduce's act[3] -> act[0].
+            // The barrier after them orders everything before the shared
+            // expert's own swiglu.
             if (d.shexp != null) {
                 const d_sh = Dims{ .rows = @intCast(d.shexp_ffn), .cols = @intCast(dim) };
                 const d_shd = Dims{ .rows = @intCast(dim), .cols = @intCast(d.shexp_ffn) };

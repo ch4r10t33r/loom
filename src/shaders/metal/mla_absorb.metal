@@ -6,11 +6,11 @@
 // and axpy'd it, which forced a synchronization in the middle of every layer
 // whatever else was recorded around it.
 //
-// `W_k` arrives pre-dequantized to f32 and device-resident. That is a
-// deliberate trade: `kv_b` is 8 MB a layer against ~45 MB of experts, it is
-// read on every layer of every token, and holding it as f32 turns this from a
-// per-element K-quant unpack -- which needs block lookup per output column --
-// into a plain transposed matvec.
+// `W_k` arrives pre-dequantized to f16 and device-resident: the same trade as
+// f32 -- no per-element K-quant unpack in the transposed access -- at half the
+// bandwidth, which at ~113 MB per token as f32 was the largest single
+// reducible read outside the experts themselves. f16 rounding of a weight
+// already quantized to ~4.5 bits is noise against the quantization itself.
 //
 // Transposed because the tensor is row-major over kvr: row r of W_k is
 // contiguous, and the output is a sum over rows weighted by q_nope[r]. So each
@@ -40,7 +40,7 @@ struct AbsorbDims {
 // terms; gridding one SIMD group per output makes it 8,192 groups on the real
 // model, and the column reads within a group are contiguous across lanes.
 kernel void mla_absorb(
-    device const float *wk  [[buffer(0)]], // [n_heads * stride][kvr], f32
+    device const half  *wk  [[buffer(0)]], // [n_heads * stride][kvr], f16
     device const float *q   [[buffer(1)]],
     device float       *out [[buffer(2)]], // [n_heads][kvr]
     constant AbsorbDims &d  [[buffer(3)]],
@@ -54,11 +54,11 @@ kernel void mla_absorb(
     if (h >= d.n_heads) return;
     const uint i = g - h * d.kvr;
 
-    device const float *wh = wk + (ulong)h * d.stride * d.kvr;
+    device const half *wh = wk + (ulong)h * d.stride * d.kvr;
     device const float *qh = q + (ulong)h * d.q_stride + d.q_off;
 
     float acc = 0.0f;
-    for (uint r = lane; r < d.nope; r += 32) acc += qh[r] * wh[(ulong)r * d.kvr + i];
+    for (uint r = lane; r < d.nope; r += 32) acc += qh[r] * (float)wh[(ulong)r * d.kvr + i];
     acc = simd_sum(acc);
     if (lane == 0) out[(ulong)h * d.kvr + i] = acc;
 }
