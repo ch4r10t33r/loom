@@ -444,6 +444,10 @@ const Ctx = struct {
     mla_absorb_p: mtl.Pipeline,
     /// Per layer: `kv_b` dequantized to f32, device-resident.
     mla_wk: std.ArrayListUnmanaged(mtl.Buffer) = .empty,
+    /// Identity ids 0..n_heads for the W_v dispatch: every head "selects" its
+    /// own plane, which turns 16 per-head host matvecs into one id-kernel
+    /// dispatch inside the same command buffer.
+    mla_vids: ?mtl.Buffer = null,
     rope_p: mtl.Pipeline,
     kvw_p: mtl.Pipeline,
     sadd_p: mtl.Pipeline,
@@ -1196,7 +1200,8 @@ pub fn mlaAttnHeads(
     pos: usize,
     q_nope: []const f32,
     q_rope: []const f32,
-    out: []f32,
+    kv_b: WeightRef,
+    out: []f32, // n_heads * v_head_dim: W_v applied, not o_latent
     n_heads: usize,
     nope: usize,
     v_head_dim: usize,
@@ -1222,8 +1227,25 @@ pub fn mlaAttnHeads(
     if (li >= cx.mla_wk.items.len) return false;
     const kvr = cx.mla_kvr;
     if ((q_nope.len + q_rope.len) * 4 > cx.scratch_x.len) return false;
+    if (out.len != n_heads * v_head_dim) return false;
     if (out.len * 4 > cx.scratch_out.len) return false;
-    if (n_heads * kvr * 4 > cx.act[1].len) return false;
+    if (n_heads * kvr * 4 > cx.act[1].len or n_heads * kvr * 4 > cx.act[2].len) return false;
+
+    // W_v as one id-kernel dispatch with identity ids: head h's value rows are
+    // a plane at stride (nope + v_head_dim) rows, offset nope rows in, and its
+    // input is its own o_latent -- exactly the per-slot x-stride shape built
+    // for the MoE down projection. This replaces sixteen per-head host
+    // matvecs, which were the last host step inside attention.
+    const vsel = dmmvIdFor(cx, kv_b.ty) orelse return false;
+    if (kvr % colsMultiple(kv_b.ty) != 0) return false;
+    if (v_head_dim % vsel.per != 0) return false;
+    const vw = wrapFor(cx, kv_b.data) orelse return false;
+    const row_bytes = kv_b.data.len / (n_heads * (nope + v_head_dim));
+    if (cx.mla_vids == null) {
+        const b = cx.dev.alloc(64 * @sizeOf(u32)) catch return false;
+        for (0..64) |k| b.slice(u32)[k] = @intCast(k);
+        cx.mla_vids = b;
+    }
 
     @memcpy(cx.scratch_x.slice(f32)[0..q_nope.len], q_nope);
     @memcpy(cx.scratch_x.slice(f32)[q_nope.len..][0..q_rope.len], q_rope);
@@ -1259,10 +1281,28 @@ pub fn mlaAttnHeads(
     e.barrier();
     e.dispatch(
         cx.mla_attn_p,
-        &.{ cx.act[1], cx.scratch_x, cbuf, rbuf, cx.scratch_out },
+        &.{ cx.act[1], cx.scratch_x, cbuf, rbuf, cx.act[2] },
         &.{ 0, q_nope.len * 4, c_off, r_off, 0 },
         std.mem.asBytes(&dims),
         n_heads * group,
+        group,
+    );
+    e.barrier();
+    const vd_dims = IdDims{
+        .rows = @intCast(v_head_dim),
+        .cols = @intCast(kvr),
+        .n_used = @intCast(n_heads),
+        .plane_stride = @intCast((nope + v_head_dim) * row_bytes),
+        .x_stride = @intCast(kvr),
+    };
+    const vthreads = ((n_heads * v_head_dim + vsel.per - 1) / vsel.per) * SIMD_W;
+    const vgrid = ((vthreads + group - 1) / group) * group;
+    e.dispatch(
+        vsel.pipe,
+        &.{ vw.buf, cx.act[2], cx.scratch_out, cx.mla_vids.? },
+        &.{ vw.off + nope * row_bytes, 0, 0, 0 },
+        std.mem.asBytes(&vd_dims),
+        vgrid,
         group,
     );
     e.end();
@@ -3986,7 +4026,9 @@ test "mla attention matches an exact cpu reference" {
     // as a failure.
     const gpa = std.testing.allocator;
     const n_heads = 4;
-    const kvr = 64;
+    // A multiple of 256: kv_b is q4_k and the W_v id dispatch declines a width
+    // its kernel cannot walk. 512 on the real model.
+    const kvr = 256;
     const rope = 16;
     const seq = 37; // not a multiple of the threadgroup size, on purpose
     const layers = 2;
@@ -4050,14 +4092,27 @@ test "mla attention matches an exact cpu reference" {
     if (!mlaSetWk(0, zero)) return error.SkipZigTest;
     if (!mlaSetWk(li, wk)) return error.SkipZigTest;
 
-    const got = try gpa.alloc(f32, n_heads * kvr);
+    // W_v: q4_k planes, pinned scales, random quants -- the id dispatch inside
+    // mlaAttnHeads applies it, so the oracle below must too.
+    const kvb = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, kvr, n_heads * stride));
+    defer gpa.free(kvb);
+    rnd.bytes(kvb);
+    {
+        var b: usize = 0;
+        while (b + 144 <= kvb.len) : (b += 144) {
+            std.mem.writeInt(u16, kvb[b..][0..2], 0x2C00, .little);
+            std.mem.writeInt(u16, kvb[b + 2 ..][0..2], 0x2800, .little);
+        }
+    }
+
+    const got = try gpa.alloc(f32, n_heads * vd);
     defer gpa.free(got);
-    if (!mlaAttnHeads(li, seq - 1, q_nope, qr, got, n_heads, nope, vd, scale)) return error.SkipZigTest;
+    if (!mlaAttnHeads(li, seq - 1, q_nope, qr, .{ .ty = .q4_k, .data = kvb }, got, n_heads, nope, vd, scale)) return error.SkipZigTest;
 
     // Reference in f64: softmax over 37 terms then a weighted sum is exactly
     // the kind of reduction where an f32 oracle reports its own drift.
-    const want = try gpa.alloc(f32, n_heads * kvr);
-    defer gpa.free(want);
+    const want_lat = try gpa.alloc(f32, n_heads * kvr);
+    defer gpa.free(want_lat);
     const sc = try gpa.alloc(f64, seq);
     defer gpa.free(sc);
     for (0..n_heads) |h| {
@@ -4077,7 +4132,21 @@ test "mla attention matches an exact cpu reference" {
         for (0..kvr) |i| {
             var acc: f64 = 0;
             for (0..seq) |t| acc += sc[t] * @as(f64, c_rows[t * kvr + i]);
-            want[h * kvr + i] = @floatCast(acc / sum);
+            want_lat[h * kvr + i] = @floatCast(acc / sum);
+        }
+    }
+
+    // Then W_v exactly: head h's value rows start nope rows into its plane.
+    const want = try gpa.alloc(f32, n_heads * vd);
+    defer gpa.free(want);
+    const vrow = try gpa.alloc(f32, kvr);
+    defer gpa.free(vrow);
+    for (0..n_heads) |h| {
+        for (0..vd) |i| {
+            cpu.dequantRow(.q4_k, vrow, kvb, h * stride + nope + i, kvr);
+            var acc: f64 = 0;
+            for (vrow, want_lat[h * kvr ..][0..kvr]) |wv, ov| acc += @as(f64, wv) * @as(f64, ov);
+            want[h * vd + i] = @floatCast(acc);
         }
     }
 
@@ -4086,7 +4155,7 @@ test "mla attention matches an exact cpu reference" {
     const tol = (mass / @as(f32, @floatFromInt(want.len))) * 2e-3;
     for (want, got, 0..) |a, b, k| {
         std.testing.expectApproxEqAbs(a, b, tol) catch |e| {
-            std.debug.print("mla head {d} dim {d}: cpu {d} vs gpu {d}\n", .{ k / kvr, k % kvr, a, b });
+            std.debug.print("mla head {d} dim {d}: cpu {d} vs gpu {d}\n", .{ k / vd, k % vd, a, b });
             return e;
         };
     }

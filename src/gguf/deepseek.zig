@@ -873,7 +873,21 @@ fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_a
     }
     // One call, two dispatches, one command buffer: absorption then attention,
     // with q_abs staying on the device between them.
-    const on_device = backend.mlaAttnHeads(li, pos, st.q_nope_all, st.mla_qr, st.mla_ol, cfg.n_heads, nope, vd, scale);
+    // One call, three dispatches, one command buffer: absorption, attention,
+    // and W_v -- the result is head_out, ready for the output projection. The
+    // fallback below is the full host loop including its own W_v.
+    const on_device = backend.mlaAttnHeads(
+        li,
+        pos,
+        st.q_nope_all,
+        st.mla_qr,
+        .{ .ty = l.attn_kv_b.ty, .data = l.attn_kv_b.data },
+        st.head_out[0 .. cfg.n_heads * vd],
+        cfg.n_heads,
+        nope,
+        vd,
+        scale,
+    );
     if (!on_device) {
         h = 0;
         while (h < cfg.n_heads) : (h += 1) {
@@ -891,9 +905,10 @@ fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_a
 
     h = 0;
     while (h < cfg.n_heads) : (h += 1) {
+        if (on_device) break; // head_out is already complete
         const kb_base = h * (nope + vd);
         const v_rows = l.attn_kv_b.data[(kb_base + nope) * ggml.rowBytes(l.attn_kv_b.ty, kvr) ..];
-        const o_lat = if (on_device) st.mla_ol[h * kvr ..][0..kvr] else blk: {
+        const o_lat = blk: {
             // Host fallback: scores, softmax and the weighted sum, all in
             // compressed space.
             const qa = st.mla_qa[h * kvr ..][0..kvr];
