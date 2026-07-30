@@ -149,6 +149,9 @@ pub const Model = struct {
     /// come through Source.get() — local tier or peer fetch — instead of the
     /// (possibly sparse) memory map.
     dist: ?*expert_fetch.Source = null,
+    /// Whole-token frame descriptors, built at load; null when a layer holds
+    /// something the frame cannot express.
+    frame_descs: ?[]backend.MlaLayerDesc = null,
     /// (layer * n_expert + e) -> manifest shard id; built by attachDist.
     expert_shard: []usize = &.{},
 
@@ -1145,6 +1148,84 @@ pub fn decodeBatch(
     }
 }
 
+/// Frame descriptors, built once. Null when any layer cannot be expressed --
+/// a router bias, the q-LoRA path, a missing tensor -- in which case the
+/// engine never tries the frame.
+pub fn buildFrameDescs(m: *const Model, gpa: std.mem.Allocator) ?[]backend.MlaLayerDesc {
+    const cfg = m.cfg;
+    if (cfg.q_lora_rank > 0) return null; // frame speaks the direct-q path only
+    const descs = gpa.alloc(backend.MlaLayerDesc, cfg.n_layers) catch return null;
+    for (m.layers, 0..) |l, i| {
+        if (l.attn_q == null or l.exp_probs_b != null) {
+            gpa.free(descs);
+            return null;
+        }
+        var d = backend.MlaLayerDesc{
+            .attn_norm = asF32(l.attn_norm),
+            .wq = .{ .ty = l.attn_q.?.ty, .data = l.attn_q.?.data },
+            .kv_a = .{ .ty = l.attn_kv_a_mqa.ty, .data = l.attn_kv_a_mqa.data },
+            .kv_a_norm = asF32(l.attn_kv_a_norm),
+            .kv_b = .{ .ty = l.attn_kv_b.ty, .data = l.attn_kv_b.data },
+            .attn_out = .{ .ty = l.attn_output.ty, .data = l.attn_output.data },
+            .ffn_norm = asF32(l.ffn_norm),
+            .is_moe = l.is_moe,
+        };
+        if (l.is_moe) {
+            const gt = l.ffn_gate_exps orelse {
+                gpa.free(descs);
+                return null;
+            };
+            d.router = .{ .ty = l.ffn_gate_inp.?.ty, .data = l.ffn_gate_inp.?.data };
+            d.gate = .{ .ty = gt.ty, .data = gt.data };
+            d.up = .{ .ty = l.ffn_up_exps.?.ty, .data = l.ffn_up_exps.?.data };
+            d.down = .{ .ty = l.ffn_down_exps.?.ty, .data = l.ffn_down_exps.?.data };
+            d.ffn = gt.ne1;
+            if (l.ffn_gate_shexp) |gs| {
+                d.shexp = .{
+                    .{ .ty = gs.ty, .data = gs.data },
+                    .{ .ty = l.ffn_up_shexp.?.ty, .data = l.ffn_up_shexp.?.data },
+                    .{ .ty = l.ffn_down_shexp.?.ty, .data = l.ffn_down_shexp.?.data },
+                };
+                d.shexp_ffn = gs.ne1;
+            }
+        } else {
+            const dg = l.ffn_gate orelse {
+                gpa.free(descs);
+                return null;
+            };
+            d.dgate = .{ .ty = dg.ty, .data = dg.data };
+            d.dup = .{ .ty = l.ffn_up.?.ty, .data = l.ffn_up.?.data };
+            d.ddown = .{ .ty = l.ffn_down.?.ty, .data = l.ffn_down.?.data };
+            d.dffn = dg.ne1;
+        }
+        descs[i] = d;
+    }
+    return descs;
+}
+
+fn frameCfg(cfg: Config) backend.MlaFrameCfg {
+    return .{
+        .dim = cfg.dim,
+        .n_heads = cfg.n_heads,
+        .nope = cfg.nope_dim,
+        .rope = cfg.rope_dim,
+        .kvr = cfg.kv_lora_rank,
+        .v_head_dim = cfg.v_head_dim,
+        .eps = cfg.eps,
+        .scale = cfg.attn_scale,
+        .rope_base = cfg.rope_base,
+        .yarn_factor = cfg.yarn_factor,
+        .yarn_orig_ctx = cfg.yarn_orig_ctx,
+        .routed = .{
+            .n_expert = cfg.n_expert,
+            .n_used = cfg.n_used,
+            .gating_sigmoid = cfg.gating == .sigmoid,
+            .weights_norm = cfg.weights_norm,
+            .weights_scale = cfg.weights_scale,
+        },
+    };
+}
+
 pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     const prof = Profile.enabled();
     const t_step = if (prof) Profile.now() else 0;
@@ -1163,6 +1244,32 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     // here rather than trusting the two to agree (security issue #29).
     if (token >= cfg.vocab) return error.TokenOutOfRange;
     backend.dequantRow(m.token_embd.ty, st.x, m.token_embd.data, token, cfg.dim);
+
+    // The whole token as one submission, when the backend takes it. On
+    // success the device cache holds this position's rows and the host copy
+    // does not, so they are mirrored back -- the fallback below must be able
+    // to attend over every position however it was produced.
+    if (m.frame_descs) |fd| frame: {
+        if (m.dist != null) break :frame;
+        const t_f0 = if (prof) Profile.now() else 0;
+        if (!backend.mlaTokenFrame(fd, frameCfg(cfg), st.x, pos, asF32(m.output_norm), .{ .ty = m.output.ty, .data = m.output.data }, st.logits[0..cfg.vocab])) break :frame;
+        for (0..cfg.n_layers) |li| {
+            const c_kv = st.c_kv_cache[(li * cfg.ctx_len + pos) * cfg.kv_lora_rank ..][0..cfg.kv_lora_rank];
+            const k_rope = st.k_rope_cache[(li * cfg.ctx_len + pos) * cfg.rope_dim ..][0..cfg.rope_dim];
+            _ = backend.mlaReadCache(li, pos, c_kv, k_rope);
+        }
+        if (prof) {
+            t_ffn += Profile.now() - t_f0;
+            n_block += @intCast(cfg.n_layers);
+            Profile.cmdbufs += backend.takeCmdBufCount();
+            Profile.tokens += 1;
+            const total = Profile.now() - t_step;
+            Profile.expert_ffn_ns += t_ffn;
+            Profile.other_ns += total - t_ffn;
+            if (Profile.tokens % 16 == 0) Profile.dump();
+        }
+        return;
+    }
 
     for (m.layers, 0..) |l, li| {
         // ---- MLA attention ----
