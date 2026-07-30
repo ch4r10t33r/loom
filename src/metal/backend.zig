@@ -74,6 +74,7 @@ const dmmv_q6k_src = @embedFile("../shaders/metal/dmmv_q6k.metal");
 const gemm_q4k_src = @embedFile("../shaders/metal/gemm_q4k.metal");
 const attn_src = @embedFile("../shaders/metal/attn.metal");
 const mla_attn_src = @embedFile("../shaders/metal/mla_attn.metal");
+const mla_absorb_src = @embedFile("../shaders/metal/mla_absorb.metal");
 const rope_src = @embedFile("../shaders/metal/rope.metal");
 const moe_acc_src = @embedFile("../shaders/metal/moe_acc.metal");
 const dmmv_q5_1_src = @embedFile("../shaders/metal/dmmv_q5_1.metal");
@@ -427,6 +428,9 @@ const Ctx = struct {
     gemm_q4k: mtl.Pipeline,
     attn_p: mtl.Pipeline,
     mla_attn_p: mtl.Pipeline,
+    mla_absorb_p: mtl.Pipeline,
+    /// Per layer: `kv_b` dequantized to f32, device-resident.
+    mla_wk: std.ArrayListUnmanaged(mtl.Buffer) = .empty,
     rope_p: mtl.Pipeline,
     kvw_p: mtl.Pipeline,
     sadd_p: mtl.Pipeline,
@@ -544,6 +548,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const pabs = dev.pipeline(mla_absorb_src, "mla_absorb") catch {
+        dev.deinit();
+        return;
+    };
     const psadd = dev.pipeline(moe_acc_src, "scaled_add") catch {
         dev.deinit();
         return;
@@ -587,7 +595,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -1119,6 +1127,55 @@ pub fn hasMlaCache() bool {
     return ensureMla(cx);
 }
 
+/// Hand one layer's `kv_b`, already dequantized to f32, to the device. Layers
+/// must arrive in order; returns false if the device will not take it, in
+/// which case the host absorption stays in use for every layer.
+pub fn mlaSetWk(li: usize, wk_f32: []const f32) bool {
+    const cx = &(ctx orelse return false);
+    if (li != cx.mla_wk.items.len) return false;
+    const b = cx.dev.alloc(wk_f32.len * @sizeOf(f32)) catch return false;
+    @memcpy(b.slice(f32)[0..wk_f32.len], wk_f32);
+    cx.mla_wk.append(cx.gpa, b) catch return false;
+    return true;
+}
+
+/// q_abs = W_k^T q_nope for every head of one layer, in one dispatch. False
+/// when this layer's W_k was never uploaded, so the caller runs its host loop.
+pub fn mlaAbsorb(
+    li: usize,
+    q_nope: []const f32,
+    out: []f32,
+    n_heads: usize,
+    nope: usize,
+    kvr: usize,
+    stride: usize,
+) bool {
+    const cx = &(ctx orelse return false);
+    if (!use_gpu_ops and !attn_worthwhile) return false;
+    if (li >= cx.mla_wk.items.len) return false;
+    if (q_nope.len * 4 > cx.scratch_x.len or out.len * 4 > cx.scratch_out.len) return false;
+    @memcpy(cx.scratch_x.slice(f32)[0..q_nope.len], q_nope);
+    const dims = AbsorbDims{
+        .n_heads = @intCast(n_heads),
+        .nope = @intCast(nope),
+        .kvr = @intCast(kvr),
+        .stride = @intCast(stride),
+    };
+    const group: usize = 64;
+    const cb = cx.dev.commandBuffer();
+    cb.dispatch(
+        cx.mla_absorb_p,
+        &.{ cx.mla_wk.items[li], cx.scratch_x, cx.scratch_out },
+        &.{ 0, 0, 0 },
+        std.mem.asBytes(&dims),
+        n_heads * group,
+        group,
+    );
+    cb.commitAndWait();
+    @memcpy(out, cx.scratch_out.slice(f32)[0..out.len]);
+    return true;
+}
+
 /// Every head's MLA attention for one layer, over the compressed cache.
 ///
 /// `q_absorbed` is W_k^T q_nope per head -- the absorption identity, so the
@@ -1297,6 +1354,8 @@ const MAX_MOE_EXPERTS = 16;
 const AccDims = extern struct { n: u32, alpha: f32 };
 /// The MLA cache shape asked for at model load, before there is a device.
 var mla_want: ?struct { layers: usize, ctx_len: usize, kvr: usize, rope: usize } = null;
+
+const AbsorbDims = extern struct { n_heads: u32, nope: u32, kvr: u32, stride: u32 };
 
 const MlaDims = extern struct { n_heads: u32, kvr: u32, rope: u32, seq: u32, scale: f32 };
 const MAX_MOE_REDUCE = 16;

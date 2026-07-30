@@ -68,7 +68,10 @@ pub const GgufModel = union(enum) {
     /// keeps its host cache and the host attention path either way.
     pub fn initDeviceAttn(self: *GgufModel) void {
         switch (self.*) {
-            .deepseek => |*m| _ = backend.mlaInit(m.cfg.n_layers, m.cfg.ctx_len, m.cfg.kv_lora_rank, m.cfg.rope_dim),
+            .deepseek => |*m| {
+                _ = backend.mlaInit(m.cfg.n_layers, m.cfg.ctx_len, m.cfg.kv_lora_rank, m.cfg.rope_dim);
+                deepseek.uploadAbsorbWeights(m, m.gpa);
+            },
             .gqa => {},
         }
     }

@@ -168,6 +168,13 @@ pub const mlaAppend = impl.mlaAppend;
 pub const hasMlaCache = impl.hasMlaCache;
 pub const mlaAttnHeads = impl.mlaAttnHeads;
 
+/// W_k dequantized to f32 and held on the device, and the absorption
+/// (W_k^T q_nope) that reads it. The absorption was the last host step inside
+/// an MLA layer, so it forced a synchronization mid-layer however much of the
+/// rest was recorded.
+pub const mlaSetWk = impl.mlaSetWk;
+pub const mlaAbsorb = impl.mlaAbsorb;
+
 /// One shape the engine will issue, for calibration.
 pub const Shape = impl.Shape;
 
