@@ -151,6 +151,17 @@ fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
         const line = std.mem.trimEnd(u8, raw, "\r\n");
         try handleLine(ctx, line, ri, wi);
         try wi.flush();
+        // The deadline is there to hang up on a socket that is *idle* -- a
+        // slowloris holding a connection open. A peer that just took a shard
+        // is the opposite of idle, so push it out, exactly as the HTTP server
+        // does between tokens.
+        //
+        // Without this the whole connection lived inside one 30 s budget,
+        // which is invisible on loopback (a full sync finishes in seconds) and
+        // fatal over a real link: a 905-shard bootstrap is ~5.4 GB, about 190 s
+        // at the 29 MB/s measured Mac-to-Hetzner, so the server shut the socket
+        // down mid-transfer and the client reported EndOfStream.
+        sockopt.refreshServe(ctx.io, dl);
     }
 }
 

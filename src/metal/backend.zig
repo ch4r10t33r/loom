@@ -74,6 +74,10 @@ const dmmv_q6k_src = @embedFile("../shaders/metal/dmmv_q6k.metal");
 const gemm_q4k_src = @embedFile("../shaders/metal/gemm_q4k.metal");
 const attn_src = @embedFile("../shaders/metal/attn.metal");
 const rope_src = @embedFile("../shaders/metal/rope.metal");
+const moe_acc_src = @embedFile("../shaders/metal/moe_acc.metal");
+const dmmv_q5_1_src = @embedFile("../shaders/metal/dmmv_q5_1.metal");
+const dmmv_q5_0_src = @embedFile("../shaders/metal/dmmv_q5_0.metal");
+const dmmv_q8_0_src = @embedFile("../shaders/metal/dmmv_q8_0.metal");
 const elementwise_src = @embedFile("../shaders/metal/elementwise.metal");
 
 /// Below this many rows the CPU path wins outright, so the GPU is not used.
@@ -413,10 +417,15 @@ const Ctx = struct {
     dev: mtl.Device,
     q4k: mtl.Pipeline,
     q6k: mtl.Pipeline,
+    q5_1: mtl.Pipeline,
+    q5_0: mtl.Pipeline,
+    q8_0: mtl.Pipeline,
     gemm_q4k: mtl.Pipeline,
     attn_p: mtl.Pipeline,
     rope_p: mtl.Pipeline,
     kvw_p: mtl.Pipeline,
+    sadd_p: mtl.Pipeline,
+    zero_p: mtl.Pipeline,
     /// Device-resident KV cache, [layers][ctx][kvd]. Allocated by `attnInit`.
     /// It lives here rather than in the engine's State because the whole point
     /// is that it never crosses the bus: only the one new row per layer per
@@ -500,6 +509,26 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const p51 = dev.pipeline(dmmv_q5_1_src, "dmmv_q5_1") catch {
+        dev.deinit();
+        return;
+    };
+    const p50 = dev.pipeline(dmmv_q5_0_src, "dmmv_q5_0") catch {
+        dev.deinit();
+        return;
+    };
+    const p80 = dev.pipeline(dmmv_q8_0_src, "dmmv_q8_0") catch {
+        dev.deinit();
+        return;
+    };
+    const psadd = dev.pipeline(moe_acc_src, "scaled_add") catch {
+        dev.deinit();
+        return;
+    };
+    const pzero = dev.pipeline(moe_acc_src, "zero_fill") catch {
+        dev.deinit();
+        return;
+    };
     const pn = dev.pipeline(elementwise_src, "rmsnorm") catch {
         dev.deinit();
         return;
@@ -531,7 +560,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .gemm_q4k = pg, .attn_p = pattn, .rope_p = prope, .kvw_p = pkvw, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -542,7 +571,147 @@ pub fn parallelEnd() void {
 
 /// Page-aligned MTLBuffer covering `data`, plus the offset of `data` within
 /// it. Cached per mapping so a model produces one buffer, not one per tensor.
-fn wrapFor(cx: *Ctx, data: []const u8) ?struct { buf: mtl.Buffer, off: usize } {
+/// A weight tensor resolved to its MTLBuffer and byte offset within it.
+pub const Wrapped = struct { buf: mtl.Buffer, off: usize };
+
+/// A registered region, before the device exists to wrap it.
+const Region = struct { base: usize, len: usize, done: bool = false };
+
+/// One device allocation covering part of a region.
+const Chunk = struct { base: usize, len: usize, buf: mtl.Buffer };
+
+/// Module-level rather than part of `Ctx`, because a store is mapped while the
+/// node is still assembling itself and the device is not up until the model
+/// loads. Registering into the context would have silently done nothing -- and
+/// did, until the page-in count refused to move.
+var regions: [MAX_ARENAS]?Region = @splat(null);
+var chunks: [MAX_CHUNKS]?Chunk = @splat(null);
+
+/// One per weight store. Two so a node serving its own GGUF *and* a sharded
+/// store is not a special case.
+const MAX_ARENAS = 2;
+
+/// A region is split across allocations because `maxBufferLength` is around
+/// half of physical RAM; eight covers any store this machine could map.
+const MAX_CHUNKS = 8;
+
+/// Why the last `materializeArenas` failed, for the caller to report. A
+/// mapping that silently declines to become resident is the whole bug this
+/// code exists to fix, so the reason has to be reachable.
+pub var arena_error: ?[]const u8 = null;
+
+/// Take a whole mapping, so every tensor inside it is reachable by offset.
+///
+/// The per-slice cache below keys on the page-aligned base of whatever it is
+/// handed. For a GGUF read as one mapping that already collapses to a single
+/// buffer, but a sharded expert store is read one expert extent at a time, and
+/// those bases are all different -- so the GPU ends up holding thousands of
+/// separate allocations over the same file, none of which keeps the model
+/// resident. Measured against llama.cpp on the same 10.4 GB checkpoint: the
+/// mapped-and-resident arrangement runs at 46.8-58.6 tok/s and faults in 249 MB
+/// over a generation, where per-extent wrapping faulted 6,728 MB and managed 2.5.
+///
+/// Registration only records the region; the device may not exist yet.
+pub fn registerArena(mem: []const u8) bool {
+    const page = std.heap.pageSize();
+    const base = std.mem.alignBackward(usize, @intFromPtr(mem.ptr), page);
+    const end = std.mem.alignForward(usize, @intFromPtr(mem.ptr) + mem.len, page);
+    for (&regions) |*slot| {
+        if (slot.*) |r| {
+            // Already covered: registering twice is not an error, and the
+            // second buffer would be the one wasting address space.
+            if (base >= r.base and end <= r.base + r.len) return true;
+            continue;
+        }
+        slot.* = .{ .base = base, .len = end - base };
+        return true;
+    }
+    return false;
+}
+
+/// Wrap every registered region now that the device exists, and report how many
+/// bytes are device-resident.
+///
+/// Worth doing eagerly and worth reporting: the first version deferred
+/// everything to first use and registered into a context that did not exist
+/// yet, so it silently did nothing and only the page-in counter disagreed.
+/// Command buffers submitted since the last call, and reset. The engine's
+/// profiler reports it per token.
+pub fn takeCmdBufCount() usize {
+    const n = mtl.Device.cmdbufs;
+    mtl.Device.cmdbufs = 0;
+    return n;
+}
+
+pub fn materializeArenas() usize {
+    const cx = &(ctx orelse {
+        arena_error = "no metal device";
+        return 0;
+    });
+    const page = std.heap.pageSize();
+    // Split at the device's own limit, which is around half of physical RAM:
+    // a 9.7 GB store is two allocations on a 16 GB machine and one on a 64 GB
+    // one, and asking for it whole simply fails.
+    const max_one = std.mem.alignBackward(usize, cx.dev.maxBufferLen(), page);
+    if (max_one == 0) {
+        arena_error = "device reports no maximum buffer length";
+        return 0;
+    }
+
+    var total: usize = 0;
+    for (&regions) |*slot| {
+        const r = if (slot.*) |*x| x else continue;
+        if (r.done) {
+            total += r.len;
+            continue;
+        }
+        var off: usize = 0;
+        while (off < r.len) {
+            const take = @min(max_one, r.len - off);
+            const ci = freeChunk() orelse {
+                arena_error = "too many weight regions to make resident";
+                return total;
+            };
+            const buf = cx.dev.wrapHost(@as([*]const u8, @ptrFromInt(r.base + off))[0..take]) catch |e| {
+                arena_error = @errorName(e);
+                return total;
+            };
+            // Wrapping alone only makes the pages addressable by the GPU; they
+            // stay as evictable as any other file mapping, which for a model
+            // larger than the free page cache means faulting the working set
+            // back in every token. Residency is the half that matters.
+            _ = cx.dev.makeResident(buf);
+            chunks[ci] = .{ .base = r.base + off, .len = take, .buf = buf };
+            off += take;
+        }
+        r.done = true;
+        total += r.len;
+    }
+    if (total > 0) arena_error = null;
+    return total;
+}
+
+fn freeChunk() ?usize {
+    for (chunks, 0..) |c, i| {
+        if (c == null) return i;
+    }
+    return null;
+}
+
+fn wrapFor(cx: *Ctx, data: []const u8) ?Wrapped {
+    // A registered mapping covers the slice outright, and hits here before any
+    // allocation happens.
+    const addr = @intFromPtr(data.ptr);
+    for (chunks) |slot| {
+        const ch = slot orelse continue;
+        // Whole slice inside one chunk, or not at all: a tensor straddling a
+        // split has no single buffer to name, and the per-slice path below
+        // handles the handful that do.
+        if (addr >= ch.base and addr + data.len <= ch.base + ch.len) {
+            return .{ .buf = ch.buf, .off = addr - ch.base };
+        }
+    }
+
     const page = std.heap.pageSize();
     const base = std.mem.alignBackward(usize, @intFromPtr(data.ptr), page);
     const end = std.mem.alignForward(usize, @intFromPtr(data.ptr) + data.len, page);
@@ -863,6 +1032,95 @@ pub fn attnHeads(
     return true;
 }
 
+/// One selected expert: its three weight tensors and its routing gate.
+pub const ExpertRef = struct {
+    gate: WeightRef,
+    up: WeightRef,
+    down: WeightRef,
+    /// Router weight this expert's output is scaled by before accumulation.
+    weight: f32,
+};
+
+/// A whole MoE layer's experts in one command buffer.
+///
+/// This is the piece that matters for a MoE model: `expert ffn` is ~40% of a
+/// DeepSeek token, and dispatching each expert's four kernels on its own
+/// submission costs seven command buffers per layer where one will do. The
+/// weighted accumulation runs on device between experts for the same reason —
+/// a host-side sum would end the buffer.
+///
+/// `normed` is the already-normalised input (attention still runs on the host
+/// for MLA models, so this is a host array); `out` receives the weighted sum.
+/// Returns false if any expert's types or shapes are unsupported, in which case
+/// nothing has been recorded and the caller runs its own path.
+pub fn moeFfnBlock(
+    normed: []const f32,
+    experts: []const ExpertRef,
+    ffn: usize,
+    out: []f32,
+) bool {
+    const cx = &(ctx orelse return false);
+    if (!use_gpu_ops and calibrated and !calibrating) return false;
+    const dim = normed.len;
+    if (experts.len == 0) return false;
+    if (out.len != dim) return false;
+    if (@max(ffn, dim) * 4 > cx.act[0].len) return false;
+    if (dim * 4 > cx.scratch_x.len) return false;
+
+    // Resolve everything before recording: a decline halfway through would
+    // leave a partially-built command buffer.
+    var pipes: [MAX_MOE_EXPERTS][3]mtl.Pipeline = undefined;
+    var wraps: [MAX_MOE_EXPERTS][3]Wrapped = undefined;
+    if (experts.len > MAX_MOE_EXPERTS) return false;
+    for (experts, 0..) |e, i| {
+        pipes[i][0] = pipelineFor(cx, e.gate.ty) orelse return false;
+        pipes[i][1] = pipelineFor(cx, e.up.ty) orelse return false;
+        pipes[i][2] = pipelineFor(cx, e.down.ty) orelse return false;
+        // Per tensor, not one rule for the layer: gate and up read `dim`
+        // columns, down reads `ffn`, and each type has its own block width.
+        if (dim % colsMultiple(e.gate.ty) != 0 or dim % colsMultiple(e.up.ty) != 0) return false;
+        if (ffn % colsMultiple(e.down.ty) != 0) return false;
+        wraps[i][0] = wrapFor(cx, e.gate.data) orelse return false;
+        wraps[i][1] = wrapFor(cx, e.up.data) orelse return false;
+        wraps[i][2] = wrapFor(cx, e.down.data) orelse return false;
+    }
+
+    @memcpy(cx.scratch_x.slice(f32)[0..dim], normed);
+
+    const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+    const dims_ffn = Dims{ .rows = @intCast(ffn), .cols = @intCast(dim) };
+    const dims_down = Dims{ .rows = @intCast(dim), .cols = @intCast(ffn) };
+    const len_ffn = extern struct { n: u32 }{ .n = @intCast(ffn) };
+    const zero_d = AccDims{ .n = @intCast(dim), .alpha = 0 };
+
+    // Slots: 0 = accumulator, 1 = gate, 2 = up, 3 = this expert's output.
+    const cb = cx.dev.commandBuffer();
+    const e = cb.encoder();
+    e.dispatch(cx.zero_p, &.{cx.act[0]}, &.{0}, std.mem.asBytes(&zero_d), dim, 64);
+    e.barrier();
+    for (experts, 0..) |ex, i| {
+        e.dispatch(pipes[i][0], &.{ wraps[i][0].buf, cx.scratch_x, cx.act[1] }, &.{ wraps[i][0].off, 0, 0 }, std.mem.asBytes(&dims_ffn), groupsFor(ex.gate.ty, ffn), group);
+        e.dispatch(pipes[i][1], &.{ wraps[i][1].buf, cx.scratch_x, cx.act[2] }, &.{ wraps[i][1].off, 0, 0 }, std.mem.asBytes(&dims_ffn), groupsFor(ex.up.ty, ffn), group);
+        e.barrier();
+        e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_ffn), ffn, 64);
+        e.barrier();
+        e.dispatch(pipes[i][2], &.{ wraps[i][2].buf, cx.act[1], cx.act[3] }, &.{ wraps[i][2].off, 0, 0 }, std.mem.asBytes(&dims_down), groupsFor(ex.down.ty, dim), group);
+        e.barrier();
+        const acc_d = AccDims{ .n = @intCast(dim), .alpha = ex.weight };
+        e.dispatch(cx.sadd_p, &.{ cx.act[0], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&acc_d), dim, 64);
+        e.barrier();
+    }
+    e.end();
+    cb.commitAndWait();
+    @memcpy(out, cx.act[0].slice(f32)[0..dim]);
+    return true;
+}
+
+/// Experts one call can record. DeepSeek activates 6 routed plus a shared one.
+const MAX_MOE_EXPERTS = 16;
+
+const AccDims = extern struct { n: u32, alpha: f32 };
+
 /// Everything one GQA layer needs, so the whole layer is one call.
 pub const LayerSpec = struct {
     li: usize,
@@ -1043,6 +1301,17 @@ pub fn frameStoreX(x: []f32) bool {
 /// no error, no NaN, just half a projection. That is what shipped: TinyLlama's
 /// `ffn_down` is Q6_K, dispatched with the Q4_K group count, so every layer's
 /// FFN output was half stale and the model produced confident nonsense.
+/// Column multiple a type's kernel requires — its block width. Q4_K and Q6_K
+/// are 256-value super-blocks; Q5_1 is a 32-value block, which is why
+/// DeepSeek's 1408-wide expert `down` is legal for it and not for them.
+fn colsMultiple(t: ggml.Type) usize {
+    return switch (t) {
+        .q4_k, .q6_k => 256,
+        .q5_1, .q5_0, .q8_0 => 32,
+        else => 256,
+    };
+}
+
 fn rowsPerGroup(t: ggml.Type) usize {
     return switch (t) {
         .q4_k => 2, // NR0 in dmmv_q4k.metal
@@ -1061,6 +1330,9 @@ fn pipelineFor(cx: *Ctx, t: ggml.Type) ?mtl.Pipeline {
     return switch (t) {
         .q4_k => cx.q4k,
         .q6_k => cx.q6k,
+        .q5_1 => cx.q5_1,
+        .q5_0 => cx.q5_0,
+        .q8_0 => cx.q8_0,
         else => null,
     };
 }
@@ -1068,7 +1340,14 @@ fn pipelineFor(cx: *Ctx, t: ggml.Type) ?mtl.Pipeline {
 pub fn matvec(t: ggml.Type, out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
     const cx = &(ctx orelse return cpu.matvec(t, out, data, x, rows, cols));
     const pipe = pipelineFor(cx, t);
-    if (!use_gpu_ops or !gpu_worthwhile or pipe == null or rows < min_rows or cols % 256 != 0) {
+    // `colsMultiple`, not a hardcoded 256: Q4_K and Q6_K are 256-value
+    // super-blocks but Q5_1 is a 32-value block, and a stale 256 here sent
+    // every Q5_1 matvec to the CPU. That fallback is silent and the CPU Q5_1
+    // kernel is approximate (int8 activations), so it presents as a slightly
+    // wrong GPU kernel rather than as an unused one -- which cost a long
+    // detour through bit-extraction and summation order before the test was
+    // taught to detect a fallback directly.
+    if (!use_gpu_ops or !gpu_worthwhile or pipe == null or rows < min_rows or cols % colsMultiple(t) != 0) {
         return cpu.matvec(t, out, data, x, rows, cols);
     }
     if (x.len * 4 > cx.scratch_x.len or out.len * 4 > cx.scratch_out.len) {
@@ -1638,6 +1917,221 @@ test "metal layer block matches the cpu layer, end to end" {
                 return e;
             };
         }
+    }
+}
+
+test "metal q5_1 matvec agrees with the exact cpu reference" {
+    // Q5_1 is affine (d*q + m) with a 32-value block, so unlike Q4_K there is
+    // no per-sub-block scale and no bias to separate — the thing to get wrong
+    // is the fifth bit, which lives in a u32 at byte 4 with value i at bit i
+    // and value i+16 at bit i+16. Dropping it silently halves every weight's
+    // range and still produces plausible output.
+    const gpa = std.testing.allocator;
+    const cols = 1408; // DeepSeek's expert `down` width: 44 blocks of 32
+    const rows = 256;
+
+    var prng = std.Random.DefaultPrng.init(0x51A1);
+    const rnd = prng.random();
+    const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q5_1, cols, rows));
+    defer gpa.free(data);
+    rnd.bytes(data);
+    // Pin d and m rather than leaving them random.
+    //
+    // A 1408-column Q5_1 row is 44 blocks against Q4_K's 5 super-blocks, and
+    // random f16 scales span five orders of magnitude. Summing 44 terms of
+    // wildly different size in f32 is ill-conditioned whatever the kernel
+    // does, so the comparison measures summation order rather than
+    // correctness -- the first version of this test failed at 2.85e-4 of mass
+    // for exactly that reason. The quantized nibbles and the fifth bits, which
+    // are what the kernel indexes, stay random.
+    var b: usize = 0;
+    while (b + 24 <= data.len) : (b += 24) {
+        std.mem.writeInt(u16, data[b..][0..2], 0x2C00, .little); // d = 0.0625
+        std.mem.writeInt(u16, data[b + 2 ..][0..2], 0x2800, .little); // m = 0.03125
+    }
+
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+    const saved_min = min_rows;
+    const saved_ok = gpu_worthwhile;
+    const saved_use = use_gpu_ops;
+    min_rows = 0;
+    gpu_worthwhile = true;
+    use_gpu_ops = true;
+    defer {
+        min_rows = saved_min;
+        gpu_worthwhile = saved_ok;
+        use_gpu_ops = saved_use;
+    }
+
+    const got = try gpa.alloc(f32, rows);
+    defer gpa.free(got);
+    @memset(got, std.math.nan(f32));
+    matvec(.q5_1, got, data, x, rows, cols);
+
+    // Did the GPU path actually run? `matvec` falls back to `cpu.matvec` for
+    // any reason it declines, and the CPU Q5_1 kernel quantizes activations to
+    // int8 -- approximate by ~0.4% per element. A silent fallback therefore
+    // looks exactly like a slightly-wrong kernel, which is how the first
+    // version of this test was read for far too long.
+    const cpu_ref = try gpa.alloc(f32, rows);
+    defer gpa.free(cpu_ref);
+    cpu.matvec(.q5_1, cpu_ref, data, x, rows, cols);
+    var identical: usize = 0;
+    for (got, cpu_ref) |g, c| {
+        if (g == c) identical += 1;
+    }
+    if (identical == rows) {
+        std.debug.print("q5_1: matvec fell back to the CPU -- the GPU path never ran\n", .{});
+        return error.SkipZigTest;
+    }
+
+    const row = try gpa.alloc(f32, cols);
+    defer gpa.free(row);
+    // The reference accumulates in f64, which matters at this width.
+    //
+    // A 1408-column row is 1408 terms, and a sequential f32 sum carries an
+    // error bound around n*eps -- ~1.7e-4 of the summed mass. The GPU sums
+    // 32-64 terms per lane and then tree-reduces, so it is *more* accurate
+    // than an f32 oracle, and the first version of this test duly reported the
+    // oracle's own drift as a kernel bug. It was chased through pinned scales
+    // and an all-positive input before the arithmetic was checked.
+    for (0..rows) |r| {
+        cpu.dequantRow(.q5_1, row, data, r, cols);
+        var acc64: f64 = 0;
+        var mass64: f64 = 0;
+        for (row, x) |wv, xv| {
+            acc64 += @as(f64, wv) * @as(f64, xv);
+            mass64 += @abs(@as(f64, wv) * @as(f64, xv));
+        }
+        const want: f32 = @floatCast(acc64);
+        const mass: f32 = @floatCast(mass64);
+        // With the scales pinned this is back to ordinary reassociation, so
+        // the same 1e-5 of summed mass the other kernel tests use. A wrong
+        // fifth bit or a swapped nibble half moves a result by percent.
+        const tol = mass * 1e-5;
+        std.testing.expectApproxEqAbs(want, got[r], tol) catch |e| {
+            std.debug.print("metal q5_1 row {d}: reference {d} vs gpu {d} (rel-to-mass {e:.2})\n", .{ r, want, got[r], @abs(want - got[r]) / mass });
+            return e;
+        };
+    }
+}
+
+test "metal moe block matches the cpu expert loop" {
+    // Several experts and a weighted sum in one command buffer. What this has
+    // to catch is the accumulation: a dropped or double-applied router weight
+    // still produces a well-formed vector, and with random weights the result
+    // looks equally plausible either way. Three experts with deliberately
+    // different gates, so a mixed-up ordering shows.
+    const gpa = std.testing.allocator;
+    const dim = 2048;
+    const ffn = 1408; // DeepSeek-V2-Lite's expert width
+    const n_exp = 3;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+    const saved_use = use_gpu_ops;
+    use_gpu_ops = true;
+    defer use_gpu_ops = saved_use;
+
+    var prng = std.Random.DefaultPrng.init(0x30E5);
+    const rnd = prng.random();
+    // Types as the real checkpoint has them: gate and up are Q4_K over `dim`
+    // columns, down is Q5_1 over `ffn`. That is not incidental -- 1408 is not
+    // a multiple of 256, so a Q4_K `down` is not a legal tensor, and the first
+    // version of this test built one and was correctly refused.
+    const mk = struct {
+        fn f(g: std.mem.Allocator, r: std.Random, ty: ggml.Type, rows: usize, cols: usize) ![]align(16384) u8 {
+            const d = try g.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(ty, cols, rows));
+            r.bytes(d);
+            const bs: usize = if (ty == .q4_k) 144 else 24;
+            var b: usize = 0;
+            while (b + bs <= d.len) : (b += bs) {
+                std.mem.writeInt(u16, d[b..][0..2], 0x2C00, .little);
+                std.mem.writeInt(u16, d[b + 2 ..][0..2], 0x2800, .little);
+            }
+            return d;
+        }
+    }.f;
+
+    var wg: [n_exp][]align(16384) u8 = undefined;
+    var wu: [n_exp][]align(16384) u8 = undefined;
+    var wd: [n_exp][]align(16384) u8 = undefined;
+    for (0..n_exp) |i| {
+        wg[i] = try mk(gpa, rnd, .q4_k, ffn, dim);
+        wu[i] = try mk(gpa, rnd, .q4_k, ffn, dim);
+        wd[i] = try mk(gpa, rnd, .q5_1, dim, ffn);
+    }
+    defer for (0..n_exp) |i| {
+        gpa.free(wg[i]);
+        gpa.free(wu[i]);
+        gpa.free(wd[i]);
+    };
+
+    const normed = try gpa.alloc(f32, dim);
+    defer gpa.free(normed);
+    for (normed) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    const gates = [n_exp]f32{ 0.6, 0.25, 0.15 };
+
+    var refs: [n_exp]ExpertRef = undefined;
+    for (0..n_exp) |i| refs[i] = .{
+        .gate = .{ .ty = .q4_k, .data = wg[i] },
+        .up = .{ .ty = .q4_k, .data = wu[i] },
+        .down = .{ .ty = .q5_1, .data = wd[i] },
+        .weight = gates[i],
+    };
+
+    const got = try gpa.alloc(f32, dim);
+    defer gpa.free(got);
+    if (!moeFfnBlock(normed, &refs, ffn, got)) return error.SkipZigTest;
+
+    // Reference: exact dequantize-then-dot, not cpu.matvec — the CPU kernel
+    // quantizes activations and chaining four of them per expert compounds
+    // into drift this would report as a GPU bug.
+    const exact = struct {
+        fn f(g: std.mem.Allocator, ty: ggml.Type, o: []f32, data: []const u8, xv: []const f32, rows: usize, cols: usize) !void {
+            const rb = try g.alloc(f32, cols);
+            defer g.free(rb);
+            for (0..rows) |r| {
+                cpu.dequantRow(ty, rb, data, r, cols);
+                var a: f32 = 0;
+                for (rb, xv) |wv, x2| a += wv * x2;
+                o[r] = a;
+            }
+        }
+    }.f;
+
+    const want = try gpa.alloc(f32, dim);
+    defer gpa.free(want);
+    @memset(want, 0);
+    const gbuf = try gpa.alloc(f32, ffn);
+    defer gpa.free(gbuf);
+    const ubuf = try gpa.alloc(f32, ffn);
+    defer gpa.free(ubuf);
+    const obuf = try gpa.alloc(f32, dim);
+    defer gpa.free(obuf);
+    for (0..n_exp) |i| {
+        try exact(gpa, .q4_k, gbuf, wg[i], normed, ffn, dim);
+        try exact(gpa, .q4_k, ubuf, wu[i], normed, ffn, dim);
+        cpu.swiglu(gbuf, gbuf, ubuf);
+        try exact(gpa, .q5_1, obuf, wd[i], gbuf, dim, ffn);
+        for (want, obuf) |*a, v| a.* += gates[i] * v;
+    }
+
+    var mass: f32 = 0;
+    for (want) |v| mass += @abs(v);
+    const tol = (mass / @as(f32, @floatFromInt(dim))) * 2e-3;
+    for (0..dim) |i| {
+        std.testing.expectApproxEqAbs(want[i], got[i], tol) catch |err| {
+            std.debug.print("moe block dim {d}: cpu {d} vs gpu {d} (tol {d})\n", .{ i, want[i], got[i], tol });
+            return err;
+        };
     }
 }
 
@@ -2253,5 +2747,240 @@ test "probe: peak streaming-read bandwidth" {
             @as(f64, @floatFromInt(best)) / 1e6,
             @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(best)),
         });
+    }
+}
+
+test "metal q5_0 matvec agrees with the exact cpu reference" {
+    // Q5_0 is symmetric (d*(q-16)) with a 32-value block. Two things are easy to
+    // get wrong and both stay plausible: the fifth bit, which lives in a u32 at
+    // byte 2 with value i at bit i and value i+16 at bit i+16, and the -16
+    // offset, which has to be applied to every element and not to the block
+    // sum. Dropping either shifts results without making them obviously wrong.
+    const gpa = std.testing.allocator;
+    const cols = 1408; // DeepSeek's expert `down` width: 44 blocks of 32
+    const rows = 256;
+
+    var prng = std.Random.DefaultPrng.init(0x50A0);
+    const rnd = prng.random();
+    const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q5_0, cols, rows));
+    defer gpa.free(data);
+    rnd.bytes(data);
+    // Pin the scale, as the Q5_1 test does and for the same reason: random f16
+    // scales span five orders of magnitude, so summing 44 blocks in f32 is
+    // ill-conditioned whatever the kernel does and the comparison would
+    // measure summation order rather than correctness. The quants stay random.
+    var b: usize = 0;
+    while (b + 22 <= data.len) : (b += 22) {
+        std.mem.writeInt(u16, data[b..][0..2], 0x2C00, .little); // d = 0.0625
+    }
+
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+    const saved_min = min_rows;
+    const saved_ok = gpu_worthwhile;
+    const saved_use = use_gpu_ops;
+    min_rows = 0;
+    gpu_worthwhile = true;
+    use_gpu_ops = true;
+    defer {
+        min_rows = saved_min;
+        gpu_worthwhile = saved_ok;
+        use_gpu_ops = saved_use;
+    }
+
+    const got = try gpa.alloc(f32, rows);
+    defer gpa.free(got);
+    @memset(got, std.math.nan(f32));
+    matvec(.q5_0, got, data, x, rows, cols);
+
+    // Did the GPU path actually run? `matvec` falls back to `cpu.matvec` for
+    // any reason it declines, and the CPU kernel is int8-approximate, so a
+    // silent fallback presents as a slightly-wrong kernel rather than an
+    // unused one. This is the check that would have caught the real bug here:
+    // the type had no pipeline at all, so every expert `down` in the
+    // checkpoint took the host path and the batched MoE block never ran.
+    const cpu_ref = try gpa.alloc(f32, rows);
+    defer gpa.free(cpu_ref);
+    cpu.matvec(.q5_0, cpu_ref, data, x, rows, cols);
+    var identical: usize = 0;
+    for (got, cpu_ref) |g, c| {
+        if (g == c) identical += 1;
+    }
+    if (identical == rows) {
+        std.debug.print("q5_0: matvec fell back to the CPU -- the GPU path never ran\n", .{});
+        return error.SkipZigTest;
+    }
+
+    const row = try gpa.alloc(f32, cols);
+    defer gpa.free(row);
+    // f64 oracle: a sequential f32 sum over 1408 terms drifts by ~1.7e-4 of
+    // the summed mass, which is larger than the tolerance below, so an f32
+    // reference would report its own error as the kernel's.
+    for (0..rows) |r| {
+        cpu.dequantRow(.q5_0, row, data, r, cols);
+        var acc64: f64 = 0;
+        var mass64: f64 = 0;
+        for (row, x) |wv, xv| {
+            acc64 += @as(f64, wv) * @as(f64, xv);
+            mass64 += @abs(@as(f64, wv) * @as(f64, xv));
+        }
+        const want: f32 = @floatCast(acc64);
+        const mass: f32 = @floatCast(mass64);
+        const tol = mass * 1e-5;
+        std.testing.expectApproxEqAbs(want, got[r], tol) catch |e| {
+            std.debug.print("metal q5_0 row {d}: reference {d} vs gpu {d} (rel-to-mass {e:.2})\n", .{ r, want, got[r], @abs(want - got[r]) / mass });
+            return e;
+        };
+    }
+}
+
+test "metal q8_0 matvec agrees with the exact cpu reference" {
+    // Q8_0 has no unpacking at all -- the quants are already signed bytes -- so
+    // the only thing to get wrong is signedness. Reading them as unsigned turns
+    // every negative weight into a large positive one, which a model absorbs
+    // into plausible-looking text rather than failing.
+    const gpa = std.testing.allocator;
+    const cols = 1408; // DeepSeek's expert `down` width: 44 blocks of 32
+    const rows = 256;
+
+    var prng = std.Random.DefaultPrng.init(0x80A0);
+    const rnd = prng.random();
+    const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q8_0, cols, rows));
+    defer gpa.free(data);
+    rnd.bytes(data);
+    // Pin the scale, as the Q5_1 test does and for the same reason: random f16
+    // scales span five orders of magnitude, so summing 44 blocks in f32 is
+    // ill-conditioned whatever the kernel does and the comparison would
+    // measure summation order rather than correctness. The quants stay random.
+    var b: usize = 0;
+    while (b + 34 <= data.len) : (b += 34) {
+        std.mem.writeInt(u16, data[b..][0..2], 0x2C00, .little); // d = 0.0625
+    }
+
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+    const saved_min = min_rows;
+    const saved_ok = gpu_worthwhile;
+    const saved_use = use_gpu_ops;
+    min_rows = 0;
+    gpu_worthwhile = true;
+    use_gpu_ops = true;
+    defer {
+        min_rows = saved_min;
+        gpu_worthwhile = saved_ok;
+        use_gpu_ops = saved_use;
+    }
+
+    const got = try gpa.alloc(f32, rows);
+    defer gpa.free(got);
+    @memset(got, std.math.nan(f32));
+    matvec(.q8_0, got, data, x, rows, cols);
+
+    // Did the GPU path actually run? `matvec` falls back to `cpu.matvec` for
+    // any reason it declines, and the CPU kernel is int8-approximate, so a
+    // silent fallback presents as a slightly-wrong kernel rather than an
+    // unused one. This is the check that would have caught the real bug here:
+    // the type had no pipeline at all, so every expert `down` in the
+    // checkpoint took the host path and the batched MoE block never ran.
+    const cpu_ref = try gpa.alloc(f32, rows);
+    defer gpa.free(cpu_ref);
+    cpu.matvec(.q8_0, cpu_ref, data, x, rows, cols);
+    var identical: usize = 0;
+    for (got, cpu_ref) |g, c| {
+        if (g == c) identical += 1;
+    }
+    if (identical == rows) {
+        std.debug.print("q8_0: matvec fell back to the CPU -- the GPU path never ran\n", .{});
+        return error.SkipZigTest;
+    }
+
+    const row = try gpa.alloc(f32, cols);
+    defer gpa.free(row);
+    // f64 oracle: a sequential f32 sum over 1408 terms drifts by ~1.7e-4 of
+    // the summed mass, which is larger than the tolerance below, so an f32
+    // reference would report its own error as the kernel's.
+    for (0..rows) |r| {
+        cpu.dequantRow(.q8_0, row, data, r, cols);
+        var acc64: f64 = 0;
+        var mass64: f64 = 0;
+        for (row, x) |wv, xv| {
+            acc64 += @as(f64, wv) * @as(f64, xv);
+            mass64 += @abs(@as(f64, wv) * @as(f64, xv));
+        }
+        const want: f32 = @floatCast(acc64);
+        const mass: f32 = @floatCast(mass64);
+        const tol = mass * 1e-5;
+        std.testing.expectApproxEqAbs(want, got[r], tol) catch |e| {
+            std.debug.print("metal q8_0 row {d}: reference {d} vs gpu {d} (rel-to-mass {e:.2})\n", .{ r, want, got[r], @abs(want - got[r]) / mass });
+            return e;
+        };
+    }
+}
+
+test "moe block accepts every down-projection type real checkpoints use" {
+    // The bug this exists to prevent, stated plainly: DeepSeek-V2-Lite Q4_K_M
+    // stores `ffn_down_exps` as Q5_0 in some layers and Q8_0 in others, neither
+    // of which had a pipeline -- so `moeFfnBlock` declined at
+    // `pipelineFor(e.down.ty)` for every MoE layer in the checkpoint and the
+    // batched path was dead on the one model it was written for.
+    //
+    // It survived because the block's other test treats a decline as
+    // `error.SkipZigTest`. A backend that refuses everything passes a suite
+    // built that way. So this asserts acceptance rather than agreement -- the
+    // numbers are the other test's job -- and it *fails* on a decline.
+    const gpa = std.testing.allocator;
+    const dim = 2048;
+    const ffn = 1408;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+    const saved_use = use_gpu_ops;
+    use_gpu_ops = true;
+    defer use_gpu_ops = saved_use;
+
+    var prng = std.Random.DefaultPrng.init(0xD0);
+    const rnd = prng.random();
+
+    const normed = try gpa.alloc(f32, dim);
+    defer gpa.free(normed);
+    for (normed) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    const got = try gpa.alloc(f32, dim);
+    defer gpa.free(got);
+
+    // gate and up are Q4_K over `dim` in every mix that ships; `down` is the
+    // one that varies, and 1408 is not a multiple of 256 so it can never be a
+    // K-quant.
+    const wg = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, dim, ffn));
+    defer gpa.free(wg);
+    const wu = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, dim, ffn));
+    defer gpa.free(wu);
+    rnd.bytes(wg);
+    rnd.bytes(wu);
+
+    for ([_]ggml.Type{ .q5_0, .q8_0, .q5_1 }) |down_ty| {
+        const wd = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(down_ty, ffn, dim));
+        defer gpa.free(wd);
+        rnd.bytes(wd);
+        const refs = [_]ExpertRef{.{
+            .gate = .{ .ty = .q4_k, .data = wg },
+            .up = .{ .ty = .q4_k, .data = wu },
+            .down = .{ .ty = down_ty, .data = wd },
+            .weight = 1.0,
+        }};
+        if (!moeFfnBlock(normed, &refs, ffn, got)) {
+            std.debug.print("moe block declined a {t} down-projection: every MoE layer of such a checkpoint falls back to the host\n", .{down_ty});
+            return error.MoeBlockDeclinedARealType;
+        }
     }
 }

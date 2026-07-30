@@ -116,7 +116,7 @@ other makes you a joiner.
 | `--gguf FILE` | off | Be the **origin**: shard `FILE`, compute the manifest (SHA-256 per shard, Merkle root = the model version id), and hold and serve everything. If the file is MoE, sharding is expert-aligned and this node also becomes the **bootnode** for the swarm. |
 | `--bootstrap HOST:PORT` | off | **Join** an existing swarm: adopt that peer's manifest (root-verified), get a committee and shard assignment from the bootnode, then fetch the assigned shards, each digest-verified. Also seeds the gossip table. |
 | `--peers H:P,...` | none | Extra known peers, comma-separated. Seeds the gossip table and gives bootstrap and repair more sources to try. |
-| `--hold-fraction F` | `1.0` | Fraction of expert shards this node wants to hold, `0.0`–`1.0`. This is the capacity knob: `0.3` on a small box means it holds ~30% and streams the rest from peers at token time. Resident (non-expert) shards are always held in full regardless. |
+| `--hold-fraction F` | `1.0` | Fraction of expert shards this node holds, `0.0`–`1.0`. A real cap, enforced continuously: a shard fetched from a peer at token time is persisted and marked held, and once the count exceeds the cap the least-recently-used expert is evicted — its holdings bit cleared and its blocks hole-punched back to the filesystem. Resident (non-expert) shards are mandatory and never evicted. Set it below 1.0 and the node's store stays that size no matter how long it serves; leave it at 1.0 (the default) and the node keeps everything, which is what an origin wants. Note the trade: a cap well below the model's hot set makes the node re-fetch evicted experts, so the miss rate — and on a slow link the token latency — rises sharply. |
 | `--range-mb M` | `4.0` | Shard size when *building* a fresh manifest, for non-MoE files that use fixed-size ranges. Ignored when joining (you adopt the peer's layout) and for expert-aligned sharding (where the shard is one expert). |
 | `--r-target N` | `2` | Redundancy target when acting as bootnode: how many committee members should hold each shard before the committee counts as saturated. Higher means more copies and more resilience, at more storage. |
 
@@ -338,7 +338,7 @@ target triple, the Zig version that compiled it, and the optimization mode:
 loom 0.1.0 (1e35bba...)
   target   aarch64-macos-none
   zig      0.16.0
-  mode     ReleaseFast
+  mode     ReleaseSafe
 ```
 
 `loom node` and `loom light` print the same identity as a banner at startup,
@@ -356,6 +356,7 @@ downloaded binary misbehaves on unexpected hardware.
 
 | Option | Default | What it does |
 |---|---|---|
-| `-Doptimize=ReleaseFast` | `Debug` | Roughly 10x faster inference. Use it for anything but debugging. |
+| `-Doptimize=ReleaseSafe` | `Debug` | What releases and the container image ship. Roughly 10x faster than Debug, with bounds checks kept. |
+| `-Doptimize=ReleaseFast` | `Debug` | A further ~11% over ReleaseSafe by dropping bounds checks. Not what loom ships: a node writes peer-supplied shards into buffers, and this is the mode in which a 16 MB write into a 6.3 MB slot ran silently rather than trapping. Reasonable for a benchmark, not for a daemon on a network. |
 | `-Dgpu=none\|metal\|vulkan` | `none` | Compute backend, resolved at compile time. The inactive backends are not compiled in, so a GPU toolchain never becomes a requirement for a CPU build. `metal` is macOS-only and `vulkan` is not available on macOS; both are still unimplemented (issues #12, #13) and fail the build with a message saying so rather than silently falling back to CPU. |
 | `-Dcommit=<sha>` | `unknown` | Stamped into `loom version`. CI sets it. |
