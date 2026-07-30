@@ -448,6 +448,7 @@ const Ctx = struct {
     kvw_p: mtl.Pipeline,
     sadd_p: mtl.Pipeline,
     reduce_p: mtl.Pipeline,
+    reduce_dev_p: mtl.Pipeline,
     zero_p: mtl.Pipeline,
     /// Device-resident KV cache, [layers][ctx][kvd]. Allocated by `attnInit`.
     /// It lives here rather than in the engine's State because the whole point
@@ -585,6 +586,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const predd = dev.pipeline(moe_acc_src, "moe_reduce_dev") catch {
+        dev.deinit();
+        return;
+    };
     const pred = dev.pipeline(moe_acc_src, "moe_reduce") catch {
         dev.deinit();
         return;
@@ -624,7 +629,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0_id = p50id, .q8_0_id = p80id, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .route_p = proute, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0_id = p50id, .q8_0_id = p80id, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .reduce_dev_p = predd, .route_p = proute, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -1468,7 +1473,7 @@ const RouteDims = extern struct {
     weights_scale: f32,
 };
 
-const IdDims = extern struct { rows: u32, cols: u32, n_used: u32, plane_stride: u32 };
+const IdDims = extern struct { rows: u32, cols: u32, n_used: u32, plane_stride: u32, x_stride: u32 };
 
 const AbsorbDims = extern struct { n_heads: u32, nope: u32, kvr: u32, stride: u32 };
 
@@ -3923,57 +3928,67 @@ test "id-indexed matvec equals the plain kernel, for every expert type" {
     }
     defer for (datas[0..n_alloc]) |d| gpa.free(d);
 
-    const x = try gpa.alloc(f32, cols);
-    defer gpa.free(x);
-    for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    // Enough distinct vectors for the strided case; the shared case uses the
+    // first. Strided is the down projection's shape -- each slot's input is
+    // its own expert's SwiGLU output -- and a kernel that ignored x_stride
+    // would compute every slot against slot 0's vector: plausible output,
+    // since the matrices still differ per slot.
+    const xs = try gpa.alloc(f32, ids.len * cols);
+    defer gpa.free(xs);
+    for (xs) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
 
     for (types, 0..) |ty, i| {
         const data = datas[i];
         const plane_bytes = ggml.tensorBytes(ty, cols, rows);
 
-        // Reference: the plain kernel, once per plane, ids out of order --
-        // 3,0,5,1,4,2 -- because a stride bug gives a correct first expert and
-        // garbage after it, which in a MoE layer is a plausible output vector:
-        // the first expert usually carries the largest gate.
-        const want = try gpa.alloc(f32, ids.len * rows);
-        defer gpa.free(want);
-        for (ids, 0..) |id, slot| {
-            matvec(ty, want[slot * rows ..][0..rows], data[id * plane_bytes ..][0..plane_bytes], x, rows, cols);
-        }
+        for ([_]bool{ false, true }) |strided| {
+            // Reference: the plain kernel, once per plane, ids out of order --
+            // 3,0,5,1,4,2 -- because a stride bug gives a correct first expert
+            // and garbage after it, which in a MoE layer is a plausible output
+            // vector: the first expert usually carries the largest gate.
+            const want = try gpa.alloc(f32, ids.len * rows);
+            defer gpa.free(want);
+            for (ids, 0..) |id, slot| {
+                const xv = if (strided) xs[slot * cols ..][0..cols] else xs[0..cols];
+                matvec(ty, want[slot * rows ..][0..rows], data[id * plane_bytes ..][0..plane_bytes], xv, rows, cols);
+            }
 
-        const sel = dmmvIdFor(cx, ty) orelse return error.SkipZigTest;
-        const idbuf = cx.dev.alloc(ids.len * @sizeOf(u32)) catch return error.SkipZigTest;
-        @memcpy(idbuf.slice(u32)[0..ids.len], &ids);
-        const outbuf = cx.dev.alloc(ids.len * rows * @sizeOf(f32)) catch return error.SkipZigTest;
-        const w = wrapFor(cx, data) orelse return error.SkipZigTest;
-        @memcpy(cx.scratch_x.slice(f32)[0..cols], x);
+            const sel = dmmvIdFor(cx, ty) orelse return error.SkipZigTest;
+            const idbuf = cx.dev.alloc(ids.len * @sizeOf(u32)) catch return error.SkipZigTest;
+            @memcpy(idbuf.slice(u32)[0..ids.len], &ids);
+            const outbuf = cx.dev.alloc(ids.len * rows * @sizeOf(f32)) catch return error.SkipZigTest;
+            const w = wrapFor(cx, data) orelse return error.SkipZigTest;
+            const n_x: usize = if (strided) ids.len * cols else cols;
+            @memcpy(cx.scratch_x.slice(f32)[0..n_x], xs[0..n_x]);
 
-        const dims = IdDims{
-            .rows = @intCast(rows),
-            .cols = @intCast(cols),
-            .n_used = @intCast(ids.len),
-            .plane_stride = @intCast(plane_bytes),
-        };
-        const group = SIMD_W * SIMDGROUPS_PER_GROUP;
-        const threads = ((ids.len * rows + sel.per - 1) / sel.per) * SIMD_W;
-        const grid = ((threads + group - 1) / group) * group;
-        const cb = cx.dev.commandBuffer();
-        cb.dispatch(
-            sel.pipe,
-            &.{ w.buf, cx.scratch_x, outbuf, idbuf },
-            &.{ w.off, 0, 0, 0 },
-            std.mem.asBytes(&dims),
-            grid,
-            group,
-        );
-        cb.commitAndWait();
-
-        const got = outbuf.slice(f32)[0 .. ids.len * rows];
-        for (want, got, 0..) |a, c, k| {
-            std.testing.expectEqual(a, c) catch |e| {
-                std.debug.print("{t} id matvec slot {d} (expert {d}) row {d}: plain {d} vs id {d}\n", .{ ty, k / rows, ids[k / rows], k % rows, a, c });
-                return e;
+            const dims = IdDims{
+                .rows = @intCast(rows),
+                .cols = @intCast(cols),
+                .n_used = @intCast(ids.len),
+                .plane_stride = @intCast(plane_bytes),
+                .x_stride = if (strided) @intCast(cols) else 0,
             };
+            const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+            const threads = ((ids.len * rows + sel.per - 1) / sel.per) * SIMD_W;
+            const grid = ((threads + group - 1) / group) * group;
+            const cb = cx.dev.commandBuffer();
+            cb.dispatch(
+                sel.pipe,
+                &.{ w.buf, cx.scratch_x, outbuf, idbuf },
+                &.{ w.off, 0, 0, 0 },
+                std.mem.asBytes(&dims),
+                grid,
+                group,
+            );
+            cb.commitAndWait();
+
+            const got = outbuf.slice(f32)[0 .. ids.len * rows];
+            for (want, got, 0..) |a, c, k| {
+                std.testing.expectEqual(a, c) catch |e| {
+                    std.debug.print("{t} strided={} id matvec slot {d} (expert {d}) row {d}: plain {d} vs id {d}\n", .{ ty, strided, k / rows, ids[k / rows], k % rows, a, c });
+                    return e;
+                };
+            }
         }
     }
 }
