@@ -722,7 +722,7 @@ pub const Profile = struct {
         const t: f64 = @floatFromInt(tot);
         const n: f64 = @floatFromInt(tokens);
         std.debug.print(
-            "profile {d} tok: attn {d:.1}/{d:.0}%  get {d:.1}/{d:.0}%  ffn {d:.1}/{d:.0}%  other {d:.1}/{d:.0}%  total {d:.1}ms\n",
+            "profile {d} tok: attn {d:.1}/{d:.0}%  get {d:.1}/{d:.0}%  ffn {d:.1}/{d:.0}%  other {d:.1}/{d:.0}%  total {d:.1}ms  cb/tok {d:.1}\n",
             .{
                 tokens,
                 @as(f64, @floatFromInt(attn_ns)) / 1e6 / n,
@@ -734,6 +734,7 @@ pub const Profile = struct {
                 @as(f64, @floatFromInt(other_ns)) / 1e6 / n,
                 100 * @as(f64, @floatFromInt(other_ns)) / t,
                 t / 1e6 / n,
+                @as(f64, @floatFromInt(cmdbufs)) / n,
             },
         );
     }
@@ -800,7 +801,12 @@ pub const Profile = struct {
 /// one. Attention is the part a batch cannot share -- every sequence has its
 /// own KV cache and its own position -- so it stays per sequence either way,
 /// and only the FFN below it gets to amortize a weight read across the batch.
-fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_attn: *i128) void {
+/// Returns true when the fused layer tail ran, in which case the caller must
+/// not run its own FFN: the tail already did attention *and* the whole routed
+/// MoE, one submission. `allow_tail` exists because decodeBatch shares this
+/// function and batches the FFN itself -- a tail firing there would run the
+/// FFN twice with different routing, and the output would be plausible.
+fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_attn: *i128, allow_tail: bool) bool {
     const prof = Profile.enabled();
     const cfg = m.cfg;
     const kd = cfg.keyDim();
@@ -873,6 +879,56 @@ fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_a
     }
     // One call, two dispatches, one command buffer: absorption then attention,
     // with q_abs staying on the device between them.
+    // The whole rest of the layer -- absorb, attention, W_v, projection,
+    // residual, norm, router, routed MoE, second residual -- as one
+    // submission, when the backend will take it. Local MoE layers only.
+    const t_tail0 = if (prof) Profile.now() else 0;
+    // LOOM_NO_TAIL bisects the fused tail against the two-buffer path in one
+    // binary; cross-run comparison on this machine has misled before.
+    if (allow_tail and l.is_moe and m.dist == null and std.c.getenv("LOOM_NO_TAIL") == null) {
+        if (l.ffn_gate_exps) |gt| {
+            const rbias: ?[]const f32 = if (l.exp_probs_b) |b| asF32(b) else null;
+            const shexp: ?[3]backend.WeightRef = if (l.ffn_gate_shexp) |gs| .{
+                .{ .ty = gs.ty, .data = gs.data },
+                .{ .ty = l.ffn_up_shexp.?.ty, .data = l.ffn_up_shexp.?.data },
+                .{ .ty = l.ffn_down_shexp.?.ty, .data = l.ffn_down_shexp.?.data },
+            } else null;
+            if (backend.mlaLayerTail(
+                li,
+                pos,
+                st.x,
+                st.q_nope_all,
+                st.mla_qr,
+                .{ .ty = l.attn_kv_b.ty, .data = l.attn_kv_b.data },
+                .{ .ty = l.attn_output.ty, .data = l.attn_output.data },
+                asF32(l.ffn_norm),
+                cfg.eps,
+                .{ .ty = l.ffn_gate_inp.?.ty, .data = l.ffn_gate_inp.?.data },
+                rbias,
+                .{ .ty = gt.ty, .data = gt.data },
+                .{ .ty = l.ffn_up_exps.?.ty, .data = l.ffn_up_exps.?.data },
+                .{ .ty = l.ffn_down_exps.?.ty, .data = l.ffn_down_exps.?.data },
+                shexp,
+                gt.ne1,
+                if (l.ffn_gate_shexp) |gs| gs.ne1 else 0,
+                .{
+                    .n_expert = cfg.n_expert,
+                    .n_used = cfg.n_used,
+                    .gating_sigmoid = cfg.gating == .sigmoid,
+                    .weights_norm = cfg.weights_norm,
+                    .weights_scale = cfg.weights_scale,
+                },
+                cfg.n_heads,
+                nope,
+                vd,
+                scale,
+            )) {
+                if (prof) t_attn.* += Profile.now() - t_tail0;
+                return true;
+            }
+        }
+    }
+
     // One call, three dispatches, one command buffer: absorption, attention,
     // and W_v -- the result is head_out, ready for the output projection. The
     // fallback below is the full host loop including its own W_v.
@@ -934,6 +990,7 @@ fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_a
     if (prof) t_attn.* += Profile.now() - t_a0;
     mv(l.attn_output, st.proj_out, st.head_out);
     backend.add(st.x, st.proj_out);
+    return false;
 }
 
 /// Largest batch a decode step will take. Bounded by `backend.MAX_BATCH`,
@@ -988,7 +1045,7 @@ pub fn decodeBatch(
     if (cfg.dim > 8192 or widest > 8192) return error.ModelTooWideForBatch;
 
     for (m.layers, 0..) |l, li| {
-        for (states, positions) |st, pos| attnLayer(m, l, li, st, pos, &t_attn);
+        for (states, positions) |st, pos| _ = attnLayer(m, l, li, st, pos, &t_attn, false);
         for (states) |st| backend.rmsnorm(st.normed, st.x, asF32(l.ffn_norm), cfg.eps);
 
         if (l.ffn_gate_exps == null) {
@@ -1104,7 +1161,10 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
 
     for (m.layers, 0..) |l, li| {
         // ---- MLA attention ----
-        attnLayer(m, l, li, st, pos, &t_attn);
+        if (attnLayer(m, l, li, st, pos, &t_attn, true)) {
+            if (prof) n_block += 1;
+            continue;
+        }
 
         // ---- FFN ----
         backend.rmsnorm(st.normed, st.x, asF32(l.ffn_norm), cfg.eps);

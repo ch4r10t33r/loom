@@ -60,6 +60,11 @@ pub fn hasMlaCache() bool {
 
 pub const RoutedCfg = struct { n_expert: usize, n_used: usize, gating_sigmoid: bool, weights_norm: bool, weights_scale: f32 };
 
+pub fn mlaLayerTail(li: usize, pos: usize, x: []f32, q_nope: []const f32, q_rope: []const f32, kv_b: WeightRef, attn_out_w: WeightRef, ffn_norm: []const f32, eps: f32, router_w: WeightRef, router_bias: ?[]const f32, gate_w: WeightRef, up_w: WeightRef, down_w: WeightRef, shexp: ?[3]WeightRef, ffn: usize, shexp_ffn: usize, cfg: RoutedCfg, n_heads: usize, nope: usize, v_head_dim: usize, scale: f32) bool {
+    _ = .{ li, pos, x, q_nope, q_rope, kv_b, attn_out_w, ffn_norm, eps, router_w, router_bias, gate_w, up_w, down_w, shexp, ffn, shexp_ffn, cfg, n_heads, nope, v_head_dim, scale };
+    return false;
+}
+
 pub fn moeFfnBlockRouted(normed: []const f32, logits: []const f32, bias: ?[]const f32, gate_w: WeightRef, up_w: WeightRef, down_w: WeightRef, shexp: ?[3]WeightRef, ffn: usize, shexp_ffn: usize, cfg: RoutedCfg, out: []f32) bool {
     _ = .{ normed, logits, bias, gate_w, up_w, down_w, shexp, ffn, shexp_ffn, cfg, out };
     return false;

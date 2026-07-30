@@ -84,6 +84,7 @@ const moe_route_src = @embedFile("../shaders/metal/moe_route.metal");
 const dmmv_q5_1_src = @embedFile("../shaders/metal/dmmv_q5_1.metal");
 const dmmv_q5_0_src = @embedFile("../shaders/metal/dmmv_q5_0.metal");
 const dmmv_q8_0_src = @embedFile("../shaders/metal/dmmv_q8_0.metal");
+const dmmv_f32_src = @embedFile("../shaders/metal/dmmv_f32.metal");
 const elementwise_src = @embedFile("../shaders/metal/elementwise.metal");
 
 /// Below this many rows the CPU path wins outright, so the GPU is not used.
@@ -438,6 +439,7 @@ const Ctx = struct {
     route_gates: ?mtl.Buffer = null,
     q5_0: mtl.Pipeline,
     q8_0: mtl.Pipeline,
+    f32p: mtl.Pipeline,
     gemm_q4k: mtl.Pipeline,
     attn_p: mtl.Pipeline,
     mla_attn_p: mtl.Pipeline,
@@ -570,6 +572,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const pf32 = dev.pipeline(dmmv_f32_src, "dmmv_f32") catch {
+        dev.deinit();
+        return;
+    };
     const p80 = dev.pipeline(dmmv_q8_0_src, "dmmv_q8_0") catch {
         dev.deinit();
         return;
@@ -633,7 +639,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0_id = p50id, .q8_0_id = p80id, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .reduce_dev_p = predd, .route_p = proute, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0_id = p50id, .q8_0_id = p80id, .q5_0 = p50, .q8_0 = p80, .f32p = pf32, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .reduce_dev_p = predd, .route_p = proute, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -1612,6 +1618,195 @@ pub fn moeFfnBlockRouted(
     return true;
 }
 
+/// One MLA layer's tail as a single submission: absorb, attention, W_v, the
+/// output projection, the residual add, the FFN rmsnorm, the router matvec,
+/// then the whole routed MoE layer -- route, experts, reduce, shared expert.
+///
+/// This merges what were two command buffers per layer plus four host ops
+/// between them. The host ops were cheap; the second submission was not: each
+/// buffer ends in a wait, and ~27 of them per token is the difference the
+/// submission counter has tracked all along. In: the residual stream and this
+/// position's queries. Out: the residual stream after the layer.
+///
+/// The attention *head* of the layer -- attn norm, q/kv projections, kv_a
+/// norm, rope, cache append -- stays on the host for now; it feeds the
+/// compressed cache this reads.
+pub fn mlaLayerTail(
+    li: usize,
+    pos: usize,
+    x: []f32, // residual stream, updated in place
+    q_nope: []const f32,
+    q_rope: []const f32,
+    kv_b: WeightRef,
+    attn_out_w: WeightRef,
+    ffn_norm: []const f32,
+    eps: f32,
+    router_w: WeightRef, // n_expert rows over dim
+    router_bias: ?[]const f32,
+    gate_w: WeightRef,
+    up_w: WeightRef,
+    down_w: WeightRef,
+    shexp: ?[3]WeightRef,
+    ffn: usize,
+    shexp_ffn: usize,
+    cfg: RoutedCfg,
+    n_heads: usize,
+    nope: usize,
+    v_head_dim: usize,
+    scale: f32,
+) bool {
+    const cx = &(ctx orelse return false);
+    if (!use_gpu_ops) return false;
+    if (li >= cx.mla_wk.items.len) return false;
+    const cbuf = cx.mla_c orelse return false;
+    const rbuf = cx.mla_krope orelse return false;
+    const seq = pos + 1;
+    if (seq > cx.mla_ctx) return false;
+    const kvr = cx.mla_kvr;
+    const dim = x.len;
+
+    // Staging: q_nope, q_rope, x, bias -- one buffer, fixed offsets.
+    const off_qr = q_nope.len;
+    const off_x = off_qr + q_rope.len;
+    const off_bias = off_x + dim;
+    if ((off_bias + cfg.n_expert) * 4 > cx.scratch_x.len) return false;
+
+    // Slot plan. 1: q_abs / per-slot gate. 2: o_latent / per-slot up.
+    // 3: head_out then proj then down outputs. 4: x then x' (residual).
+    // 5: normed. 6: router logits. 0: MoE accumulator.
+    const widest = @max(ffn, shexp_ffn);
+    if (cfg.n_used * ffn * 4 > cx.act[1].len or widest * 4 > cx.act[1].len) return false;
+    if (@max(cfg.n_used * dim, n_heads * kvr) * 4 > cx.act[3].len) return false;
+    if (n_heads * kvr * 4 > cx.act[2].len) return false;
+
+    const vsel = dmmvIdFor(cx, kv_b.ty) orelse return false;
+    if (kvr % colsMultiple(kv_b.ty) != 0 or v_head_dim % vsel.per != 0) return false;
+    const psel = dmmvFor(cx, attn_out_w.ty, dim) orelse return false;
+    if ((n_heads * v_head_dim) % colsMultiple(attn_out_w.ty) != 0) return false;
+    const rsel = dmmvFor(cx, router_w.ty, cfg.n_expert) orelse return false;
+    if (dim % colsMultiple(router_w.ty) != 0) return false;
+    const gsel = dmmvIdFor(cx, gate_w.ty) orelse return false;
+    const usel = dmmvIdFor(cx, up_w.ty) orelse return false;
+    const dsel = dmmvIdFor(cx, down_w.ty) orelse return false;
+    if (dim % colsMultiple(gate_w.ty) != 0 or dim % colsMultiple(up_w.ty) != 0) return false;
+    if (ffn % colsMultiple(down_w.ty) != 0) return false;
+
+    const vw = wrapFor(cx, kv_b.data) orelse return false;
+    const pw = wrapFor(cx, attn_out_w.data) orelse return false;
+    const nw = wrapFor(cx, std.mem.sliceAsBytes(ffn_norm)) orelse return false;
+    const rw = wrapFor(cx, router_w.data) orelse return false;
+    const gw = wrapFor(cx, gate_w.data) orelse return false;
+    const uw = wrapFor(cx, up_w.data) orelse return false;
+    const dw = wrapFor(cx, down_w.data) orelse return false;
+    var sh_pipes: [3]@TypeOf(dmmvFor(undefined, .q4_k, 0).?) = undefined;
+    var sh_wraps: [3]Wrapped = undefined;
+    if (shexp) |sw| {
+        sh_pipes[0] = dmmvFor(cx, sw[0].ty, shexp_ffn) orelse return false;
+        sh_pipes[1] = dmmvFor(cx, sw[1].ty, shexp_ffn) orelse return false;
+        sh_pipes[2] = dmmvFor(cx, sw[2].ty, dim) orelse return false;
+        if (dim % colsMultiple(sw[0].ty) != 0 or shexp_ffn % colsMultiple(sw[2].ty) != 0) return false;
+        for (sw, 0..) |w, i| sh_wraps[i] = wrapFor(cx, w.data) orelse return false;
+    }
+    const row_bytes = kv_b.data.len / (n_heads * (nope + v_head_dim));
+    if (cx.mla_vids == null) {
+        const b = cx.dev.alloc(64 * @sizeOf(u32)) catch return false;
+        for (0..64) |k| b.slice(u32)[k] = @intCast(k);
+        cx.mla_vids = b;
+    }
+    if (cx.route_ids == null) {
+        cx.route_ids = cx.dev.alloc(MAX_MOE_EXPERTS * @sizeOf(u32)) catch return false;
+        cx.route_gates = cx.dev.alloc(MAX_MOE_EXPERTS * @sizeOf(f32)) catch return false;
+    }
+
+    @memcpy(cx.scratch_x.slice(f32)[0..q_nope.len], q_nope);
+    @memcpy(cx.scratch_x.slice(f32)[off_qr..][0..q_rope.len], q_rope);
+    @memcpy(cx.scratch_x.slice(f32)[off_x..][0..dim], x);
+    if (router_bias) |b| @memcpy(cx.scratch_x.slice(f32)[off_bias..][0..cfg.n_expert], b);
+
+    const ad = AbsorbDims{ .n_heads = @intCast(n_heads), .nope = @intCast(nope), .kvr = @intCast(kvr), .stride = @intCast(nope + v_head_dim) };
+    const dims = MlaDims{ .n_heads = @intCast(n_heads), .kvr = @intCast(kvr), .rope = @intCast(cx.mla_rope), .seq = @intCast(seq), .scale = scale };
+    const c_off = li * cx.mla_ctx * kvr * @sizeOf(f32);
+    const r_off = li * cx.mla_ctx * cx.mla_rope * @sizeOf(f32);
+    const vd_dims = IdDims{ .rows = @intCast(v_head_dim), .cols = @intCast(kvr), .n_used = @intCast(n_heads), .plane_stride = @intCast((nope + v_head_dim) * row_bytes), .x_stride = @intCast(kvr) };
+    const pd = Dims{ .rows = @intCast(dim), .cols = @intCast(n_heads * v_head_dim) };
+    const len_dim = extern struct { n: u32 }{ .n = @intCast(dim) };
+    const nd = extern struct { n: u32, eps: f32 }{ .n = @intCast(dim), .eps = eps };
+    const rdd = Dims{ .rows = @intCast(cfg.n_expert), .cols = @intCast(dim) };
+    const route_d = RouteDims{ .n_expert = @intCast(cfg.n_expert), .n_used = @intCast(cfg.n_used), .gating = if (cfg.gating_sigmoid) 1 else 0, .weights_norm = if (cfg.weights_norm) 1 else 0, .has_bias = if (router_bias != null) 1 else 0, .weights_scale = cfg.weights_scale };
+    const gate_plane: u32 = @intCast(gate_w.data.len / cfg.n_expert);
+    const up_plane: u32 = @intCast(up_w.data.len / cfg.n_expert);
+    const down_plane: u32 = @intCast(down_w.data.len / cfg.n_expert);
+    const d_gate = IdDims{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = gate_plane, .x_stride = 0 };
+    const d_up = IdDims{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = up_plane, .x_stride = 0 };
+    const d_down = IdDims{ .rows = @intCast(dim), .cols = @intCast(ffn), .n_used = @intCast(cfg.n_used), .plane_stride = down_plane, .x_stride = @intCast(ffn) };
+    const len_ffn = extern struct { n: u32 }{ .n = @intCast(ffn) };
+    const rdim = ReduceDims{ .n = @intCast(cfg.n_used), .dim = @intCast(dim), .w = @splat(0) };
+
+    const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+    const grid = struct {
+        fn f(rows: usize, per: usize, n: usize) usize {
+            const threads = ((n * rows + per - 1) / per) * SIMD_W;
+            return ((threads + group - 1) / group) * group;
+        }
+    }.f;
+
+    const cb = cx.dev.commandBuffer();
+    const e = cb.encoder();
+    // ---- attention ----
+    e.dispatch(cx.mla_absorb_p, &.{ cx.mla_wk.items[li], cx.scratch_x, cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&ad), n_heads * group, group);
+    e.barrier();
+    e.dispatch(cx.mla_attn_p, &.{ cx.act[1], cx.scratch_x, cbuf, rbuf, cx.act[2] }, &.{ 0, off_qr * 4, c_off, r_off, 0 }, std.mem.asBytes(&dims), n_heads * group, group);
+    e.barrier();
+    e.dispatch(vsel.pipe, &.{ vw.buf, cx.act[2], cx.act[3], cx.mla_vids.? }, &.{ vw.off + nope * row_bytes, 0, 0, 0 }, std.mem.asBytes(&vd_dims), grid(v_head_dim, vsel.per, n_heads), group);
+    e.barrier();
+    // ---- projection, residual, norm, router ----
+    e.dispatch(psel.pipe, &.{ pw.buf, cx.act[3], cx.act[4] }, &.{ pw.off, 0, 0 }, std.mem.asBytes(&pd), psel.groups, group);
+    e.barrier();
+    // x' = x + proj: add is a += b, so stage x into act[4]? act[4] holds proj;
+    // add x from scratch: dispatch add(proj += x_staged) -- order is symmetric.
+    e.dispatch(cx.add_p, &.{ cx.act[4], cx.scratch_x }, &.{ 0, off_x * 4 }, std.mem.asBytes(&len_dim), dim, 64);
+    e.barrier();
+    e.dispatch(cx.rmsnorm_p, &.{ cx.act[4], nw.buf, cx.act[5] }, &.{ 0, nw.off, 0 }, std.mem.asBytes(&nd), SIMD_W, SIMD_W);
+    e.barrier();
+    e.dispatch(rsel.pipe, &.{ rw.buf, cx.act[5], cx.act[6] }, &.{ rw.off, 0, 0 }, std.mem.asBytes(&rdd), rsel.groups, group);
+    e.barrier();
+    // ---- routed MoE, reading normed from act[5] and logits from act[6] ----
+    e.dispatch(cx.route_p, &.{ cx.act[6], cx.scratch_x, cx.route_ids.?, cx.route_gates.? }, &.{ 0, off_bias * 4, 0, 0 }, std.mem.asBytes(&route_d), 32, 32);
+    e.barrier();
+    e.dispatch(gsel.pipe, &.{ gw.buf, cx.act[5], cx.act[1], cx.route_ids.? }, &.{ gw.off, 0, 0, 0 }, std.mem.asBytes(&d_gate), grid(ffn, gsel.per, cfg.n_used), group);
+    e.dispatch(usel.pipe, &.{ uw.buf, cx.act[5], cx.act[2], cx.route_ids.? }, &.{ uw.off, 0, 0, 0 }, std.mem.asBytes(&d_up), grid(ffn, usel.per, cfg.n_used), group);
+    e.barrier();
+    for (0..cfg.n_used) |k| {
+        e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ k * ffn * 4, k * ffn * 4, k * ffn * 4 }, std.mem.asBytes(&len_ffn), ffn, 64);
+    }
+    e.barrier();
+    e.dispatch(dsel.pipe, &.{ dw.buf, cx.act[1], cx.act[3], cx.route_ids.? }, &.{ dw.off, 0, 0, 0 }, std.mem.asBytes(&d_down), grid(dim, dsel.per, cfg.n_used), group);
+    e.barrier();
+    e.dispatch(cx.reduce_dev_p, &.{ cx.act[0], cx.act[3], cx.route_gates.? }, &.{ 0, 0, 0 }, std.mem.asBytes(&rdim), dim, 64);
+    e.barrier();
+    if (shexp != null) {
+        const d_sh = Dims{ .rows = @intCast(shexp_ffn), .cols = @intCast(dim) };
+        const d_shd = Dims{ .rows = @intCast(dim), .cols = @intCast(shexp_ffn) };
+        const len_sh = extern struct { n: u32 }{ .n = @intCast(shexp_ffn) };
+        e.dispatch(sh_pipes[0].pipe, &.{ sh_wraps[0].buf, cx.act[5], cx.act[1] }, &.{ sh_wraps[0].off, 0, 0 }, std.mem.asBytes(&d_sh), sh_pipes[0].groups, group);
+        e.dispatch(sh_pipes[1].pipe, &.{ sh_wraps[1].buf, cx.act[5], cx.act[2] }, &.{ sh_wraps[1].off, 0, 0 }, std.mem.asBytes(&d_sh), sh_pipes[1].groups, group);
+        e.barrier();
+        e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_sh), shexp_ffn, 64);
+        e.barrier();
+        e.dispatch(sh_pipes[2].pipe, &.{ sh_wraps[2].buf, cx.act[1], cx.act[3] }, &.{ sh_wraps[2].off, 0, 0 }, std.mem.asBytes(&d_shd), sh_pipes[2].groups, group);
+        e.barrier();
+        const acc_d = AccDims{ .n = @intCast(dim), .alpha = 1.0 };
+        e.dispatch(cx.sadd_p, &.{ cx.act[0], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&acc_d), dim, 64);
+        e.barrier();
+    }
+    // x'' = x' + ffn: both on device.
+    e.dispatch(cx.add_p, &.{ cx.act[4], cx.act[0] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), dim, 64);
+    e.end();
+    cb.commitAndWait();
+    @memcpy(x, cx.act[4].slice(f32)[0..dim]);
+    return true;
+}
+
 /// One selected expert: its three weight tensors and its routing gate.
 pub const ExpertRef = struct {
     gate: WeightRef,
@@ -1936,6 +2131,7 @@ fn colsMultiple(t: ggml.Type) usize {
     return switch (t) {
         .q4_k, .q6_k => 256,
         .q5_1, .q5_0, .q8_0 => 32,
+        .f32 => 1,
         else => 256,
     };
 }
@@ -1987,6 +2183,7 @@ fn dmmvFor(cx: *Ctx, t: ggml.Type, rows: usize) ?struct { pipe: mtl.Pipeline, gr
         .q5_1 => cx.q5_1,
         .q5_0 => cx.q5_0,
         .q8_0 => cx.q8_0,
+        .f32 => cx.f32p,
         else => return null,
     };
     return .{ .pipe = pipe, .groups = groupsFor(t, rows) };
@@ -4477,6 +4674,169 @@ test "fused routed layer equals host routing plus the verified block" {
     for (want, got, 0..) |a, c, k| {
         std.testing.expectApproxEqAbs(a, c, tol) catch |e| {
             std.debug.print("fused routed dim {d}: host-routed {d} vs fused {d}\n", .{ k, a, c });
+            return e;
+        };
+    }
+}
+
+test "layer tail equals its constituent buffers plus host glue" {
+    // mlaLayerTail is assembly: absorb+attention+W_v (verified against an f64
+    // oracle), projection/residual/norm/router (kernels each verified), and
+    // the routed MoE block (verified differentially). This test pins the
+    // assembly itself -- the offsets and slot plan -- by running the same
+    // inputs through the constituent calls with host glue between them. A
+    // wrong slot or offset here produces a plausible residual stream, which
+    // 32 tokens of identical text can miss but 2048 compared floats cannot.
+    const gpa = std.testing.allocator;
+    const dim = 2048;
+    const n_heads = 4;
+    const nope = 64;
+    const vd = 64; // n_heads * vd = 256, a legal q4_k width for the projection
+    const kvr = 256;
+    const rope = 16;
+    const seq = 9;
+    const ffn = 1408;
+    const n_expert = 8;
+    const n_used = 3;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+    const saved_use = use_gpu_ops;
+    use_gpu_ops = true;
+    defer use_gpu_ops = saved_use;
+
+    var prng = std.Random.DefaultPrng.init(0x7A11);
+    const rnd = prng.random();
+    const mkq = struct {
+        fn f(g: std.mem.Allocator, r: std.Random, ty: ggml.Type, rows: usize, cols: usize, planes: usize) ![]align(16384) u8 {
+            const d = try g.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(ty, cols, rows) * planes);
+            r.bytes(d);
+            const bs: usize = if (ty == .q4_k) 144 else 22;
+            var b: usize = 0;
+            while (b + bs <= d.len) : (b += bs) {
+                std.mem.writeInt(u16, d[b..][0..2], 0x2C00, .little);
+                if (ty == .q4_k) std.mem.writeInt(u16, d[b + 2 ..][0..2], 0x2800, .little);
+            }
+            return d;
+        }
+    }.f;
+
+    // MLA cache and W_k, on layer 1 so a layer stride shows.
+    if (!mlaInit(2, 64, kvr, rope)) return error.SkipZigTest;
+    const stride = nope + vd;
+    const wk = try gpa.alloc(f32, n_heads * stride * kvr);
+    defer gpa.free(wk);
+    for (wk) |*v| v.* = (rnd.float(f32) - 0.5) * 0.1;
+    // Uploads are once per context and another test may have gone first. That
+    // is fine for a differential: both sides below read the *same* device W_k,
+    // whichever upload won. All that matters is that layer 1 exists.
+    const zero = try gpa.alloc(f32, n_heads * stride * kvr);
+    defer gpa.free(zero);
+    @memset(zero, 0);
+    _ = mlaSetWk(0, zero);
+    _ = mlaSetWk(1, wk);
+    if (!hasMlaCache()) return error.SkipZigTest;
+    const li = 1;
+    const c_rows = try gpa.alloc(f32, seq * kvr);
+    defer gpa.free(c_rows);
+    const r_rows = try gpa.alloc(f32, seq * rope);
+    defer gpa.free(r_rows);
+    for (c_rows) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    for (r_rows) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    for (0..seq) |t| {
+        if (!mlaAppend(li, t, c_rows[t * kvr ..][0..kvr], r_rows[t * rope ..][0..rope])) return error.SkipZigTest;
+    }
+
+    const kvb = try mkq(gpa, rnd, .q4_k, n_heads * stride, kvr, 1);
+    defer gpa.free(kvb);
+    const proj = try mkq(gpa, rnd, .q4_k, dim, n_heads * vd, 1);
+    defer gpa.free(proj);
+    const gw = try mkq(gpa, rnd, .q4_k, ffn, dim, n_expert);
+    defer gpa.free(gw);
+    const uw = try mkq(gpa, rnd, .q4_k, ffn, dim, n_expert);
+    defer gpa.free(uw);
+    const dw = try mkq(gpa, rnd, .q5_0, dim, ffn, n_expert);
+    defer gpa.free(dw);
+    const router = try gpa.alloc(f32, n_expert * dim);
+    defer gpa.free(router);
+    for (router) |*v| v.* = (rnd.float(f32) - 0.5) * 0.05;
+    const norm_w = try gpa.alloc(f32, dim);
+    defer gpa.free(norm_w);
+    for (norm_w) |*v| v.* = 1.0;
+
+    const q_nope = try gpa.alloc(f32, n_heads * nope);
+    defer gpa.free(q_nope);
+    const q_rope = try gpa.alloc(f32, n_heads * rope);
+    defer gpa.free(q_rope);
+    for (q_nope) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    for (q_rope) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    const x0 = try gpa.alloc(f32, dim);
+    defer gpa.free(x0);
+    for (x0) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    const rcfg = RoutedCfg{ .n_expert = n_expert, .n_used = n_used, .gating_sigmoid = true, .weights_norm = true, .weights_scale = 1.0 };
+    const eps: f32 = 1e-6;
+
+    // ---- tail ----
+    const x_tail = try gpa.dupe(f32, x0);
+    defer gpa.free(x_tail);
+    if (!mlaLayerTail(
+        li,
+        seq - 1,
+        x_tail,
+        q_nope,
+        q_rope,
+        .{ .ty = .q4_k, .data = kvb },
+        .{ .ty = .q4_k, .data = proj },
+        norm_w,
+        eps,
+        .{ .ty = .f32, .data = std.mem.sliceAsBytes(router) },
+        null,
+        .{ .ty = .q4_k, .data = gw },
+        .{ .ty = .q4_k, .data = uw },
+        .{ .ty = .q5_0, .data = dw },
+        null,
+        ffn,
+        0,
+        rcfg,
+        n_heads,
+        nope,
+        vd,
+        0.25,
+    )) return error.SkipZigTest;
+
+    // ---- constituents with host glue ----
+    const head_out = try gpa.alloc(f32, n_heads * vd);
+    defer gpa.free(head_out);
+    if (!mlaAttnHeads(li, seq - 1, q_nope, q_rope, .{ .ty = .q4_k, .data = kvb }, head_out, n_heads, nope, vd, 0.25)) return error.SkipZigTest;
+    const x_ref = try gpa.dupe(f32, x0);
+    defer gpa.free(x_ref);
+    const pvec = try gpa.alloc(f32, dim);
+    defer gpa.free(pvec);
+    matvec(.q4_k, pvec, proj, head_out, dim, n_heads * vd);
+    for (x_ref, pvec) |*a, v| a.* += v;
+    const normed = try gpa.alloc(f32, dim);
+    defer gpa.free(normed);
+    cpu.rmsnorm(normed, x_ref, norm_w, eps);
+    const logits = try gpa.alloc(f32, n_expert);
+    defer gpa.free(logits);
+    for (0..n_expert) |e2| {
+        var acc: f32 = 0;
+        for (router[e2 * dim ..][0..dim], normed) |wv, nv| acc += wv * nv;
+        logits[e2] = acc;
+    }
+    const ffn_out = try gpa.alloc(f32, dim);
+    defer gpa.free(ffn_out);
+    if (!moeFfnBlockRouted(normed, logits, null, .{ .ty = .q4_k, .data = gw }, .{ .ty = .q4_k, .data = uw }, .{ .ty = .q5_0, .data = dw }, null, ffn, 0, rcfg, ffn_out)) return error.SkipZigTest;
+    for (x_ref, ffn_out) |*a, v| a.* += v;
+
+    var mass: f32 = 0;
+    for (x_ref) |v| mass += @abs(v);
+    const tol = (mass / @as(f32, @floatFromInt(dim))) * 1e-3;
+    for (x_ref, x_tail, 0..) |a, b, k| {
+        std.testing.expectApproxEqAbs(a, b, tol) catch |e| {
+            std.debug.print("layer tail dim {d}: constituents {d} vs tail {d}\n", .{ k, a, b });
             return e;
         };
     }
