@@ -78,6 +78,7 @@ const gemm_q4k_src = @embedFile("../shaders/metal/gemm_q4k.metal");
 const attn_src = @embedFile("../shaders/metal/attn.metal");
 const mla_attn_src = @embedFile("../shaders/metal/mla_attn.metal");
 const mla_absorb_src = @embedFile("../shaders/metal/mla_absorb.metal");
+const mla_rope_src = @embedFile("../shaders/metal/mla_rope.metal");
 const rope_src = @embedFile("../shaders/metal/rope.metal");
 const moe_acc_src = @embedFile("../shaders/metal/moe_acc.metal");
 const moe_route_src = @embedFile("../shaders/metal/moe_route.metal");
@@ -444,6 +445,7 @@ const Ctx = struct {
     attn_p: mtl.Pipeline,
     mla_attn_p: mtl.Pipeline,
     mla_absorb_p: mtl.Pipeline,
+    mla_rope_p: mtl.Pipeline,
     /// Per layer: `kv_b` dequantized to f32, device-resident.
     mla_wk: std.ArrayListUnmanaged(mtl.Buffer) = .empty,
     /// Identity ids 0..n_heads for the W_v dispatch: every head "selects" its
@@ -487,6 +489,7 @@ const Ctx = struct {
     rmsnorm_p: mtl.Pipeline,
     swiglu_p: mtl.Pipeline,
     add_p: mtl.Pipeline,
+    copy_p: mtl.Pipeline,
     /// Device-resident activation scratch. The whole point of keeping these
     /// on the GPU is that a block of work can be encoded into one command
     /// buffer without the host reading anything in between.
@@ -584,6 +587,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const pmrope = dev.pipeline(mla_rope_src, "mla_rope") catch {
+        dev.deinit();
+        return;
+    };
     const pabs = dev.pipeline(mla_absorb_src, "mla_absorb") catch {
         dev.deinit();
         return;
@@ -616,6 +623,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const pcp = dev.pipeline(elementwise_src, "copy_f32") catch {
+        dev.deinit();
+        return;
+    };
     const pa = dev.pipeline(elementwise_src, "add_inplace") catch {
         dev.deinit();
         return;
@@ -639,7 +650,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0_id = p50id, .q8_0_id = p80id, .q5_0 = p50, .q8_0 = p80, .f32p = pf32, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .reduce_dev_p = predd, .route_p = proute, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0_id = p50id, .q8_0_id = p80id, .q5_0 = p50, .q8_0 = p80, .f32p = pf32, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_absorb_p = pabs, .mla_rope_p = pmrope, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .reduce_dev_p = predd, .route_p = proute, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .copy_p = pcp, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -1261,6 +1272,8 @@ pub fn mlaAttnHeads(
         .nope = @intCast(nope),
         .kvr = @intCast(kvr),
         .stride = @intCast(nope + v_head_dim),
+        .q_stride = @intCast(nope),
+        .q_off = 0,
     };
 
     const dims = MlaDims{
@@ -1268,6 +1281,8 @@ pub fn mlaAttnHeads(
         .kvr = @intCast(cx.mla_kvr),
         .rope = @intCast(cx.mla_rope),
         .seq = @intCast(seq),
+        .qr_stride = @intCast(cx.mla_rope),
+        .qr_off = 0,
         .scale = scale,
     };
     const c_off = li * cx.mla_ctx * cx.mla_kvr * @sizeOf(f32);
@@ -1723,8 +1738,8 @@ pub fn mlaLayerTail(
     @memcpy(cx.scratch_x.slice(f32)[off_x..][0..dim], x);
     if (router_bias) |b| @memcpy(cx.scratch_x.slice(f32)[off_bias..][0..cfg.n_expert], b);
 
-    const ad = AbsorbDims{ .n_heads = @intCast(n_heads), .nope = @intCast(nope), .kvr = @intCast(kvr), .stride = @intCast(nope + v_head_dim) };
-    const dims = MlaDims{ .n_heads = @intCast(n_heads), .kvr = @intCast(kvr), .rope = @intCast(cx.mla_rope), .seq = @intCast(seq), .scale = scale };
+    const ad = AbsorbDims{ .n_heads = @intCast(n_heads), .nope = @intCast(nope), .kvr = @intCast(kvr), .stride = @intCast(nope + v_head_dim), .q_stride = @intCast(nope), .q_off = 0 };
+    const dims = MlaDims{ .n_heads = @intCast(n_heads), .kvr = @intCast(kvr), .rope = @intCast(cx.mla_rope), .seq = @intCast(seq), .qr_stride = @intCast(cx.mla_rope), .qr_off = 0, .scale = scale };
     const c_off = li * cx.mla_ctx * kvr * @sizeOf(f32);
     const r_off = li * cx.mla_ctx * cx.mla_rope * @sizeOf(f32);
     const vd_dims = IdDims{ .rows = @intCast(v_head_dim), .cols = @intCast(kvr), .n_used = @intCast(n_heads), .plane_stride = @intCast((nope + v_head_dim) * row_bytes), .x_stride = @intCast(kvr) };
@@ -1938,9 +1953,11 @@ const RouteDims = extern struct {
 
 const IdDims = extern struct { rows: u32, cols: u32, n_used: u32, plane_stride: u32, x_stride: u32 };
 
-const AbsorbDims = extern struct { n_heads: u32, nope: u32, kvr: u32, stride: u32 };
+const MlaRopeDims = extern struct { n_vec: u32, rope: u32, stride: u32, offset: u32, pos: u32, base: f32, yarn_factor: f32, yarn_orig_ctx: f32 };
 
-const MlaDims = extern struct { n_heads: u32, kvr: u32, rope: u32, seq: u32, scale: f32 };
+const AbsorbDims = extern struct { n_heads: u32, nope: u32, kvr: u32, stride: u32, q_stride: u32, q_off: u32 };
+
+const MlaDims = extern struct { n_heads: u32, kvr: u32, rope: u32, seq: u32, qr_stride: u32, qr_off: u32, scale: f32 };
 const MAX_MOE_REDUCE = 16;
 const ReduceDims = extern struct { n: u32, dim: u32, w: [MAX_MOE_REDUCE]f32 };
 
@@ -4839,5 +4856,54 @@ test "layer tail equals its constituent buffers plus host glue" {
             std.debug.print("layer tail dim {d}: constituents {d} vs tail {d}\n", .{ k, a, b });
             return e;
         };
+    }
+}
+
+test "mla rope kernel matches the host ropeApply, plain and yarn, strided" {
+    // Rotates in place where q lives -- stride kd, offset nope -- so a wrong
+    // stride rotates the wrong halves of the wrong heads, which is exactly as
+    // silent as every other rope bug.
+    const gpa = std.testing.allocator;
+    const deepseek = @import("../gguf/deepseek.zig");
+    const n_vec = 4;
+    const rope = 16;
+    const stride = 48; // like kd: rope section sits `offset` in
+    const offset = 24;
+    const pos = 37;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    const cx = &(ctx orelse return error.SkipZigTest);
+    var prng = std.Random.DefaultPrng.init(0x1207E);
+    const rnd = prng.random();
+    const host = try gpa.alloc(f32, n_vec * stride);
+    defer gpa.free(host);
+    for (host) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    inline for (.{ 1.0, 40.0 }) |yf| {
+        const dev_buf = cx.dev.alloc(host.len * @sizeOf(f32)) catch return error.SkipZigTest;
+        @memcpy(dev_buf.slice(f32)[0..host.len], host);
+        const want = try gpa.dupe(f32, host);
+        defer gpa.free(want);
+        // Host reference through the engine's own function per vector.
+        var cfg: deepseek.Config = undefined;
+        cfg.rope_base = 10000.0;
+        cfg.yarn_factor = yf;
+        cfg.yarn_orig_ctx = 4096.0;
+        cfg.yarn_log_mul = 0;
+        for (0..n_vec) |k| deepseek.ropeApplyForTest(cfg, want[k * stride + offset ..][0..rope], pos);
+
+        const d = MlaRopeDims{ .n_vec = n_vec, .rope = rope, .stride = stride, .offset = offset, .pos = pos, .base = 10000.0, .yarn_factor = yf, .yarn_orig_ctx = 4096.0 };
+        const cb = cx.dev.commandBuffer();
+        cb.dispatch(cx.mla_rope_p, &.{dev_buf}, &.{0}, std.mem.asBytes(&d), n_vec * rope / 2, 32);
+        cb.commitAndWait();
+
+        const got = dev_buf.slice(f32)[0..host.len];
+        for (want, got, 0..) |a, b, k| {
+            std.testing.expectApproxEqAbs(a, b, 1e-5) catch |e| {
+                std.debug.print("rope yf={d} idx {d}: host {d} vs gpu {d}\n", .{ yf, k, a, b });
+                return e;
+            };
+        }
     }
 }

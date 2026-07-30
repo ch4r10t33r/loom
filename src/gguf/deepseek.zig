@@ -534,6 +534,11 @@ fn mv(t: Tensor, out: []f32, x: []const f32) void {
 /// frequency by a ramp over the corrected dimension range (beta_fast=32,
 /// beta_slow=1), as in ggml's rope_yarn. The in-rope mscale is omitted —
 /// deepseek2 cancels it and applies mscale to the attention scale instead.
+/// Test seam: the Metal rope kernel is verified against this exact function.
+pub fn ropeApplyForTest(cfg: Config, vec: []f32, pos: usize) void {
+    ropeApply(cfg, vec, pos);
+}
+
 fn ropeApply(cfg: Config, vec: []f32, pos: usize) void {
     if (cfg.yarn_factor <= 1.0) {
         ropeNormPlain(vec, pos, cfg.rope_base);

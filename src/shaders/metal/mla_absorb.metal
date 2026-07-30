@@ -21,9 +21,15 @@ using namespace metal;
 
 struct AbsorbDims {
     uint n_heads;
-    uint nope;   // rows of W_k per head
-    uint kvr;    // columns: the compressed width
-    uint stride; // rows per head in the source tensor, (nope + v_head_dim)
+    uint nope;     // rows of W_k per head
+    uint kvr;      // columns: the compressed width
+    uint stride;   // rows per head in the source tensor, (nope + v_head_dim)
+    // Floats between heads in `q`, and floats before each head's nope section.
+    // The engine's gathered layout is (nope, 0); on-device q is laid out as
+    // [n_heads][kd] straight from the projection, which is (kd, 0) -- reading
+    // it in place is what removes the host gather.
+    uint q_stride;
+    uint q_off;
 };
 
 kernel void mla_absorb(
@@ -42,7 +48,7 @@ kernel void mla_absorb(
     // v_head_dim rows are W_v, which this kernel must not touch -- hence the
     // explicit stride rather than assuming the two are the same size.
     device const float *wh = wk + (ulong)h * d.stride * d.kvr;
-    device const float *qh = q + (ulong)h * d.nope;
+    device const float *qh = q + (ulong)h * d.q_stride + d.q_off;
 
     for (uint i = tid; i < d.kvr; i += nt) {
         float acc = 0.0f;
