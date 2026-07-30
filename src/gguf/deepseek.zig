@@ -880,7 +880,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
                     if (!src.stablePointers(sel.len)) break :blk_b false;
                 }
                 const gt = l.ffn_gate_exps orelse break :blk_b false;
-                var refs: [moe.MAX_SELECTED]backend.ExpertRef = undefined;
+                var refs: [moe.MAX_SELECTED + 1]backend.ExpertRef = undefined;
                 const t_g1 = if (prof) Profile.now() else 0;
                 for (sel, 0..) |s2, k| {
                     const parts = expertParts(m, l, li, s2.expert) catch break :blk_b false;
@@ -889,11 +889,28 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
                         .up = .{ .ty = l.ffn_up_exps.?.ty, .data = parts.up },
                         .down = .{ .ty = l.ffn_down_exps.?.ty, .data = parts.down },
                         .weight = s2.gate,
+                        .ffn = gt.ne1,
                     };
+                }
+                var n_refs = sel.len;
+                // The shared expert joins as one more expert: wider, always on,
+                // unweighted. It lost against the per-expert block, where every
+                // step sat behind a barrier; against the phase-parallel one it
+                // is a seventh column of the same four phases. On the host it
+                // was 20.2 ms/token, a third of the whole expert-FFN bucket.
+                if (l.ffn_gate_shexp) |gs| {
+                    refs[n_refs] = .{
+                        .gate = .{ .ty = gs.ty, .data = gs.data },
+                        .up = .{ .ty = l.ffn_up_shexp.?.ty, .data = l.ffn_up_shexp.?.data },
+                        .down = .{ .ty = l.ffn_down_shexp.?.ty, .data = l.ffn_down_shexp.?.data },
+                        .weight = 1.0,
+                        .ffn = gs.ne1,
+                    };
+                    n_refs += 1;
                 }
                 if (prof) t_get += Profile.now() - t_g1;
                 const t_f1 = if (prof) Profile.now() else 0;
-                const ok = backend.moeFfnBlock(st.normed, refs[0..sel.len], gt.ne1, acc);
+                const ok = backend.moeFfnBlock(st.normed, refs[0..n_refs], acc);
                 if (prof) t_ffn += Profile.now() - t_f1;
                 break :blk_b ok;
             };
@@ -947,7 +964,9 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             // matvec that loses to the CPU at these row counts, which is the
             // same verdict calibration reaches unprompted. Worth revisiting
             // once the kernel wins at 1408-2816 rows, not before.
-            if (l.ffn_gate_shexp) |gs| {
+            // Only when the block did not already take it.
+            const folded = batched and l.ffn_gate_shexp != null;
+            if (!folded) if (l.ffn_gate_shexp) |gs| {
                 const t_s0 = if (prof) Profile.now() else 0;
                 denseFFN(st, gs, l.ffn_up_shexp.?, l.ffn_down_shexp.?);
                 backend.add(acc, st.ffn_out);
@@ -956,7 +975,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
                     t_ffn += d;
                     t_shexp += d;
                 }
-            }
+            };
             backend.add(st.x, acc);
         }
     }

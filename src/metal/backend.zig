@@ -1051,6 +1051,9 @@ pub const ExpertRef = struct {
     down: WeightRef,
     /// Router weight this expert's output is scaled by before accumulation.
     weight: f32,
+    /// This expert's hidden width, per expert because the shared expert is
+    /// wider than a routed one.
+    ffn: usize,
 };
 
 /// A whole MoE layer's experts in one command buffer.
@@ -1068,7 +1071,6 @@ pub const ExpertRef = struct {
 pub fn moeFfnBlock(
     normed: []const f32,
     experts: []const ExpertRef,
-    ffn: usize,
     out: []f32,
 ) bool {
     const cx = &(ctx orelse return false);
@@ -1076,8 +1078,10 @@ pub fn moeFfnBlock(
     const dim = normed.len;
     if (experts.len == 0) return false;
     if (out.len != dim) return false;
-    if (@max(ffn, dim) * 4 > cx.act[0].len) return false;
     if (dim * 4 > cx.scratch_x.len) return false;
+    var widest: usize = dim;
+    for (experts) |e| widest = @max(widest, e.ffn);
+    if (widest * 4 > cx.act[0].len) return false;
 
     // Resolve everything before recording: a decline halfway through would
     // leave a partially-built command buffer.
@@ -1085,13 +1089,13 @@ pub fn moeFfnBlock(
     var wraps: [MAX_MOE_EXPERTS][3]Wrapped = undefined;
     if (experts.len > MAX_MOE_EXPERTS) return false;
     for (experts, 0..) |e, i| {
-        pipes[i][0] = dmmvFor(cx, e.gate.ty, ffn) orelse return false;
-        pipes[i][1] = dmmvFor(cx, e.up.ty, ffn) orelse return false;
+        pipes[i][0] = dmmvFor(cx, e.gate.ty, e.ffn) orelse return false;
+        pipes[i][1] = dmmvFor(cx, e.up.ty, e.ffn) orelse return false;
         pipes[i][2] = dmmvFor(cx, e.down.ty, dim) orelse return false;
         // Per tensor, not one rule for the layer: gate and up read `dim`
         // columns, down reads `ffn`, and each type has its own block width.
         if (dim % colsMultiple(e.gate.ty) != 0 or dim % colsMultiple(e.up.ty) != 0) return false;
-        if (ffn % colsMultiple(e.down.ty) != 0) return false;
+        if (e.ffn % colsMultiple(e.down.ty) != 0) return false;
         wraps[i][0] = wrapFor(cx, e.gate.data) orelse return false;
         wraps[i][1] = wrapFor(cx, e.up.data) orelse return false;
         wraps[i][2] = wrapFor(cx, e.down.data) orelse return false;
@@ -1100,9 +1104,14 @@ pub fn moeFfnBlock(
     @memcpy(cx.scratch_x.slice(f32)[0..dim], normed);
 
     const group = SIMD_W * SIMDGROUPS_PER_GROUP;
-    const dims_ffn = Dims{ .rows = @intCast(ffn), .cols = @intCast(dim) };
-    const dims_down = Dims{ .rows = @intCast(dim), .cols = @intCast(ffn) };
-    const len_ffn = extern struct { n: u32 }{ .n = @intCast(ffn) };
+    var dims_ffn: [MAX_MOE_EXPERTS]Dims = undefined;
+    var dims_down: [MAX_MOE_EXPERTS]Dims = undefined;
+    var len_ffn: [MAX_MOE_EXPERTS]extern struct { n: u32 } = undefined;
+    for (experts, 0..) |ex, k| {
+        dims_ffn[k] = .{ .rows = @intCast(ex.ffn), .cols = @intCast(dim) };
+        dims_down[k] = .{ .rows = @intCast(dim), .cols = @intCast(ex.ffn) };
+        len_ffn[k] = .{ .n = @intCast(ex.ffn) };
+    }
 
     // Phase-parallel across experts, not expert-by-expert.
     //
@@ -1116,7 +1125,7 @@ pub fn moeFfnBlock(
     // Slot 0 is the accumulator; 1 and 2 hold every expert's gate and up,
     // 3 every expert's output, each strided by expert. `ffn * 4` and `dim * 4`
     // are multiples of 256 for every real width, so the offsets are aligned.
-    const gate_stride = ffn * 4;
+    const gate_stride = widest * 4;
     const out_stride = dim * 4;
     if (experts.len * gate_stride > cx.act[1].len) return false;
     if (experts.len * gate_stride > cx.act[2].len) return false;
@@ -1125,16 +1134,16 @@ pub fn moeFfnBlock(
     const cb = cx.dev.commandBuffer();
     const e = cb.encoder();
     for (experts, 0..) |_, i| {
-        e.dispatch(pipes[i][0].pipe, &.{ wraps[i][0].buf, cx.scratch_x, cx.act[1] }, &.{ wraps[i][0].off, 0, i * gate_stride }, std.mem.asBytes(&dims_ffn), pipes[i][0].groups, group);
-        e.dispatch(pipes[i][1].pipe, &.{ wraps[i][1].buf, cx.scratch_x, cx.act[2] }, &.{ wraps[i][1].off, 0, i * gate_stride }, std.mem.asBytes(&dims_ffn), pipes[i][1].groups, group);
+        e.dispatch(pipes[i][0].pipe, &.{ wraps[i][0].buf, cx.scratch_x, cx.act[1] }, &.{ wraps[i][0].off, 0, i * gate_stride }, std.mem.asBytes(&dims_ffn[i]), pipes[i][0].groups, group);
+        e.dispatch(pipes[i][1].pipe, &.{ wraps[i][1].buf, cx.scratch_x, cx.act[2] }, &.{ wraps[i][1].off, 0, i * gate_stride }, std.mem.asBytes(&dims_ffn[i]), pipes[i][1].groups, group);
     }
     e.barrier();
     for (experts, 0..) |_, i| {
-        e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ i * gate_stride, i * gate_stride, i * gate_stride }, std.mem.asBytes(&len_ffn), ffn, 64);
+        e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ i * gate_stride, i * gate_stride, i * gate_stride }, std.mem.asBytes(&len_ffn[i]), experts[i].ffn, 64);
     }
     e.barrier();
     for (experts, 0..) |_, i| {
-        e.dispatch(pipes[i][2].pipe, &.{ wraps[i][2].buf, cx.act[1], cx.act[3] }, &.{ wraps[i][2].off, i * gate_stride, i * out_stride }, std.mem.asBytes(&dims_down), pipes[i][2].groups, group);
+        e.dispatch(pipes[i][2].pipe, &.{ wraps[i][2].buf, cx.act[1], cx.act[3] }, &.{ wraps[i][2].off, i * gate_stride, i * out_stride }, std.mem.asBytes(&dims_down[i]), pipes[i][2].groups, group);
     }
     e.barrier();
     // One dispatch for the weighted sum: a `scaled_add` per expert all write
@@ -2165,11 +2174,12 @@ test "metal moe block matches the cpu expert loop" {
         .up = .{ .ty = .q4_k, .data = wu[i] },
         .down = .{ .ty = .q5_1, .data = wd[i] },
         .weight = gates[i],
+        .ffn = ffn,
     };
 
     const got = try gpa.alloc(f32, dim);
     defer gpa.free(got);
-    if (!moeFfnBlock(normed, &refs, ffn, got)) return error.SkipZigTest;
+    if (!moeFfnBlock(normed, &refs, got)) return error.SkipZigTest;
 
     // Reference: exact dequantize-then-dot, not cpu.matvec — the CPU kernel
     // quantizes activations and chaining four of them per expert compounds
@@ -3071,8 +3081,9 @@ test "moe block accepts every down-projection type real checkpoints use" {
             .up = .{ .ty = .q4_k, .data = wu },
             .down = .{ .ty = down_ty, .data = wd },
             .weight = 1.0,
+            .ffn = ffn,
         }};
-        if (!moeFfnBlock(normed, &refs, ffn, got)) {
+        if (!moeFfnBlock(normed, &refs, got)) {
             std.debug.print("moe block declined a {t} down-projection: every MoE layer of such a checkpoint falls back to the host\n", .{down_ty});
             return error.MoeBlockDeclinedARealType;
         }
