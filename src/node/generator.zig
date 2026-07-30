@@ -300,6 +300,9 @@ fn genGgufInner(
     // sitting idle overnight must not peg every core.
     backend.parallelBegin(threads());
     defer backend.parallelEnd();
+    // The device exists now; wire any weight mappings registered at load.
+    const resident = backend.materializeArenas();
+    if (std.c.getenv("LOOM_FUSED_DEBUG") != null) std.debug.print("arena resident: {d} MB\n", .{resident / (1024 * 1024)});
 
     const toks = try m.encodePrompt(gpa, prompt_text, parse_special);
     defer gpa.free(toks);
