@@ -68,6 +68,7 @@ static inline void scale_min_k4(uint j, device const uchar *s, thread uchar &sc,
 #define NR0 4
 #endif
 
+
 kernel void dmmv_q4k(
     device const uchar *weights [[buffer(0)]],
     device const float *x       [[buffer(1)]],
@@ -80,6 +81,7 @@ kernel void dmmv_q4k(
 {
     const uint first_row = (tgid * nsg + sgid) * NR0;
     if (first_row >= dims.rows) return;
+
     const bool have_r1 = (first_row + 1) < dims.rows;
     const bool have_r2 = (first_row + 2) < dims.rows;
     const bool have_r3 = (first_row + 3) < dims.rows;

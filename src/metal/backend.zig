@@ -2684,12 +2684,19 @@ test "metal scaling: where does the gpu actually win" {
         const w = wrapFor(cx, data) orelse continue;
         const dims = Dims{ .rows = @intCast(rows), .cols = @intCast(cols) };
         const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+        // Through the same selector the engine uses, not a hardcoded pipeline
+        // and grid. This had `cx.q4k` with `((rows + 1) / 2) * SIMD_W` left
+        // over from when Q4_K covered two rows per group; against the four-row
+        // kernel that dispatches twice the groups needed and measures the
+        // waste, which is why it reported 47 GB/s at 1408 rows where an
+        // honest grid gives 89.
+        const sel = dmmvFor(cx, .q4_k, rows) orelse continue;
 
         const N = 20;
         // warm
         {
             const cb = cx.dev.commandBuffer();
-            cb.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), rows * SIMD_W, group);
+            cb.dispatch(sel.pipe, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), sel.groups, group);
             cb.commitAndWait();
         }
         // Best-of rather than mean. This machine shares its GPU with the
@@ -2700,7 +2707,7 @@ test "metal scaling: where does the gpu actually win" {
         for (0..N) |_| {
             const t0 = now(io);
             const cb = cx.dev.commandBuffer();
-            cb.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), ((rows + 1) / 2) * SIMD_W, group);
+            cb.dispatch(sel.pipe, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), sel.groups, group);
             cb.commitAndWait();
             const dt = now(io) - t0;
             if (dt < gpu) gpu = dt;
@@ -2719,7 +2726,7 @@ test "metal scaling: where does the gpu actually win" {
             const t0 = now(io);
             const cb = cx.dev.commandBuffer();
             const e = cb.encoder();
-            for (0..D) |_| e.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), ((rows + 1) / 2) * SIMD_W, group);
+            for (0..D) |_| e.dispatch(sel.pipe, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), sel.groups, group);
             e.end();
             cb.commitAndWait();
             const dt = @divTrunc(now(io) - t0, D);
@@ -3110,5 +3117,78 @@ test "both q4_k kernels agree with the oracle, on each side of the threshold" {
                 return e;
             };
         }
+    }
+}
+
+test "q4_k variants, interleaved so drift cannot favour one" {
+    // Why this exists rather than another sweep: comparing kernel variants
+    // across separate runs does not work on this machine. The same binary
+    // reported 62.4, 52.9, 42.8 and 46.1 GB/s at 2816 rows on four
+    // consecutive runs -- a +-20% band that swallows every difference between
+    // the variants being compared, and which produced two confident wrong
+    // conclusions before it was noticed.
+    //
+    // Best-of-N inside one run is not enough either, because the drift is
+    // between runs. So the variants are interleaved round-by-round within a
+    // single run: whatever the window server is doing, it is doing it to all
+    // three at once, and best-of over rounds then means the same thing for
+    // each.
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    parallelBegin(8);
+    defer parallelEnd();
+    const cx = &(ctx orelse return error.SkipZigTest);
+    var t: std.Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+    const now = struct {
+        fn f(i: std.Io) i128 {
+            return std.Io.Clock.Timestamp.now(i, .awake).raw.toNanoseconds();
+        }
+    }.f;
+
+    const cols = 2048;
+    const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+    const Variant = struct { name: []const u8, pipe: mtl.Pipeline, per: usize };
+    const variants = [_]Variant{
+        .{ .name = "NR0=4", .pipe = cx.q4k, .per = 4 },
+        .{ .name = "NR0=2", .pipe = cx.q4k_wide, .per = 2 },
+    };
+
+    std.debug.print("\n  rows   {s:>14} {s:>14}   (GB/s, best of 40 interleaved rounds)\n", .{ variants[0].name, variants[1].name });
+    for ([_]usize{ 1408, 2048, 2816 }) |rows| {
+        const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, cols, rows));
+        defer gpa.free(data);
+        var prng = std.Random.DefaultPrng.init(7);
+        prng.random().bytes(data);
+        for (0..data.len / 2) |i| data[i * 2 + 1] &= 0xFB;
+        const x = try gpa.alloc(f32, cols);
+        defer gpa.free(x);
+        for (x) |*v| v.* = prng.random().float(f32) - 0.5;
+        if (rows * 4 > cx.scratch_out.len) continue;
+        @memcpy(cx.scratch_x.slice(f32)[0..cols], x);
+        const w = wrapFor(cx, data) orelse continue;
+        const dims = Dims{ .rows = @intCast(rows), .cols = @intCast(cols) };
+
+        var best: [variants.len]i128 = @splat(std.math.maxInt(i64));
+        const D = 32; // dispatches per buffer: amortizes the ~262 us submission
+        for (0..40) |_| {
+            for (variants, 0..) |v, vi| {
+                const threads = ((rows + v.per - 1) / v.per) * SIMD_W;
+                const grid = ((threads + group - 1) / group) * group;
+                const t0 = now(io);
+                const cb = cx.dev.commandBuffer();
+                const e = cb.encoder();
+                for (0..D) |_| e.dispatch(v.pipe, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), grid, group);
+                e.end();
+                cb.commitAndWait();
+                const dt = @divTrunc(now(io) - t0, D);
+                if (dt < best[vi]) best[vi] = dt;
+            }
+        }
+        const bytes: f64 = @floatFromInt(ggml.tensorBytes(.q4_k, cols, rows));
+        var gbs: [variants.len]f64 = undefined;
+        for (best, 0..) |b, i| gbs[i] = bytes / @as(f64, @floatFromInt(b));
+        std.debug.print("  {d:>5}   {d:>14.1} {d:>14.1}\n", .{ rows, gbs[0], gbs[1] });
     }
 }
