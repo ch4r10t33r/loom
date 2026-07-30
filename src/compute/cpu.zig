@@ -58,6 +58,13 @@ pub fn hasMlaCache() bool {
     return false;
 }
 
+pub const RoutedCfg = struct { n_expert: usize, n_used: usize, gating_sigmoid: bool, weights_norm: bool, weights_scale: f32 };
+
+pub fn moeFfnBlockRouted(normed: []const f32, logits: []const f32, bias: ?[]const f32, gate_w: WeightRef, up_w: WeightRef, down_w: WeightRef, shexp: ?[3]WeightRef, ffn: usize, shexp_ffn: usize, cfg: RoutedCfg, out: []f32) bool {
+    _ = .{ normed, logits, bias, gate_w, up_w, down_w, shexp, ffn, shexp_ffn, cfg, out };
+    return false;
+}
+
 pub fn moeRoute(logits: []const f32, bias: ?[]const f32, ids_out: []u32, gates_out: []f32, gating_sigmoid: bool, weights_norm: bool, weights_scale: f32) bool {
     _ = .{ logits, bias, ids_out, gates_out, gating_sigmoid, weights_norm, weights_scale };
     return false;

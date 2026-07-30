@@ -633,6 +633,10 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
 }
 
 fn cmdGgufRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8, args: [][]const u8) !void {
+    // Same opt-in as the node: the measured-slower GPU paths run only when
+    // asked, and this command is where the *local* fused MoE path is
+    // exercised, since a model file loaded here has no distributed source.
+    if (hasFlag(args, "--gpu-ops")) backend.useGpuOps.* = true;
     // a store directory (partial, expert-sharded) runs distributed
     {
         var pbuf: [4096]u8 = undefined;
@@ -776,6 +780,12 @@ fn runStoreWith(
     try out.flush();
 
     backend.parallelBegin(generator.threads());
+    // The device exists now; make any weight mappings registered at load
+    // device-resident. Without this the GPU paths read the mmap through bare
+    // per-tensor wrappings and fault file-backed pages per access -- measured
+    // at ~285 MB/s inside the fused MoE block, 30-100 ms per matvec dispatch
+    // that costs under a millisecond resident.
+    _ = backend.materializeArenas();
     defer backend.parallelEnd();
 
     var st = try E.State.init(gpa, c);
@@ -868,6 +878,12 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
     try out.flush();
 
     backend.parallelBegin(generator.threads());
+    // The device exists now; make any weight mappings registered at load
+    // device-resident. Without this the GPU paths read the mmap through bare
+    // per-tensor wrappings and fault file-backed pages per access -- measured
+    // at ~285 MB/s inside the fused MoE block, 30-100 ms per matvec dispatch
+    // that costs under a millisecond resident.
+    _ = backend.materializeArenas();
     defer backend.parallelEnd();
 
     var st = try eng.State.init(gpa, c);

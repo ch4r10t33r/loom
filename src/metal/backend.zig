@@ -1344,6 +1344,234 @@ pub fn moeRoute(
     return true;
 }
 
+/// A whole routed MoE layer in one command buffer: route, every selected
+/// expert's gate/up/SwiGLU/down, the gated reduce, and the shared expert --
+/// with nothing returning to the host in between.
+///
+/// This is the assembly `build_moe_ffn` encodes as graph ops: `moe_route` is
+/// `ggml_argsort_top_k`, the id kernels are `ggml_mul_mat_id`, and the ids and
+/// gates live in device buffers throughout. The caller hands over router
+/// *logits*, not routed experts -- routing on the host is exactly the
+/// synchronization this exists to remove.
+///
+/// Local-path only: the experts must be planes of the given 3D tensors. The
+/// distributed path's experts are offsets into a store and keep the
+/// host-routed block.
+pub const RoutedCfg = struct {
+    n_expert: usize,
+    n_used: usize,
+    gating_sigmoid: bool,
+    weights_norm: bool,
+    weights_scale: f32,
+};
+
+pub fn moeFfnBlockRouted(
+    normed: []const f32,
+    logits: []const f32,
+    bias: ?[]const f32,
+    gate_w: WeightRef, // full 3D tensor, n_expert planes
+    up_w: WeightRef,
+    down_w: WeightRef,
+    shexp: ?[3]WeightRef, // gate/up/down of the shared expert, or null
+    ffn: usize,
+    shexp_ffn: usize,
+    cfg: RoutedCfg,
+    out: []f32,
+) bool {
+    const cx = &(ctx orelse return false);
+    if (!use_gpu_ops) return false;
+    const dim = normed.len;
+    if (out.len != dim) return false;
+    if (cfg.n_used == 0 or cfg.n_used > MAX_MOE_EXPERTS) return false;
+    if (cfg.n_expert != logits.len) return false;
+
+    // Staging: normed, then logits, then bias, all in scratch_x.
+    const need_x = dim + cfg.n_expert * 2;
+    if (need_x * 4 > cx.scratch_x.len) return false;
+    // act[1]/act[2] hold every slot's gate/up at an ffn stride; act[3] every
+    // slot's down output at a dim stride; act[0] the accumulator.
+    const widest = @max(ffn, shexp_ffn);
+    if (cfg.n_used * ffn * 4 > cx.act[1].len or widest * 4 > cx.act[1].len) return false;
+    if (cfg.n_used * dim * 4 > cx.act[3].len) return false;
+
+    const gsel = dmmvIdFor(cx, gate_w.ty) orelse return false;
+    const usel = dmmvIdFor(cx, up_w.ty) orelse return false;
+    const dsel = dmmvIdFor(cx, down_w.ty) orelse return false;
+    if (dim % colsMultiple(gate_w.ty) != 0 or dim % colsMultiple(up_w.ty) != 0) return false;
+    if (ffn % colsMultiple(down_w.ty) != 0) return false;
+    const gw = wrapFor(cx, gate_w.data) orelse return false;
+    const uw = wrapFor(cx, up_w.data) orelse return false;
+    const dw = wrapFor(cx, down_w.data) orelse return false;
+
+    // The shared expert resolves before recording, like everything else: a
+    // decline halfway through would leave a partially built buffer.
+    var sh_pipes: [3]@TypeOf(dmmvFor(undefined, .q4_k, 0).?) = undefined;
+    var sh_wraps: [3]Wrapped = undefined;
+    if (shexp) |sw| {
+        sh_pipes[0] = dmmvFor(cx, sw[0].ty, shexp_ffn) orelse return false;
+        sh_pipes[1] = dmmvFor(cx, sw[1].ty, shexp_ffn) orelse return false;
+        sh_pipes[2] = dmmvFor(cx, sw[2].ty, dim) orelse return false;
+        if (dim % colsMultiple(sw[0].ty) != 0 or shexp_ffn % colsMultiple(sw[2].ty) != 0) return false;
+        for (sw, 0..) |w, i| sh_wraps[i] = wrapFor(cx, w.data) orelse return false;
+    }
+
+    if (cx.route_ids == null) {
+        cx.route_ids = cx.dev.alloc(MAX_MOE_EXPERTS * @sizeOf(u32)) catch return false;
+        cx.route_gates = cx.dev.alloc(MAX_MOE_EXPERTS * @sizeOf(f32)) catch return false;
+    }
+
+    @memcpy(cx.scratch_x.slice(f32)[0..dim], normed);
+    @memcpy(cx.scratch_x.slice(f32)[dim..][0..cfg.n_expert], logits);
+    if (bias) |b| @memcpy(cx.scratch_x.slice(f32)[dim + cfg.n_expert ..][0..cfg.n_expert], b);
+
+    const rd = RouteDims{
+        .n_expert = @intCast(cfg.n_expert),
+        .n_used = @intCast(cfg.n_used),
+        .gating = if (cfg.gating_sigmoid) 1 else 0,
+        .weights_norm = if (cfg.weights_norm) 1 else 0,
+        .has_bias = if (bias != null) 1 else 0,
+        .weights_scale = cfg.weights_scale,
+    };
+    const gate_plane: u32 = @intCast(gate_w.data.len / cfg.n_expert);
+    const up_plane: u32 = @intCast(up_w.data.len / cfg.n_expert);
+    const down_plane: u32 = @intCast(down_w.data.len / cfg.n_expert);
+    const d_gate = IdDims{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = gate_plane, .x_stride = 0 };
+    const d_up = IdDims{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = up_plane, .x_stride = 0 };
+    const d_down = IdDims{ .rows = @intCast(dim), .cols = @intCast(ffn), .n_used = @intCast(cfg.n_used), .plane_stride = down_plane, .x_stride = @intCast(ffn) };
+    const len_ffn = extern struct { n: u32 }{ .n = @intCast(ffn) };
+    const rdim = ReduceDims{ .n = @intCast(cfg.n_used), .dim = @intCast(dim), .w = @splat(0) };
+
+    const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+    const grid = struct {
+        fn f(rows: usize, per: usize, n: usize) usize {
+            const threads = ((n * rows + per - 1) / per) * SIMD_W;
+            return ((threads + group - 1) / group) * group;
+        }
+    }.f;
+
+    // LOOM_FUSED_DEBUG splits the one buffer into per-phase submissions and
+    // prints each phase's wall time -- the only way to see inside a command
+    // buffer without a Metal capture. Diagnostic only: the whole point of the
+    // fused path is that these are one submission.
+    const debug_split = std.c.getenv("LOOM_FUSED_DEBUG") != null;
+    if (debug_split) {
+        var t = [_]i128{0} ** 6;
+        const now = struct {
+            fn f() i128 {
+                var ts: std.c.timespec = undefined;
+                _ = std.c.clock_gettime(.MONOTONIC, &ts);
+                return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+            }
+        }.f;
+        const phase = struct {
+            fn go(cx2: *Ctx, comptime f: anytype, args: anytype) void {
+                const cb2 = cx2.dev.commandBuffer();
+                const e2 = cb2.encoder();
+                @call(.auto, f, .{e2} ++ args);
+                e2.end();
+                cb2.commitAndWait();
+            }
+        };
+        _ = phase;
+        var t0 = now();
+        {
+            const cb2 = cx.dev.commandBuffer();
+            const e2 = cb2.encoder();
+            e2.dispatch(cx.route_p, &.{ cx.scratch_x, cx.scratch_x, cx.route_ids.?, cx.route_gates.? }, &.{ dim * 4, (dim + cfg.n_expert) * 4, 0, 0 }, std.mem.asBytes(&rd), 32, 32);
+            e2.end();
+            cb2.commitAndWait();
+        }
+        t[0] = now() - t0;
+        t0 = now();
+        {
+            const cb2 = cx.dev.commandBuffer();
+            const e2 = cb2.encoder();
+            e2.dispatch(gsel.pipe, &.{ gw.buf, cx.scratch_x, cx.act[1], cx.route_ids.? }, &.{ gw.off, 0, 0, 0 }, std.mem.asBytes(&d_gate), grid(ffn, gsel.per, cfg.n_used), group);
+            e2.end();
+            cb2.commitAndWait();
+        }
+        t[1] = now() - t0;
+        t0 = now();
+        {
+            const cb2 = cx.dev.commandBuffer();
+            const e2 = cb2.encoder();
+            e2.dispatch(usel.pipe, &.{ uw.buf, cx.scratch_x, cx.act[2], cx.route_ids.? }, &.{ uw.off, 0, 0, 0 }, std.mem.asBytes(&d_up), grid(ffn, usel.per, cfg.n_used), group);
+            e2.end();
+            cb2.commitAndWait();
+        }
+        t[2] = now() - t0;
+        t0 = now();
+        {
+            const cb2 = cx.dev.commandBuffer();
+            const e2 = cb2.encoder();
+            for (0..cfg.n_used) |k| {
+                e2.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ k * ffn * 4, k * ffn * 4, k * ffn * 4 }, std.mem.asBytes(&len_ffn), ffn, 64);
+            }
+            e2.end();
+            cb2.commitAndWait();
+        }
+        t[3] = now() - t0;
+        t0 = now();
+        {
+            const cb2 = cx.dev.commandBuffer();
+            const e2 = cb2.encoder();
+            e2.dispatch(dsel.pipe, &.{ dw.buf, cx.act[1], cx.act[3], cx.route_ids.? }, &.{ dw.off, 0, 0, 0 }, std.mem.asBytes(&d_down), grid(dim, dsel.per, cfg.n_used), group);
+            e2.end();
+            cb2.commitAndWait();
+        }
+        t[4] = now() - t0;
+        t0 = now();
+        {
+            const cb2 = cx.dev.commandBuffer();
+            const e2 = cb2.encoder();
+            e2.dispatch(cx.reduce_dev_p, &.{ cx.act[0], cx.act[3], cx.route_gates.? }, &.{ 0, 0, 0 }, std.mem.asBytes(&rdim), dim, 64);
+            e2.end();
+            cb2.commitAndWait();
+        }
+        t[5] = now() - t0;
+        std.debug.print("fused phases us: route {d} gate {d} up {d} swiglu {d} down {d} reduce {d}\n", .{
+            @divTrunc(t[0], 1000), @divTrunc(t[1], 1000), @divTrunc(t[2], 1000),
+            @divTrunc(t[3], 1000), @divTrunc(t[4], 1000), @divTrunc(t[5], 1000),
+        });
+        @memcpy(out, cx.act[0].slice(f32)[0..dim]);
+        return true;
+    }
+
+    const cb = cx.dev.commandBuffer();
+    const e = cb.encoder();
+    e.dispatch(cx.route_p, &.{ cx.scratch_x, cx.scratch_x, cx.route_ids.?, cx.route_gates.? }, &.{ dim * 4, (dim + cfg.n_expert) * 4, 0, 0 }, std.mem.asBytes(&rd), 32, 32);
+    e.barrier();
+    e.dispatch(gsel.pipe, &.{ gw.buf, cx.scratch_x, cx.act[1], cx.route_ids.? }, &.{ gw.off, 0, 0, 0 }, std.mem.asBytes(&d_gate), grid(ffn, gsel.per, cfg.n_used), group);
+    e.dispatch(usel.pipe, &.{ uw.buf, cx.scratch_x, cx.act[2], cx.route_ids.? }, &.{ uw.off, 0, 0, 0 }, std.mem.asBytes(&d_up), grid(ffn, usel.per, cfg.n_used), group);
+    e.barrier();
+    for (0..cfg.n_used) |k| {
+        e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ k * ffn * 4, k * ffn * 4, k * ffn * 4 }, std.mem.asBytes(&len_ffn), ffn, 64);
+    }
+    e.barrier();
+    e.dispatch(dsel.pipe, &.{ dw.buf, cx.act[1], cx.act[3], cx.route_ids.? }, &.{ dw.off, 0, 0, 0 }, std.mem.asBytes(&d_down), grid(dim, dsel.per, cfg.n_used), group);
+    e.barrier();
+    e.dispatch(cx.reduce_dev_p, &.{ cx.act[0], cx.act[3], cx.route_gates.? }, &.{ 0, 0, 0 }, std.mem.asBytes(&rdim), dim, 64);
+    e.barrier();
+    if (shexp != null) {
+        const d_sh = Dims{ .rows = @intCast(shexp_ffn), .cols = @intCast(dim) };
+        const d_shd = Dims{ .rows = @intCast(dim), .cols = @intCast(shexp_ffn) };
+        const len_sh = extern struct { n: u32 }{ .n = @intCast(shexp_ffn) };
+        e.dispatch(sh_pipes[0].pipe, &.{ sh_wraps[0].buf, cx.scratch_x, cx.act[1] }, &.{ sh_wraps[0].off, 0, 0 }, std.mem.asBytes(&d_sh), sh_pipes[0].groups, group);
+        e.dispatch(sh_pipes[1].pipe, &.{ sh_wraps[1].buf, cx.scratch_x, cx.act[2] }, &.{ sh_wraps[1].off, 0, 0 }, std.mem.asBytes(&d_sh), sh_pipes[1].groups, group);
+        e.barrier();
+        e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_sh), shexp_ffn, 64);
+        e.barrier();
+        e.dispatch(sh_pipes[2].pipe, &.{ sh_wraps[2].buf, cx.act[1], cx.act[3] }, &.{ sh_wraps[2].off, 0, 0 }, std.mem.asBytes(&d_shd), sh_pipes[2].groups, group);
+        e.barrier();
+        const acc_d = AccDims{ .n = @intCast(dim), .alpha = 1.0 };
+        e.dispatch(cx.sadd_p, &.{ cx.act[0], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&acc_d), dim, 64);
+    }
+    e.end();
+    cb.commitAndWait();
+    @memcpy(out, cx.act[0].slice(f32)[0..dim]);
+    return true;
+}
+
 /// One selected expert: its three weight tensors and its routing gate.
 pub const ExpertRef = struct {
     gate: WeightRef,
@@ -4058,5 +4286,129 @@ test "device routing agrees with moe.route, bias and all" {
                 }
             }
         }
+    }
+}
+
+test "fused routed layer equals host routing plus the verified block" {
+    // Differential between two paths whose parts are each verified: the fused
+    // buffer (route + id kernels + device-gated reduce + shared expert) against
+    // host moe.route feeding the host-pointer moeFfnBlock. Same kernels for
+    // the arithmetic, routing verified to pick identical experts, so the two
+    // must agree closely -- the tolerance covers only the gates' exp() drift.
+    const gpa = std.testing.allocator;
+    const moe = @import("../gguf/moe.zig");
+    const dim = 2048;
+    const ffn = 1408;
+    const shexp_ffn = 2816;
+    const n_expert = 8;
+    const n_used = 3;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest;
+    const saved_use = use_gpu_ops;
+    use_gpu_ops = true;
+    defer use_gpu_ops = saved_use;
+
+    var prng = std.Random.DefaultPrng.init(0xF05E);
+    const rnd = prng.random();
+    const mk = struct {
+        fn f(g: std.mem.Allocator, r: std.Random, ty: ggml.Type, rows: usize, cols: usize, planes: usize) ![]align(16384) u8 {
+            const d = try g.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(ty, cols, rows) * planes);
+            r.bytes(d);
+            const bs: usize = if (ty == .q4_k) 144 else 22;
+            var b: usize = 0;
+            while (b + bs <= d.len) : (b += bs) {
+                std.mem.writeInt(u16, d[b..][0..2], 0x2C00, .little);
+                if (ty == .q4_k) std.mem.writeInt(u16, d[b + 2 ..][0..2], 0x2800, .little);
+            }
+            return d;
+        }
+    }.f;
+
+    // Held for the whole test: wrapFor's contract.
+    const gw = try mk(gpa, rnd, .q4_k, ffn, dim, n_expert);
+    defer gpa.free(gw);
+    const uw = try mk(gpa, rnd, .q4_k, ffn, dim, n_expert);
+    defer gpa.free(uw);
+    const dw = try mk(gpa, rnd, .q5_0, dim, ffn, n_expert);
+    defer gpa.free(dw);
+    const sg = try mk(gpa, rnd, .q4_k, shexp_ffn, dim, 1);
+    defer gpa.free(sg);
+    const su = try mk(gpa, rnd, .q4_k, shexp_ffn, dim, 1);
+    defer gpa.free(su);
+    const sd = try mk(gpa, rnd, .q5_0, dim, shexp_ffn, 1);
+    defer gpa.free(sd);
+
+    const normed = try gpa.alloc(f32, dim);
+    defer gpa.free(normed);
+    for (normed) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    const logits = try gpa.alloc(f32, n_expert);
+    defer gpa.free(logits);
+    for (logits) |*v| v.* = (rnd.float(f32) - 0.5) * 6.0;
+
+    const rcfg = RoutedCfg{
+        .n_expert = n_expert,
+        .n_used = n_used,
+        .gating_sigmoid = true,
+        .weights_norm = true,
+        .weights_scale = 1.0,
+    };
+    const got = try gpa.alloc(f32, dim);
+    defer gpa.free(got);
+    if (!moeFfnBlockRouted(
+        normed,
+        logits,
+        null,
+        .{ .ty = .q4_k, .data = gw },
+        .{ .ty = .q4_k, .data = uw },
+        .{ .ty = .q5_0, .data = dw },
+        .{ .{ .ty = .q4_k, .data = sg }, .{ .ty = .q4_k, .data = su }, .{ .ty = .q5_0, .data = sd } },
+        ffn,
+        shexp_ffn,
+        rcfg,
+        got,
+    )) return error.SkipZigTest;
+
+    // Reference: host routing into the verified host-pointer block, shared
+    // expert as its extra column, exactly as the engine builds it today.
+    var sel: [n_used]moe.Selected = undefined;
+    moe.route(.{
+        .n_expert = n_expert,
+        .n_used = n_used,
+        .gating = .sigmoid,
+        .weights_norm = true,
+        .weights_scale = 1.0,
+    }, logits, null, &sel);
+    const plane_g = ggml.tensorBytes(.q4_k, dim, ffn);
+    const plane_u = plane_g;
+    const plane_d = ggml.tensorBytes(.q5_0, ffn, dim);
+    var refs: [n_used + 1]ExpertRef = undefined;
+    for (sel, 0..) |sv, k| refs[k] = .{
+        .gate = .{ .ty = .q4_k, .data = gw[sv.expert * plane_g ..][0..plane_g] },
+        .up = .{ .ty = .q4_k, .data = uw[sv.expert * plane_u ..][0..plane_u] },
+        .down = .{ .ty = .q5_0, .data = dw[sv.expert * plane_d ..][0..plane_d] },
+        .weight = sv.gate,
+        .ffn = ffn,
+    };
+    refs[n_used] = .{
+        .gate = .{ .ty = .q4_k, .data = sg },
+        .up = .{ .ty = .q4_k, .data = su },
+        .down = .{ .ty = .q5_0, .data = sd },
+        .weight = 1.0,
+        .ffn = shexp_ffn,
+    };
+    const want = try gpa.alloc(f32, dim);
+    defer gpa.free(want);
+    if (!moeFfnBlock(normed, &refs, want)) return error.SkipZigTest;
+
+    var mass: f32 = 0;
+    for (want) |v| mass += @abs(v);
+    const tol = (mass / @as(f32, @floatFromInt(dim))) * 1e-4;
+    for (want, got, 0..) |a, c, k| {
+        std.testing.expectApproxEqAbs(a, c, tol) catch |e| {
+            std.debug.print("fused routed dim {d}: host-routed {d} vs fused {d}\n", .{ k, a, c });
+            return e;
+        };
     }
 }

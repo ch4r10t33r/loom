@@ -261,6 +261,12 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
 
     const file = try Io.Dir.cwd().openFile(io, path, .{});
     errdefer file.close(io);
+    // The whole mapping goes to the compute backend as an arena, so the GPU
+    // paths read it through a resident buffer instead of faulting file-backed
+    // pages per token. Measured on the fused MoE path before this: 0.2 tok/s
+    // with every bucket -- host attention included -- 10x slower, which is
+    // memory pressure, not arithmetic. Registration only records the region;
+    // the buffers are made when a device exists.
     var mm = try file.createMemoryMap(io, .{
         .len = @intCast(parsed.file_size),
         .protection = .{ .read = true, .write = false },
@@ -419,6 +425,13 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
     model.layers = layers;
 
     model.tok = try Tok.init(gpa, &model.parsed);
+    // The whole mapping goes to the compute backend as an arena, so GPU paths
+    // read it through a resident buffer instead of faulting file-backed pages
+    // per token. Measured on the fused MoE path before this: 0.2 tok/s, every
+    // bucket -- host attention included -- 10x slower, which is memory
+    // pressure rather than arithmetic. Registration records the region; the
+    // buffers are made once a device exists.
+    _ = backend.registerArena(model.mm.memory);
     return model;
 }
 
@@ -1095,6 +1108,49 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             var acc_buf: [8192]f32 = undefined;
             const acc = acc_buf[0..cfg.dim];
             @memset(acc, 0);
+            // Local path first: hand the backend the router *logits* and let it
+            // route, select and reduce in one command buffer. Routing on the
+            // host is a read-back between attention and the FFN, and that
+            // read-back is the one thing keeping them in separate submissions.
+            // The distributed path keeps host routing: its experts are offsets
+            // into a store, not planes of a tensor.
+            routed: {
+                if (m.dist != null) break :routed;
+                const gt = l.ffn_gate_exps orelse break :routed;
+                const rbias: ?[]const f32 = if (l.exp_probs_b) |b| asF32(b) else null;
+                const shexp: ?[3]backend.WeightRef = if (l.ffn_gate_shexp) |gs| .{
+                    .{ .ty = gs.ty, .data = gs.data },
+                    .{ .ty = l.ffn_up_shexp.?.ty, .data = l.ffn_up_shexp.?.data },
+                    .{ .ty = l.ffn_down_shexp.?.ty, .data = l.ffn_down_shexp.?.data },
+                } else null;
+                const t_f2 = if (prof) Profile.now() else 0;
+                const ok = backend.moeFfnBlockRouted(
+                    st.normed,
+                    st.router[0..cfg.n_expert],
+                    rbias,
+                    .{ .ty = gt.ty, .data = gt.data },
+                    .{ .ty = l.ffn_up_exps.?.ty, .data = l.ffn_up_exps.?.data },
+                    .{ .ty = l.ffn_down_exps.?.ty, .data = l.ffn_down_exps.?.data },
+                    shexp,
+                    gt.ne1,
+                    if (l.ffn_gate_shexp) |gs| gs.ne1 else 0,
+                    .{
+                        .n_expert = cfg.n_expert,
+                        .n_used = cfg.n_used,
+                        .gating_sigmoid = cfg.gating == .sigmoid,
+                        .weights_norm = cfg.weights_norm,
+                        .weights_scale = cfg.weights_scale,
+                    },
+                    acc,
+                );
+                if (!ok) break :routed;
+                if (prof) {
+                    t_ffn += Profile.now() - t_f2;
+                    n_block += 1;
+                }
+                backend.add(st.x, acc);
+                continue;
+            }
             if (m.dist) |src| {
                 // warm the missing shards in parallel: per-layer miss latency
                 // becomes max(fetch), not sum(fetch)

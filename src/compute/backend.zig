@@ -173,6 +173,11 @@ pub const mlaAttnHeads = impl.mlaAttnHeads;
 /// FFN share a command buffer.
 pub const moeRoute = impl.moeRoute;
 
+/// A whole routed MoE layer -- routing included -- as one submission. Takes
+/// router logits, not routed experts; see the Metal backend for why.
+pub const RoutedCfg = impl.RoutedCfg;
+pub const moeFfnBlockRouted = impl.moeFfnBlockRouted;
+
 /// W_k dequantized to f32 and held on the device, and the absorption
 /// (W_k^T q_nope) that reads it. The absorption was the last host step inside
 /// an MLA layer, so it forced a synchronization mid-layer however much of the
