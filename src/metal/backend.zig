@@ -73,6 +73,7 @@ const dmmv_q4k_src = @embedFile("../shaders/metal/dmmv_q4k.metal");
 const dmmv_q6k_src = @embedFile("../shaders/metal/dmmv_q6k.metal");
 const gemm_q4k_src = @embedFile("../shaders/metal/gemm_q4k.metal");
 const attn_src = @embedFile("../shaders/metal/attn.metal");
+const mla_attn_src = @embedFile("../shaders/metal/mla_attn.metal");
 const rope_src = @embedFile("../shaders/metal/rope.metal");
 const moe_acc_src = @embedFile("../shaders/metal/moe_acc.metal");
 const dmmv_q5_1_src = @embedFile("../shaders/metal/dmmv_q5_1.metal");
@@ -425,6 +426,7 @@ const Ctx = struct {
     q8_0: mtl.Pipeline,
     gemm_q4k: mtl.Pipeline,
     attn_p: mtl.Pipeline,
+    mla_attn_p: mtl.Pipeline,
     rope_p: mtl.Pipeline,
     kvw_p: mtl.Pipeline,
     sadd_p: mtl.Pipeline,
@@ -435,6 +437,15 @@ const Ctx = struct {
     /// is that it never crosses the bus: only the one new row per layer per
     /// token is written, O(kvd), instead of the whole cache being staged every
     /// step, O(seq*kvd).
+    /// Compressed MLA cache: one c_kv row and one rope key per position, shared
+    /// by every head. Separate from `kv_k`/`kv_v` because MLA never
+    /// materializes keys or values -- these are ~576 floats per position where
+    /// a dense cache would be n_heads * (nope + v_head_dim).
+    mla_c: ?mtl.Buffer = null,
+    mla_krope: ?mtl.Buffer = null,
+    mla_ctx: usize = 0,
+    mla_kvr: usize = 0,
+    mla_rope: usize = 0,
     kv_k: ?mtl.Buffer = null,
     kv_v: ?mtl.Buffer = null,
     /// Per-layer norm weights, all layers resident at once.
@@ -529,6 +540,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const pmla = dev.pipeline(mla_attn_src, "mla_attn_head") catch {
+        dev.deinit();
+        return;
+    };
     const psadd = dev.pipeline(moe_acc_src, "scaled_add") catch {
         dev.deinit();
         return;
@@ -572,7 +587,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -1044,6 +1059,106 @@ pub fn attnHeads(
     return true;
 }
 
+/// Size the device-resident compressed MLA cache. False when it will not fit
+/// the kernel's bounds, in which case the engine keeps its host cache and this
+/// path is simply not used.
+pub fn mlaInit(layers: usize, ctx_len: usize, kvr: usize, rope: usize) bool {
+    const cx = &(ctx orelse return false);
+    if (cx.mla_c != null) return true;
+    // The kernel holds scores in threadgroup memory, so a context past its
+    // bound cannot be served. Declining is the whole point -- truncating would
+    // silently attend to a prefix.
+    if (ctx_len > ATTN_MAX_SEQ) return false;
+    const c_len = layers * ctx_len * kvr * @sizeOf(f32);
+    const r_len = layers * ctx_len * rope * @sizeOf(f32);
+    var cb = cx.dev.alloc(c_len) catch return false;
+    const rb = cx.dev.alloc(r_len) catch {
+        cb.deinit();
+        return false;
+    };
+    cx.mla_c = cb;
+    cx.mla_krope = rb;
+    cx.mla_ctx = ctx_len;
+    cx.mla_kvr = kvr;
+    cx.mla_rope = rope;
+    return true;
+}
+
+/// Append one position's compressed cache row. The host keeps its own copy:
+/// this path can decline at any point and the engine's cache has to be the
+/// authoritative one when it does -- a device mirror written by one path and
+/// not another is how the GQA cache once served zeros at prefilled positions,
+/// which reads as fluent, wrong text.
+pub fn mlaAppend(li: usize, pos: usize, c_kv: []const f32, k_rope: []const f32) bool {
+    const cx = &(ctx orelse return false);
+    const cb = cx.mla_c orelse return false;
+    const rb = cx.mla_krope orelse return false;
+    if (pos >= cx.mla_ctx or c_kv.len != cx.mla_kvr or k_rope.len != cx.mla_rope) return false;
+    const ci = (li * cx.mla_ctx + pos) * cx.mla_kvr;
+    const ri = (li * cx.mla_ctx + pos) * cx.mla_rope;
+    @memcpy(cb.slice(f32)[ci..][0..c_kv.len], c_kv);
+    @memcpy(rb.slice(f32)[ri..][0..k_rope.len], k_rope);
+    return true;
+}
+
+pub fn hasMlaCache() bool {
+    const cx = &(ctx orelse return false);
+    return cx.mla_c != null;
+}
+
+/// Every head's MLA attention for one layer, over the compressed cache.
+///
+/// `q_absorbed` is W_k^T q_nope per head -- the absorption identity, so the
+/// kernel dots against the cache directly instead of rebuilding keys. `out` is
+/// o_latent per head, still compressed; W_v is applied to it by the caller.
+pub fn mlaAttnHeads(
+    li: usize,
+    pos: usize,
+    q_absorbed: []const f32,
+    q_rope: []const f32,
+    out: []f32,
+    n_heads: usize,
+    scale: f32,
+) bool {
+    const cx = &(ctx orelse return false);
+    const cbuf = cx.mla_c orelse return false;
+    const rbuf = cx.mla_krope orelse return false;
+    if (!attn_worthwhile) return false;
+    const seq = pos + 1;
+    if (seq > cx.mla_ctx) return false;
+    const qa_bytes = q_absorbed.len * 4;
+    const qr_bytes = q_rope.len * 4;
+    if (qa_bytes + qr_bytes > cx.scratch_x.len) return false;
+    if (out.len * 4 > cx.scratch_out.len) return false;
+
+    // Both query halves share the one staging buffer, absorbed first.
+    @memcpy(cx.scratch_x.slice(f32)[0..q_absorbed.len], q_absorbed);
+    @memcpy(cx.scratch_x.slice(f32)[q_absorbed.len..][0..q_rope.len], q_rope);
+
+    const dims = MlaDims{
+        .n_heads = @intCast(n_heads),
+        .kvr = @intCast(cx.mla_kvr),
+        .rope = @intCast(cx.mla_rope),
+        .seq = @intCast(seq),
+        .scale = scale,
+    };
+    const c_off = li * cx.mla_ctx * cx.mla_kvr * @sizeOf(f32);
+    const r_off = li * cx.mla_ctx * cx.mla_rope * @sizeOf(f32);
+    const group: usize = 64;
+    const cb = cx.dev.commandBuffer();
+    cb.dispatch(
+        cx.mla_attn_p,
+        &.{ cx.scratch_x, cx.scratch_x, cbuf, rbuf, cx.scratch_out },
+        &.{ 0, q_absorbed.len * 4, c_off, r_off, 0 },
+        std.mem.asBytes(&dims),
+        n_heads * group,
+        group,
+    );
+    cb.commitAndWait();
+    @memcpy(out, cx.scratch_out.slice(f32)[0..out.len]);
+    return true;
+}
+
 /// One selected expert: its three weight tensors and its routing gate.
 pub const ExpertRef = struct {
     gate: WeightRef,
@@ -1161,6 +1276,7 @@ pub fn moeFfnBlock(
 const MAX_MOE_EXPERTS = 16;
 
 const AccDims = extern struct { n: u32, alpha: f32 };
+const MlaDims = extern struct { n_heads: u32, kvr: u32, rope: u32, seq: u32, scale: f32 };
 const MAX_MOE_REDUCE = 16;
 const ReduceDims = extern struct { n: u32, dim: u32, w: [MAX_MOE_REDUCE]f32 };
 
@@ -3425,5 +3541,97 @@ test "moe block: back to back against a host gap between calls" {
         });
     } else {
         std.debug.print("    inside a 2 GB arena  did not run\n", .{});
+    }
+}
+
+fn backend_ctx_absent() bool {
+    return ctx == null;
+}
+
+test "mla attention matches an exact cpu reference" {
+    // The identity being tested is the absorption one: scores are
+    // q_absorbed . c_t + q_rope . k_rope_t, and the weighted sum stays in
+    // compressed space. Getting either half wrong still produces a normalized,
+    // plausible output vector -- dropping the rope term entirely just makes
+    // attention position-blind, which reads as slightly worse text rather than
+    // as a failure.
+    const gpa = std.testing.allocator;
+    const n_heads = 4;
+    const kvr = 64;
+    const rope = 16;
+    const seq = 37; // not a multiple of the threadgroup size, on purpose
+    const layers = 2;
+    const ctx_len = 64;
+    const scale: f32 = 0.3;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (backend_ctx_absent()) return error.SkipZigTest;
+    const saved_attn = attn_worthwhile;
+    attn_worthwhile = true;
+    defer attn_worthwhile = saved_attn;
+
+    if (!mlaInit(layers, ctx_len, kvr, rope)) return error.SkipZigTest;
+
+    var prng = std.Random.DefaultPrng.init(0x11A);
+    const rnd = prng.random();
+    const qa = try gpa.alloc(f32, n_heads * kvr);
+    defer gpa.free(qa);
+    const qr = try gpa.alloc(f32, n_heads * rope);
+    defer gpa.free(qr);
+    for (qa) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    for (qr) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    const c_rows = try gpa.alloc(f32, seq * kvr);
+    defer gpa.free(c_rows);
+    const r_rows = try gpa.alloc(f32, seq * rope);
+    defer gpa.free(r_rows);
+    for (c_rows) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    for (r_rows) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    const li = 1; // not layer zero, so a missing layer stride shows
+    for (0..seq) |t| {
+        if (!mlaAppend(li, t, c_rows[t * kvr ..][0..kvr], r_rows[t * rope ..][0..rope])) return error.SkipZigTest;
+    }
+
+    const got = try gpa.alloc(f32, n_heads * kvr);
+    defer gpa.free(got);
+    if (!mlaAttnHeads(li, seq - 1, qa, qr, got, n_heads, scale)) return error.SkipZigTest;
+
+    // Reference in f64: softmax over 37 terms then a weighted sum is exactly
+    // the kind of reduction where an f32 oracle reports its own drift.
+    const want = try gpa.alloc(f32, n_heads * kvr);
+    defer gpa.free(want);
+    const sc = try gpa.alloc(f64, seq);
+    defer gpa.free(sc);
+    for (0..n_heads) |h| {
+        var mx: f64 = -std.math.inf(f64);
+        for (0..seq) |t| {
+            var s: f64 = 0;
+            for (0..kvr) |i| s += @as(f64, qa[h * kvr + i]) * @as(f64, c_rows[t * kvr + i]);
+            for (0..rope) |i| s += @as(f64, qr[h * rope + i]) * @as(f64, r_rows[t * rope + i]);
+            sc[t] = s * scale;
+            mx = @max(mx, sc[t]);
+        }
+        var sum: f64 = 0;
+        for (sc) |*v| {
+            v.* = @exp(v.* - mx);
+            sum += v.*;
+        }
+        for (0..kvr) |i| {
+            var acc: f64 = 0;
+            for (0..seq) |t| acc += sc[t] * @as(f64, c_rows[t * kvr + i]);
+            want[h * kvr + i] = @floatCast(acc / sum);
+        }
+    }
+
+    var mass: f32 = 0;
+    for (want) |v| mass += @abs(v);
+    const tol = (mass / @as(f32, @floatFromInt(want.len))) * 2e-3;
+    for (want, got, 0..) |a, b, k| {
+        std.testing.expectApproxEqAbs(a, b, tol) catch |e| {
+            std.debug.print("mla head {d} dim {d}: cpu {d} vs gpu {d}\n", .{ k / kvr, k % kvr, a, b });
+            return e;
+        };
     }
 }

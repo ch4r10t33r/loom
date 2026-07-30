@@ -159,6 +159,15 @@ pub const frameStoreX = impl.frameStoreX;
 /// False means the engine runs its own path.
 pub const attnHeads = impl.attnHeads;
 
+/// Multi-head Latent Attention over a device-resident *compressed* cache.
+/// MLA never materializes keys or values, so this is a different shape from
+/// `attnHeads`: the queries arrive absorbed (W_k^T q_nope) and the result is
+/// o_latent, still compressed, for the caller to apply W_v to.
+pub const mlaInit = impl.mlaInit;
+pub const mlaAppend = impl.mlaAppend;
+pub const hasMlaCache = impl.hasMlaCache;
+pub const mlaAttnHeads = impl.mlaAttnHeads;
+
 /// One shape the engine will issue, for calibration.
 pub const Shape = impl.Shape;
 
