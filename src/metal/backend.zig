@@ -428,6 +428,7 @@ const Ctx = struct {
     rope_p: mtl.Pipeline,
     kvw_p: mtl.Pipeline,
     sadd_p: mtl.Pipeline,
+    reduce_p: mtl.Pipeline,
     zero_p: mtl.Pipeline,
     /// Device-resident KV cache, [layers][ctx][kvd]. Allocated by `attnInit`.
     /// It lives here rather than in the engine's State because the whole point
@@ -532,6 +533,10 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
+    const pred = dev.pipeline(moe_acc_src, "moe_reduce") catch {
+        dev.deinit();
+        return;
+    };
     const pzero = dev.pipeline(moe_acc_src, "zero_fill") catch {
         dev.deinit();
         return;
@@ -567,7 +572,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q5_0 = p50, .q8_0 = p80, .gemm_q4k = pg, .attn_p = pattn, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -1098,25 +1103,45 @@ pub fn moeFfnBlock(
     const dims_ffn = Dims{ .rows = @intCast(ffn), .cols = @intCast(dim) };
     const dims_down = Dims{ .rows = @intCast(dim), .cols = @intCast(ffn) };
     const len_ffn = extern struct { n: u32 }{ .n = @intCast(ffn) };
-    const zero_d = AccDims{ .n = @intCast(dim), .alpha = 0 };
 
-    // Slots: 0 = accumulator, 1 = gate, 2 = up, 3 = this expert's output.
+    // Phase-parallel across experts, not expert-by-expert.
+    //
+    // The per-expert form ran gate, up, swiglu, down and accumulate as a chain
+    // with a barrier at every step -- about thirty barriers for a layer, each a
+    // full pipeline drain, and never more than two dispatches able to run at
+    // once. Experts are independent until the final sum, so the whole layer is
+    // four phases instead: every gate and up together (twelve-way parallel for
+    // six experts), every swiglu, every down, then one fused reduce.
+    //
+    // Slot 0 is the accumulator; 1 and 2 hold every expert's gate and up,
+    // 3 every expert's output, each strided by expert. `ffn * 4` and `dim * 4`
+    // are multiples of 256 for every real width, so the offsets are aligned.
+    const gate_stride = ffn * 4;
+    const out_stride = dim * 4;
+    if (experts.len * gate_stride > cx.act[1].len) return false;
+    if (experts.len * gate_stride > cx.act[2].len) return false;
+    if (experts.len * out_stride > cx.act[3].len) return false;
+
     const cb = cx.dev.commandBuffer();
     const e = cb.encoder();
-    e.dispatch(cx.zero_p, &.{cx.act[0]}, &.{0}, std.mem.asBytes(&zero_d), dim, 64);
-    e.barrier();
-    for (experts, 0..) |ex, i| {
-        e.dispatch(pipes[i][0].pipe, &.{ wraps[i][0].buf, cx.scratch_x, cx.act[1] }, &.{ wraps[i][0].off, 0, 0 }, std.mem.asBytes(&dims_ffn), pipes[i][0].groups, group);
-        e.dispatch(pipes[i][1].pipe, &.{ wraps[i][1].buf, cx.scratch_x, cx.act[2] }, &.{ wraps[i][1].off, 0, 0 }, std.mem.asBytes(&dims_ffn), pipes[i][1].groups, group);
-        e.barrier();
-        e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&len_ffn), ffn, 64);
-        e.barrier();
-        e.dispatch(pipes[i][2].pipe, &.{ wraps[i][2].buf, cx.act[1], cx.act[3] }, &.{ wraps[i][2].off, 0, 0 }, std.mem.asBytes(&dims_down), pipes[i][2].groups, group);
-        e.barrier();
-        const acc_d = AccDims{ .n = @intCast(dim), .alpha = ex.weight };
-        e.dispatch(cx.sadd_p, &.{ cx.act[0], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&acc_d), dim, 64);
-        e.barrier();
+    for (experts, 0..) |_, i| {
+        e.dispatch(pipes[i][0].pipe, &.{ wraps[i][0].buf, cx.scratch_x, cx.act[1] }, &.{ wraps[i][0].off, 0, i * gate_stride }, std.mem.asBytes(&dims_ffn), pipes[i][0].groups, group);
+        e.dispatch(pipes[i][1].pipe, &.{ wraps[i][1].buf, cx.scratch_x, cx.act[2] }, &.{ wraps[i][1].off, 0, i * gate_stride }, std.mem.asBytes(&dims_ffn), pipes[i][1].groups, group);
     }
+    e.barrier();
+    for (experts, 0..) |_, i| {
+        e.dispatch(cx.swiglu_p, &.{ cx.act[1], cx.act[2], cx.act[1] }, &.{ i * gate_stride, i * gate_stride, i * gate_stride }, std.mem.asBytes(&len_ffn), ffn, 64);
+    }
+    e.barrier();
+    for (experts, 0..) |_, i| {
+        e.dispatch(pipes[i][2].pipe, &.{ wraps[i][2].buf, cx.act[1], cx.act[3] }, &.{ wraps[i][2].off, i * gate_stride, i * out_stride }, std.mem.asBytes(&dims_down), pipes[i][2].groups, group);
+    }
+    e.barrier();
+    // One dispatch for the weighted sum: a `scaled_add` per expert all write
+    // the same accumulator and so needed a barrier between each.
+    var rd = ReduceDims{ .n = @intCast(experts.len), .dim = @intCast(dim), .w = @splat(0) };
+    for (experts, 0..) |ex, i| rd.w[i] = ex.weight;
+    e.dispatch(cx.reduce_p, &.{ cx.act[0], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&rd), dim, 64);
     e.end();
     cb.commitAndWait();
     @memcpy(out, cx.act[0].slice(f32)[0..dim]);
@@ -1127,6 +1152,8 @@ pub fn moeFfnBlock(
 const MAX_MOE_EXPERTS = 16;
 
 const AccDims = extern struct { n: u32, alpha: f32 };
+const MAX_MOE_REDUCE = 16;
+const ReduceDims = extern struct { n: u32, dim: u32, w: [MAX_MOE_REDUCE]f32 };
 
 /// Everything one GQA layer needs, so the whole layer is one call.
 pub const LayerSpec = struct {
@@ -2684,12 +2711,19 @@ test "metal scaling: where does the gpu actually win" {
         const w = wrapFor(cx, data) orelse continue;
         const dims = Dims{ .rows = @intCast(rows), .cols = @intCast(cols) };
         const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+        // Through the same selector the engine uses, not a hardcoded pipeline
+        // and grid. This had `cx.q4k` with `((rows + 1) / 2) * SIMD_W` left
+        // over from when Q4_K covered two rows per group; against the four-row
+        // kernel that dispatches twice the groups needed and measures the
+        // waste, which is why it reported 47 GB/s at 1408 rows where an
+        // honest grid gives 89.
+        const sel = dmmvFor(cx, .q4_k, rows) orelse continue;
 
         const N = 20;
         // warm
         {
             const cb = cx.dev.commandBuffer();
-            cb.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), rows * SIMD_W, group);
+            cb.dispatch(sel.pipe, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), sel.groups, group);
             cb.commitAndWait();
         }
         // Best-of rather than mean. This machine shares its GPU with the
@@ -2700,7 +2734,7 @@ test "metal scaling: where does the gpu actually win" {
         for (0..N) |_| {
             const t0 = now(io);
             const cb = cx.dev.commandBuffer();
-            cb.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), ((rows + 1) / 2) * SIMD_W, group);
+            cb.dispatch(sel.pipe, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), sel.groups, group);
             cb.commitAndWait();
             const dt = now(io) - t0;
             if (dt < gpu) gpu = dt;
@@ -2719,7 +2753,7 @@ test "metal scaling: where does the gpu actually win" {
             const t0 = now(io);
             const cb = cx.dev.commandBuffer();
             const e = cb.encoder();
-            for (0..D) |_| e.dispatch(cx.q4k, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), ((rows + 1) / 2) * SIMD_W, group);
+            for (0..D) |_| e.dispatch(sel.pipe, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), sel.groups, group);
             e.end();
             cb.commitAndWait();
             const dt = @divTrunc(now(io) - t0, D);
@@ -3110,5 +3144,78 @@ test "both q4_k kernels agree with the oracle, on each side of the threshold" {
                 return e;
             };
         }
+    }
+}
+
+test "q4_k variants, interleaved so drift cannot favour one" {
+    // Why this exists rather than another sweep: comparing kernel variants
+    // across separate runs does not work on this machine. The same binary
+    // reported 62.4, 52.9, 42.8 and 46.1 GB/s at 2816 rows on four
+    // consecutive runs -- a +-20% band that swallows every difference between
+    // the variants being compared, and which produced two confident wrong
+    // conclusions before it was noticed.
+    //
+    // Best-of-N inside one run is not enough either, because the drift is
+    // between runs. So the variants are interleaved round-by-round within a
+    // single run: whatever the window server is doing, it is doing it to all
+    // three at once, and best-of over rounds then means the same thing for
+    // each.
+    if (@import("builtin").mode != .ReleaseFast) return error.SkipZigTest;
+    const gpa = std.testing.allocator;
+    parallelBegin(8);
+    defer parallelEnd();
+    const cx = &(ctx orelse return error.SkipZigTest);
+    var t: std.Io.Threaded = .init(gpa, .{});
+    defer t.deinit();
+    const io = t.io();
+    const now = struct {
+        fn f(i: std.Io) i128 {
+            return std.Io.Clock.Timestamp.now(i, .awake).raw.toNanoseconds();
+        }
+    }.f;
+
+    const cols = 2048;
+    const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+    const Variant = struct { name: []const u8, pipe: mtl.Pipeline, per: usize };
+    const variants = [_]Variant{
+        .{ .name = "NR0=4", .pipe = cx.q4k, .per = 4 },
+        .{ .name = "NR0=2", .pipe = cx.q4k_wide, .per = 2 },
+    };
+
+    std.debug.print("\n  rows   {s:>14} {s:>14}   (GB/s, best of 40 interleaved rounds)\n", .{ variants[0].name, variants[1].name });
+    for ([_]usize{ 1408, 2048, 2816 }) |rows| {
+        const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q4_k, cols, rows));
+        defer gpa.free(data);
+        var prng = std.Random.DefaultPrng.init(7);
+        prng.random().bytes(data);
+        for (0..data.len / 2) |i| data[i * 2 + 1] &= 0xFB;
+        const x = try gpa.alloc(f32, cols);
+        defer gpa.free(x);
+        for (x) |*v| v.* = prng.random().float(f32) - 0.5;
+        if (rows * 4 > cx.scratch_out.len) continue;
+        @memcpy(cx.scratch_x.slice(f32)[0..cols], x);
+        const w = wrapFor(cx, data) orelse continue;
+        const dims = Dims{ .rows = @intCast(rows), .cols = @intCast(cols) };
+
+        var best: [variants.len]i128 = @splat(std.math.maxInt(i64));
+        const D = 32; // dispatches per buffer: amortizes the ~262 us submission
+        for (0..40) |_| {
+            for (variants, 0..) |v, vi| {
+                const threads = ((rows + v.per - 1) / v.per) * SIMD_W;
+                const grid = ((threads + group - 1) / group) * group;
+                const t0 = now(io);
+                const cb = cx.dev.commandBuffer();
+                const e = cb.encoder();
+                for (0..D) |_| e.dispatch(v.pipe, &.{ w.buf, cx.scratch_x, cx.scratch_out }, &.{ w.off, 0, 0 }, std.mem.asBytes(&dims), grid, group);
+                e.end();
+                cb.commitAndWait();
+                const dt = @divTrunc(now(io) - t0, D);
+                if (dt < best[vi]) best[vi] = dt;
+            }
+        }
+        const bytes: f64 = @floatFromInt(ggml.tensorBytes(.q4_k, cols, rows));
+        var gbs: [variants.len]f64 = undefined;
+        for (best, 0..) |b, i| gbs[i] = bytes / @as(f64, @floatFromInt(b));
+        std.debug.print("  {d:>5}   {d:>14.1} {d:>14.1}\n", .{ rows, gbs[0], gbs[1] });
     }
 }
