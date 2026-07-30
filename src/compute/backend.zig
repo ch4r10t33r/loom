@@ -183,6 +183,13 @@ pub const moeFfnBlockRouted = impl.moeFfnBlockRouted;
 /// stream after the layer.
 pub const mlaLayerTail = impl.mlaLayerTail;
 
+/// A whole token as one submission, and the cache read-back that keeps the
+/// host copy authoritative after it.
+pub const MlaLayerDesc = impl.MlaLayerDesc;
+pub const MlaFrameCfg = impl.MlaFrameCfg;
+pub const mlaTokenFrame = impl.mlaTokenFrame;
+pub const mlaReadCache = impl.mlaReadCache;
+
 /// W_k dequantized to f32 and held on the device, and the absorption
 /// (W_k^T q_nope) that reads it. The absorption was the last host step inside
 /// an MLA layer, so it forced a synchronization mid-layer however much of the

@@ -799,6 +799,7 @@ fn runStoreWith(
     // instance of a device path silently off because its setup lived on
     // another code path.
     if (@hasDecl(E, "uploadAbsorbWeights")) E.uploadAbsorbWeights(&m, gpa);
+    if (@hasDecl(E, "buildFrameDescs")) m.frame_descs = E.buildFrameDescs(&m, gpa);
     defer backend.parallelEnd();
 
     var st = try E.State.init(gpa, c);
@@ -910,6 +911,7 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
     // instance of a device path silently off because its setup lived on
     // another code path.
     if (@hasDecl(eng, "uploadAbsorbWeights")) eng.uploadAbsorbWeights(&m, gpa);
+    if (@hasDecl(eng, "buildFrameDescs")) m.frame_descs = eng.buildFrameDescs(&m, gpa);
     defer backend.parallelEnd();
 
     var st = try eng.State.init(gpa, c);
