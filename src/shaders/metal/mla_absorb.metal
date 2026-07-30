@@ -32,27 +32,33 @@ struct AbsorbDims {
     uint q_off;
 };
 
+// One SIMD group per output element, the nope-sum split across lanes.
+//
+// The first version gave each *head* a threadgroup -- sixteen threadgroups on
+// a device that wants hundreds, every thread crawling tens of kilobytes
+// serially. The work is n_heads * kvr independent dot products over nope
+// terms; gridding one SIMD group per output makes it 8,192 groups on the real
+// model, and the column reads within a group are contiguous across lanes.
 kernel void mla_absorb(
     device const float *wk  [[buffer(0)]], // [n_heads * stride][kvr], f32
-    device const float *q   [[buffer(1)]], // [n_heads][nope]
+    device const float *q   [[buffer(1)]],
     device float       *out [[buffer(2)]], // [n_heads][kvr]
     constant AbsorbDims &d  [[buffer(3)]],
-    uint hg  [[threadgroup_position_in_grid]],
-    uint tid [[thread_position_in_threadgroup]],
-    uint nt  [[threads_per_threadgroup]])
+    uint  tgid [[threadgroup_position_in_grid]],
+    uint  sgid [[simdgroup_index_in_threadgroup]],
+    uint  lane [[thread_index_in_simdgroup]],
+    uint  nsg  [[simdgroups_per_threadgroup]])
 {
-    const uint h = hg;
+    const uint g = tgid * nsg + sgid;
+    const uint h = g / d.kvr;
     if (h >= d.n_heads) return;
+    const uint i = g - h * d.kvr;
 
-    // This head's W_k block: the first `nope` rows of its slice. The remaining
-    // v_head_dim rows are W_v, which this kernel must not touch -- hence the
-    // explicit stride rather than assuming the two are the same size.
     device const float *wh = wk + (ulong)h * d.stride * d.kvr;
     device const float *qh = q + (ulong)h * d.q_stride + d.q_off;
 
-    for (uint i = tid; i < d.kvr; i += nt) {
-        float acc = 0.0f;
-        for (uint r = 0; r < d.nope; r++) acc += qh[r] * wh[(ulong)r * d.kvr + i];
-        out[(ulong)h * d.kvr + i] = acc;
-    }
+    float acc = 0.0f;
+    for (uint r = lane; r < d.nope; r += 32) acc += qh[r] * wh[(ulong)r * d.kvr + i];
+    acc = simd_sum(acc);
+    if (lane == 0) out[(ulong)h * d.kvr + i] = acc;
 }

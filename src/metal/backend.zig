@@ -1296,8 +1296,8 @@ pub fn mlaAttnHeads(
         &.{ cx.mla_wk.items[li], cx.scratch_x, cx.act[1] },
         &.{ 0, 0, 0 },
         std.mem.asBytes(&ad),
-        n_heads * group,
-        group,
+        absorbGrid(n_heads, kvr),
+        SIMD_W * SIMDGROUPS_PER_GROUP,
     );
     e.barrier();
     e.dispatch(
@@ -1768,7 +1768,7 @@ pub fn mlaLayerTail(
     const cb = cx.dev.commandBuffer();
     const e = cb.encoder();
     // ---- attention ----
-    e.dispatch(cx.mla_absorb_p, &.{ cx.mla_wk.items[li], cx.scratch_x, cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&ad), n_heads * group, group);
+    e.dispatch(cx.mla_absorb_p, &.{ cx.mla_wk.items[li], cx.scratch_x, cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&ad), absorbGrid(n_heads, kvr), group);
     e.barrier();
     e.dispatch(cx.mla_attn_p, &.{ cx.act[1], cx.scratch_x, cbuf, rbuf, cx.act[2] }, &.{ 0, off_qr * 4, c_off, r_off, 0 }, std.mem.asBytes(&dims), n_heads * group, group);
     e.barrier();
@@ -2019,8 +2019,24 @@ pub fn mlaTokenFrame(
     const route_d = RouteDims{ .n_expert = @intCast(fc.routed.n_expert), .n_used = @intCast(fc.routed.n_used), .gating = if (fc.routed.gating_sigmoid) 1 else 0, .weights_norm = if (fc.routed.weights_norm) 1 else 0, .has_bias = 0, .weights_scale = fc.routed.weights_scale };
     const rdd = Dims{ .rows = @intCast(fc.routed.n_expert), .cols = @intCast(dim) };
 
-    const cb = cx.dev.commandBuffer();
-    const e = cb.encoder();
+    // LOOM_FRAME_DEBUG: emit each layer as four waited sub-buffers -- head,
+    // attention, projection block, FFN -- and print the per-category sums.
+    // The only way to see where the fused token's time goes without a Metal
+    // capture; the split's own submission overhead (~108 waits) makes the
+    // absolute total meaningless, so only the ratios and the comparison with
+    // the fused total carry information.
+    const debug_split = std.c.getenv("LOOM_FRAME_DEBUG") != null;
+    var ph = [_]i128{0} ** 5;
+    const nowf = struct {
+        fn f() i128 {
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(.MONOTONIC, &ts);
+            return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+        }
+    }.f;
+
+    var cb = cx.dev.commandBuffer();
+    var e = cb.encoder();
     for (descs, 0..) |d, li| {
         const p = &plans_buf[li];
         const c_pos = (li * cx.mla_ctx + pos) * fc.kvr * 4;
@@ -2038,20 +2054,44 @@ pub fn mlaTokenFrame(
         e.barrier();
         e.dispatch(cx.mla_rope_p, &.{rbuf}, &.{r_pos}, std.mem.asBytes(&k_rope_d), fc.rope / 2, 32);
         e.barrier();
+        if (debug_split) {
+            const t0 = nowf();
+            e.end();
+            cb.commitAndWait();
+            ph[0] += nowf() - t0;
+            cb = cx.dev.commandBuffer();
+            e = cb.encoder();
+        }
         // ---- attention ----
-        e.dispatch(cx.mla_absorb_p, &.{ cx.mla_wk.items[li], cx.act[6], cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&ad), fc.n_heads * group, group);
+        e.dispatch(cx.mla_absorb_p, &.{ cx.mla_wk.items[li], cx.act[6], cx.act[1] }, &.{ 0, 0, 0 }, std.mem.asBytes(&ad), absorbGrid(fc.n_heads, fc.kvr), group);
         e.barrier();
         e.dispatch(cx.mla_attn_p, &.{ cx.act[1], cx.act[6], cbuf, rbuf, cx.act[2] }, &.{ 0, 0, li * cx.mla_ctx * fc.kvr * 4, li * cx.mla_ctx * fc.rope * 4, 0 }, std.mem.asBytes(&at), fc.n_heads * group, group);
         e.barrier();
         const vd_dims = IdDims{ .rows = @intCast(fc.v_head_dim), .cols = @intCast(fc.kvr), .n_used = @intCast(fc.n_heads), .plane_stride = @intCast((fc.nope + fc.v_head_dim) * p.row_bytes), .x_stride = @intCast(fc.kvr) };
         e.dispatch(p.vsel.pipe, &.{ p.vw.buf, cx.act[2], cx.act[3], cx.mla_vids.? }, &.{ p.vw.off + fc.nope * p.row_bytes, 0, 0, 0 }, std.mem.asBytes(&vd_dims), grid(fc.v_head_dim, p.vsel.per, fc.n_heads), group);
         e.barrier();
+        if (debug_split) {
+            const t0 = nowf();
+            e.end();
+            cb.commitAndWait();
+            ph[1] += nowf() - t0;
+            cb = cx.dev.commandBuffer();
+            e = cb.encoder();
+        }
         e.dispatch(p.psel.pipe, &.{ p.pw.buf, cx.act[3], cx.act[7] }, &.{ p.pw.off, 0, 0 }, std.mem.asBytes(&pd), p.psel.groups, group);
         e.barrier();
         e.dispatch(cx.add_p, &.{ cx.act[4], cx.act[7] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), dim, 64);
         e.barrier();
         e.dispatch(cx.rmsnorm_p, &.{ cx.act[4], p.fnw.buf, cx.act[5] }, &.{ 0, p.fnw.off, 0 }, std.mem.asBytes(&nd), SIMD_W, SIMD_W);
         e.barrier();
+        if (debug_split) {
+            const t0 = nowf();
+            e.end();
+            cb.commitAndWait();
+            ph[2] += nowf() - t0;
+            cb = cx.dev.commandBuffer();
+            e = cb.encoder();
+        }
         if (d.is_moe) {
             e.dispatch(p.rsel.pipe, &.{ p.rw.buf, cx.act[5], cx.act[6] }, &.{ p.rw.off, 0, 0 }, std.mem.asBytes(&rdd), p.rsel.groups, group);
             e.barrier();
@@ -2105,14 +2145,32 @@ pub fn mlaTokenFrame(
             e.dispatch(cx.add_p, &.{ cx.act[4], cx.act[3] }, &.{ 0, 0 }, std.mem.asBytes(&len_dim), dim, 64);
         }
         e.barrier();
+        if (debug_split) {
+            const t0 = nowf();
+            e.end();
+            cb.commitAndWait();
+            ph[3] += nowf() - t0;
+            cb = cx.dev.commandBuffer();
+            e = cb.encoder();
+        }
     }
     // ---- final norm and lm_head ----
     e.dispatch(cx.rmsnorm_p, &.{ cx.act[4], onw.buf, cx.act[5] }, &.{ 0, onw.off, 0 }, std.mem.asBytes(&nd), SIMD_W, SIMD_W);
     e.barrier();
     const lmd = Dims{ .rows = @intCast(vocab), .cols = @intCast(dim) };
     e.dispatch(lmsel.pipe, &.{ lmw.buf, cx.act[5], cx.scratch_out }, &.{ lmw.off, 0, 0 }, std.mem.asBytes(&lmd), lmsel.groups, group);
-    e.end();
-    cb.commitAndWait();
+    {
+        const t0 = nowf();
+        e.end();
+        cb.commitAndWait();
+        ph[4] += nowf() - t0;
+    }
+    if (debug_split) {
+        std.debug.print("frame phases us: head {d} attn {d} proj {d} ffn {d} lmhead {d}\n", .{
+            @divTrunc(ph[0], 1000), @divTrunc(ph[1], 1000), @divTrunc(ph[2], 1000),
+            @divTrunc(ph[3], 1000), @divTrunc(ph[4], 1000),
+        });
+    }
     @memcpy(x, cx.act[4].slice(f32)[0..dim]);
     @memcpy(logits, cx.scratch_out.slice(f32)[0..vocab]);
     return true;
@@ -2131,6 +2189,13 @@ pub fn mlaReadCache(li: usize, pos: usize, c_kv: []f32, k_rope: []f32) bool {
     @memcpy(c_kv, cbuf.slice(f32)[(li * cx.mla_ctx + pos) * cx.mla_kvr ..][0..c_kv.len]);
     @memcpy(k_rope, rbuf.slice(f32)[(li * cx.mla_ctx + pos) * cx.mla_rope ..][0..k_rope.len]);
     return true;
+}
+
+/// One SIMD group per absorbed output element, rounded to whole threadgroups.
+fn absorbGrid(n_heads: usize, kvr: usize) usize {
+    const group = SIMD_W * SIMDGROUPS_PER_GROUP;
+    const threads = n_heads * kvr * SIMD_W;
+    return ((threads + group - 1) / group) * group;
 }
 
 fn cfgSlotsShort(cx: *Ctx, ffn: usize, shexp_ffn: usize, dim: usize, n_used: usize) bool {
