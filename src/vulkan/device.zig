@@ -80,7 +80,7 @@ const QueueFamilyProperties = extern struct { queueFlags: u32, queueCount: u32, 
 const PhysicalDeviceMemoryProperties = extern struct { memoryTypeCount: u32, memoryTypes: [32]extern struct { propertyFlags: u32, heapIndex: u32 }, memoryHeapCount: u32, memoryHeaps: [16]extern struct { size: u64, flags: u32 } };
 const DeviceQueueCreateInfo = extern struct { sType: u32 = 2, pNext: ?*anyopaque = null, flags: u32 = 0, queueFamilyIndex: u32, queueCount: u32 = 1, pQueuePriorities: *const f32 };
 const Features8Bit = extern struct { sType: u32 = 1000177000, pNext: ?*anyopaque = null, storageBuffer8BitAccess: u32 = 1, uniformAndStorageBuffer8BitAccess: u32 = 0, storagePushConstant8: u32 = 0 };
-const FeaturesInt8 = extern struct { sType: u32 = 1000082000, pNext: ?*anyopaque = null, shaderFloat16: u32 = 0, shaderInt8: u32 = 1 };
+const FeaturesInt8 = extern struct { sType: u32 = 1000082000, pNext: ?*anyopaque = null, shaderFloat16: u32 = 1, shaderInt8: u32 = 1 };
 const DeviceCreateInfo = extern struct { sType: u32 = 3, pNext: ?*anyopaque = null, flags: u32 = 0, queueCreateInfoCount: u32 = 1, pQueueCreateInfos: *const DeviceQueueCreateInfo, enabledLayerCount: u32 = 0, ppEnabledLayerNames: ?*anyopaque = null, enabledExtensionCount: u32 = 0, ppEnabledExtensionNames: ?*const [*:0]const u8 = null, pEnabledFeatures: ?*anyopaque = null };
 // usage: STORAGE_BUFFER | TRANSFER_SRC | TRANSFER_DST, so any buffer can be
 // a staging source or a device-local copy target.
