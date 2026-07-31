@@ -148,6 +148,8 @@ var accbuf: ?vk.Buffer = null;
 // the allocator hands back the same address run-dependently. That was a
 // 1-in-5 flake on real hardware, misread as a barrier race for a day; every
 // test that builds weight tensors clears this cache first.
+var dl_tmp: [16384]f32 = undefined; // readback scratch for non-frame paths
+
 const CachedWeight = struct { buf: vk.Buffer, len: usize };
 var wcache: std.AutoHashMapUnmanaged(usize, CachedWeight) = .empty;
 
@@ -287,6 +289,15 @@ fn ensure(buf: *?vk.Buffer, d: *vk.Device, len: usize) ?vk.Buffer {
     return buf.*;
 }
 
+/// Device-local variant for the working set: activations, expert slots and
+/// attention intermediates live in VRAM -- every dispatch previously pulled
+/// its inputs across PCIe from host-visible memory, a first-touch latency
+/// tax on all ~600 dispatches per token that no kernel shape could hide.
+fn ensureDev(buf: *?vk.Buffer, d: *vk.Device, len: usize) ?vk.Buffer {
+    if (buf.* == null or buf.*.?.len < len) buf.* = d.allocDevice(len) catch return null;
+    return buf.*;
+}
+
 const RoutePush = extern struct { n_expert: u32, n_used: u32, gating: u32, weights_norm: u32, has_bias: u32, weights_scale: f32 };
 const IdPush = extern struct { rows: u32, cols: u32, n_used: u32, plane_stride: u32, x_stride: u32, base: u32 = 0 };
 
@@ -353,10 +364,10 @@ pub fn moeFfnBlockRouted(normed: []const f32, logits: []const f32, bias: ?[]cons
     const uw = weightBuffer(d, up_w.data) orelse return false;
     const dw = weightBuffer(d, down_w.data) orelse return false;
     const widest = @max(ffn, shexp_ffn);
-    const s1 = ensure(&slots[0], d, @max(cfg.n_used * ffn, widest) * 4) orelse return false;
-    const s2 = ensure(&slots[1], d, @max(cfg.n_used * ffn, widest) * 4) orelse return false;
-    const s3 = ensure(&slots[2], d, @max(cfg.n_used, 1) * dim * 4) orelse return false;
-    const acc = ensure(&accbuf, d, dim * 4) orelse return false;
+    const s1 = ensureDev(&slots[0], d, @max(cfg.n_used * ffn, widest) * 4) orelse return false;
+    const s2 = ensureDev(&slots[1], d, @max(cfg.n_used * ffn, widest) * 4) orelse return false;
+    const s3 = ensureDev(&slots[2], d, @max(cfg.n_used, 1) * dim * 4) orelse return false;
+    const acc = ensureDev(&accbuf, d, dim * 4) orelse return false;
     const xb = ensure(&xbuf, d, dim * 4) orelse return false;
     @memcpy(xb.slice(f32)[0..dim], normed);
 
@@ -420,9 +431,11 @@ pub fn moeFfnBlockRouted(normed: []const f32, logits: []const f32, bias: ?[]cons
     d.submitWait(c) catch return false;
     cmdbufs += 1;
 
-    @memcpy(out, acc.slice(f32)[0..dim]);
+    d.download(acc, std.mem.sliceAsBytes(out)) catch return false;
     if (shexp != null) {
-        for (out, s3.slice(f32)[0..dim]) |*o, v| o.* += v;
+        if (dim > dl_tmp.len) return false;
+        d.download(s3, std.mem.sliceAsBytes(dl_tmp[0..dim])) catch return false;
+        for (out, dl_tmp[0..dim]) |*o, v| o.* += v;
     }
     return true;
 }
@@ -474,13 +487,20 @@ pub fn mlaInit(layers: usize, ctx_len: usize, kvr: usize, rope: usize) bool {
     return true;
 }
 
+var mla_mirror: ?vk.Buffer = null; // host-visible: this position's rows, [layers][kvr+rope]
+var mirror_pos: usize = std.math.maxInt(usize);
+
 fn ensureMlaCache(d: *vk.Device) ?MlaWant {
     const w = mla_want orelse return null;
     if (mla_cache == null) {
         const c_elems = w.layers * w.ctx * w.kvr;
         const r_elems = w.layers * w.ctx * w.rope;
-        mla_cache = d.alloc((c_elems + r_elems) * 4) catch return null;
+        // Device-local: attention reads the whole valid prefix every layer,
+        // and host-visible placement made that a PCIe stream per token.
+        mla_cache = d.allocDevice((c_elems + r_elems) * 4) catch return null;
         mla_r0 = c_elems;
+        mla_mirror = d.alloc(w.layers * (w.kvr + w.rope) * 4) catch return null;
+        mirror_pos = std.math.maxInt(usize);
     }
     return w;
 }
@@ -497,9 +517,10 @@ pub fn mlaAppend(li: usize, pos: usize, c_kv: []const f32, k_rope: []const f32) 
     const d = &(dev orelse return false);
     const w = ensureMlaCache(d) orelse return false;
     if (pos >= w.ctx or c_kv.len != w.kvr or k_rope.len != w.rope) return false;
-    const cache = mla_cache.?;
-    @memcpy(cache.slice(f32)[(li * w.ctx + pos) * w.kvr ..][0..w.kvr], c_kv);
-    @memcpy(cache.slice(f32)[mla_r0 + (li * w.ctx + pos) * w.rope ..][0..w.rope], k_rope);
+    // Staged uploads: this is the per-layer fallback path and test setup;
+    // the frame writes its cache rows on the device.
+    d.uploadAt(mla_cache.?, (li * w.ctx + pos) * w.kvr * 4, std.mem.sliceAsBytes(c_kv)) catch return false;
+    d.uploadAt(mla_cache.?, (mla_r0 + (li * w.ctx + pos) * w.rope) * 4, std.mem.sliceAsBytes(k_rope)) catch return false;
     return true;
 }
 
@@ -507,9 +528,14 @@ pub fn mlaReadCache(li: usize, pos: usize, c_kv: []f32, k_rope: []f32) bool {
     const d = &(dev orelse return false);
     const w = ensureMlaCache(d) orelse return false;
     if (pos >= w.ctx or c_kv.len != w.kvr or k_rope.len != w.rope) return false;
-    const cache = mla_cache.?;
-    @memcpy(c_kv, cache.slice(f32)[(li * w.ctx + pos) * w.kvr ..][0..w.kvr]);
-    @memcpy(k_rope, cache.slice(f32)[mla_r0 + (li * w.ctx + pos) * w.rope ..][0..w.rope]);
+    if (pos == mirror_pos) {
+        const m = mla_mirror.?.slice(f32)[li * (w.kvr + w.rope) ..];
+        @memcpy(c_kv, m[0..w.kvr]);
+        @memcpy(k_rope, m[w.kvr..][0..w.rope]);
+        return true;
+    }
+    d.downloadAt(mla_cache.?, (li * w.ctx + pos) * w.kvr * 4, std.mem.sliceAsBytes(c_kv)) catch return false;
+    d.downloadAt(mla_cache.?, (mla_r0 + (li * w.ctx + pos) * w.rope) * 4, std.mem.sliceAsBytes(k_rope)) catch return false;
     return true;
 }
 
@@ -558,10 +584,10 @@ fn prepAttn(d: *vk.Device, li: usize, pos: usize, q_nope: []const f32, q_rope: [
         vids = b;
     }
     _ = ensure(&qbuf, d, (q_nope.len + q_rope.len) * 4) orelse return null;
-    _ = ensure(&qabs, d, n_heads * w.kvr * 4) orelse return null;
-    _ = ensure(&probs_buf, d, n_heads * w.ctx * 4) orelse return null;
-    _ = ensure(&olat, d, n_heads * w.kvr * 4) orelse return null;
-    _ = ensure(&hout, d, n_heads * v_head_dim * 4) orelse return null;
+    _ = ensureDev(&qabs, d, n_heads * w.kvr * 4) orelse return null;
+    _ = ensureDev(&probs_buf, d, n_heads * w.ctx * 4) orelse return null;
+    _ = ensureDev(&olat, d, n_heads * w.kvr * 4) orelse return null;
+    _ = ensureDev(&hout, d, n_heads * v_head_dim * 4) orelse return null;
     @memcpy(qbuf.?.slice(f32)[0..q_nope.len], q_nope);
     @memcpy(qbuf.?.slice(f32)[q_nope.len..][0..q_rope.len], q_rope);
     return .{ .w = w, .vp = vp, .vw = vw, .row_bytes = row_bytes, .seq = seq };
@@ -613,7 +639,7 @@ pub fn mlaAttnHeads(li: usize, pos: usize, q_nope: []const f32, q_rope: []const 
     recordAttn(d, c, p, li, n_heads, nope, v_head_dim, scale, qbuf.?, nope, 0, p.w.rope, n_heads * nope) catch return false;
     d.submitWait(c) catch return false;
     cmdbufs += 1;
-    @memcpy(out, hout.?.slice(f32)[0..out.len]);
+    d.download(hout.?, std.mem.sliceAsBytes(out)) catch return false;
     return true;
 }
 
@@ -659,9 +685,9 @@ pub fn mlaLayerTail(li: usize, pos: usize, x: []f32, q_nope: []const f32, q_rope
     const idb = ensure(&ids_buf, d, MAX_MOE_EXPERTS * 4) orelse return false;
     const gb = ensure(&gates_buf, d, MAX_MOE_EXPERTS * 4) orelse return false;
     const xr = ensure(&xres, d, dim * 4) orelse return false;
-    const pj = ensure(&projb, d, dim * 4) orelse return false;
+    const pj = ensureDev(&projb, d, dim * 4) orelse return false;
     const nw = ensure(&normw, d, dim * 4) orelse return false;
-    const nb = ensure(&normed_buf, d, dim * 4) orelse return false;
+    const nb = ensureDev(&normed_buf, d, dim * 4) orelse return false;
     const lb = ensure(&lbuf, d, cfg.n_expert * 2 * 4) orelse return false;
     @memcpy(xr.slice(f32)[0..dim], x);
     @memcpy(nw.slice(f32)[0..dim], ffn_norm);
@@ -853,21 +879,21 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         vids = b;
     }
     const xr = ensure(&xres, d, dim * 4) orelse return false;
-    const nb = ensure(&normed_buf, d, dim * 4) orelse return false;
-    const qf = ensure(&qfull, d, fc.n_heads * kd * 4) orelse return false;
-    const kva = ensure(&kva_buf, d, (fc.kvr + fc.rope) * 4) orelse return false;
-    _ = ensure(&qabs, d, fc.n_heads * fc.kvr * 4) orelse return false;
-    _ = ensure(&probs_buf, d, fc.n_heads * w.ctx * 4) orelse return false;
-    _ = ensure(&olat, d, fc.n_heads * fc.kvr * 4) orelse return false;
-    _ = ensure(&hout, d, fc.n_heads * fc.v_head_dim * 4) orelse return false;
-    const pj = ensure(&projb, d, dim * 4) orelse return false;
+    const nb = ensureDev(&normed_buf, d, dim * 4) orelse return false;
+    const qf = ensureDev(&qfull, d, fc.n_heads * kd * 4) orelse return false;
+    const kva = ensureDev(&kva_buf, d, (fc.kvr + fc.rope) * 4) orelse return false;
+    _ = ensureDev(&qabs, d, fc.n_heads * fc.kvr * 4) orelse return false;
+    _ = ensureDev(&probs_buf, d, fc.n_heads * w.ctx * 4) orelse return false;
+    _ = ensureDev(&olat, d, fc.n_heads * fc.kvr * 4) orelse return false;
+    _ = ensureDev(&hout, d, fc.n_heads * fc.v_head_dim * 4) orelse return false;
+    const pj = ensureDev(&projb, d, dim * 4) orelse return false;
     const lb = ensure(&lbuf, d, @max(fc.routed.n_expert, 1) * 2 * 4) orelse return false;
     const idb = ensure(&ids_buf, d, MAX_MOE_EXPERTS * 4) orelse return false;
     const gb = ensure(&gates_buf, d, MAX_MOE_EXPERTS * 4) orelse return false;
-    const s1 = ensure(&slots[0], d, s12_len * 4) orelse return false;
-    const s2 = ensure(&slots[1], d, s12_len * 4) orelse return false;
-    const s3 = ensure(&slots[2], d, @max(fc.routed.n_used, 1) * dim * 4) orelse return false;
-    const acc = ensure(&accbuf, d, dim * 4) orelse return false;
+    const s1 = ensureDev(&slots[0], d, s12_len * 4) orelse return false;
+    const s2 = ensureDev(&slots[1], d, s12_len * 4) orelse return false;
+    const s3 = ensureDev(&slots[2], d, @max(fc.routed.n_used, 1) * dim * 4) orelse return false;
+    const acc = ensureDev(&accbuf, d, dim * 4) orelse return false;
     const ob = ensure(&obuf, d, vocab * 4) orelse return false;
     @memcpy(xr.slice(f32)[0..dim], x);
 
@@ -932,8 +958,20 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
             c = d.beginCmd() catch return false;
         }
         // ---- attention, q read in place: nope at h*kd, rope at h*kd+nope ----
+        // The finished cache row also lands in the host-visible mirror strip
+        // (post-frame readback becomes a memcpy); disjoint from the absorb,
+        // but the c-row copy must follow the norm-into-cache, so it rides
+        // after this group's barrier -- wait: c row was written before the
+        // rope barrier, r row rotated just above; both copies are safe here.
         d.record(c, pipes.absorb, &.{ mla_wk.items[li], qf, qabs.? }, std.mem.asBytes(&apush), @intCast(fc.n_heads * ((fc.kvr + 63) / 64))) catch return false;
         d.barrier(c);
+        // Mirror the finished cache row to the host-visible strip alongside
+        // the attention dispatch: both only READ the cache, and the rope that
+        // finished the r row is ordered by the barrier above.
+        const mcp_c = CopyPush{ .n = @intCast(fc.kvr), .in_off = @intCast(c_pos), .out_off = @intCast(li * (fc.kvr + fc.rope)) };
+        d.record(c, pipes.copy, &.{ mla_cache.?, mla_mirror.? }, std.mem.asBytes(&mcp_c), @intCast((fc.kvr + 63) / 64)) catch return false;
+        const mcp_r = CopyPush{ .n = @intCast(fc.rope), .in_off = @intCast(r_pos), .out_off = @intCast(li * (fc.kvr + fc.rope) + fc.kvr) };
+        d.record(c, pipes.copy, &.{ mla_cache.?, mla_mirror.? }, std.mem.asBytes(&mcp_r), @intCast((fc.rope + 63) / 64)) catch return false;
         const tpush = AttnPush{ .n_heads = @intCast(fc.n_heads), .kvr = @intCast(fc.kvr), .rope = @intCast(fc.rope), .seq = @intCast(seq), .qr_stride = @intCast(kd), .qr_off = @intCast(fc.nope), .c_base = @intCast(li * w.ctx * fc.kvr), .r_base = @intCast(mla_r0 + li * w.ctx * fc.rope), .scale = fc.scale };
         d.record(c, pipes.attn, &.{ qabs.?, qf, mla_cache.?, probs_buf.? }, std.mem.asBytes(&tpush), @intCast(fc.n_heads)) catch return false;
         d.barrier(c);
@@ -1052,6 +1090,7 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
     cmdbufs += 1;
     @memcpy(x, xr.slice(f32)[0..dim]);
     @memcpy(logits, ob.slice(f32)[0..vocab]);
+    mirror_pos = pos;
     return true;
 }
 
