@@ -1,12 +1,12 @@
-// Q8_0 matvec, vectorized: unaligned word loads (34-byte blocks) with
-// sign-extending byte extracts, vec4 activations. Value = d*q.
+// Q8_0 matvec, four rows per workgroup, unaligned word loads over the
+// 34-byte blocks. Value = d*q.
 #version 450
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) readonly buffer W { uint w4[]; };
 layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
 layout(std430, binding = 2) writeonly buffer O { float o[]; };
 layout(push_constant) uniform PC { uint rows; uint cols; } pc;
-shared float red[64];
+shared vec4 red[64];
 
 // Unaligned 4-byte load: the 22/34/210-byte block formats put fields at
 // half-word offsets. The device layer pads every buffer by a word, so the
@@ -23,24 +23,42 @@ float sum4(vec4 v) { return v.x + v.y + v.z + v.w; }
 const uint QK = 32u;
 const uint BLK = 34u;
 
+vec4 sbytes(uint qw) {
+    int q = int(qw);
+    return vec4(float(bitfieldExtract(q, 0, 8)), float(bitfieldExtract(q, 8, 8)), float(bitfieldExtract(q, 16, 8)), float(bitfieldExtract(q, 24, 8)));
+}
+
 void main() {
-    uint row = gl_WorkGroupID.x;
-    if (row >= pc.rows) return;
     uint tid = gl_LocalInvocationID.x;
+    uint row0 = gl_WorkGroupID.x * 4u;
+    if (row0 >= pc.rows) return;
     uint blocks = pc.cols / QK;
-    uint row_base = row * blocks * BLK;
+    uint rb = blocks * BLK;
+    uint nr = min(4u, pc.rows - row0);
+    // A short tail group re-reads row0's bytes for its missing rows and
+    // discards the result -- valid memory, no divergent inner loop.
+    uint base0 = row0 * rb;
+    uint b1 = base0 + min(1u, nr - 1u) * rb;
+    uint b2 = base0 + min(2u, nr - 1u) * rb;
+    uint b3 = base0 + min(3u, nr - 1u) * rb;
     uint x0 = 0u;
 
-    float acc = 0.0;
+    vec4 acc = vec4(0.0);
     for (uint b = tid; b < blocks; b += 64u) {
-        uint blk = row_base + b * BLK;
-        float d = unpackHalf2x16(loadU32(blk)).x;
+        uint k0 = base0 + b * BLK;
+        uint k1 = b1 + b * BLK;
+        uint k2 = b2 + b * BLK;
+        uint k3 = b3 + b * BLK;
+        vec4 d = vec4(unpackHalf2x16(loadU32(k0)).x, unpackHalf2x16(loadU32(k1)).x, unpackHalf2x16(loadU32(k2)).x, unpackHalf2x16(loadU32(k3)).x);
         uint xb4 = (x0 >> 2u) + b * 8u;
-        float s = 0.0;
+        vec4 s = vec4(0.0);
         for (uint j = 0u; j < 8u; j++) {
-            int qw = int(loadU32(blk + 2u + 4u * j));
-            vec4 q = vec4(float(bitfieldExtract(qw, 0, 8)), float(bitfieldExtract(qw, 8, 8)), float(bitfieldExtract(qw, 16, 8)), float(bitfieldExtract(qw, 24, 8)));
-            s += dot(q, x4[xb4 + j]);
+            vec4 xv = x4[xb4 + j];
+            uint off = 2u + 4u * j;
+            s.x += dot(sbytes(loadU32(k0 + off)), xv);
+            s.y += dot(sbytes(loadU32(k1 + off)), xv);
+            s.z += dot(sbytes(loadU32(k2 + off)), xv);
+            s.w += dot(sbytes(loadU32(k3 + off)), xv);
         }
         acc += d * s;
     }
@@ -51,5 +69,11 @@ void main() {
         if (tid < s) red[tid] += red[tid + s];
         barrier();
     }
-    if (tid == 0u) o[row] = red[0];
+    if (tid == 0u) {
+        vec4 r = red[0];
+        o[row0] = r.x;
+        if (nr > 1u) o[row0 + 1u] = r.y;
+        if (nr > 2u) o[row0 + 2u] = r.z;
+        if (nr > 3u) o[row0 + 3u] = r.w;
+    }
 }

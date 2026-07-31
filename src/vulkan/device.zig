@@ -316,6 +316,9 @@ pub const Device = struct {
     /// the barrier's name is in the frame test's history.)
     pub fn barrier(self: *Device, c: Cmd) void {
         _ = self;
+        // LOOM_NO_BARRIER: diagnostic ONLY -- output is garbage, but the wall
+        // time bounds what barrier drains cost. Never in a correctness path.
+        if (std.c.getenv("LOOM_NO_BARRIER") != null) return;
         const mb = MemoryBarrier{ .srcAccessMask = 0x40, .dstAccessMask = 0x20 | 0x40 }; // SHADER_WRITE -> SHADER_READ|WRITE
         v.vkCmdPipelineBarrier(c.cmd, 0x800, 0x800, 0, 1, @ptrCast(&mb), 0, null, 0, null); // COMPUTE -> COMPUTE
     }

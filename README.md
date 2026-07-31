@@ -134,12 +134,57 @@ threads running during a generation, and past that point oversubscription
 costs more than the extra cores return. Override with `--threads N`;
 `--threads 1` disables the pool.
 
-This is still CPU-only, and the CPU path is not exhausted: Q4_K runs at about
-5.8 GB/s against roughly 70 GB/s of achievable bandwidth. GPU backends —
-Metal on Apple, Vulkan on Linux and Windows — are planned in
-[`docs/GPU-BACKENDS.md`](docs/GPU-BACKENDS.md), following the structure
-[ZINC](https://github.com/zolotukhin/zinc) used for its Apple Silicon
-bring-up.
+The CPU path is not exhausted — Q4_K runs at about 5.8 GB/s against roughly
+70 GB/s of achievable bandwidth — but the GPU backends below have overtaken
+it on every machine that has one.
+
+### GPU: Metal (Apple Silicon)
+
+DeepSeek-Coder-V2-Lite-Instruct Q4_K_M (16B MoE, ~10 GB), single-stream
+decode on an Apple M5, `--gpu-ops`. The reference bar was llama.cpp's
+reported 38 tok/s on an M3. The chain that got there — each step merged only
+after a differential test against the exact reference:
+
+| step | tok/s |
+|---|---|
+| CPU baseline (int8, 8 threads) | ~3.7 |
+| device-resident weights + per-op kernels | ~12 |
+| device-side routing + fused MoE layer | ~25 |
+| whole-layer submission (`mlaLayerTail`) | 34.7 |
+| whole-token command buffer, 1.8 cb/token | 42 |
+| **+ attention re-grids, f16 W_k** | **39.7–44.4** |
+
+The recurring lesson: submission count is the number that never lies. The
+same work in fewer `commitAndWait`s is where every large jump came from.
+
+### GPU: Vulkan (NVIDIA / anything with a driver)
+
+Same model, RTX 3060 12 GB (driver 580.173, Ubuntu 22.04), one afternoon of
+measured steps from bring-up to 6.5x the CPU. End-to-end numbers include the
+CPU prompt prefill; marginal is the steady-state decode rate:
+
+| step | end-to-end tok/s |
+|---|---|
+| CPU baseline (9 cores) | 3.1 |
+| bring-up (host-memory weights, ~500 submits/token) | 0.6 |
+| VRAM weights + one-submission MoE chain | 1.5 |
+| + measured matvec size cutover (small ops stay on CPU) | 4.4 |
+| + MLA attention and whole layer tail on device | 7.1 |
+| + whole-token frame, **1.0 command buffers/token** | 9.7 |
+| + vectorized dmmv kernels (u32 + vec4 loads) | 15.6 |
+| + coalesced attention grids | 19.8 |
+| **+ four-rows-per-workgroup dmmv** | **20.3** (27 tok/s marginal) |
+
+Every kernel is pinned by an f64 dequantize-everything differential, and the
+whole-token frame carries a same-inputs determinism probe — both ran as
+30-run soaks on real hardware before merging. `LOOM_FRAME_DEBUG=1` splits a
+token into per-phase timings; `LOOM_VK_MIN_BYTES` moves the CPU/GPU matvec
+cutover for re-measurement on other hardware.
+
+Remaining, in measured order: the MoE expert kernels still read at ~60 GB/s
+effective against the card's 360, and prefill still runs the CPU batched
+path. Backend design notes are in
+[`docs/GPU-BACKENDS.md`](docs/GPU-BACKENDS.md).
 
 ## Benchmarking
 
