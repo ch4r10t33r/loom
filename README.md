@@ -173,7 +173,8 @@ CPU prompt prefill; marginal is the steady-state decode rate:
 | + whole-token frame, **1.0 command buffers/token** | 9.7 |
 | + vectorized dmmv kernels (u32 + vec4 loads) | 15.6 |
 | + coalesced attention grids | 19.8 |
-| **+ four-rows-per-workgroup dmmv** | **20.3** (27 tok/s marginal) |
+| + four-rows-per-workgroup dmmv | 20.3 (27 tok/s marginal) |
+| **+ working set to VRAM (activations, slots, cache)** | **32.1** (**63.7 tok/s marginal**) |
 
 Every kernel is pinned by an f64 dequantize-everything differential, and the
 whole-token frame carries a same-inputs determinism probe — both ran as
@@ -181,10 +182,12 @@ whole-token frame carries a same-inputs determinism probe — both ran as
 token into per-phase timings; `LOOM_VK_MIN_BYTES` moves the CPU/GPU matvec
 cutover for re-measurement on other hardware.
 
-Remaining, in measured order: the MoE expert kernels still read at ~60 GB/s
-effective against the card's 360, and prefill still runs the CPU batched
-path. Backend design notes are in
-[`docs/GPU-BACKENDS.md`](docs/GPU-BACKENDS.md).
+The decisive fix was memory placement, not kernel shape: ten kernel-level
+experiments measured neutral before the profiler's uniform per-kernel deficit
+identified host-visible intermediates -- every dispatch paying PCIe
+first-touch latency -- as the real cost. With the working set in VRAM the
+3060 passes the M5's Metal path (44 tok/s) at 63.7 tok/s marginal decode.
+Backend design notes are in [`docs/GPU-BACKENDS.md`](docs/GPU-BACKENDS.md).
 
 ## Benchmarking
 

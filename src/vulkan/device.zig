@@ -298,6 +298,51 @@ pub const Device = struct {
         return pipe;
     }
 
+    /// Offset variants for row-granular cache access.
+    pub fn uploadAt(self: *Device, dst: Buffer, dst_off: usize, data: []const u8) Error!void {
+        if (dst.ptr != null) {
+            @memcpy(dst.slice(u8)[dst_off..][0..data.len], data);
+            return;
+        }
+        if (self.staging == null or self.staging.?.len < data.len) self.staging = try self.alloc(data.len);
+        const st = self.staging.?;
+        @memcpy(st.slice(u8)[0..data.len], data);
+        const c = try self.beginCmd();
+        const region = BufferCopy{ .dstOffset = dst_off, .size = data.len };
+        v.vkCmdCopyBuffer(c.cmd, st.handle, dst.handle, 1, @ptrCast(&region));
+        try self.submitWait(c);
+    }
+
+    pub fn downloadAt(self: *Device, src: Buffer, src_off: usize, out: []u8) Error!void {
+        if (src.ptr != null) {
+            @memcpy(out, src.slice(u8)[src_off..][0..out.len]);
+            return;
+        }
+        if (self.staging == null or self.staging.?.len < out.len) self.staging = try self.alloc(out.len);
+        const st = self.staging.?;
+        const c = try self.beginCmd();
+        const region = BufferCopy{ .srcOffset = src_off, .size = out.len };
+        v.vkCmdCopyBuffer(c.cmd, src.handle, st.handle, 1, @ptrCast(&region));
+        try self.submitWait(c);
+        @memcpy(out, st.slice(u8)[0..out.len]);
+    }
+
+    /// Read a device-local buffer back to host memory: direct memcpy when
+    /// mapped, otherwise a staged copy through the bounce buffer.
+    pub fn download(self: *Device, src: Buffer, out: []u8) Error!void {
+        if (src.ptr != null) {
+            @memcpy(out, src.slice(u8)[0..out.len]);
+            return;
+        }
+        if (self.staging == null or self.staging.?.len < out.len) self.staging = try self.alloc(out.len);
+        const st = self.staging.?;
+        const c = try self.beginCmd();
+        const region = BufferCopy{ .size = out.len };
+        v.vkCmdCopyBuffer(c.cmd, src.handle, st.handle, 1, @ptrCast(&region));
+        try self.submitWait(c);
+        @memcpy(out, st.slice(u8)[0..out.len]);
+    }
+
     /// An open command buffer recording dispatches. Descriptor sets come from
     /// the shared pool, reset at `beginCmd` -- one recording can hold up to
     /// the pool's 64 sets. This is what turns a chain of ops into one
