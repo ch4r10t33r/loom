@@ -1,11 +1,12 @@
 // Q5_0 matvec, four rows per workgroup, fifth bits from qh. Value = d*(q-16).
 #version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) readonly buffer W { uint w4[]; };
 layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
 layout(std430, binding = 2) writeonly buffer O { float o[]; };
 layout(push_constant) uniform PC { uint rows; uint cols; } pc;
-shared vec4 red[64];
+shared vec4 red[16];
 
 // Unaligned 4-byte load: the 22/34/210-byte block formats put fields at
 // half-word offsets. The device layer pads every buffer by a word, so the
@@ -83,14 +84,12 @@ void main() {
         acc += d * (s_qx - 16.0 * s_x);
     }
 
-    red[tid] = acc;
+    acc = subgroupAdd(acc);
+    if (subgroupElect()) red[gl_SubgroupID] = acc;
     barrier();
-    for (uint s = 32u; s > 0u; s >>= 1u) {
-        if (tid < s) red[tid] += red[tid + s];
-        barrier();
-    }
     if (tid == 0u) {
-        vec4 r = red[0];
+        vec4 r = vec4(0.0);
+        for (uint s = 0u; s < gl_NumSubgroups; s++) r += red[s];
         o[row0] = r.x;
         if (nr > 1u) o[row0 + 1u] = r.y;
         if (nr > 2u) o[row0 + 2u] = r.z;
