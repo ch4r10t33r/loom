@@ -1,12 +1,12 @@
-// Q6_K matvec, vectorized: word loads over the ql/qh planes, signed
-// per-16 scales, vec4 activations. Value = d*sc*(q-32).
+// Q6_K matvec, four rows per workgroup, the matvecQ6K run layout.
+// Value = d*sc*(q-32).
 #version 450
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) readonly buffer W { uint w4[]; };
 layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
 layout(std430, binding = 2) writeonly buffer O { float o[]; };
 layout(push_constant) uniform PC { uint rows; uint cols; } pc;
-shared float red[64];
+shared vec4 red[64];
 
 // Unaligned 4-byte load: the 22/34/210-byte block formats put fields at
 // half-word offsets. The device layer pads every buffer by a word, so the
@@ -23,40 +23,60 @@ float sum4(vec4 v) { return v.x + v.y + v.z + v.w; }
 const uint QK_K = 256u;
 const uint BLK = 210u;
 
+vec4 q6v(uint qlw, uint qhw, uint k) {
+    vec4 lo4 = (k < 2u) ? vec4(float(qlw & 15u), float((qlw >> 8u) & 15u), float((qlw >> 16u) & 15u), float((qlw >> 24u) & 15u))
+                        : vec4(float((qlw >> 4u) & 15u), float((qlw >> 12u) & 15u), float((qlw >> 20u) & 15u), float((qlw >> 28u) & 15u));
+    uint sh = 2u * k;
+    vec4 hi4 = vec4(float((qhw >> sh) & 3u), float((qhw >> (8u + sh)) & 3u), float((qhw >> (16u + sh)) & 3u), float((qhw >> (24u + sh)) & 3u));
+    return lo4 + hi4 * 16.0 - 32.0;
+}
+
 void main() {
-    uint row = gl_WorkGroupID.x;
-    if (row >= pc.rows) return;
     uint tid = gl_LocalInvocationID.x;
+    uint row0 = gl_WorkGroupID.x * 4u;
+    if (row0 >= pc.rows) return;
     uint blocks = pc.cols / QK_K;
-    uint row_base = row * blocks * BLK;
+    uint rb = blocks * BLK;
+    uint nr = min(4u, pc.rows - row0);
+    // A short tail group re-reads row0's bytes for its missing rows and
+    // discards the result -- valid memory, no divergent inner loop.
+    uint base0 = row0 * rb;
+    uint b1 = base0 + min(1u, nr - 1u) * rb;
+    uint b2 = base0 + min(2u, nr - 1u) * rb;
+    uint b3 = base0 + min(3u, nr - 1u) * rb;
     uint x0 = 0u;
 
-    // Thread t owns run (t & 7) -- half n = run>>2, run k = run&3 -- and
-    // strides super-blocks by 8, exactly the layout matvecQ6K walks.
-    float acc = 0.0;
+    vec4 acc = vec4(0.0);
     uint run = tid & 7u;
     uint n = run >> 2u;
     uint k = run & 3u;
+    uint qoff = n * 64u + ((k & 1u) == 1u ? 32u : 0u);
+    uint hoff = 128u + n * 32u;
+    uint soff = 192u + n * 8u + k * 2u;
     for (uint b = tid >> 3u; b < blocks; b += 8u) {
-        uint blk = row_base + b * BLK;
-        float d = unpackHalf2x16(loadU32(blk + 208u)).x;
-        uint scw = loadU32(blk + 192u + n * 8u + k * 2u);
-        float sc0 = float(bitfieldExtract(int(scw), 0, 8));
-        float sc1 = float(bitfieldExtract(int(scw), 8, 8));
-        uint ql = blk + n * 64u + ((k & 1u) == 1u ? 32u : 0u);
-        uint qh = blk + 128u + n * 32u;
+        uint k0 = base0 + b * BLK;
+        uint k1 = b1 + b * BLK;
+        uint k2 = b2 + b * BLK;
+        uint k3 = b3 + b * BLK;
+        vec4 d = vec4(unpackHalf2x16(loadU32(k0 + 208u)).x, unpackHalf2x16(loadU32(k1 + 208u)).x, unpackHalf2x16(loadU32(k2 + 208u)).x, unpackHalf2x16(loadU32(k3 + 208u)).x);
+        int c0 = int(loadU32(k0 + soff));
+        int c1 = int(loadU32(k1 + soff));
+        int c2 = int(loadU32(k2 + soff));
+        int c3 = int(loadU32(k3 + soff));
+        vec4 sc0 = vec4(float(bitfieldExtract(c0, 0, 8)), float(bitfieldExtract(c1, 0, 8)), float(bitfieldExtract(c2, 0, 8)), float(bitfieldExtract(c3, 0, 8)));
+        vec4 sc1 = vec4(float(bitfieldExtract(c0, 8, 8)), float(bitfieldExtract(c1, 8, 8)), float(bitfieldExtract(c2, 8, 8)), float(bitfieldExtract(c3, 8, 8)));
         uint xb4 = (x0 >> 2u) + b * 64u + n * 32u + k * 8u;
-        float s0 = 0.0;
-        float s1 = 0.0;
+        vec4 s0 = vec4(0.0);
+        vec4 s1 = vec4(0.0);
         for (uint j = 0u; j < 8u; j++) {
-            uint qlw = loadU32(ql + 4u * j);
-            uint qhw = loadU32(qh + 4u * j);
-            vec4 lo4 = (k < 2u) ? vec4(float(qlw & 15u), float((qlw >> 8u) & 15u), float((qlw >> 16u) & 15u), float((qlw >> 24u) & 15u))
-                                : vec4(float((qlw >> 4u) & 15u), float((qlw >> 12u) & 15u), float((qlw >> 20u) & 15u), float((qlw >> 28u) & 15u));
-            uint sh = 2u * k;
-            vec4 hi4 = vec4(float((qhw >> sh) & 3u), float((qhw >> (8u + sh)) & 3u), float((qhw >> (16u + sh)) & 3u), float((qhw >> (24u + sh)) & 3u));
-            vec4 v = (lo4 + hi4 * 16.0 - 32.0) * x4[xb4 + j];
-            if (j < 4u) s0 += sum4(v); else s1 += sum4(v);
+            vec4 xv = x4[xb4 + j];
+            uint qo = qoff + 4u * j;
+            uint ho = hoff + 4u * j;
+            vec4 v = vec4(dot(q6v(loadU32(k0 + qo), loadU32(k0 + ho), k), xv),
+                          dot(q6v(loadU32(k1 + qo), loadU32(k1 + ho), k), xv),
+                          dot(q6v(loadU32(k2 + qo), loadU32(k2 + ho), k), xv),
+                          dot(q6v(loadU32(k3 + qo), loadU32(k3 + ho), k), xv));
+            if (j < 4u) s0 += v; else s1 += v;
         }
         acc += d * (sc0 * s0 + sc1 * s1);
     }
@@ -67,5 +87,11 @@ void main() {
         if (tid < s) red[tid] += red[tid + s];
         barrier();
     }
-    if (tid == 0u) o[row] = red[0];
+    if (tid == 0u) {
+        vec4 r = red[0];
+        o[row0] = r.x;
+        if (nr > 1u) o[row0 + 1u] = r.y;
+        if (nr > 2u) o[row0 + 2u] = r.z;
+        if (nr > 3u) o[row0 + 3u] = r.w;
+    }
 }

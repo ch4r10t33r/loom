@@ -255,7 +255,7 @@ pub fn matvec(t: ggml.Type, out: []f32, data: []const u8, x: []const f32, rows: 
     if (obuf == null or obuf.?.len < out.len * 4) obuf = d.alloc(out.len * 4) catch return cpu.matvec(t, out, data, x, rows, cols);
     @memcpy(xbuf.?.slice(f32)[0..x.len], x);
     const push = extern struct { rows: u32, cols: u32 }{ .rows = @intCast(rows), .cols = @intCast(cols) };
-    d.dispatchWait(pipe, &.{ wb, xbuf.?, obuf.? }, std.mem.asBytes(&push), @intCast(rows)) catch
+    d.dispatchWait(pipe, &.{ wb, xbuf.?, obuf.? }, std.mem.asBytes(&push), @intCast((rows + 3) / 4)) catch
         return cpu.matvec(t, out, data, x, rows, cols);
     cmdbufs += 1;
     @memcpy(out, obuf.?.slice(f32)[0..out.len]);
@@ -385,12 +385,12 @@ pub fn moeFfnBlockRouted(normed: []const f32, logits: []const f32, bias: ?[]cons
     const c = d.beginCmd() catch return false;
     d.record(c, pipes.route, &.{ rin, idb, gb }, std.mem.asBytes(&rpush), 1) catch return false;
     d.barrier(c);
-    d.record(c, gp, &.{ gw, xb, s1, idb }, std.mem.asBytes(&d_gate), @intCast(cfg.n_used * ffn)) catch return false;
-    d.record(c, up, &.{ uw, xb, s2, idb }, std.mem.asBytes(&d_up), @intCast(cfg.n_used * ffn)) catch return false;
+    d.record(c, gp, &.{ gw, xb, s1, idb }, std.mem.asBytes(&d_gate), @intCast(cfg.n_used * ((ffn + 3) / 4))) catch return false;
+    d.record(c, up, &.{ uw, xb, s2, idb }, std.mem.asBytes(&d_up), @intCast(cfg.n_used * ((ffn + 3) / 4))) catch return false;
     d.barrier(c);
     d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_sw), @intCast((cfg.n_used * ffn + 63) / 64)) catch return false;
     d.barrier(c);
-    d.record(c, dp, &.{ dw, s1, s3, idb }, std.mem.asBytes(&d_down), @intCast(cfg.n_used * dim)) catch return false;
+    d.record(c, dp, &.{ dw, s1, s3, idb }, std.mem.asBytes(&d_down), @intCast(cfg.n_used * ((dim + 3) / 4))) catch return false;
     d.barrier(c);
     d.record(c, pipes.reduce_dev, &.{ acc, s3, gb }, std.mem.asBytes(&n_red), @intCast((dim + 63) / 64)) catch return false;
     if (shexp != null) {
@@ -398,12 +398,12 @@ pub fn moeFfnBlockRouted(normed: []const f32, logits: []const f32, bias: ?[]cons
         const d_shd = extern struct { rows: u32, cols: u32 }{ .rows = @intCast(dim), .cols = @intCast(shexp_ffn) };
         const n_shsw = extern struct { n: u32 }{ .n = @intCast(shexp_ffn) };
         d.barrier(c);
-        d.record(c, sh_pipes[0], &.{ shw[0], xb, s1 }, std.mem.asBytes(&d_sh), @intCast(shexp_ffn)) catch return false;
-        d.record(c, sh_pipes[1], &.{ shw[1], xb, s2 }, std.mem.asBytes(&d_sh), @intCast(shexp_ffn)) catch return false;
+        d.record(c, sh_pipes[0], &.{ shw[0], xb, s1 }, std.mem.asBytes(&d_sh), @intCast((shexp_ffn + 3) / 4)) catch return false;
+        d.record(c, sh_pipes[1], &.{ shw[1], xb, s2 }, std.mem.asBytes(&d_sh), @intCast((shexp_ffn + 3) / 4)) catch return false;
         d.barrier(c);
         d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_shsw), @intCast((shexp_ffn + 63) / 64)) catch return false;
         d.barrier(c);
-        d.record(c, sh_pipes[2], &.{ shw[2], s1, s3 }, std.mem.asBytes(&d_shd), @intCast(dim)) catch return false;
+        d.record(c, sh_pipes[2], &.{ shw[2], s1, s3 }, std.mem.asBytes(&d_shd), @intCast((dim + 3) / 4)) catch return false;
     }
     d.submitWait(c) catch return false;
     cmdbufs += 1;
@@ -588,7 +588,7 @@ fn recordAttn(d: *vk.Device, c: vk.Device.Cmd, p: AttnPrep, li: usize, n_heads: 
         .x_stride = @intCast(w.kvr),
         .base = @intCast(nope * p.row_bytes),
     };
-    try d.record(c, p.vp, &.{ p.vw, olat.?, hout.?, vids.? }, std.mem.asBytes(&vpush), @intCast(n_heads * v_head_dim));
+    try d.record(c, p.vp, &.{ p.vw, olat.?, hout.?, vids.? }, std.mem.asBytes(&vpush), @intCast(n_heads * ((v_head_dim + 3) / 4)));
 }
 
 /// Every head's MLA attention over the compressed cache, W_v applied -- one
@@ -678,24 +678,24 @@ pub fn mlaLayerTail(li: usize, pos: usize, x: []f32, q_nope: []const f32, q_rope
     const c = d.beginCmd() catch return false;
     recordAttn(d, c, p, li, n_heads, nope, v_head_dim, scale, qbuf.?, nope, 0, p.w.rope, n_heads * nope) catch return false;
     d.barrier(c);
-    d.record(c, ap, &.{ aw, hout.?, pj }, std.mem.asBytes(&d_proj), @intCast(dim)) catch return false;
+    d.record(c, ap, &.{ aw, hout.?, pj }, std.mem.asBytes(&d_proj), @intCast((dim + 3) / 4)) catch return false;
     d.barrier(c);
     d.record(c, pipes.add, &.{ xr, pj }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
     d.barrier(c);
     d.record(c, pipes.rmsnorm, &.{ xr, nw, nb }, std.mem.asBytes(&d_norm), 1) catch return false;
     d.barrier(c);
-    d.record(c, rp, &.{ rw, nb, lb }, std.mem.asBytes(&d_router), @intCast(cfg.n_expert)) catch return false;
+    d.record(c, rp, &.{ rw, nb, lb }, std.mem.asBytes(&d_router), @intCast((cfg.n_expert + 3) / 4)) catch return false;
     d.barrier(c);
     // The routed chain, identical in shape to moeFfnBlockRouted's recording,
     // reading its activation from the device-resident `nb`.
     d.record(c, pipes.route, &.{ lb, idb, gb }, std.mem.asBytes(&rpush), 1) catch return false;
     d.barrier(c);
-    d.record(c, gp, &.{ gw, nb, s1, idb }, std.mem.asBytes(&d_gate), @intCast(cfg.n_used * ffn)) catch return false;
-    d.record(c, up, &.{ uw, nb, s2, idb }, std.mem.asBytes(&d_up), @intCast(cfg.n_used * ffn)) catch return false;
+    d.record(c, gp, &.{ gw, nb, s1, idb }, std.mem.asBytes(&d_gate), @intCast(cfg.n_used * ((ffn + 3) / 4))) catch return false;
+    d.record(c, up, &.{ uw, nb, s2, idb }, std.mem.asBytes(&d_up), @intCast(cfg.n_used * ((ffn + 3) / 4))) catch return false;
     d.barrier(c);
     d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_sw), @intCast((cfg.n_used * ffn + 63) / 64)) catch return false;
     d.barrier(c);
-    d.record(c, dp, &.{ dw, s1, s3, idb }, std.mem.asBytes(&d_down), @intCast(cfg.n_used * dim)) catch return false;
+    d.record(c, dp, &.{ dw, s1, s3, idb }, std.mem.asBytes(&d_down), @intCast(cfg.n_used * ((dim + 3) / 4))) catch return false;
     d.barrier(c);
     d.record(c, pipes.reduce_dev, &.{ acc, s3, gb }, std.mem.asBytes(&n_red), @intCast((dim + 63) / 64)) catch return false;
     d.barrier(c);
@@ -705,12 +705,12 @@ pub fn mlaLayerTail(li: usize, pos: usize, x: []f32, q_nope: []const f32, q_rope
         const d_shd = extern struct { rows: u32, cols: u32 }{ .rows = @intCast(dim), .cols = @intCast(shexp_ffn) };
         const n_shsw = extern struct { n: u32 }{ .n = @intCast(shexp_ffn) };
         d.barrier(c);
-        d.record(c, sh_pipes[0], &.{ shw[0], nb, s1 }, std.mem.asBytes(&d_sh), @intCast(shexp_ffn)) catch return false;
-        d.record(c, sh_pipes[1], &.{ shw[1], nb, s2 }, std.mem.asBytes(&d_sh), @intCast(shexp_ffn)) catch return false;
+        d.record(c, sh_pipes[0], &.{ shw[0], nb, s1 }, std.mem.asBytes(&d_sh), @intCast((shexp_ffn + 3) / 4)) catch return false;
+        d.record(c, sh_pipes[1], &.{ shw[1], nb, s2 }, std.mem.asBytes(&d_sh), @intCast((shexp_ffn + 3) / 4)) catch return false;
         d.barrier(c);
         d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_shsw), @intCast((shexp_ffn + 63) / 64)) catch return false;
         d.barrier(c);
-        d.record(c, sh_pipes[2], &.{ shw[2], s1, s3 }, std.mem.asBytes(&d_shd), @intCast(dim)) catch return false;
+        d.record(c, sh_pipes[2], &.{ shw[2], s1, s3 }, std.mem.asBytes(&d_shd), @intCast((dim + 3) / 4)) catch return false;
         d.barrier(c);
         d.record(c, pipes.add, &.{ xr, s3 }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
     }
@@ -889,8 +889,8 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         // ---- head ----
         d.record(c, pipes.rmsnorm, &.{ xr, p.anw, nb }, std.mem.asBytes(&nd), 1) catch return false;
         d.barrier(c);
-        d.record(c, p.qp, &.{ p.qw, nb, qf }, std.mem.asBytes(&d_q), @intCast(fc.n_heads * kd)) catch return false;
-        d.record(c, p.kap, &.{ p.kaw, nb, kva }, std.mem.asBytes(&d_ka), @intCast(fc.kvr + fc.rope)) catch return false;
+        d.record(c, p.qp, &.{ p.qw, nb, qf }, std.mem.asBytes(&d_q), @intCast((fc.n_heads * kd + 3) / 4)) catch return false;
+        d.record(c, p.kap, &.{ p.kaw, nb, kva }, std.mem.asBytes(&d_ka), @intCast((fc.kvr + fc.rope + 3) / 4)) catch return false;
         d.barrier(c);
         // c_kv: norm straight into the cache row; k_rope: copy then rotate there.
         const nd_kv = NormPush{ .n = @intCast(fc.kvr), .eps = fc.eps, .x_off = 0, .out_off = @intCast(c_pos) };
@@ -918,7 +918,7 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         d.record(c, pipes.wsum, &.{ probs_buf.?, mla_cache.?, olat.? }, std.mem.asBytes(&wpush), @intCast(fc.n_heads * ((fc.kvr + 63) / 64))) catch return false;
         d.barrier(c);
         const vpush = IdPush{ .rows = @intCast(fc.v_head_dim), .cols = @intCast(fc.kvr), .n_used = @intCast(fc.n_heads), .plane_stride = @intCast((fc.nope + fc.v_head_dim) * p.row_bytes), .x_stride = @intCast(fc.kvr), .base = @intCast(fc.nope * p.row_bytes) };
-        d.record(c, p.vp, &.{ p.vw, olat.?, hout.?, vids.? }, std.mem.asBytes(&vpush), @intCast(fc.n_heads * fc.v_head_dim)) catch return false;
+        d.record(c, p.vp, &.{ p.vw, olat.?, hout.?, vids.? }, std.mem.asBytes(&vpush), @intCast(fc.n_heads * ((fc.v_head_dim + 3) / 4))) catch return false;
         d.barrier(c);
         if (debug_split) {
             const t0 = nowf();
@@ -927,7 +927,7 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
             c = d.beginCmd() catch return false;
         }
         // ---- projection, residual, FFN norm ----
-        d.record(c, p.pp, &.{ p.pw, hout.?, pj }, std.mem.asBytes(&d_proj), @intCast(dim)) catch return false;
+        d.record(c, p.pp, &.{ p.pw, hout.?, pj }, std.mem.asBytes(&d_proj), @intCast((dim + 3) / 4)) catch return false;
         d.barrier(c);
         d.record(c, pipes.add, &.{ xr, pj }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
         d.barrier(c);
@@ -940,20 +940,20 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
             c = d.beginCmd() catch return false;
         }
         if (dd.is_moe) {
-            d.record(c, p.rp, &.{ p.rw, nb, lb }, std.mem.asBytes(&d_router), @intCast(fc.routed.n_expert)) catch return false;
+            d.record(c, p.rp, &.{ p.rw, nb, lb }, std.mem.asBytes(&d_router), @intCast((fc.routed.n_expert + 3) / 4)) catch return false;
             d.barrier(c);
             d.record(c, pipes.route, &.{ lb, idb, gb }, std.mem.asBytes(&rpush), 1) catch return false;
             d.barrier(c);
             const d_gate = IdPush{ .rows = @intCast(dd.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(dd.gate.data.len / fc.routed.n_expert), .x_stride = 0 };
             const d_up = IdPush{ .rows = @intCast(dd.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(dd.up.data.len / fc.routed.n_expert), .x_stride = 0 };
             const d_down = IdPush{ .rows = @intCast(dim), .cols = @intCast(dd.ffn), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(dd.down.data.len / fc.routed.n_expert), .x_stride = @intCast(dd.ffn) };
-            d.record(c, p.gp, &.{ p.gw, nb, s1, idb }, std.mem.asBytes(&d_gate), @intCast(fc.routed.n_used * dd.ffn)) catch return false;
-            d.record(c, p.up, &.{ p.uw, nb, s2, idb }, std.mem.asBytes(&d_up), @intCast(fc.routed.n_used * dd.ffn)) catch return false;
+            d.record(c, p.gp, &.{ p.gw, nb, s1, idb }, std.mem.asBytes(&d_gate), @intCast(fc.routed.n_used * ((dd.ffn + 3) / 4))) catch return false;
+            d.record(c, p.up, &.{ p.uw, nb, s2, idb }, std.mem.asBytes(&d_up), @intCast(fc.routed.n_used * ((dd.ffn + 3) / 4))) catch return false;
             d.barrier(c);
             const n_sw = extern struct { n: u32 }{ .n = @intCast(fc.routed.n_used * dd.ffn) };
             d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_sw), @intCast((fc.routed.n_used * dd.ffn + 63) / 64)) catch return false;
             d.barrier(c);
-            d.record(c, p.dp, &.{ p.dw, s1, s3, idb }, std.mem.asBytes(&d_down), @intCast(fc.routed.n_used * dim)) catch return false;
+            d.record(c, p.dp, &.{ p.dw, s1, s3, idb }, std.mem.asBytes(&d_down), @intCast(fc.routed.n_used * ((dim + 3) / 4))) catch return false;
             d.barrier(c);
             const n_red = extern struct { n: u32, dim: u32 }{ .n = @intCast(fc.routed.n_used), .dim = @intCast(dim) };
             d.record(c, pipes.reduce_dev, &.{ acc, s3, gb }, std.mem.asBytes(&n_red), @intCast((dim + 63) / 64)) catch return false;
@@ -962,12 +962,12 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
                 const d_sh = Dims2{ .rows = @intCast(dd.shexp_ffn), .cols = @intCast(dim) };
                 const d_shd = Dims2{ .rows = @intCast(dim), .cols = @intCast(dd.shexp_ffn) };
                 const n_shsw = extern struct { n: u32 }{ .n = @intCast(dd.shexp_ffn) };
-                d.record(c, p.sh_pipes[0], &.{ p.shw[0], nb, s1 }, std.mem.asBytes(&d_sh), @intCast(dd.shexp_ffn)) catch return false;
-                d.record(c, p.sh_pipes[1], &.{ p.shw[1], nb, s2 }, std.mem.asBytes(&d_sh), @intCast(dd.shexp_ffn)) catch return false;
+                d.record(c, p.sh_pipes[0], &.{ p.shw[0], nb, s1 }, std.mem.asBytes(&d_sh), @intCast((dd.shexp_ffn + 3) / 4)) catch return false;
+                d.record(c, p.sh_pipes[1], &.{ p.shw[1], nb, s2 }, std.mem.asBytes(&d_sh), @intCast((dd.shexp_ffn + 3) / 4)) catch return false;
                 d.barrier(c);
                 d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_shsw), @intCast((dd.shexp_ffn + 63) / 64)) catch return false;
                 d.barrier(c);
-                d.record(c, p.sh_pipes[2], &.{ p.shw[2], s1, s3 }, std.mem.asBytes(&d_shd), @intCast(dim)) catch return false;
+                d.record(c, p.sh_pipes[2], &.{ p.shw[2], s1, s3 }, std.mem.asBytes(&d_shd), @intCast((dim + 3) / 4)) catch return false;
                 d.barrier(c);
                 d.record(c, pipes.add, &.{ acc, s3 }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
                 d.barrier(c);
@@ -977,12 +977,12 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
             const d_f = Dims2{ .rows = @intCast(dd.dffn), .cols = @intCast(dim) };
             const d_fd = Dims2{ .rows = @intCast(dim), .cols = @intCast(dd.dffn) };
             const n_f = extern struct { n: u32 }{ .n = @intCast(dd.dffn) };
-            d.record(c, p.dqp[0], &.{ p.dqw[0], nb, s1 }, std.mem.asBytes(&d_f), @intCast(dd.dffn)) catch return false;
-            d.record(c, p.dqp[1], &.{ p.dqw[1], nb, s2 }, std.mem.asBytes(&d_f), @intCast(dd.dffn)) catch return false;
+            d.record(c, p.dqp[0], &.{ p.dqw[0], nb, s1 }, std.mem.asBytes(&d_f), @intCast((dd.dffn + 3) / 4)) catch return false;
+            d.record(c, p.dqp[1], &.{ p.dqw[1], nb, s2 }, std.mem.asBytes(&d_f), @intCast((dd.dffn + 3) / 4)) catch return false;
             d.barrier(c);
             d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_f), @intCast((dd.dffn + 63) / 64)) catch return false;
             d.barrier(c);
-            d.record(c, p.dqp[2], &.{ p.dqw[2], s1, s3 }, std.mem.asBytes(&d_fd), @intCast(dim)) catch return false;
+            d.record(c, p.dqp[2], &.{ p.dqw[2], s1, s3 }, std.mem.asBytes(&d_fd), @intCast((dim + 3) / 4)) catch return false;
             d.barrier(c);
             d.record(c, pipes.add, &.{ xr, s3 }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
         }
@@ -998,7 +998,7 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
     d.record(c, pipes.rmsnorm, &.{ xr, onw, nb }, std.mem.asBytes(&nd), 1) catch return false;
     d.barrier(c);
     const d_lm = Dims2{ .rows = @intCast(vocab), .cols = @intCast(dim) };
-    d.record(c, lmp, &.{ lmw, nb, ob }, std.mem.asBytes(&d_lm), @intCast(vocab)) catch return false;
+    d.record(c, lmp, &.{ lmw, nb, ob }, std.mem.asBytes(&d_lm), @intCast((vocab + 3) / 4)) catch return false;
     {
         const t0 = nowf();
         d.submitWait(c) catch return false;

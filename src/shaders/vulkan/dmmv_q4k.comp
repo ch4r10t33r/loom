@@ -1,13 +1,13 @@
-// Q4_K dequantize-multiply-matrix-vector, vectorized: word loads for
-// quants and scales, vec4 activations. Arithmetic identical to the scalar
-// bring-up form this replaced -- d*sc*q - dmin*m per 6-bit scale pair.
+// Q4_K matvec, four rows per workgroup: the activation vector is loaded
+// once and dotted against all four rows, quartering x traffic and the
+// reduction overhead. Arithmetic per value unchanged: d*sc*q - dmin*m.
 #version 450
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) readonly buffer W { uint w4[]; };
 layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
 layout(std430, binding = 2) writeonly buffer O { float o[]; };
 layout(push_constant) uniform PC { uint rows; uint cols; } pc;
-shared float red[64];
+shared vec4 red[64];
 
 // Unaligned 4-byte load: the 22/34/210-byte block formats put fields at
 // half-word offsets. The device layer pads every buffer by a word, so the
@@ -37,38 +37,61 @@ void scale_min(uint j, uint u, out float sc, out float mn) {
     }
 }
 
+vec4 nib(uint qw, bool hi) {
+    return hi ? vec4(float((qw >> 4u) & 15u), float((qw >> 12u) & 15u), float((qw >> 20u) & 15u), float((qw >> 28u) & 15u))
+              : vec4(float(qw & 15u), float((qw >> 8u) & 15u), float((qw >> 16u) & 15u), float((qw >> 24u) & 15u));
+}
+
 void main() {
-    uint row = gl_WorkGroupID.x;
-    if (row >= pc.rows) return;
     uint tid = gl_LocalInvocationID.x;
+    uint row0 = gl_WorkGroupID.x * 4u;
+    if (row0 >= pc.rows) return;
     uint blocks = pc.cols / QK_K;
-    uint row_base = row * blocks * BLK;
+    uint rb = blocks * BLK;
+    uint nr = min(4u, pc.rows - row0);
+    // A short tail group re-reads row0's bytes for its missing rows and
+    // discards the result -- valid memory, no divergent inner loop.
+    uint base0 = row0 * rb;
+    uint b1 = base0 + min(1u, nr - 1u) * rb;
+    uint b2 = base0 + min(2u, nr - 1u) * rb;
+    uint b3 = base0 + min(3u, nr - 1u) * rb;
     uint x0 = 0u;
 
-    // Thread t owns sub-block (t & 7) of super-blocks strided by 8; the
-    // 32-byte quant run is eight word loads against eight vec4 x loads.
-    float acc = 0.0;
+    vec4 acc = vec4(0.0);
     uint sb = tid & 7u;
     uint h = sb >> 1u;
     bool hi = (sb & 1u) == 1u;
     for (uint b = tid >> 3u; b < blocks; b += 8u) {
-        uint u = (row_base + b * BLK) >> 2u; // BLK is word-aligned
-        vec2 dd = unpackHalf2x16(w4[u]);
-        float sc, mn;
-        scale_min(sb, u, sc, mn);
-        uint qbase = u + 4u + h * 8u;
+        uint u0 = (base0 + b * BLK) >> 2u;
+        uint u1 = (b1 + b * BLK) >> 2u;
+        uint u2 = (b2 + b * BLK) >> 2u;
+        uint u3 = (b3 + b * BLK) >> 2u;
+        vec2 dd0 = unpackHalf2x16(w4[u0]);
+        vec2 dd1 = unpackHalf2x16(w4[u1]);
+        vec2 dd2 = unpackHalf2x16(w4[u2]);
+        vec2 dd3 = unpackHalf2x16(w4[u3]);
+        vec4 scv;
+        vec4 mnv;
+        scale_min(sb, u0, scv.x, mnv.x);
+        scale_min(sb, u1, scv.y, mnv.y);
+        scale_min(sb, u2, scv.z, mnv.z);
+        scale_min(sb, u3, scv.w, mnv.w);
+        uint q0 = u0 + 4u + h * 8u;
+        uint q1 = u1 + 4u + h * 8u;
+        uint q2 = u2 + 4u + h * 8u;
+        uint q3 = u3 + 4u + h * 8u;
         uint xb4 = (x0 >> 2u) + b * 64u + sb * 8u;
-        float s_qx = 0.0;
+        vec4 s_qx = vec4(0.0);
         float s_x = 0.0;
         for (uint j = 0u; j < 8u; j++) {
-            uint qw = w4[qbase + j];
             vec4 xv = x4[xb4 + j];
-            vec4 q = hi ? vec4(float((qw >> 4u) & 15u), float((qw >> 12u) & 15u), float((qw >> 20u) & 15u), float((qw >> 28u) & 15u))
-                        : vec4(float(qw & 15u), float((qw >> 8u) & 15u), float((qw >> 16u) & 15u), float((qw >> 24u) & 15u));
-            s_qx += dot(q, xv);
             s_x += sum4(xv);
+            s_qx.x += dot(nib(w4[q0 + j], hi), xv);
+            s_qx.y += dot(nib(w4[q1 + j], hi), xv);
+            s_qx.z += dot(nib(w4[q2 + j], hi), xv);
+            s_qx.w += dot(nib(w4[q3 + j], hi), xv);
         }
-        acc += dd.x * sc * s_qx - dd.y * mn * s_x;
+        acc += vec4(dd0.x, dd1.x, dd2.x, dd3.x) * scv * s_qx - vec4(dd0.y, dd1.y, dd2.y, dd3.y) * mnv * s_x;
     }
 
     red[tid] = acc;
@@ -77,5 +100,11 @@ void main() {
         if (tid < s) red[tid] += red[tid + s];
         barrier();
     }
-    if (tid == 0u) o[row] = red[0];
+    if (tid == 0u) {
+        vec4 r = red[0];
+        o[row0] = r.x;
+        if (nr > 1u) o[row0 + 1u] = r.y;
+        if (nr > 2u) o[row0 + 2u] = r.z;
+        if (nr > 3u) o[row0 + 3u] = r.w;
+    }
 }
