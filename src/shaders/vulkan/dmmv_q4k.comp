@@ -1,10 +1,10 @@
-// Q4_K matvec, 128-bit loads: the 16-byte block header (d, dmin, twelve
-// scale bytes) is one uvec4, the 32-byte quant run two more -- the load
-// width NVIDIA needs for full bandwidth. Four rows per workgroup.
+// Q4_K matvec in llama.cpp mul_mat_vec_q4_k shape: 128-thread workgroups,
+// 16 threads per super-block, 128-bit loads, four rows sharing every
+// activation read. Value = d*sc*q - dmin*m, unchanged.
 #version 450
 #extension GL_KHR_shader_subgroup_arithmetic : require
 #extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
-layout(local_size_x = 64) in;
+layout(local_size_x = 128) in;
 layout(std430, binding = 0) readonly buffer W { uvec4 w16[]; };
 layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
 layout(std430, binding = 2) writeonly buffer O { float o[]; };
@@ -29,10 +29,33 @@ void scale_min(uint j, uvec4 hdr, out float sc, out float mn) {
     }
 }
 
-// unpack8 turns a masked word into four byte lanes in one instruction --
-// the dequant-ALU trick llama.cpp's mul_mat_vec_q4_k.comp uses.
 vec4 nib(uint qw, bool hi) {
     return vec4(unpack8((hi ? (qw >> 4u) : qw) & 0x0F0F0F0Fu));
+}
+
+// One row's whole contribution for this thread's 16 values: the y1/y2 pairs
+// of qs0/qs64 against their four scale pairs -- llama.cpp's
+// mul_mat_vec_q4_k per-thread shape.
+float rowPart(uvec4 hdr, uint qbase, uint v_im, vec4 xa, vec4 xb, vec4 xc, vec4 xd) {
+    vec2 dd = unpackHalf2x16(hdr.x);
+    float scA;
+    float mnA;
+    float scB;
+    float mnB;
+    float scC;
+    float mnC;
+    float scD;
+    float mnD;
+    scale_min(2u * v_im, hdr, scA, mnA);
+    scale_min(2u * v_im + 1u, hdr, scB, mnB);
+    scale_min(2u * v_im + 4u, hdr, scC, mnC);
+    scale_min(2u * v_im + 5u, hdr, scD, mnD);
+    // qbase is a u32 word index; select the word inside its uvec4.
+    uint qa = w16[qbase >> 2u][qbase & 3u];
+    uint qb = w16[(qbase + 16u) >> 2u][(qbase + 16u) & 3u];
+    float s = scA * dot(nib(qa, false), xa) + scB * dot(nib(qa, true), xb) + scC * dot(nib(qb, false), xc) + scD * dot(nib(qb, true), xd);
+    float m = mnA * sum4(xa) + mnB * sum4(xb) + mnC * sum4(xc) + mnD * sum4(xd);
+    return dd.x * s - dd.y * m;
 }
 
 void main() {
@@ -40,7 +63,7 @@ void main() {
     uint row0 = gl_WorkGroupID.x * 4u;
     if (row0 >= pc.rows) return;
     uint blocks = pc.cols / 256u;
-    uint rb16 = blocks * 9u; // 144 bytes = 9 uvec4 per super-block
+    uint rb16 = blocks * 9u;
     uint nr = min(4u, pc.rows - row0);
     uint base0 = row0 * rb16;
     uint r1 = base0 + min(1u, nr - 1u) * rb16;
@@ -48,50 +71,26 @@ void main() {
     uint r3 = base0 + min(3u, nr - 1u) * rb16;
     uint x0 = 0u;
 
+    // llama.cpp's thread map: itid 0..15 covers one super-block -- v_im picks
+    // the 128-half, v_in the 4-value column -- so a warp's quant loads are
+    // contiguous; ix strides super-blocks 8 at a time. Four rows share every
+    // activation load.
+    uint itid = tid & 15u;
+    uint ix = tid >> 4u;
+    uint v_im = itid >> 3u;
+    uint v_in = itid & 7u;
+    uint qoff = 4u + 8u * v_im + v_in; // u32 word of qs[32*v_im + 4*v_in]
     vec4 acc = vec4(0.0);
-    uint sb = tid & 7u;
-    uint h = sb >> 1u;
-    bool hi = (sb & 1u) == 1u;
-    for (uint b = tid >> 3u; b < blocks; b += 8u) {
-        uint u0 = base0 + b * 9u;
-        uint u1 = r1 + b * 9u;
-        uint u2 = r2 + b * 9u;
-        uint u3 = r3 + b * 9u;
-        uvec4 h0 = w16[u0];
-        uvec4 h1 = w16[u1];
-        uvec4 h2 = w16[u2];
-        uvec4 h3 = w16[u3];
-        vec4 scv;
-        vec4 mnv;
-        scale_min(sb, h0, scv.x, mnv.x);
-        scale_min(sb, h1, scv.y, mnv.y);
-        scale_min(sb, h2, scv.z, mnv.z);
-        scale_min(sb, h3, scv.w, mnv.w);
-        uint q0 = u0 + 1u + h * 2u;
-        uint q1 = u1 + 1u + h * 2u;
-        uint q2 = u2 + 1u + h * 2u;
-        uint q3 = u3 + 1u + h * 2u;
-        uint xb4 = (x0 >> 2u) + b * 64u + sb * 8u;
-        vec4 s_qx = vec4(0.0);
-        float s_x = 0.0;
-        for (uint jw = 0u; jw < 2u; jw++) {
-            uvec4 w0 = w16[q0 + jw];
-            uvec4 w1 = w16[q1 + jw];
-            uvec4 w2 = w16[q2 + jw];
-            uvec4 w3 = w16[q3 + jw];
-            uint xj = xb4 + jw * 4u;
-            vec4 xa = x4[xj];
-            vec4 xb = x4[xj + 1u];
-            vec4 xc = x4[xj + 2u];
-            vec4 xd = x4[xj + 3u];
-            s_x += sum4(xa) + sum4(xb) + sum4(xc) + sum4(xd);
-            s_qx.x += dot(nib(w0.x, hi), xa) + dot(nib(w0.y, hi), xb) + dot(nib(w0.z, hi), xc) + dot(nib(w0.w, hi), xd);
-            s_qx.y += dot(nib(w1.x, hi), xa) + dot(nib(w1.y, hi), xb) + dot(nib(w1.z, hi), xc) + dot(nib(w1.w, hi), xd);
-            s_qx.z += dot(nib(w2.x, hi), xa) + dot(nib(w2.y, hi), xb) + dot(nib(w2.z, hi), xc) + dot(nib(w2.w, hi), xd);
-            s_qx.w += dot(nib(w3.x, hi), xa) + dot(nib(w3.y, hi), xb) + dot(nib(w3.z, hi), xc) + dot(nib(w3.w, hi), xd);
-        }
-        acc += vec4(unpackHalf2x16(h0.x).x, unpackHalf2x16(h1.x).x, unpackHalf2x16(h2.x).x, unpackHalf2x16(h3.x).x) * scv * s_qx
-             - vec4(unpackHalf2x16(h0.x).y, unpackHalf2x16(h1.x).y, unpackHalf2x16(h2.x).y, unpackHalf2x16(h3.x).y) * mnv * s_x;
+    for (uint b = ix; b < blocks; b += 8u) {
+        uint xb4 = (x0 >> 2u) + b * 64u + 16u * v_im + v_in;
+        vec4 xa = x4[xb4];
+        vec4 xb = x4[xb4 + 8u];
+        vec4 xc = x4[xb4 + 32u];
+        vec4 xd = x4[xb4 + 40u];
+        acc.x += rowPart(w16[base0 + b * 9u], (base0 + b * 9u) * 4u + qoff, v_im, xa, xb, xc, xd);
+        acc.y += rowPart(w16[r1 + b * 9u], (r1 + b * 9u) * 4u + qoff, v_im, xa, xb, xc, xd);
+        acc.z += rowPart(w16[r2 + b * 9u], (r2 + b * 9u) * 4u + qoff, v_im, xa, xb, xc, xd);
+        acc.w += rowPart(w16[r3 + b * 9u], (r3 + b * 9u) * 4u + qoff, v_im, xa, xb, xc, xd);
     }
 
     acc = subgroupAdd(acc);
