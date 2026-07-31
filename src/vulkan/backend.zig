@@ -720,6 +720,15 @@ pub fn mlaLayerTail(li: usize, pos: usize, x: []f32, q_nope: []const f32, q_rope
     return true;
 }
 
+var prof_frames: usize = 0;
+
+fn pipeName(h: u64) []const u8 {
+    inline for (@typeInfo(Pipes).@"struct".fields) |f| {
+        if (@field(pipes, f.name) == h) return f.name;
+    }
+    return "?";
+}
+
 var qfull: ?vk.Buffer = null; // [n_heads][kd] straight from the q projection
 var kva_buf: ?vk.Buffer = null; // kvr + rope, the kv_a projection
 
@@ -1003,6 +1012,18 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         const t0 = nowf();
         d.submitWait(c) catch return false;
         ph[4] += nowf() - t0;
+    }
+    if (d.prof) {
+        prof_frames += 1;
+        if (prof_frames % 32 == 0) {
+            var total: u64 = 0;
+            for (d.prof_ticks) |t| total += t;
+            std.debug.print("kernel prof over {d} frames (GPU ticks):\n", .{prof_frames});
+            for (d.prof_pipes, d.prof_ticks, d.prof_calls) |h, t, n| {
+                if (h == 0) continue;
+                std.debug.print("  {s:<14} {d:>12} ({d}%)  calls {d}\n", .{ pipeName(h), t, t * 100 / @max(total, 1), n });
+            }
+        }
     }
     if (debug_split) {
         std.debug.print("frame phases us: head {d} attn {d} proj {d} ffn {d} lmhead {d}\n", .{
