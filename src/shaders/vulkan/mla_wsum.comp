@@ -1,0 +1,27 @@
+// o_latent[h][i] = sum_t probs[h][t] * c[t][i] -- the value side of MLA, in
+// compressed space; the port of mla_attn_wsum. One workgroup per (h, i).
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer P { float probs[]; };
+layout(std430, binding = 1) readonly buffer C { float c_cache[]; };
+layout(std430, binding = 2) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC { uint n_heads; uint kvr; uint seq; uint c_base; } pc;
+shared float red[64];
+
+void main() {
+    uint g = gl_WorkGroupID.x;
+    uint h = g / pc.kvr;
+    if (h >= pc.n_heads) return;
+    uint i = g - h * pc.kvr;
+    uint tid = gl_LocalInvocationID.x;
+    uint ph = h * pc.seq;
+    float acc = 0.0;
+    for (uint t = tid; t < pc.seq; t += 64u) acc += probs[ph + t] * c_cache[pc.c_base + t * pc.kvr + i];
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) o[h * pc.kvr + i] = red[0];
+}

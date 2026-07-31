@@ -7,7 +7,7 @@ layout(std430, binding = 0) readonly buffer W { uint8_t w[]; };
 layout(std430, binding = 1) readonly buffer X { float x[]; };
 layout(std430, binding = 2) writeonly buffer O { float o[]; };
 layout(std430, binding = 3) readonly buffer I { uint ids[]; };
-layout(push_constant) uniform PC { uint rows; uint cols; uint n_used; uint plane_stride; uint x_stride; } pc;
+layout(push_constant) uniform PC { uint rows; uint cols; uint n_used; uint plane_stride; uint x_stride; uint base; } pc;
 shared float red[64];
 
 float halfAt(uint off) {
@@ -26,7 +26,7 @@ void main() {
     uint row = g - slot * pc.rows;
     uint tid = gl_LocalInvocationID.x;
     uint blocks = pc.cols / QK;
-    uint row_base = ids[slot] * pc.plane_stride + row * blocks * BLK;
+    uint row_base = pc.base + ids[slot] * pc.plane_stride + row * blocks * BLK;
     uint x0 = slot * pc.x_stride;
 
     float acc = 0.0;
