@@ -1,0 +1,63 @@
+// MoE routing on the device: score, top-k select, gate -- the Vulkan port of
+// moe_route.metal (ggml_argsort_top_k's role). Mirrors moe.route exactly,
+// including the two silent-when-wrong details: bias shifts *selection* only
+// (emitted gates are the unbiased scores), and the renormalization divisor is
+// clamped to the smallest normal f16, as llama.cpp does.
+//
+// One thread does everything: top-k over <=256 experts picking <=16 is a few
+// hundred comparisons, once per layer, against an FFN moving megabytes. The
+// bias, when present, follows the logits in the same buffer at offset
+// n_expert -- the pipeline layout has four bindings and this keeps to three.
+#version 450
+layout(local_size_x = 1) in;
+layout(std430, binding = 0) readonly buffer L { float logits[]; };
+layout(std430, binding = 1) writeonly buffer I { uint ids[]; };
+layout(std430, binding = 2) buffer G { float gates[]; }; // read back during renormalization
+layout(push_constant) uniform PC { uint n_expert; uint n_used; uint gating; uint weights_norm; uint has_bias; float weights_scale; } pc;
+
+const uint MAX_EXPERTS = 256u;
+const uint MAX_SELECTED = 16u;
+
+void main() {
+    float scores[MAX_EXPERTS];
+    float choice[MAX_EXPERTS];
+    if (pc.n_expert > MAX_EXPERTS || pc.n_used > MAX_SELECTED) return;
+
+    if (pc.gating == 1u) {
+        for (uint e = 0u; e < pc.n_expert; e++) scores[e] = 1.0 / (1.0 + exp(-logits[e]));
+    } else {
+        float mx = -1.0 / 0.0;
+        for (uint e = 0u; e < pc.n_expert; e++) mx = max(mx, logits[e]);
+        float sum = 0.0;
+        for (uint e = 0u; e < pc.n_expert; e++) {
+            float v = exp(logits[e] - mx);
+            scores[e] = v;
+            sum += v;
+        }
+        float inv = 1.0 / sum;
+        for (uint e = 0u; e < pc.n_expert; e++) scores[e] *= inv;
+    }
+
+    for (uint e = 0u; e < pc.n_expert; e++) {
+        choice[e] = scores[e] + (pc.has_bias == 1u ? logits[pc.n_expert + e] : 0.0);
+    }
+    for (uint k = 0u; k < pc.n_used; k++) {
+        uint best = 0u;
+        float best_v = -1.0 / 0.0;
+        for (uint e = 0u; e < pc.n_expert; e++) {
+            if (choice[e] > best_v) { best_v = choice[e]; best = e; }
+        }
+        choice[best] = -1.0 / 0.0;
+        ids[k] = best;
+        gates[k] = scores[best]; // unbiased, deliberately
+    }
+    if (pc.weights_norm == 1u) {
+        float sum = 0.0;
+        for (uint k = 0u; k < pc.n_used; k++) sum += gates[k];
+        float denom = max(sum, 6.103515625e-5); // smallest normal f16
+        for (uint k = 0u; k < pc.n_used; k++) gates[k] /= denom;
+    }
+    if (pc.weights_scale != 1.0) {
+        for (uint k = 0u; k < pc.n_used; k++) gates[k] *= pc.weights_scale;
+    }
+}
