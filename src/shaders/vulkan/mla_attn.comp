@@ -7,9 +7,9 @@
 // r_base.
 #version 450
 layout(local_size_x = 64) in;
-layout(std430, binding = 0) readonly buffer QA { float q_abs[]; }; // [n_heads][kvr]
-layout(std430, binding = 1) readonly buffer Q { float q[]; };      // q_rope at qr_off
-layout(std430, binding = 2) readonly buffer C { float c_cache[]; };
+layout(std430, binding = 0) readonly buffer QA { vec4 q_abs4[]; }; // [n_heads][kvr]
+layout(std430, binding = 1) readonly buffer Q { vec4 q4[]; };      // q_rope at qr_off
+layout(std430, binding = 2) readonly buffer C { vec4 c4[]; };      // every offset here is 16-byte aligned
 layout(std430, binding = 3) buffer P { float probs[]; };           // [n_heads][seq]; r_cache appended at rk_off
 layout(push_constant) uniform PC { uint n_heads; uint kvr; uint rope; uint seq; uint qr_stride; uint qr_off; uint c_base; uint r_base; float scale; } pc;
 
@@ -22,16 +22,16 @@ void main() {
     uint h = gl_WorkGroupID.x;
     if (h >= pc.n_heads) return;
     uint tid = gl_LocalInvocationID.x;
-    uint qa = h * pc.kvr;
-    uint qr = pc.qr_off + h * pc.qr_stride;
+    uint qa4 = (h * pc.kvr) >> 2u;
+    uint qr4 = (pc.qr_off + h * pc.qr_stride) >> 2u;
 
     for (uint t = tid; t < pc.seq; t += 64u) {
-        uint ct = pc.c_base + t * pc.kvr;
-        uint rt = pc.r_base + t * pc.rope;
-        float s = 0.0;
-        for (uint i = 0u; i < pc.kvr; i++) s += q_abs[qa + i] * c_cache[ct + i];
-        for (uint i = 0u; i < pc.rope; i++) s += q[qr + i] * c_cache[rt + i];
-        scores[t] = s * pc.scale;
+        uint ct4 = (pc.c_base + t * pc.kvr) >> 2u;
+        uint rt4 = (pc.r_base + t * pc.rope) >> 2u;
+        vec4 sv = vec4(0.0);
+        for (uint i = 0u; i < pc.kvr >> 2u; i++) sv += q_abs4[qa4 + i] * c4[ct4 + i];
+        for (uint i = 0u; i < pc.rope >> 2u; i++) sv += q4[qr4 + i] * c4[rt4 + i];
+        scores[t] = (sv.x + sv.y + sv.z + sv.w) * pc.scale;
     }
     barrier();
 

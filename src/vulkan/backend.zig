@@ -560,7 +560,7 @@ fn prepAttn(d: *vk.Device, li: usize, pos: usize, q_nope: []const f32, q_rope: [
 fn recordAttn(d: *vk.Device, c: vk.Device.Cmd, p: AttnPrep, li: usize, n_heads: usize, nope: usize, v_head_dim: usize, scale: f32, qsrc: vk.Buffer, q_stride: usize, q_off: usize, qr_stride: usize, qr_off: usize) vk.Error!void {
     const w = p.w;
     const apush = AbsorbPush{ .n_heads = @intCast(n_heads), .nope = @intCast(nope), .kvr = @intCast(w.kvr), .stride = @intCast(nope + v_head_dim), .q_stride = @intCast(q_stride), .q_off = @intCast(q_off) };
-    try d.record(c, pipes.absorb, &.{ mla_wk.items[li], qsrc, qabs.? }, std.mem.asBytes(&apush), @intCast(n_heads * w.kvr));
+    try d.record(c, pipes.absorb, &.{ mla_wk.items[li], qsrc, qabs.? }, std.mem.asBytes(&apush), @intCast(n_heads * ((w.kvr + 63) / 64)));
     d.barrier(c);
     const tpush = AttnPush{
         .n_heads = @intCast(n_heads),
@@ -576,7 +576,7 @@ fn recordAttn(d: *vk.Device, c: vk.Device.Cmd, p: AttnPrep, li: usize, n_heads: 
     try d.record(c, pipes.attn, &.{ qabs.?, qsrc, mla_cache.?, probs_buf.? }, std.mem.asBytes(&tpush), @intCast(n_heads));
     d.barrier(c);
     const wpush = WsumPush{ .n_heads = @intCast(n_heads), .kvr = @intCast(w.kvr), .seq = @intCast(p.seq), .c_base = @intCast(li * w.ctx * w.kvr) };
-    try d.record(c, pipes.wsum, &.{ probs_buf.?, mla_cache.?, olat.? }, std.mem.asBytes(&wpush), @intCast(n_heads * w.kvr));
+    try d.record(c, pipes.wsum, &.{ probs_buf.?, mla_cache.?, olat.? }, std.mem.asBytes(&wpush), @intCast(n_heads * ((w.kvr + 63) / 64)));
     d.barrier(c);
     // W_v with identity ids: head h's value rows are a plane at stride
     // (nope + vd) rows, offset nope rows in, its input its own o_latent.
@@ -868,7 +868,20 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
     const apush = AbsorbPush{ .n_heads = @intCast(fc.n_heads), .nope = @intCast(fc.nope), .kvr = @intCast(fc.kvr), .stride = @intCast(fc.nope + fc.v_head_dim), .q_stride = @intCast(kd), .q_off = 0 };
     const rope_q = RopePush{ .n_vec = @intCast(fc.n_heads), .rope = @intCast(fc.rope), .stride = @intCast(kd), .offset = @intCast(fc.nope), .pos = @intCast(pos), .buf_off = 0, .base = fc.rope_base, .yarn_factor = fc.yarn_factor, .yarn_orig_ctx = fc.yarn_orig_ctx };
 
-    const c = d.beginCmd() catch return false;
+    // LOOM_FRAME_DEBUG: emit each layer as four waited sub-buffers -- head,
+    // attention, projection block, FFN -- and print per-category sums. The
+    // split's own submission overhead makes the absolute total meaningless;
+    // only the ratios carry information. Diagnostic only.
+    const debug_split = std.c.getenv("LOOM_FRAME_DEBUG") != null;
+    var ph = [_]i128{0} ** 5;
+    const nowf = struct {
+        fn f() i128 {
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(.MONOTONIC, &ts);
+            return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
+        }
+    }.f;
+    var c = d.beginCmd() catch return false;
     for (descs, 0..) |dd, li| {
         const p = &plans[li];
         const c_pos: usize = (li * w.ctx + pos) * fc.kvr;
@@ -889,18 +902,30 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         const rope_k = RopePush{ .n_vec = 1, .rope = @intCast(fc.rope), .stride = 0, .offset = 0, .pos = @intCast(pos), .buf_off = @intCast(r_pos), .base = fc.rope_base, .yarn_factor = fc.yarn_factor, .yarn_orig_ctx = fc.yarn_orig_ctx };
         d.record(c, pipes.rope, &.{mla_cache.?}, std.mem.asBytes(&rope_k), @intCast((fc.rope / 2 + 31) / 32)) catch return false;
         d.barrier(c);
+        if (debug_split) {
+            const t0 = nowf();
+            d.submitWait(c) catch return false;
+            ph[0] += nowf() - t0;
+            c = d.beginCmd() catch return false;
+        }
         // ---- attention, q read in place: nope at h*kd, rope at h*kd+nope ----
-        d.record(c, pipes.absorb, &.{ mla_wk.items[li], qf, qabs.? }, std.mem.asBytes(&apush), @intCast(fc.n_heads * fc.kvr)) catch return false;
+        d.record(c, pipes.absorb, &.{ mla_wk.items[li], qf, qabs.? }, std.mem.asBytes(&apush), @intCast(fc.n_heads * ((fc.kvr + 63) / 64))) catch return false;
         d.barrier(c);
         const tpush = AttnPush{ .n_heads = @intCast(fc.n_heads), .kvr = @intCast(fc.kvr), .rope = @intCast(fc.rope), .seq = @intCast(seq), .qr_stride = @intCast(kd), .qr_off = @intCast(fc.nope), .c_base = @intCast(li * w.ctx * fc.kvr), .r_base = @intCast(mla_r0 + li * w.ctx * fc.rope), .scale = fc.scale };
         d.record(c, pipes.attn, &.{ qabs.?, qf, mla_cache.?, probs_buf.? }, std.mem.asBytes(&tpush), @intCast(fc.n_heads)) catch return false;
         d.barrier(c);
         const wpush = WsumPush{ .n_heads = @intCast(fc.n_heads), .kvr = @intCast(fc.kvr), .seq = @intCast(seq), .c_base = @intCast(li * w.ctx * fc.kvr) };
-        d.record(c, pipes.wsum, &.{ probs_buf.?, mla_cache.?, olat.? }, std.mem.asBytes(&wpush), @intCast(fc.n_heads * fc.kvr)) catch return false;
+        d.record(c, pipes.wsum, &.{ probs_buf.?, mla_cache.?, olat.? }, std.mem.asBytes(&wpush), @intCast(fc.n_heads * ((fc.kvr + 63) / 64))) catch return false;
         d.barrier(c);
         const vpush = IdPush{ .rows = @intCast(fc.v_head_dim), .cols = @intCast(fc.kvr), .n_used = @intCast(fc.n_heads), .plane_stride = @intCast((fc.nope + fc.v_head_dim) * p.row_bytes), .x_stride = @intCast(fc.kvr), .base = @intCast(fc.nope * p.row_bytes) };
         d.record(c, p.vp, &.{ p.vw, olat.?, hout.?, vids.? }, std.mem.asBytes(&vpush), @intCast(fc.n_heads * fc.v_head_dim)) catch return false;
         d.barrier(c);
+        if (debug_split) {
+            const t0 = nowf();
+            d.submitWait(c) catch return false;
+            ph[1] += nowf() - t0;
+            c = d.beginCmd() catch return false;
+        }
         // ---- projection, residual, FFN norm ----
         d.record(c, p.pp, &.{ p.pw, hout.?, pj }, std.mem.asBytes(&d_proj), @intCast(dim)) catch return false;
         d.barrier(c);
@@ -908,6 +933,12 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         d.barrier(c);
         d.record(c, pipes.rmsnorm, &.{ xr, p.fnw, nb }, std.mem.asBytes(&nd), 1) catch return false;
         d.barrier(c);
+        if (debug_split) {
+            const t0 = nowf();
+            d.submitWait(c) catch return false;
+            ph[2] += nowf() - t0;
+            c = d.beginCmd() catch return false;
+        }
         if (dd.is_moe) {
             d.record(c, p.rp, &.{ p.rw, nb, lb }, std.mem.asBytes(&d_router), @intCast(fc.routed.n_expert)) catch return false;
             d.barrier(c);
@@ -956,13 +987,29 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
             d.record(c, pipes.add, &.{ xr, s3 }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
         }
         d.barrier(c);
+        if (debug_split) {
+            const t0 = nowf();
+            d.submitWait(c) catch return false;
+            ph[3] += nowf() - t0;
+            c = d.beginCmd() catch return false;
+        }
     }
     // ---- final norm and lm_head ----
     d.record(c, pipes.rmsnorm, &.{ xr, onw, nb }, std.mem.asBytes(&nd), 1) catch return false;
     d.barrier(c);
     const d_lm = Dims2{ .rows = @intCast(vocab), .cols = @intCast(dim) };
     d.record(c, lmp, &.{ lmw, nb, ob }, std.mem.asBytes(&d_lm), @intCast(vocab)) catch return false;
-    d.submitWait(c) catch return false;
+    {
+        const t0 = nowf();
+        d.submitWait(c) catch return false;
+        ph[4] += nowf() - t0;
+    }
+    if (debug_split) {
+        std.debug.print("frame phases us: head {d} attn {d} proj {d} ffn {d} lmhead {d}\n", .{
+            @divTrunc(ph[0], 1000), @divTrunc(ph[1], 1000), @divTrunc(ph[2], 1000),
+            @divTrunc(ph[3], 1000), @divTrunc(ph[4], 1000),
+        });
+    }
     cmdbufs += 1;
     @memcpy(x, xr.slice(f32)[0..dim]);
     @memcpy(logits, ob.slice(f32)[0..vocab]);
