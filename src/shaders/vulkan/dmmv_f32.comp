@@ -1,35 +1,19 @@
+// F32 matvec for the small unquantized tensors -- the MoE router.
 #version 450
-#extension GL_EXT_shader_8bit_storage : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 layout(local_size_x = 64) in;
-layout(std430, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(std430, binding = 0) readonly buffer W { float w[]; };
 layout(std430, binding = 1) readonly buffer X { float x[]; };
 layout(std430, binding = 2) writeonly buffer O { float o[]; };
 layout(push_constant) uniform PC { uint rows; uint cols; } pc;
 shared float red[64];
 
-float halfAt(uint off) {
-    uint lo = uint(w[off]);
-    uint hi = uint(w[off + 1u]);
-    return unpackHalf2x16(lo | (hi << 8u)).x;
-}
-
-// F32: for the small unquantized tensors -- the MoE router on the token path.
 void main() {
     uint row = gl_WorkGroupID.x;
     if (row >= pc.rows) return;
     uint tid = gl_LocalInvocationID.x;
-    uint base4 = row * pc.cols;
+    uint base = row * pc.cols;
     float acc = 0.0;
-    for (uint i = tid; i < pc.cols; i += 64u) {
-        uint off = (base4 + i) * 4u;
-        uint b0 = uint(w[off]);
-        uint b1 = uint(w[off + 1u]);
-        uint b2 = uint(w[off + 2u]);
-        uint b3 = uint(w[off + 3u]);
-        acc += uintBitsToFloat(b0 | (b1 << 8u) | (b2 << 16u) | (b3 << 24u)) * x[i];
-    }
-
+    for (uint i = tid; i < pc.cols; i += 64u) acc += w[base + i] * x[i];
     red[tid] = acc;
     barrier();
     for (uint s = 32u; s > 0u; s >>= 1u) {

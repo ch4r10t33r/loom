@@ -1,31 +1,33 @@
-// Q4_K dequantize-multiply-matrix-vector, Vulkan.
-//
-// The bring-up kernel, exactly as it was for Metal: the hottest operation
-// first, verified against the exact CPU reference before anything else is
-// ported. The arithmetic mirrors dmmv_q4k.metal's semantics -- per-256-value
-// super-block, 6-bit scale/min pairs, d*sc*q - dmin*m -- but the shape is the
-// simple one: one workgroup of 64 threads per row, shared-memory reduction.
-// Correctness first; the occupancy lessons from the Metal effort apply once
-// there is a physical GPU to measure on, which llvmpipe is not.
+// Q4_K dequantize-multiply-matrix-vector, vectorized: word loads for
+// quants and scales, vec4 activations. Arithmetic identical to the scalar
+// bring-up form this replaced -- d*sc*q - dmin*m per 6-bit scale pair.
 #version 450
-#extension GL_EXT_shader_8bit_storage : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 layout(local_size_x = 64) in;
-
-layout(std430, binding = 0) readonly buffer W { uint8_t w[]; };
-layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 0) readonly buffer W { uint w4[]; };
+layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
 layout(std430, binding = 2) writeonly buffer O { float o[]; };
 layout(push_constant) uniform PC { uint rows; uint cols; } pc;
-
 shared float red[64];
+
+// Unaligned 4-byte load: the 22/34/210-byte block formats put fields at
+// half-word offsets. The device layer pads every buffer by a word, so the
+// word+1 read at the tail stays in bounds.
+uint loadU32(uint byte_off) {
+    uint word = byte_off >> 2u;
+    uint sh = (byte_off & 3u) * 8u;
+    if (sh == 0u) return w4[word];
+    return (w4[word] >> sh) | (w4[word + 1u] << (32u - sh));
+}
+
+float sum4(vec4 v) { return v.x + v.y + v.z + v.w; }
 
 const uint QK_K = 256u;
 const uint BLK = 144u;
 
-void scale_min(uint j, uint base, out float sc, out float mn) {
-    uint a = uint(w[base + j]);
-    uint b = uint(w[base + j + 4u]);
-    uint c = uint(w[base + (j & 3u)]);
+void scale_min(uint j, uint u, out float sc, out float mn) {
+    uint a = (w4[u + 1u + (j >> 2u)] >> ((j & 3u) * 8u)) & 0xFFu;
+    uint b = (w4[u + 1u + ((j + 4u) >> 2u)] >> (((j + 4u) & 3u) * 8u)) & 0xFFu;
+    uint c = (w4[u + 1u] >> ((j & 3u) * 8u)) & 0xFFu;
     if (j < 4u) {
         sc = float(a & 63u);
         mn = float(b & 63u);
@@ -35,47 +37,38 @@ void scale_min(uint j, uint base, out float sc, out float mn) {
     }
 }
 
-float halfAt(uint byte_off) {
-    uint lo = uint(w[byte_off]);
-    uint hi = uint(w[byte_off + 1u]);
-    return unpackHalf2x16(lo | (hi << 8u)).x;
-}
-
 void main() {
     uint row = gl_WorkGroupID.x;
     if (row >= pc.rows) return;
     uint tid = gl_LocalInvocationID.x;
     uint blocks = pc.cols / QK_K;
     uint row_base = row * blocks * BLK;
+    uint x0 = 0u;
 
-    // Each thread owns one 32-value sub-block of consecutive super-blocks:
-    // thread t handles sub-block (t % 8) of super-block (t / 8), striding by 8
-    // super-blocks per pass. 64 threads = 8 super-blocks in flight.
+    // Thread t owns sub-block (t & 7) of super-blocks strided by 8; the
+    // 32-byte quant run is eight word loads against eight vec4 x loads.
     float acc = 0.0;
-    uint sb = tid & 7u;      // sub-block 0..7 within a super-block
+    uint sb = tid & 7u;
+    uint h = sb >> 1u;
+    bool hi = (sb & 1u) == 1u;
     for (uint b = tid >> 3u; b < blocks; b += 8u) {
-        uint blk = row_base + b * BLK;
-        float d = halfAt(blk);
-        float dmin = halfAt(blk + 2u);
+        uint u = (row_base + b * BLK) >> 2u; // BLK is word-aligned
+        vec2 dd = unpackHalf2x16(w4[u]);
         float sc, mn;
-        scale_min(sb, blk + 4u, sc, mn);
-        // Sub-block sb covers values [sb*32, sb*32+32): the low nibbles of
-        // bytes [ (sb/2)*32 + (sb%2? +0..31 high : low) ] -- Q4_K packs value
-        // i of half h in byte h*32+i%32, low nibble for even sub-block pairs.
-        uint h = sb >> 1u;
-        bool hi = (sb & 1u) == 1u;
-        uint qs = blk + 16u + h * 32u;
-        uint xb = b * QK_K + sb * 32u;
+        scale_min(sb, u, sc, mn);
+        uint qbase = u + 4u + h * 8u;
+        uint xb4 = (x0 >> 2u) + b * 64u + sb * 8u;
         float s_qx = 0.0;
         float s_x = 0.0;
-        for (uint i = 0u; i < 32u; i++) {
-            uint byte_v = uint(w[qs + i]);
-            float q = float(hi ? (byte_v >> 4u) : (byte_v & 0xFu));
-            float xv = x[xb + i];
-            s_qx += q * xv;
-            s_x += xv;
+        for (uint j = 0u; j < 8u; j++) {
+            uint qw = w4[qbase + j];
+            vec4 xv = x4[xb4 + j];
+            vec4 q = hi ? vec4(float((qw >> 4u) & 15u), float((qw >> 12u) & 15u), float((qw >> 20u) & 15u), float((qw >> 28u) & 15u))
+                        : vec4(float(qw & 15u), float((qw >> 8u) & 15u), float((qw >> 16u) & 15u), float((qw >> 24u) & 15u));
+            s_qx += dot(q, xv);
+            s_x += sum4(xv);
         }
-        acc += d * sc * s_qx - dmin * mn * s_x;
+        acc += dd.x * sc * s_qx - dd.y * mn * s_x;
     }
 
     red[tid] = acc;

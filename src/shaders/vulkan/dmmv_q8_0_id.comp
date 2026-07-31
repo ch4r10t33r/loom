@@ -1,20 +1,25 @@
-// Q8_0 id-indexed matvec; row arithmetic identical to dmmv_q8_0.comp.
+// Q8_0 id-indexed matvec, vectorized; row arithmetic identical to
+// dmmv_q8_0.comp.
 #version 450
-#extension GL_EXT_shader_8bit_storage : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 layout(local_size_x = 64) in;
-layout(std430, binding = 0) readonly buffer W { uint8_t w[]; };
-layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 0) readonly buffer W { uint w4[]; };
+layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
 layout(std430, binding = 2) writeonly buffer O { float o[]; };
 layout(std430, binding = 3) readonly buffer I { uint ids[]; };
 layout(push_constant) uniform PC { uint rows; uint cols; uint n_used; uint plane_stride; uint x_stride; uint base; } pc;
 shared float red[64];
 
-float halfAt(uint off) {
-    uint lo = uint(w[off]);
-    uint hi = uint(w[off + 1u]);
-    return unpackHalf2x16(lo | (hi << 8u)).x;
+// Unaligned 4-byte load: the 22/34/210-byte block formats put fields at
+// half-word offsets. The device layer pads every buffer by a word, so the
+// word+1 read at the tail stays in bounds.
+uint loadU32(uint byte_off) {
+    uint word = byte_off >> 2u;
+    uint sh = (byte_off & 3u) * 8u;
+    if (sh == 0u) return w4[word];
+    return (w4[word] >> sh) | (w4[word + 1u] << (32u - sh));
 }
+
+float sum4(vec4 v) { return v.x + v.y + v.z + v.w; }
 
 const uint QK = 32u;
 const uint BLK = 34u;
@@ -32,11 +37,13 @@ void main() {
     float acc = 0.0;
     for (uint b = tid; b < blocks; b += 64u) {
         uint blk = row_base + b * BLK;
-        float d = halfAt(blk);
-        uint xb = x0 + b * QK;
+        float d = unpackHalf2x16(loadU32(blk)).x;
+        uint xb4 = (x0 >> 2u) + b * 8u;
         float s = 0.0;
-        for (uint i = 0u; i < QK; i++) {
-            s += float(int8_t(w[blk + 2u + i])) * x[xb + i];
+        for (uint j = 0u; j < 8u; j++) {
+            int qw = int(loadU32(blk + 2u + 4u * j));
+            vec4 q = vec4(float(bitfieldExtract(qw, 0, 8)), float(bitfieldExtract(qw, 8, 8)), float(bitfieldExtract(qw, 16, 8)), float(bitfieldExtract(qw, 24, 8)));
+            s += dot(q, x4[xb4 + j]);
         }
         acc += d * s;
     }

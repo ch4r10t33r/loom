@@ -1,20 +1,25 @@
-// Q5_0 id-indexed matvec; row arithmetic identical to dmmv_q5_0.comp.
+// Q5_0 id-indexed matvec, vectorized; row arithmetic identical to
+// dmmv_q5_0.comp.
 #version 450
-#extension GL_EXT_shader_8bit_storage : require
-#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 layout(local_size_x = 64) in;
-layout(std430, binding = 0) readonly buffer W { uint8_t w[]; };
-layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 0) readonly buffer W { uint w4[]; };
+layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
 layout(std430, binding = 2) writeonly buffer O { float o[]; };
 layout(std430, binding = 3) readonly buffer I { uint ids[]; };
 layout(push_constant) uniform PC { uint rows; uint cols; uint n_used; uint plane_stride; uint x_stride; uint base; } pc;
 shared float red[64];
 
-float halfAt(uint off) {
-    uint lo = uint(w[off]);
-    uint hi = uint(w[off + 1u]);
-    return unpackHalf2x16(lo | (hi << 8u)).x;
+// Unaligned 4-byte load: the 22/34/210-byte block formats put fields at
+// half-word offsets. The device layer pads every buffer by a word, so the
+// word+1 read at the tail stays in bounds.
+uint loadU32(uint byte_off) {
+    uint word = byte_off >> 2u;
+    uint sh = (byte_off & 3u) * 8u;
+    if (sh == 0u) return w4[word];
+    return (w4[word] >> sh) | (w4[word + 1u] << (32u - sh));
 }
+
+float sum4(vec4 v) { return v.x + v.y + v.z + v.w; }
 
 const uint QK = 32u;
 const uint BLK = 22u;
@@ -32,20 +37,26 @@ void main() {
     float acc = 0.0;
     for (uint b = tid; b < blocks; b += 64u) {
         uint blk = row_base + b * BLK;
-        float d = halfAt(blk);
-        uint qh = uint(w[blk + 2u]) | (uint(w[blk + 3u]) << 8u) | (uint(w[blk + 4u]) << 16u) | (uint(w[blk + 5u]) << 24u);
-        uint qs = blk + 6u;
-        uint xb = x0 + b * QK;
+        float d = unpackHalf2x16(loadU32(blk)).x;
+        uint qh = loadU32(blk + 2u);
+        uint xb4 = (x0 >> 2u) + b * 8u;
         float s_qx = 0.0;
         float s_x = 0.0;
-        for (uint i = 0u; i < 16u; i++) {
-            uint byte_v = uint(w[qs + i]);
-            float q_lo = float((byte_v & 0x0Fu) | (((qh >> i) & 1u) << 4u));
-            float q_hi = float((byte_v >> 4u) | (((qh >> (i + 16u)) & 1u) << 4u));
-            float x_lo = x[xb + i];
-            float x_hi = x[xb + i + 16u];
-            s_qx += q_lo * x_lo + q_hi * x_hi;
-            s_x += x_lo + x_hi;
+        for (uint j = 0u; j < 4u; j++) {
+            uint qw = loadU32(blk + 6u + 4u * j);
+            uint i = 4u * j;
+            vec4 qlo = vec4(float((qw & 15u) | (((qh >> i) & 1u) << 4u)),
+                            float(((qw >> 8u) & 15u) | (((qh >> (i + 1u)) & 1u) << 4u)),
+                            float(((qw >> 16u) & 15u) | (((qh >> (i + 2u)) & 1u) << 4u)),
+                            float(((qw >> 24u) & 15u) | (((qh >> (i + 3u)) & 1u) << 4u)));
+            vec4 qhi = vec4(float(((qw >> 4u) & 15u) | (((qh >> (i + 16u)) & 1u) << 4u)),
+                            float(((qw >> 12u) & 15u) | (((qh >> (i + 17u)) & 1u) << 4u)),
+                            float(((qw >> 20u) & 15u) | (((qh >> (i + 18u)) & 1u) << 4u)),
+                            float(((qw >> 28u) & 15u) | (((qh >> (i + 19u)) & 1u) << 4u)));
+            vec4 xlo = x4[xb4 + j];
+            vec4 xhi = x4[xb4 + 4u + j];
+            s_qx += dot(qlo, xlo) + dot(qhi, xhi);
+            s_x += sum4(xlo) + sum4(xhi);
         }
         acc += d * (s_qx - 16.0 * s_x);
     }
