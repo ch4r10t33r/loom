@@ -1,0 +1,16 @@
+// acc[i] = sum_e gates[e] * outs[e*dim + i], gates read from the device
+// buffer moe_route wrote -- the port of moe_reduce_dev in moe_acc.metal.
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) writeonly buffer ACC { float acc[]; };
+layout(std430, binding = 1) readonly buffer OUTS { float outs[]; };
+layout(std430, binding = 2) readonly buffer G { float gates[]; };
+layout(push_constant) uniform PC { uint n; uint dim; } pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid >= pc.dim) return;
+    float a = 0.0;
+    for (uint e = 0u; e < pc.n; e++) a += gates[e] * outs[e * pc.dim + gid];
+    acc[gid] = a;
+}
