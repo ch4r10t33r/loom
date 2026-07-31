@@ -201,7 +201,9 @@ pub const Device = struct {
 
     fn allocIn(self: *Device, len: usize, want_flags: u32) Error!Buffer {
         var buf: NDHandle = 0;
-        var bci = BufferCreateInfo{ .size = len };
+        // Padded by a word: the vectorized kernels' unaligned loadU32 helper
+        // may read the word straddling the last byte.
+        var bci = BufferCreateInfo{ .size = len + 4 };
         if (v.vkCreateBuffer(self.dev, &bci, null, &buf) != VK_SUCCESS) return error.CreateFailed;
         var req: MemoryRequirements = undefined;
         v.vkGetBufferMemoryRequirements(self.dev, buf, &req);

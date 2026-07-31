@@ -1,32 +1,26 @@
-// q_abs = W_k^T q_nope per head -- the MLA absorption identity, the port of
-// mla_absorb.metal. W_k arrives as the full dequantized kv_b (f32, all
-// nope+vd rows per head); the kernel strides past the W_v rows, so the
-// device layout matches the tensor exactly. One workgroup per output element
-// (h, i), the nope-sum split across threads.
+// q_abs = W_k^T q_nope per head -- the MLA absorption identity. One
+// workgroup per (head, 64-wide tile of kvr outputs): thread j owns output
+// i = tile*64+j and walks the nope rows serially, so consecutive threads
+// read consecutive W_k addresses -- the coalesced shape. The first form
+// gave each output element a whole workgroup reducing across threads, which
+// made every W_k read a 64-way scatter.
 #version 450
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) readonly buffer W { float wk[]; };
 layout(std430, binding = 1) readonly buffer Q { float q[]; }; // head h nope section at q_off + h*q_stride
 layout(std430, binding = 2) writeonly buffer O { float o[]; };
 layout(push_constant) uniform PC { uint n_heads; uint nope; uint kvr; uint stride; uint q_stride; uint q_off; } pc;
-shared float red[64];
 
 void main() {
+    uint tiles = (pc.kvr + 63u) / 64u;
     uint g = gl_WorkGroupID.x;
-    uint h = g / pc.kvr;
+    uint h = g / tiles;
     if (h >= pc.n_heads) return;
-    uint i = g - h * pc.kvr;
-    uint tid = gl_LocalInvocationID.x;
-
+    uint i = (g - h * tiles) * 64u + gl_LocalInvocationID.x;
+    if (i >= pc.kvr) return;
     uint wh = h * pc.stride * pc.kvr;
     uint qh = pc.q_off + h * pc.q_stride;
     float acc = 0.0;
-    for (uint r = tid; r < pc.nope; r += 64u) acc += q[qh + r] * wk[wh + r * pc.kvr + i];
-    red[tid] = acc;
-    barrier();
-    for (uint s = 32u; s > 0u; s >>= 1u) {
-        if (tid < s) red[tid] += red[tid + s];
-        barrier();
-    }
-    if (tid == 0u) o[h * pc.kvr + i] = red[0];
+    for (uint r = 0u; r < pc.nope; r++) acc += q[qh + r] * wk[wh + r * pc.kvr + i];
+    o[h * pc.kvr + i] = acc;
 }
