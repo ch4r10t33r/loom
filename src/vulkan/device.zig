@@ -75,7 +75,7 @@ const Handle = ?*opaque {};
 const NDHandle = u64; // non-dispatchable handles are 64-bit always
 
 const InstanceCreateInfo = extern struct { sType: u32 = 1, pNext: ?*anyopaque = null, flags: u32 = 0, pApplicationInfo: ?*const ApplicationInfo = null, enabledLayerCount: u32 = 0, ppEnabledLayerNames: ?*anyopaque = null, enabledExtensionCount: u32 = 0, ppEnabledExtensionNames: ?*anyopaque = null };
-const ApplicationInfo = extern struct { sType: u32 = 0, pNext: ?*anyopaque = null, pApplicationName: ?[*:0]const u8 = null, applicationVersion: u32 = 0, pEngineName: ?[*:0]const u8 = null, engineVersion: u32 = 0, apiVersion: u32 = (1 << 22) | (1 << 12) };
+const ApplicationInfo = extern struct { sType: u32 = 0, pNext: ?*anyopaque = null, pApplicationName: ?[*:0]const u8 = null, applicationVersion: u32 = 0, pEngineName: ?[*:0]const u8 = null, engineVersion: u32 = 0, apiVersion: u32 = (1 << 22) | (2 << 12) };
 const QueueFamilyProperties = extern struct { queueFlags: u32, queueCount: u32, timestampValidBits: u32, minImageTransferGranularity: [3]u32 };
 const PhysicalDeviceMemoryProperties = extern struct { memoryTypeCount: u32, memoryTypes: [32]extern struct { propertyFlags: u32, heapIndex: u32 }, memoryHeapCount: u32, memoryHeaps: [16]extern struct { size: u64, flags: u32 } };
 const DeviceQueueCreateInfo = extern struct { sType: u32 = 2, pNext: ?*anyopaque = null, flags: u32 = 0, queueFamilyIndex: u32, queueCount: u32 = 1, pQueuePriorities: *const f32 };
