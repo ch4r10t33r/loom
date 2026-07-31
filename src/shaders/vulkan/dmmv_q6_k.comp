@@ -1,0 +1,65 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC { uint rows; uint cols; } pc;
+shared float red[64];
+
+float halfAt(uint off) {
+    uint lo = uint(w[off]);
+    uint hi = uint(w[off + 1u]);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+// Q6_K: 256-value super-blocks of 210 bytes -- ql[128], qh[64], sc[16] i8,
+// d(half). Value = d * sc * (q - 32); q = (k<2 ? ql&0xF : ql>>4) | ((qh>>2k)&3)<<4.
+// Structure mirrors matvecQ6K in ggml.zig exactly: two 128-value halves, four
+// 32-wide runs each; run k of half n reads ql[n*64 + (k&1)*32 + j] and
+// qh[n*32 + j], with x index n*128 + k*32 + j and scale sc[n*8 + k*2 + j/16].
+const uint QK_K = 256u;
+const uint BLK = 210u;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint blocks = pc.cols / QK_K;
+    uint row_base = row * blocks * BLK;
+
+    // Thread t owns run (t % 8) of a super-block -- 2 halves x 4 runs -- and
+    // strides super-blocks by 8. 64 threads keep 8 super-blocks in flight.
+    float acc = 0.0;
+    uint run = tid & 7u;
+    uint n = run >> 2u;   // half
+    uint k = run & 3u;    // run within half
+    for (uint b = tid >> 3u; b < blocks; b += 8u) {
+        uint blk = row_base + b * BLK;
+        float d = halfAt(blk + 208u);
+        float sc0 = float(int8_t(w[blk + 192u + n * 8u + k * 2u]));
+        float sc1 = float(int8_t(w[blk + 192u + n * 8u + k * 2u + 1u]));
+        uint ql = blk + n * 64u + ((k & 1u) == 1u ? 32u : 0u);
+        uint qh = blk + 128u + n * 32u;
+        uint xb = b * QK_K + n * 128u + k * 32u;
+        float s0 = 0.0;
+        float s1 = 0.0;
+        for (uint j = 0u; j < 32u; j++) {
+            uint lo = uint(w[ql + j]);
+            uint hi = uint(w[qh + j]);
+            uint q = ((k < 2u) ? (lo & 0x0Fu) : (lo >> 4u)) | (((hi >> (2u * k)) & 3u) << 4u);
+            float v = (float(q) - 32.0) * x[xb + j];
+            if (j < 16u) s0 += v; else s1 += v;
+        }
+        acc += d * (sc0 * s0 + sc1 * s1);
+    }
+
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) o[row] = red[0];
+}
