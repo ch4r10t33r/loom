@@ -1,0 +1,88 @@
+// Q4_K dequantize-multiply-matrix-vector, Vulkan.
+//
+// The bring-up kernel, exactly as it was for Metal: the hottest operation
+// first, verified against the exact CPU reference before anything else is
+// ported. The arithmetic mirrors dmmv_q4k.metal's semantics -- per-256-value
+// super-block, 6-bit scale/min pairs, d*sc*q - dmin*m -- but the shape is the
+// simple one: one workgroup of 64 threads per row, shared-memory reduction.
+// Correctness first; the occupancy lessons from the Metal effort apply once
+// there is a physical GPU to measure on, which llvmpipe is not.
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC { uint rows; uint cols; } pc;
+
+shared float red[64];
+
+const uint QK_K = 256u;
+const uint BLK = 144u;
+
+void scale_min(uint j, uint base, out float sc, out float mn) {
+    uint a = uint(w[base + j]);
+    uint b = uint(w[base + j + 4u]);
+    uint c = uint(w[base + (j & 3u)]);
+    if (j < 4u) {
+        sc = float(a & 63u);
+        mn = float(b & 63u);
+    } else {
+        sc = float((b & 0xFu) | ((c >> 6u) << 4u));
+        mn = float((b >> 4u) | ((a >> 6u) << 4u));
+    }
+}
+
+float halfAt(uint byte_off) {
+    uint lo = uint(w[byte_off]);
+    uint hi = uint(w[byte_off + 1u]);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint blocks = pc.cols / QK_K;
+    uint row_base = row * blocks * BLK;
+
+    // Each thread owns one 32-value sub-block of consecutive super-blocks:
+    // thread t handles sub-block (t % 8) of super-block (t / 8), striding by 8
+    // super-blocks per pass. 64 threads = 8 super-blocks in flight.
+    float acc = 0.0;
+    uint sb = tid & 7u;      // sub-block 0..7 within a super-block
+    for (uint b = tid >> 3u; b < blocks; b += 8u) {
+        uint blk = row_base + b * BLK;
+        float d = halfAt(blk);
+        float dmin = halfAt(blk + 2u);
+        float sc, mn;
+        scale_min(sb, blk + 4u, sc, mn);
+        // Sub-block sb covers values [sb*32, sb*32+32): the low nibbles of
+        // bytes [ (sb/2)*32 + (sb%2? +0..31 high : low) ] -- Q4_K packs value
+        // i of half h in byte h*32+i%32, low nibble for even sub-block pairs.
+        uint h = sb >> 1u;
+        bool hi = (sb & 1u) == 1u;
+        uint qs = blk + 16u + h * 32u;
+        uint xb = b * QK_K + sb * 32u;
+        float s_qx = 0.0;
+        float s_x = 0.0;
+        for (uint i = 0u; i < 32u; i++) {
+            uint byte_v = uint(w[qs + i]);
+            float q = float(hi ? (byte_v >> 4u) : (byte_v & 0xFu));
+            float xv = x[xb + i];
+            s_qx += q * xv;
+            s_x += xv;
+        }
+        acc += d * sc * s_qx - dmin * mn * s_x;
+    }
+
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) o[row] = red[0];
+}
