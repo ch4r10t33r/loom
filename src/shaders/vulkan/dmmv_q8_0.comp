@@ -1,0 +1,47 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC { uint rows; uint cols; } pc;
+shared float red[64];
+
+float halfAt(uint off) {
+    uint lo = uint(w[off]);
+    uint hi = uint(w[off + 1u]);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+// Q8_0: 32 signed bytes after a half scale, 34 bytes per block. Value is d*q.
+const uint QK = 32u;
+const uint BLK = 34u;
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint blocks = pc.cols / QK;
+    uint row_base = row * blocks * BLK;
+
+    float acc = 0.0;
+    for (uint b = tid; b < blocks; b += 64u) {
+        uint blk = row_base + b * BLK;
+        float d = halfAt(blk);
+        uint xb = b * QK;
+        float s = 0.0;
+        for (uint i = 0u; i < QK; i++) {
+            s += float(int8_t(w[blk + 2u + i])) * x[xb + i];
+        }
+        acc += d * s;
+    }
+
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) o[row] = red[0];
+}
