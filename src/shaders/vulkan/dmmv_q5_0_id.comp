@@ -1,0 +1,60 @@
+// Q5_0 id-indexed matvec; row arithmetic identical to dmmv_q5_0.comp.
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer W { uint8_t w[]; };
+layout(std430, binding = 1) readonly buffer X { float x[]; };
+layout(std430, binding = 2) writeonly buffer O { float o[]; };
+layout(std430, binding = 3) readonly buffer I { uint ids[]; };
+layout(push_constant) uniform PC { uint rows; uint cols; uint n_used; uint plane_stride; uint x_stride; } pc;
+shared float red[64];
+
+float halfAt(uint off) {
+    uint lo = uint(w[off]);
+    uint hi = uint(w[off + 1u]);
+    return unpackHalf2x16(lo | (hi << 8u)).x;
+}
+
+const uint QK = 32u;
+const uint BLK = 22u;
+
+void main() {
+    uint g = gl_WorkGroupID.x;
+    uint slot = g / pc.rows;
+    if (slot >= pc.n_used) return;
+    uint row = g - slot * pc.rows;
+    uint tid = gl_LocalInvocationID.x;
+    uint blocks = pc.cols / QK;
+    uint row_base = ids[slot] * pc.plane_stride + row * blocks * BLK;
+    uint x0 = slot * pc.x_stride;
+
+    float acc = 0.0;
+    for (uint b = tid; b < blocks; b += 64u) {
+        uint blk = row_base + b * BLK;
+        float d = halfAt(blk);
+        uint qh = uint(w[blk + 2u]) | (uint(w[blk + 3u]) << 8u) | (uint(w[blk + 4u]) << 16u) | (uint(w[blk + 5u]) << 24u);
+        uint qs = blk + 6u;
+        uint xb = x0 + b * QK;
+        float s_qx = 0.0;
+        float s_x = 0.0;
+        for (uint i = 0u; i < 16u; i++) {
+            uint byte_v = uint(w[qs + i]);
+            float q_lo = float((byte_v & 0x0Fu) | (((qh >> i) & 1u) << 4u));
+            float q_hi = float((byte_v >> 4u) | (((qh >> (i + 16u)) & 1u) << 4u));
+            float x_lo = x[xb + i];
+            float x_hi = x[xb + i + 16u];
+            s_qx += q_lo * x_lo + q_hi * x_hi;
+            s_x += x_lo + x_hi;
+        }
+        acc += d * (s_qx - 16.0 * s_x);
+    }
+
+    red[tid] = acc;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    if (tid == 0u) o[slot * pc.rows + row] = red[0];
+}
