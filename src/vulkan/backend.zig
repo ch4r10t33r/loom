@@ -921,8 +921,10 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         d.record(c, pipes.rope, &.{qf}, std.mem.asBytes(&rope_q), @intCast((fc.n_heads * fc.rope / 2 + 31) / 32)) catch return false;
         d.barrier(c);
         const rope_k = RopePush{ .n_vec = 1, .rope = @intCast(fc.rope), .stride = 0, .offset = 0, .pos = @intCast(pos), .buf_off = @intCast(r_pos), .base = fc.rope_base, .yarn_factor = fc.yarn_factor, .yarn_orig_ctx = fc.yarn_orig_ctx };
+        // rope on the cached row overlaps the absorb: disjoint buffers (cache
+        // row vs qf -> qabs), both ordered before attention by one barrier --
+        // Metal's schedule, one drain fewer per layer.
         d.record(c, pipes.rope, &.{mla_cache.?}, std.mem.asBytes(&rope_k), @intCast((fc.rope / 2 + 31) / 32)) catch return false;
-        d.barrier(c);
         if (debug_split) {
             const t0 = nowf();
             d.submitWait(c) catch return false;
@@ -978,7 +980,10 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
             d.barrier(c);
             const n_red = extern struct { n: u32, dim: u32 }{ .n = @intCast(fc.routed.n_used), .dim = @intCast(dim) };
             d.record(c, pipes.reduce_dev, &.{ acc, s3, gb }, std.mem.asBytes(&n_red), @intCast((dim + 63) / 64)) catch return false;
-            d.barrier(c);
+            // No barrier: the shared expert's gate/up read nb and write
+            // s1/s2, disjoint from the reduce's s3 -> acc. The barrier after
+            // them orders everything before the shared expert's swiglu and
+            // before add(xr, acc).
             if (dd.shexp != null) {
                 const d_sh = Dims2{ .rows = @intCast(dd.shexp_ffn), .cols = @intCast(dim) };
                 const d_shd = Dims2{ .rows = @intCast(dim), .cols = @intCast(dd.shexp_ffn) };
@@ -993,6 +998,7 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
                 d.record(c, pipes.add, &.{ acc, s3 }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
                 d.barrier(c);
             }
+            if (dd.shexp == null) d.barrier(c); // reduce -> add(xr, acc) when no shexp barriers intervened
             d.record(c, pipes.add, &.{ xr, acc }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
         } else {
             const d_f = Dims2{ .rows = @intCast(dd.dffn), .cols = @intCast(dim) };
