@@ -181,13 +181,42 @@ fn pipeFor(t: ggml.Type, cols: usize) ?u64 {
 fn weightBuffer(d: *vk.Device, data: []const u8) ?vk.Buffer {
     const gop = wcache.getOrPut(std.heap.page_allocator, @intFromPtr(data.ptr)) catch return null;
     if (gop.found_existing and gop.value_ptr.len == data.len) return gop.value_ptr.buf;
-    const buf = d.alloc(data.len) catch {
+    // Device-local: VRAM on a discrete GPU (staged through `upload`), plain
+    // mapped memory on llvmpipe/UMA. Must not be mid-recording -- `upload`
+    // submits its own transfer -- which is why callers resolve every weight
+    // before recording anything.
+    const buf = d.allocDevice(data.len) catch {
         if (!gop.found_existing) _ = wcache.remove(@intFromPtr(data.ptr));
         return null;
     };
-    @memcpy(buf.slice(u8)[0..data.len], data);
+    d.upload(buf, data) catch {
+        if (!gop.found_existing) _ = wcache.remove(@intFromPtr(data.ptr));
+        return null;
+    };
     gop.value_ptr.* = .{ .buf = buf, .len = data.len };
     return buf;
+}
+
+// A standalone matvec submission costs on the order of a millisecond of
+// submit-and-wait on a discrete GPU regardless of size, so below some weight
+// size the CPU wins on latency even though the GPU wins on bandwidth.
+// Measured on an RTX 3060 (DeepSeek-V2-Lite Q4_K_M, 32 tokens): every matvec
+// on the device 1.5 tok/s; cutover at 2 MB / 8 MB / 32 MB all 4.3; nothing
+// but the fused MoE chain 4.1; CPU-only 3.1. The curve is flat across the
+// 2-32 MB span because the model has no matvec between 3.6 MB (attention
+// projections, CPU-cheap) and the 172 MB lm_head (GPU-cheap), so 2 MB is the
+// default and LOOM_VK_MIN_BYTES overrides it for re-measurement on other
+// hardware.
+const default_min_bytes: usize = 2_000_000;
+var min_bytes: ?usize = null;
+fn matvecMinBytes() usize {
+    if (min_bytes == null) {
+        min_bytes = default_min_bytes;
+        if (std.c.getenv("LOOM_VK_MIN_BYTES")) |s| {
+            min_bytes = std.fmt.parseInt(usize, std.mem.span(s), 10) catch default_min_bytes;
+        }
+    }
+    return min_bytes.?;
 }
 
 /// The dmmv family (q4_k, q5_0, q8_0, q6_k, f32), one submission per call.
@@ -195,7 +224,7 @@ fn weightBuffer(d: *vk.Device, data: []const u8) ?vk.Buffer {
 /// through grow-only host-visible buffers. Anything without a kernel falls
 /// to the CPU exactly as `cpu.matvec` would.
 pub fn matvec(t: ggml.Type, out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
-    if (!use_gpu_ops) return cpu.matvec(t, out, data, x, rows, cols);
+    if (!use_gpu_ops or data.len < matvecMinBytes()) return cpu.matvec(t, out, data, x, rows, cols);
     const d = &(dev orelse return cpu.matvec(t, out, data, x, rows, cols));
     const pipe = pipeFor(t, cols) orelse return cpu.matvec(t, out, data, x, rows, cols);
     const wb = weightBuffer(d, data) orelse return cpu.matvec(t, out, data, x, rows, cols);
@@ -296,7 +325,30 @@ pub fn moeFfnBlockRouted(normed: []const f32, logits: []const f32, bias: ?[]cons
     const xb = ensure(&xbuf, d, dim * 4) orelse return false;
     @memcpy(xb.slice(f32)[0..dim], normed);
 
-    if (!routeDispatch(d, logits, bias, cfg.n_used, cfg.gating_sigmoid, cfg.weights_norm, cfg.weights_scale)) return false;
+    // Shared-expert weights resolve here too: `upload` submits its own
+    // transfer, so every weight must be resident before recording opens.
+    var shw: [3]vk.Buffer = undefined;
+    if (shexp) |sw| {
+        for (sw, 0..) |w, i| shw[i] = weightBuffer(d, w.data) orelse return false;
+    }
+
+    // Route staging, packed [logits][bias] -- host writes to mapped memory,
+    // legal any time before submit.
+    const n_expert = cfg.n_expert;
+    const rin = ensure(&route_in, d, n_expert * 2 * 4) orelse return false;
+    const idb = ensure(&ids_buf, d, MAX_MOE_EXPERTS * 4) orelse return false;
+    const gb = ensure(&gates_buf, d, MAX_MOE_EXPERTS * 4) orelse return false;
+    if (n_expert > 256) return false;
+    @memcpy(rin.slice(f32)[0..n_expert], logits);
+    if (bias) |b| @memcpy(rin.slice(f32)[n_expert..][0..n_expert], b);
+    const rpush = RoutePush{
+        .n_expert = @intCast(n_expert),
+        .n_used = @intCast(cfg.n_used),
+        .gating = if (cfg.gating_sigmoid) 1 else 0,
+        .weights_norm = if (cfg.weights_norm) 1 else 0,
+        .has_bias = if (bias != null) 1 else 0,
+        .weights_scale = cfg.weights_scale,
+    };
 
     const d_gate = IdPush{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(gate_w.data.len / cfg.n_expert), .x_stride = 0 };
     const d_up = IdPush{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(up_w.data.len / cfg.n_expert), .x_stride = 0 };
@@ -304,25 +356,37 @@ pub fn moeFfnBlockRouted(normed: []const f32, logits: []const f32, bias: ?[]cons
     const n_sw = extern struct { n: u32 }{ .n = @intCast(cfg.n_used * ffn) };
     const n_red = extern struct { n: u32, dim: u32 }{ .n = @intCast(cfg.n_used), .dim = @intCast(dim) };
 
-    d.dispatchWait(gp, &.{ gw, xb, s1, ids_buf.? }, std.mem.asBytes(&d_gate), @intCast(cfg.n_used * ffn)) catch return false;
-    d.dispatchWait(up, &.{ uw, xb, s2, ids_buf.? }, std.mem.asBytes(&d_up), @intCast(cfg.n_used * ffn)) catch return false;
-    d.dispatchWait(pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_sw), @intCast((cfg.n_used * ffn + 63) / 64)) catch return false;
-    d.dispatchWait(dp, &.{ dw, s1, s3, ids_buf.? }, std.mem.asBytes(&d_down), @intCast(cfg.n_used * dim)) catch return false;
-    d.dispatchWait(pipes.reduce_dev, &.{ acc, s3, gates_buf.? }, std.mem.asBytes(&n_red), @intCast((dim + 63) / 64)) catch return false;
-    cmdbufs += 5;
-    @memcpy(out, acc.slice(f32)[0..dim]);
-
-    if (shexp) |sw| {
-        const shw = [3]?vk.Buffer{ weightBuffer(d, sw[0].data), weightBuffer(d, sw[1].data), weightBuffer(d, sw[2].data) };
-        for (shw) |w| if (w == null) return false;
+    // The whole chain as one submission, barriers where a stage reads what
+    // the previous one wrote -- the shape Metal proved out, minus only the
+    // cross-layer fusion.
+    const c = d.beginCmd() catch return false;
+    d.record(c, pipes.route, &.{ rin, idb, gb }, std.mem.asBytes(&rpush), 1) catch return false;
+    d.barrier(c);
+    d.record(c, gp, &.{ gw, xb, s1, idb }, std.mem.asBytes(&d_gate), @intCast(cfg.n_used * ffn)) catch return false;
+    d.record(c, up, &.{ uw, xb, s2, idb }, std.mem.asBytes(&d_up), @intCast(cfg.n_used * ffn)) catch return false;
+    d.barrier(c);
+    d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_sw), @intCast((cfg.n_used * ffn + 63) / 64)) catch return false;
+    d.barrier(c);
+    d.record(c, dp, &.{ dw, s1, s3, idb }, std.mem.asBytes(&d_down), @intCast(cfg.n_used * dim)) catch return false;
+    d.barrier(c);
+    d.record(c, pipes.reduce_dev, &.{ acc, s3, gb }, std.mem.asBytes(&n_red), @intCast((dim + 63) / 64)) catch return false;
+    if (shexp != null) {
         const d_sh = extern struct { rows: u32, cols: u32 }{ .rows = @intCast(shexp_ffn), .cols = @intCast(dim) };
         const d_shd = extern struct { rows: u32, cols: u32 }{ .rows = @intCast(dim), .cols = @intCast(shexp_ffn) };
         const n_shsw = extern struct { n: u32 }{ .n = @intCast(shexp_ffn) };
-        d.dispatchWait(sh_pipes[0], &.{ shw[0].?, xb, s1 }, std.mem.asBytes(&d_sh), @intCast(shexp_ffn)) catch return false;
-        d.dispatchWait(sh_pipes[1], &.{ shw[1].?, xb, s2 }, std.mem.asBytes(&d_sh), @intCast(shexp_ffn)) catch return false;
-        d.dispatchWait(pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_shsw), @intCast((shexp_ffn + 63) / 64)) catch return false;
-        d.dispatchWait(sh_pipes[2], &.{ shw[2].?, s1, s3 }, std.mem.asBytes(&d_shd), @intCast(dim)) catch return false;
-        cmdbufs += 4;
+        d.barrier(c);
+        d.record(c, sh_pipes[0], &.{ shw[0], xb, s1 }, std.mem.asBytes(&d_sh), @intCast(shexp_ffn)) catch return false;
+        d.record(c, sh_pipes[1], &.{ shw[1], xb, s2 }, std.mem.asBytes(&d_sh), @intCast(shexp_ffn)) catch return false;
+        d.barrier(c);
+        d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_shsw), @intCast((shexp_ffn + 63) / 64)) catch return false;
+        d.barrier(c);
+        d.record(c, sh_pipes[2], &.{ shw[2], s1, s3 }, std.mem.asBytes(&d_shd), @intCast(dim)) catch return false;
+    }
+    d.submitWait(c) catch return false;
+    cmdbufs += 1;
+
+    @memcpy(out, acc.slice(f32)[0..dim]);
+    if (shexp != null) {
         for (out, s3.slice(f32)[0..dim]) |*o, v| o.* += v;
     }
     return true;
@@ -462,7 +526,7 @@ test "vulkan routed moe block agrees with the exact reference" {
         cfg,
         got,
     ));
-    try std.testing.expectEqual(before + 10, cmdbufs); // route + 5 routed + 4 shared
+    try std.testing.expectEqual(before + 1, cmdbufs); // the whole chain is one submission
 
     // f64 reference: host route, then dequantize-everything expert math.
     var sel: [n_used]moe.Selected = undefined;
@@ -532,6 +596,12 @@ test "vulkan dmmv family agrees with the exact cpu reference" {
     const saved = use_gpu_ops;
     use_gpu_ops = true;
     defer use_gpu_ops = saved;
+    // The test tensors sit under the size cutover; pin it to zero so every
+    // kernel actually runs (the submission-counter check would catch a
+    // silent fallback as a failure, not a skip).
+    const saved_min = min_bytes;
+    min_bytes = 0;
+    defer min_bytes = saved_min;
 
     var prng = std.Random.DefaultPrng.init(0x0741C);
     const rnd = prng.random();

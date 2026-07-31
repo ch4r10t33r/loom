@@ -38,6 +38,8 @@ const V = struct {
     vkCmdBindDescriptorSets: *const fn (Handle, u32, NDHandle, u32, u32, [*]const NDHandle, u32, ?*anyopaque) callconv(.c) void,
     vkCmdPushConstants: *const fn (Handle, NDHandle, u32, u32, u32, *const anyopaque) callconv(.c) void,
     vkCmdDispatch: *const fn (Handle, u32, u32, u32) callconv(.c) void,
+    vkCmdCopyBuffer: *const fn (Handle, NDHandle, NDHandle, u32, [*]const BufferCopy) callconv(.c) void,
+    vkCmdPipelineBarrier: *const fn (Handle, u32, u32, u32, u32, ?[*]const MemoryBarrier, u32, ?*anyopaque, u32, ?*anyopaque) callconv(.c) void,
     vkEndCommandBuffer: *const fn (Handle) callconv(.c) VkResult,
     vkQueueSubmit: *const fn (Handle, u32, *const SubmitInfo, NDHandle) callconv(.c) VkResult,
     vkQueueWaitIdle: *const fn (Handle) callconv(.c) VkResult,
@@ -76,7 +78,11 @@ const DeviceQueueCreateInfo = extern struct { sType: u32 = 2, pNext: ?*anyopaque
 const Features8Bit = extern struct { sType: u32 = 1000177000, pNext: ?*anyopaque = null, storageBuffer8BitAccess: u32 = 1, uniformAndStorageBuffer8BitAccess: u32 = 0, storagePushConstant8: u32 = 0 };
 const FeaturesInt8 = extern struct { sType: u32 = 1000082000, pNext: ?*anyopaque = null, shaderFloat16: u32 = 0, shaderInt8: u32 = 1 };
 const DeviceCreateInfo = extern struct { sType: u32 = 3, pNext: ?*anyopaque = null, flags: u32 = 0, queueCreateInfoCount: u32 = 1, pQueueCreateInfos: *const DeviceQueueCreateInfo, enabledLayerCount: u32 = 0, ppEnabledLayerNames: ?*anyopaque = null, enabledExtensionCount: u32 = 0, ppEnabledExtensionNames: ?*const [*:0]const u8 = null, pEnabledFeatures: ?*anyopaque = null };
-const BufferCreateInfo = extern struct { sType: u32 = 12, pNext: ?*anyopaque = null, flags: u32 = 0, size: u64, usage: u32 = 0x20, sharingMode: u32 = 0, queueFamilyIndexCount: u32 = 0, pQueueFamilyIndices: ?*anyopaque = null };
+// usage: STORAGE_BUFFER | TRANSFER_SRC | TRANSFER_DST, so any buffer can be
+// a staging source or a device-local copy target.
+const BufferCreateInfo = extern struct { sType: u32 = 12, pNext: ?*anyopaque = null, flags: u32 = 0, size: u64, usage: u32 = 0x23, sharingMode: u32 = 0, queueFamilyIndexCount: u32 = 0, pQueueFamilyIndices: ?*anyopaque = null };
+const BufferCopy = extern struct { srcOffset: u64 = 0, dstOffset: u64 = 0, size: u64 };
+const MemoryBarrier = extern struct { sType: u32 = 46, pNext: ?*anyopaque = null, srcAccessMask: u32, dstAccessMask: u32 };
 const MemoryRequirements = extern struct { size: u64, alignment: u64, memoryTypeBits: u32 };
 const MemoryAllocateInfo = extern struct { sType: u32 = 5, pNext: ?*anyopaque = null, allocationSize: u64, memoryTypeIndex: u32 };
 const ShaderModuleCreateInfo = extern struct { sType: u32 = 16, pNext: ?*anyopaque = null, flags: u32 = 0, codeSize: usize, pCode: [*]const u32 };
@@ -101,11 +107,13 @@ const SubmitInfo = extern struct { sType: u32 = 4, pNext: ?*anyopaque = null, wa
 pub const Buffer = struct {
     handle: NDHandle,
     mem: NDHandle,
-    ptr: [*]u8,
+    // Null for device-local memory with no host mapping; such a buffer is
+    // written through `upload` and never sliced.
+    ptr: ?[*]u8,
     len: usize,
 
     pub fn slice(self: Buffer, comptime T: type) []T {
-        return @as([*]T, @ptrCast(@alignCast(self.ptr)))[0 .. self.len / @sizeOf(T)];
+        return @as([*]T, @ptrCast(@alignCast(self.ptr.?)))[0 .. self.len / @sizeOf(T)];
     }
 };
 
@@ -120,6 +128,7 @@ pub const Device = struct {
     set_layout: NDHandle,
     pipe_layout: NDHandle,
     mem_props: PhysicalDeviceMemoryProperties,
+    staging: ?Buffer = null,
 
     pub fn init() Error!Device {
         try loadVulkan();
@@ -190,10 +199,7 @@ pub const Device = struct {
         return .{ .instance = inst, .phys = phys, .dev = dev, .queue = queue, .family = family, .cmd_pool = pool, .desc_pool = dpool, .set_layout = slayout, .pipe_layout = playout, .mem_props = mp };
     }
 
-    /// Host-visible, host-coherent storage buffer -- llvmpipe and every UMA
-    /// device serves these; a discrete-GPU staging path is future work with
-    /// the hardware to justify it.
-    pub fn alloc(self: *Device, len: usize) Error!Buffer {
+    fn allocIn(self: *Device, len: usize, want_flags: u32) Error!Buffer {
         var buf: NDHandle = 0;
         var bci = BufferCreateInfo{ .size = len };
         if (v.vkCreateBuffer(self.dev, &bci, null, &buf) != VK_SUCCESS) return error.CreateFailed;
@@ -203,7 +209,7 @@ pub const Device = struct {
         var ok = false;
         for (0..self.mem_props.memoryTypeCount) |i| {
             const flags = self.mem_props.memoryTypes[i].propertyFlags;
-            if (req.memoryTypeBits & (@as(u32, 1) << @intCast(i)) != 0 and flags & 0x6 == 0x6) { // HOST_VISIBLE|HOST_COHERENT
+            if (req.memoryTypeBits & (@as(u32, 1) << @intCast(i)) != 0 and flags & want_flags == want_flags) {
                 idx = @intCast(i);
                 ok = true;
                 break;
@@ -214,9 +220,45 @@ pub const Device = struct {
         var mai = MemoryAllocateInfo{ .allocationSize = req.size, .memoryTypeIndex = idx };
         if (v.vkAllocateMemory(self.dev, &mai, null, &mem) != VK_SUCCESS) return error.CreateFailed;
         if (v.vkBindBufferMemory(self.dev, buf, mem, 0) != VK_SUCCESS) return error.CreateFailed;
+        // Map when the chosen type allows it; a device-local-only type stays
+        // unmapped and is written through `upload`.
         var ptr: ?*anyopaque = null;
-        if (v.vkMapMemory(self.dev, mem, 0, len, 0, &ptr) != VK_SUCCESS) return error.MapFailed;
-        return .{ .handle = buf, .mem = mem, .ptr = @ptrCast(ptr.?), .len = len };
+        const flags = self.mem_props.memoryTypes[idx].propertyFlags;
+        if (flags & 0x6 == 0x6) {
+            if (v.vkMapMemory(self.dev, mem, 0, len, 0, &ptr) != VK_SUCCESS) return error.MapFailed;
+        }
+        return .{ .handle = buf, .mem = mem, .ptr = if (ptr) |p| @ptrCast(p) else null, .len = len };
+    }
+
+    /// Host-visible, host-coherent storage buffer: activations, staging, and
+    /// anything the host reads back.
+    pub fn alloc(self: *Device, len: usize) Error!Buffer {
+        return self.allocIn(len, 0x6); // HOST_VISIBLE|HOST_COHERENT
+    }
+
+    /// Device-local storage for weights. On a discrete GPU this is VRAM and
+    /// comes back unmapped; on llvmpipe and UMA devices the device-local type
+    /// is also host-visible, so it maps and `upload` degenerates to memcpy.
+    /// Either way the caller writes it through `upload` only.
+    pub fn allocDevice(self: *Device, len: usize) Error!Buffer {
+        return self.allocIn(len, 0x1) catch self.alloc(len); // DEVICE_LOCAL, else wherever fits
+    }
+
+    /// Write `data` into `dst`: direct memcpy when mapped, otherwise a staged
+    /// copy through a grow-only host-visible bounce buffer and a one-shot
+    /// transfer submission.
+    pub fn upload(self: *Device, dst: Buffer, data: []const u8) Error!void {
+        if (dst.ptr != null) {
+            @memcpy(dst.slice(u8)[0..data.len], data);
+            return;
+        }
+        if (self.staging == null or self.staging.?.len < data.len) self.staging = try self.alloc(data.len);
+        const st = self.staging.?;
+        @memcpy(st.slice(u8)[0..data.len], data);
+        const c = try self.beginCmd();
+        const region = BufferCopy{ .size = data.len };
+        v.vkCmdCopyBuffer(c.cmd, st.handle, dst.handle, 1, @ptrCast(&region));
+        try self.submitWait(c);
     }
 
     pub fn pipeline(self: *Device, spv: []const u8) Error!NDHandle {
@@ -229,10 +271,25 @@ pub const Device = struct {
         return pipe;
     }
 
-    /// Bind up to four buffers, push constants, dispatch, wait. One-shot per
-    /// call -- the bring-up shape, not the fast one.
-    pub fn dispatchWait(self: *Device, pipe: NDHandle, bufs: []const Buffer, push: []const u8, groups_x: u32) Error!void {
+    /// An open command buffer recording dispatches. Descriptor sets come from
+    /// the shared pool, reset at `beginCmd` -- one recording can hold up to
+    /// the pool's 64 sets. This is what turns a chain of ops into one
+    /// submission, which on a discrete GPU is the difference between the
+    /// device working and the device waiting on the host ~500 times a token.
+    pub const Cmd = struct { cmd: Handle };
+
+    pub fn beginCmd(self: *Device) Error!Cmd {
         _ = v.vkResetDescriptorPool(self.dev, self.desc_pool, 0);
+        _ = v.vkResetCommandPool(self.dev, self.cmd_pool, 0);
+        var cmd: Handle = null;
+        var cbai = CommandBufferAllocateInfo{ .commandPool = self.cmd_pool };
+        if (v.vkAllocateCommandBuffers(self.dev, &cbai, @ptrCast(&cmd)) != VK_SUCCESS) return error.CreateFailed;
+        const begin = CommandBufferBeginInfo{};
+        _ = v.vkBeginCommandBuffer(cmd, &begin);
+        return .{ .cmd = cmd };
+    }
+
+    pub fn record(self: *Device, c: Cmd, pipe: NDHandle, bufs: []const Buffer, push: []const u8, groups_x: u32) Error!void {
         var set: NDHandle = 0;
         var dsai = DescriptorSetAllocateInfo{ .descriptorPool = self.desc_pool, .pSetLayouts = &self.set_layout };
         if (v.vkAllocateDescriptorSets(self.dev, &dsai, @ptrCast(&set)) != VK_SUCCESS) return error.CreateFailed;
@@ -243,20 +300,33 @@ pub const Device = struct {
             writes[i] = .{ .dstSet = set, .dstBinding = @intCast(i), .pBufferInfo = &infos[i] };
         }
         v.vkUpdateDescriptorSets(self.dev, @intCast(bufs.len), &writes, 0, null);
+        v.vkCmdBindPipeline(c.cmd, 1, pipe); // COMPUTE bind point
+        v.vkCmdBindDescriptorSets(c.cmd, 1, self.pipe_layout, 0, 1, @ptrCast(&set), 0, null);
+        v.vkCmdPushConstants(c.cmd, self.pipe_layout, 0x20, 0, @intCast(push.len), push.ptr);
+        v.vkCmdDispatch(c.cmd, groups_x, 1, 1);
+    }
 
-        _ = v.vkResetCommandPool(self.dev, self.cmd_pool, 0);
-        var cmd: Handle = null;
-        var cbai = CommandBufferAllocateInfo{ .commandPool = self.cmd_pool };
-        if (v.vkAllocateCommandBuffers(self.dev, &cbai, @ptrCast(&cmd)) != VK_SUCCESS) return error.CreateFailed;
-        const begin = CommandBufferBeginInfo{};
-        _ = v.vkBeginCommandBuffer(cmd, &begin);
-        v.vkCmdBindPipeline(cmd, 1, pipe); // COMPUTE bind point
-        v.vkCmdBindDescriptorSets(cmd, 1, self.pipe_layout, 0, 1, @ptrCast(&set), 0, null);
-        v.vkCmdPushConstants(cmd, self.pipe_layout, 0x20, 0, @intCast(push.len), push.ptr);
-        v.vkCmdDispatch(cmd, groups_x, 1, 1);
-        _ = v.vkEndCommandBuffer(cmd);
+    /// Compute-to-compute execution and memory dependency: everything written
+    /// by dispatches recorded before it is visible to dispatches after it.
+    pub fn barrier(self: *Device, c: Cmd) void {
+        _ = self;
+        const mb = MemoryBarrier{ .srcAccessMask = 0x40, .dstAccessMask = 0x20 | 0x40 }; // SHADER_WRITE -> SHADER_READ|WRITE
+        v.vkCmdPipelineBarrier(c.cmd, 0x800, 0x800, 0, 1, @ptrCast(&mb), 0, null, 0, null); // COMPUTE -> COMPUTE
+    }
+
+    pub fn submitWait(self: *Device, c: Cmd) Error!void {
+        _ = v.vkEndCommandBuffer(c.cmd);
+        var cmd = c.cmd;
         var si = SubmitInfo{ .pCommandBuffers = &cmd };
         if (v.vkQueueSubmit(self.queue, 1, &si, 0) != VK_SUCCESS) return error.CreateFailed;
         _ = v.vkQueueWaitIdle(self.queue);
+    }
+
+    /// One dispatch as one submission -- `beginCmd`/`record`/`submitWait` for
+    /// the single-op callers.
+    pub fn dispatchWait(self: *Device, pipe: NDHandle, bufs: []const Buffer, push: []const u8, groups_x: u32) Error!void {
+        const c = try self.beginCmd();
+        try self.record(c, pipe, bufs, push, groups_x);
+        try self.submitWait(c);
     }
 };
