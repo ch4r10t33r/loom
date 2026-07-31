@@ -9,7 +9,8 @@
 // bias, when present, follows the logits in the same buffer at offset
 // n_expert -- the pipeline layout has four bindings and this keeps to three.
 #version 450
-layout(local_size_x = 1) in;
+layout(local_size_x = 64) in;
+shared float sc_sh[256];
 layout(std430, binding = 0) readonly buffer L { float logits[]; };
 layout(std430, binding = 1) writeonly buffer I { uint ids[]; };
 layout(std430, binding = 2) buffer G { float gates[]; }; // read back during renormalization
@@ -19,13 +20,22 @@ const uint MAX_EXPERTS = 256u;
 const uint MAX_SELECTED = 16u;
 
 void main() {
+    uint tid = gl_LocalInvocationID.x;
     float scores[MAX_EXPERTS];
     float choice[MAX_EXPERTS];
     if (pc.n_expert > MAX_EXPERTS || pc.n_used > MAX_SELECTED) return;
 
+    // Scoring parallelizes across the workgroup (the sigmoid case needs no
+    // reduction); the few-hundred-comparison top-k selection stays on one
+    // thread, as before -- it was the 26 serial sigmoid loops per token that
+    // showed up in the kernel profile, not the selection.
     if (pc.gating == 1u) {
-        for (uint e = 0u; e < pc.n_expert; e++) scores[e] = 1.0 / (1.0 + exp(-logits[e]));
+        for (uint e = tid; e < pc.n_expert; e += 64u) sc_sh[e] = 1.0 / (1.0 + exp(-logits[e]));
+        barrier();
+        if (tid != 0u) return;
+        for (uint e = 0u; e < pc.n_expert; e++) scores[e] = sc_sh[e];
     } else {
+        if (tid != 0u) return;
         float mx = -1.0 / 0.0;
         for (uint e = 0u; e < pc.n_expert; e++) mx = max(mx, logits[e]);
         float sum = 0.0;

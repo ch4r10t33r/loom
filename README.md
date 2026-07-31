@@ -174,7 +174,8 @@ CPU prompt prefill; marginal is the steady-state decode rate:
 | + vectorized dmmv kernels (u32 + vec4 loads) | 15.6 |
 | + coalesced attention grids | 19.8 |
 | + four-rows-per-workgroup dmmv | 20.3 (27 tok/s marginal) |
-| **+ working set to VRAM (activations, slots, cache)** | **32.1** (**63.7 tok/s marginal**) |
+| + working set to VRAM (activations, slots, cache) | 32.1 (63.7 tok/s marginal) |
+| **+ parallel route scoring** | **34.4** (**~69 tok/s marginal**) |
 
 Every kernel is pinned by an f64 dequantize-everything differential, and the
 whole-token frame carries a same-inputs determinism probe — both ran as
