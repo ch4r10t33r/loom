@@ -1,6 +1,7 @@
 // Q4_K id-indexed matvec, 128-bit loads; row arithmetic identical to
 // dmmv_q4k.comp, deliberately.
 #version 450
+#extension GL_EXT_shader_explicit_arithmetic_types_int8 : require
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) readonly buffer W { uvec4 w16[]; };
 layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
@@ -27,9 +28,10 @@ void scale_min(uint j, uvec4 hdr, out float sc, out float mn) {
     }
 }
 
+// unpack8 turns a masked word into four byte lanes in one instruction --
+// the dequant-ALU trick llama.cpp's mul_mat_vec_q4_k.comp uses.
 vec4 nib(uint qw, bool hi) {
-    return hi ? vec4(float((qw >> 4u) & 15u), float((qw >> 12u) & 15u), float((qw >> 20u) & 15u), float((qw >> 28u) & 15u))
-              : vec4(float(qw & 15u), float((qw >> 8u) & 15u), float((qw >> 16u) & 15u), float((qw >> 24u) & 15u));
+    return vec4(unpack8((hi ? (qw >> 4u) : qw) & 0x0F0F0F0Fu));
 }
 
 void main() {
