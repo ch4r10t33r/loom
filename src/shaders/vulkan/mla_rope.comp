@@ -1,0 +1,43 @@
+// DeepSeek's NORM-style rope with the YaRN branch: adjacent pairs (2i, 2i+1),
+// frequency by pair index, per-pair extrapolate/interpolate mixing on the
+// llama.cpp ramp when yarn_factor > 1. A faithful port of mla_rope.metal
+// (itself a port of ropeApply in deepseek.zig), tested against the host
+// directly -- rope is the classic silent failure.
+//
+// Rotates n_vec vectors in place, each `rope` floats, `stride` apart,
+// `offset` floats in, the whole family starting at buf_off -- so q heads
+// rotate where they live and a cache row rotates where it was appended.
+#version 450
+layout(local_size_x = 32) in;
+layout(std430, binding = 0) buffer V { float v[]; };
+layout(push_constant) uniform PC { uint n_vec; uint rope; uint stride; uint offset; uint pos; uint buf_off; float base; float yarn_factor; float yarn_orig_ctx; } pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    uint pairs = pc.rope / 2u;
+    uint vec = gid / pairs;
+    uint i = gid - vec * pairs;
+    if (vec >= pc.n_vec) return;
+    uint p = pc.buf_off + vec * pc.stride + pc.offset + 2u * i;
+
+    float dim = float(pc.rope);
+    float expo = float(2u * i) / dim;
+    float freq = pow(pc.base, -expo);
+    float theta_extrap = float(pc.pos) * freq;
+    float theta = theta_extrap;
+    if (pc.yarn_factor > 1.0) {
+        float two_pi = 6.283185307179586;
+        float low = max(0.0, floor(dim * log(pc.yarn_orig_ctx / (32.0 * two_pi)) / (2.0 * log(pc.base))));
+        float high = min(dim - 1.0, ceil(dim * log(pc.yarn_orig_ctx / (1.0 * two_pi)) / (2.0 * log(pc.base))));
+        float theta_interp = theta_extrap / pc.yarn_factor;
+        float y = (float(i) - low) / max(0.001, high - low);
+        float ramp_mix = 1.0 - clamp(y, 0.0, 1.0);
+        theta = theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix;
+    }
+    float c = cos(theta);
+    float sn = sin(theta);
+    float a = v[p];
+    float b = v[p + 1u];
+    v[p] = a * c - b * sn;
+    v[p + 1u] = a * sn + b * c;
+}

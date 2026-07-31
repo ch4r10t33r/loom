@@ -51,6 +51,10 @@ const rmsnorm_raw = @embedFile("../shaders/vulkan/rmsnorm.spv");
 const rmsnorm_spv: [rmsnorm_raw.len]u8 align(4) = rmsnorm_raw.*;
 const add_vec_raw = @embedFile("../shaders/vulkan/add_vec.spv");
 const add_vec_spv: [add_vec_raw.len]u8 align(4) = add_vec_raw.*;
+const mla_rope_raw = @embedFile("../shaders/vulkan/mla_rope.spv");
+const mla_rope_spv: [mla_rope_raw.len]u8 align(4) = mla_rope_raw.*;
+const copy_f32_raw = @embedFile("../shaders/vulkan/copy_f32.spv");
+const copy_f32_spv: [copy_f32_raw.len]u8 align(4) = copy_f32_raw.*;
 
 pub const ExpertRef = cpu.ExpertRef;
 pub const LayerSpec = cpu.LayerSpec;
@@ -82,7 +86,6 @@ pub const lastVerdict = cpu.lastVerdict;
 pub const layerBlock = cpu.layerBlock;
 pub const materializeArenas = cpu.materializeArenas;
 pub const matmul = cpu.matmul;
-pub const mlaTokenFrame = cpu.mlaTokenFrame;
 pub const moeFfnBlock = cpu.moeFfnBlock;
 pub const registerArena = cpu.registerArena;
 pub const releaseKvCache = cpu.releaseKvCache;
@@ -103,6 +106,8 @@ const Pipes = struct {
     wsum: u64 = 0,
     rmsnorm: u64 = 0,
     add: u64 = 0,
+    rope: u64 = 0,
+    copy: u64 = 0,
     q5_0: u64 = 0,
     q8_0: u64 = 0,
     q6_k: u64 = 0,
@@ -135,8 +140,11 @@ var accbuf: ?vk.Buffer = null;
 // the allocation was reused and triggers a fresh upload; the old device
 // buffer is leaked, which is acceptable because the model path uploads each
 // immutable mmap'd tensor exactly once. Same-pointer-same-length reuse with
-// *different* contents would be served stale -- impossible for mmap'd
-// weights, and the oracle test keeps its per-type buffers distinct.
+// *different* contents is served stale -- impossible for mmap'd weights, but
+// very possible for TESTS that free and reallocate same-shape tensors, where
+// the allocator hands back the same address run-dependently. That was a
+// 1-in-5 flake on real hardware, misread as a barrier race for a day; every
+// test that builds weight tensors clears this cache first.
 const CachedWeight = struct { buf: vk.Buffer, len: usize };
 var wcache: std.AutoHashMapUnmanaged(usize, CachedWeight) = .empty;
 
@@ -170,6 +178,8 @@ pub fn parallelBegin(n: usize) void {
         .wsum = d.pipeline(&mla_wsum_spv) catch return fail(),
         .rmsnorm = d.pipeline(&rmsnorm_spv) catch return fail(),
         .add = d.pipeline(&add_vec_spv) catch return fail(),
+        .rope = d.pipeline(&mla_rope_spv) catch return fail(),
+        .copy = d.pipeline(&copy_f32_spv) catch return fail(),
     };
 }
 
@@ -503,9 +513,12 @@ pub fn mlaSetWk(li: usize, wk_f32: []const f32) bool {
     return true;
 }
 
-const AbsorbPush = extern struct { n_heads: u32, nope: u32, kvr: u32, stride: u32 };
-const AttnPush = extern struct { n_heads: u32, kvr: u32, rope: u32, seq: u32, qr_off: u32, c_base: u32, r_base: u32, scale: f32 };
+const AbsorbPush = extern struct { n_heads: u32, nope: u32, kvr: u32, stride: u32, q_stride: u32, q_off: u32 };
+const AttnPush = extern struct { n_heads: u32, kvr: u32, rope: u32, seq: u32, qr_stride: u32, qr_off: u32, c_base: u32, r_base: u32, scale: f32 };
 const WsumPush = extern struct { n_heads: u32, kvr: u32, seq: u32, c_base: u32 };
+const NormPush = extern struct { n: u32, eps: f32, x_off: u32 = 0, out_off: u32 = 0 };
+const RopePush = extern struct { n_vec: u32, rope: u32, stride: u32, offset: u32, pos: u32, buf_off: u32, base: f32, yarn_factor: f32, yarn_orig_ctx: f32 };
+const CopyPush = extern struct { n: u32, in_off: u32, out_off: u32 };
 
 /// Everything the attention recording needs resolved and staged, or null to
 /// decline before anything is recorded.
@@ -544,22 +557,23 @@ fn prepAttn(d: *vk.Device, li: usize, pos: usize, q_nope: []const f32, q_rope: [
 
 /// Record absorb -> attention -> weighted sum -> W_v; the result lands in
 /// `hout` on the device.
-fn recordAttn(d: *vk.Device, c: vk.Device.Cmd, p: AttnPrep, li: usize, n_heads: usize, nope: usize, v_head_dim: usize, scale: f32) vk.Error!void {
+fn recordAttn(d: *vk.Device, c: vk.Device.Cmd, p: AttnPrep, li: usize, n_heads: usize, nope: usize, v_head_dim: usize, scale: f32, qsrc: vk.Buffer, q_stride: usize, q_off: usize, qr_stride: usize, qr_off: usize) vk.Error!void {
     const w = p.w;
-    const apush = AbsorbPush{ .n_heads = @intCast(n_heads), .nope = @intCast(nope), .kvr = @intCast(w.kvr), .stride = @intCast(nope + v_head_dim) };
-    try d.record(c, pipes.absorb, &.{ mla_wk.items[li], qbuf.?, qabs.? }, std.mem.asBytes(&apush), @intCast(n_heads * w.kvr));
+    const apush = AbsorbPush{ .n_heads = @intCast(n_heads), .nope = @intCast(nope), .kvr = @intCast(w.kvr), .stride = @intCast(nope + v_head_dim), .q_stride = @intCast(q_stride), .q_off = @intCast(q_off) };
+    try d.record(c, pipes.absorb, &.{ mla_wk.items[li], qsrc, qabs.? }, std.mem.asBytes(&apush), @intCast(n_heads * w.kvr));
     d.barrier(c);
     const tpush = AttnPush{
         .n_heads = @intCast(n_heads),
         .kvr = @intCast(w.kvr),
         .rope = @intCast(w.rope),
         .seq = @intCast(p.seq),
-        .qr_off = @intCast(n_heads * nope),
+        .qr_stride = @intCast(qr_stride),
+        .qr_off = @intCast(qr_off),
         .c_base = @intCast(li * w.ctx * w.kvr),
         .r_base = @intCast(mla_r0 + li * w.ctx * w.rope),
         .scale = scale,
     };
-    try d.record(c, pipes.attn, &.{ qabs.?, qbuf.?, mla_cache.?, probs_buf.? }, std.mem.asBytes(&tpush), @intCast(n_heads));
+    try d.record(c, pipes.attn, &.{ qabs.?, qsrc, mla_cache.?, probs_buf.? }, std.mem.asBytes(&tpush), @intCast(n_heads));
     d.barrier(c);
     const wpush = WsumPush{ .n_heads = @intCast(n_heads), .kvr = @intCast(w.kvr), .seq = @intCast(p.seq), .c_base = @intCast(li * w.ctx * w.kvr) };
     try d.record(c, pipes.wsum, &.{ probs_buf.?, mla_cache.?, olat.? }, std.mem.asBytes(&wpush), @intCast(n_heads * w.kvr));
@@ -584,7 +598,7 @@ pub fn mlaAttnHeads(li: usize, pos: usize, q_nope: []const f32, q_rope: []const 
     if (out.len != n_heads * v_head_dim) return false;
     const p = prepAttn(d, li, pos, q_nope, q_rope, kv_b, n_heads, nope, v_head_dim) orelse return false;
     const c = d.beginCmd() catch return false;
-    recordAttn(d, c, p, li, n_heads, nope, v_head_dim, scale) catch return false;
+    recordAttn(d, c, p, li, n_heads, nope, v_head_dim, scale, qbuf.?, nope, 0, p.w.rope, n_heads * nope) catch return false;
     d.submitWait(c) catch return false;
     cmdbufs += 1;
     @memcpy(out, hout.?.slice(f32)[0..out.len]);
@@ -646,7 +660,7 @@ pub fn mlaLayerTail(li: usize, pos: usize, x: []f32, q_nope: []const f32, q_rope
     const d_proj = extern struct { rows: u32, cols: u32 }{ .rows = @intCast(dim), .cols = @intCast(n_heads * v_head_dim) };
     const d_router = extern struct { rows: u32, cols: u32 }{ .rows = @intCast(cfg.n_expert), .cols = @intCast(dim) };
     const n_add = extern struct { n: u32 }{ .n = @intCast(dim) };
-    const d_norm = extern struct { n: u32, eps: f32 }{ .n = @intCast(dim), .eps = eps };
+    const d_norm = NormPush{ .n = @intCast(dim), .eps = eps };
     const rpush = RoutePush{
         .n_expert = @intCast(cfg.n_expert),
         .n_used = @intCast(cfg.n_used),
@@ -662,7 +676,7 @@ pub fn mlaLayerTail(li: usize, pos: usize, x: []f32, q_nope: []const f32, q_rope
     const n_red = extern struct { n: u32, dim: u32 }{ .n = @intCast(cfg.n_used), .dim = @intCast(dim) };
 
     const c = d.beginCmd() catch return false;
-    recordAttn(d, c, p, li, n_heads, nope, v_head_dim, scale) catch return false;
+    recordAttn(d, c, p, li, n_heads, nope, v_head_dim, scale, qbuf.?, nope, 0, p.w.rope, n_heads * nope) catch return false;
     d.barrier(c);
     d.record(c, ap, &.{ aw, hout.?, pj }, std.mem.asBytes(&d_proj), @intCast(dim)) catch return false;
     d.barrier(c);
@@ -706,6 +720,255 @@ pub fn mlaLayerTail(li: usize, pos: usize, x: []f32, q_nope: []const f32, q_rope
     return true;
 }
 
+var qfull: ?vk.Buffer = null; // [n_heads][kd] straight from the q projection
+var kva_buf: ?vk.Buffer = null; // kvr + rope, the kv_a projection
+
+/// The whole token as one submission: for every layer the attention head
+/// (attn norm, q and kv_a projections, kv_a norm into the cache row, rope on
+/// q and on the cached k_rope), the compressed-cache attention, the output
+/// projection and residual, and the FFN -- routed MoE with shared expert or
+/// dense -- then the final norm and lm_head. In: the residual stream after
+/// embedding. Out: the stream and the logits. The device cache holds this
+/// position's rows afterwards; the engine mirrors them back to its host
+/// cache, which stays authoritative for any fallback.
+///
+/// The port of Metal's `mlaTokenFrame`, dispatch for dispatch; buffer
+/// offsets become push-constant offsets throughout.
+pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos: usize, out_norm: []const f32, lm_head: WeightRef, logits: []f32) bool {
+    const d = &(dev orelse return false);
+    if (!use_gpu_ops) return false;
+    // LOOM_NO_FRAME bisects against the per-layer tail in one binary.
+    if (std.c.getenv("LOOM_NO_FRAME") != null) return false;
+    const w = ensureMlaCache(d) orelse return false;
+    if (pos + 1 > w.ctx or descs.len > mla_wk.items.len) return false;
+    const dim = fc.dim;
+    const kd = fc.nope + fc.rope;
+    const seq = pos + 1;
+    const vocab = logits.len;
+    if (x.len != dim or out_norm.len != dim) return false;
+    if (fc.routed.n_used == 0 or fc.routed.n_used > MAX_MOE_EXPERTS or fc.routed.n_expert > 256) return false;
+    if (fc.kvr != w.kvr or fc.rope != w.rope) return false;
+
+    // Resolve every layer -- pipelines, device weights, uploaded norms --
+    // before a single dispatch is recorded. Norms go through the same
+    // pointer-keyed cache as weights: uploaded once, tiny.
+    const P = struct {
+        anw: vk.Buffer,
+        qp: u64,
+        qw: vk.Buffer,
+        kap: u64,
+        kaw: vk.Buffer,
+        kanw: vk.Buffer,
+        vp: u64,
+        vw: vk.Buffer,
+        row_bytes: usize,
+        pp: u64,
+        pw: vk.Buffer,
+        fnw: vk.Buffer,
+        rp: u64 = 0,
+        rw: vk.Buffer = undefined,
+        gp: u64 = 0,
+        gw: vk.Buffer = undefined,
+        up: u64 = 0,
+        uw: vk.Buffer = undefined,
+        dp: u64 = 0,
+        dw: vk.Buffer = undefined,
+        sh_pipes: [3]u64 = @splat(0),
+        shw: [3]vk.Buffer = undefined,
+        dqp: [3]u64 = @splat(0),
+        dqw: [3]vk.Buffer = undefined,
+    };
+    var plans: [64]P = undefined;
+    if (descs.len > plans.len) return false;
+    var s12_len: usize = 1;
+    for (descs, 0..) |dd, i| {
+        var p: P = .{ .anw = undefined, .qp = undefined, .qw = undefined, .kap = undefined, .kaw = undefined, .kanw = undefined, .vp = undefined, .vw = undefined, .row_bytes = undefined, .pp = undefined, .pw = undefined, .fnw = undefined };
+        p.anw = weightBuffer(d, std.mem.sliceAsBytes(dd.attn_norm)) orelse return false;
+        p.qp = pipeFor(dd.wq.ty, dim) orelse return false;
+        p.qw = weightBuffer(d, dd.wq.data) orelse return false;
+        p.kap = pipeFor(dd.kv_a.ty, dim) orelse return false;
+        p.kaw = weightBuffer(d, dd.kv_a.data) orelse return false;
+        p.kanw = weightBuffer(d, std.mem.sliceAsBytes(dd.kv_a_norm)) orelse return false;
+        p.vp = idPipeFor(dd.kv_b.ty, fc.kvr) orelse return false;
+        p.vw = weightBuffer(d, dd.kv_b.data) orelse return false;
+        p.row_bytes = dd.kv_b.data.len / (fc.n_heads * (fc.nope + fc.v_head_dim));
+        p.pp = pipeFor(dd.attn_out.ty, fc.n_heads * fc.v_head_dim) orelse return false;
+        p.pw = weightBuffer(d, dd.attn_out.data) orelse return false;
+        p.fnw = weightBuffer(d, std.mem.sliceAsBytes(dd.ffn_norm)) orelse return false;
+        if (dd.is_moe) {
+            p.rp = pipeFor(dd.router.ty, dim) orelse return false;
+            p.rw = weightBuffer(d, dd.router.data) orelse return false;
+            p.gp = idPipeFor(dd.gate.ty, dim) orelse return false;
+            p.gw = weightBuffer(d, dd.gate.data) orelse return false;
+            p.up = idPipeFor(dd.up.ty, dim) orelse return false;
+            p.uw = weightBuffer(d, dd.up.data) orelse return false;
+            p.dp = idPipeFor(dd.down.ty, dd.ffn) orelse return false;
+            p.dw = weightBuffer(d, dd.down.data) orelse return false;
+            s12_len = @max(s12_len, fc.routed.n_used * dd.ffn);
+            if (dd.shexp) |sw| {
+                p.sh_pipes[0] = pipeFor(sw[0].ty, dim) orelse return false;
+                p.sh_pipes[1] = pipeFor(sw[1].ty, dim) orelse return false;
+                p.sh_pipes[2] = pipeFor(sw[2].ty, dd.shexp_ffn) orelse return false;
+                for (sw, 0..) |w2, k| p.shw[k] = weightBuffer(d, w2.data) orelse return false;
+                s12_len = @max(s12_len, dd.shexp_ffn);
+            }
+        } else {
+            p.dqp[0] = pipeFor(dd.dgate.ty, dim) orelse return false;
+            p.dqp[1] = pipeFor(dd.dup.ty, dim) orelse return false;
+            p.dqp[2] = pipeFor(dd.ddown.ty, dd.dffn) orelse return false;
+            p.dqw[0] = weightBuffer(d, dd.dgate.data) orelse return false;
+            p.dqw[1] = weightBuffer(d, dd.dup.data) orelse return false;
+            p.dqw[2] = weightBuffer(d, dd.ddown.data) orelse return false;
+            s12_len = @max(s12_len, dd.dffn);
+        }
+        plans[i] = p;
+    }
+    const onw = weightBuffer(d, std.mem.sliceAsBytes(out_norm)) orelse return false;
+    const lmp = pipeFor(lm_head.ty, dim) orelse return false;
+    const lmw = weightBuffer(d, lm_head.data) orelse return false;
+    if (vids == null) {
+        const b = d.alloc(64 * 4) catch return false;
+        for (0..64) |k| b.slice(u32)[k] = @intCast(k);
+        vids = b;
+    }
+    const xr = ensure(&xres, d, dim * 4) orelse return false;
+    const nb = ensure(&normed_buf, d, dim * 4) orelse return false;
+    const qf = ensure(&qfull, d, fc.n_heads * kd * 4) orelse return false;
+    const kva = ensure(&kva_buf, d, (fc.kvr + fc.rope) * 4) orelse return false;
+    _ = ensure(&qabs, d, fc.n_heads * fc.kvr * 4) orelse return false;
+    _ = ensure(&probs_buf, d, fc.n_heads * w.ctx * 4) orelse return false;
+    _ = ensure(&olat, d, fc.n_heads * fc.kvr * 4) orelse return false;
+    _ = ensure(&hout, d, fc.n_heads * fc.v_head_dim * 4) orelse return false;
+    const pj = ensure(&projb, d, dim * 4) orelse return false;
+    const lb = ensure(&lbuf, d, @max(fc.routed.n_expert, 1) * 2 * 4) orelse return false;
+    const idb = ensure(&ids_buf, d, MAX_MOE_EXPERTS * 4) orelse return false;
+    const gb = ensure(&gates_buf, d, MAX_MOE_EXPERTS * 4) orelse return false;
+    const s1 = ensure(&slots[0], d, s12_len * 4) orelse return false;
+    const s2 = ensure(&slots[1], d, s12_len * 4) orelse return false;
+    const s3 = ensure(&slots[2], d, @max(fc.routed.n_used, 1) * dim * 4) orelse return false;
+    const acc = ensure(&accbuf, d, dim * 4) orelse return false;
+    const ob = ensure(&obuf, d, vocab * 4) orelse return false;
+    @memcpy(xr.slice(f32)[0..dim], x);
+
+    const nd = NormPush{ .n = @intCast(dim), .eps = fc.eps };
+    const n_add = extern struct { n: u32 }{ .n = @intCast(dim) };
+    const Dims2 = extern struct { rows: u32, cols: u32 };
+    const d_q = Dims2{ .rows = @intCast(fc.n_heads * kd), .cols = @intCast(dim) };
+    const d_ka = Dims2{ .rows = @intCast(fc.kvr + fc.rope), .cols = @intCast(dim) };
+    const d_proj = Dims2{ .rows = @intCast(dim), .cols = @intCast(fc.n_heads * fc.v_head_dim) };
+    const d_router = Dims2{ .rows = @intCast(fc.routed.n_expert), .cols = @intCast(dim) };
+    const rpush = RoutePush{
+        .n_expert = @intCast(fc.routed.n_expert),
+        .n_used = @intCast(fc.routed.n_used),
+        .gating = if (fc.routed.gating_sigmoid) 1 else 0,
+        .weights_norm = if (fc.routed.weights_norm) 1 else 0,
+        .has_bias = 0, // buildFrameDescs declines biased-router models
+        .weights_scale = fc.routed.weights_scale,
+    };
+    const apush = AbsorbPush{ .n_heads = @intCast(fc.n_heads), .nope = @intCast(fc.nope), .kvr = @intCast(fc.kvr), .stride = @intCast(fc.nope + fc.v_head_dim), .q_stride = @intCast(kd), .q_off = 0 };
+    const rope_q = RopePush{ .n_vec = @intCast(fc.n_heads), .rope = @intCast(fc.rope), .stride = @intCast(kd), .offset = @intCast(fc.nope), .pos = @intCast(pos), .buf_off = 0, .base = fc.rope_base, .yarn_factor = fc.yarn_factor, .yarn_orig_ctx = fc.yarn_orig_ctx };
+
+    const c = d.beginCmd() catch return false;
+    for (descs, 0..) |dd, li| {
+        const p = &plans[li];
+        const c_pos: usize = (li * w.ctx + pos) * fc.kvr;
+        const r_pos: usize = mla_r0 + (li * w.ctx + pos) * fc.rope;
+        // ---- head ----
+        d.record(c, pipes.rmsnorm, &.{ xr, p.anw, nb }, std.mem.asBytes(&nd), 1) catch return false;
+        d.barrier(c);
+        d.record(c, p.qp, &.{ p.qw, nb, qf }, std.mem.asBytes(&d_q), @intCast(fc.n_heads * kd)) catch return false;
+        d.record(c, p.kap, &.{ p.kaw, nb, kva }, std.mem.asBytes(&d_ka), @intCast(fc.kvr + fc.rope)) catch return false;
+        d.barrier(c);
+        // c_kv: norm straight into the cache row; k_rope: copy then rotate there.
+        const nd_kv = NormPush{ .n = @intCast(fc.kvr), .eps = fc.eps, .x_off = 0, .out_off = @intCast(c_pos) };
+        d.record(c, pipes.rmsnorm, &.{ kva, p.kanw, mla_cache.? }, std.mem.asBytes(&nd_kv), 1) catch return false;
+        const cp = CopyPush{ .n = @intCast(fc.rope), .in_off = @intCast(fc.kvr), .out_off = @intCast(r_pos) };
+        d.record(c, pipes.copy, &.{ kva, mla_cache.? }, std.mem.asBytes(&cp), @intCast((fc.rope + 63) / 64)) catch return false;
+        d.record(c, pipes.rope, &.{qf}, std.mem.asBytes(&rope_q), @intCast((fc.n_heads * fc.rope / 2 + 31) / 32)) catch return false;
+        d.barrier(c);
+        const rope_k = RopePush{ .n_vec = 1, .rope = @intCast(fc.rope), .stride = 0, .offset = 0, .pos = @intCast(pos), .buf_off = @intCast(r_pos), .base = fc.rope_base, .yarn_factor = fc.yarn_factor, .yarn_orig_ctx = fc.yarn_orig_ctx };
+        d.record(c, pipes.rope, &.{mla_cache.?}, std.mem.asBytes(&rope_k), @intCast((fc.rope / 2 + 31) / 32)) catch return false;
+        d.barrier(c);
+        // ---- attention, q read in place: nope at h*kd, rope at h*kd+nope ----
+        d.record(c, pipes.absorb, &.{ mla_wk.items[li], qf, qabs.? }, std.mem.asBytes(&apush), @intCast(fc.n_heads * fc.kvr)) catch return false;
+        d.barrier(c);
+        const tpush = AttnPush{ .n_heads = @intCast(fc.n_heads), .kvr = @intCast(fc.kvr), .rope = @intCast(fc.rope), .seq = @intCast(seq), .qr_stride = @intCast(kd), .qr_off = @intCast(fc.nope), .c_base = @intCast(li * w.ctx * fc.kvr), .r_base = @intCast(mla_r0 + li * w.ctx * fc.rope), .scale = fc.scale };
+        d.record(c, pipes.attn, &.{ qabs.?, qf, mla_cache.?, probs_buf.? }, std.mem.asBytes(&tpush), @intCast(fc.n_heads)) catch return false;
+        d.barrier(c);
+        const wpush = WsumPush{ .n_heads = @intCast(fc.n_heads), .kvr = @intCast(fc.kvr), .seq = @intCast(seq), .c_base = @intCast(li * w.ctx * fc.kvr) };
+        d.record(c, pipes.wsum, &.{ probs_buf.?, mla_cache.?, olat.? }, std.mem.asBytes(&wpush), @intCast(fc.n_heads * fc.kvr)) catch return false;
+        d.barrier(c);
+        const vpush = IdPush{ .rows = @intCast(fc.v_head_dim), .cols = @intCast(fc.kvr), .n_used = @intCast(fc.n_heads), .plane_stride = @intCast((fc.nope + fc.v_head_dim) * p.row_bytes), .x_stride = @intCast(fc.kvr), .base = @intCast(fc.nope * p.row_bytes) };
+        d.record(c, p.vp, &.{ p.vw, olat.?, hout.?, vids.? }, std.mem.asBytes(&vpush), @intCast(fc.n_heads * fc.v_head_dim)) catch return false;
+        d.barrier(c);
+        // ---- projection, residual, FFN norm ----
+        d.record(c, p.pp, &.{ p.pw, hout.?, pj }, std.mem.asBytes(&d_proj), @intCast(dim)) catch return false;
+        d.barrier(c);
+        d.record(c, pipes.add, &.{ xr, pj }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
+        d.barrier(c);
+        d.record(c, pipes.rmsnorm, &.{ xr, p.fnw, nb }, std.mem.asBytes(&nd), 1) catch return false;
+        d.barrier(c);
+        if (dd.is_moe) {
+            d.record(c, p.rp, &.{ p.rw, nb, lb }, std.mem.asBytes(&d_router), @intCast(fc.routed.n_expert)) catch return false;
+            d.barrier(c);
+            d.record(c, pipes.route, &.{ lb, idb, gb }, std.mem.asBytes(&rpush), 1) catch return false;
+            d.barrier(c);
+            const d_gate = IdPush{ .rows = @intCast(dd.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(dd.gate.data.len / fc.routed.n_expert), .x_stride = 0 };
+            const d_up = IdPush{ .rows = @intCast(dd.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(dd.up.data.len / fc.routed.n_expert), .x_stride = 0 };
+            const d_down = IdPush{ .rows = @intCast(dim), .cols = @intCast(dd.ffn), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(dd.down.data.len / fc.routed.n_expert), .x_stride = @intCast(dd.ffn) };
+            d.record(c, p.gp, &.{ p.gw, nb, s1, idb }, std.mem.asBytes(&d_gate), @intCast(fc.routed.n_used * dd.ffn)) catch return false;
+            d.record(c, p.up, &.{ p.uw, nb, s2, idb }, std.mem.asBytes(&d_up), @intCast(fc.routed.n_used * dd.ffn)) catch return false;
+            d.barrier(c);
+            const n_sw = extern struct { n: u32 }{ .n = @intCast(fc.routed.n_used * dd.ffn) };
+            d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_sw), @intCast((fc.routed.n_used * dd.ffn + 63) / 64)) catch return false;
+            d.barrier(c);
+            d.record(c, p.dp, &.{ p.dw, s1, s3, idb }, std.mem.asBytes(&d_down), @intCast(fc.routed.n_used * dim)) catch return false;
+            d.barrier(c);
+            const n_red = extern struct { n: u32, dim: u32 }{ .n = @intCast(fc.routed.n_used), .dim = @intCast(dim) };
+            d.record(c, pipes.reduce_dev, &.{ acc, s3, gb }, std.mem.asBytes(&n_red), @intCast((dim + 63) / 64)) catch return false;
+            d.barrier(c);
+            if (dd.shexp != null) {
+                const d_sh = Dims2{ .rows = @intCast(dd.shexp_ffn), .cols = @intCast(dim) };
+                const d_shd = Dims2{ .rows = @intCast(dim), .cols = @intCast(dd.shexp_ffn) };
+                const n_shsw = extern struct { n: u32 }{ .n = @intCast(dd.shexp_ffn) };
+                d.record(c, p.sh_pipes[0], &.{ p.shw[0], nb, s1 }, std.mem.asBytes(&d_sh), @intCast(dd.shexp_ffn)) catch return false;
+                d.record(c, p.sh_pipes[1], &.{ p.shw[1], nb, s2 }, std.mem.asBytes(&d_sh), @intCast(dd.shexp_ffn)) catch return false;
+                d.barrier(c);
+                d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_shsw), @intCast((dd.shexp_ffn + 63) / 64)) catch return false;
+                d.barrier(c);
+                d.record(c, p.sh_pipes[2], &.{ p.shw[2], s1, s3 }, std.mem.asBytes(&d_shd), @intCast(dim)) catch return false;
+                d.barrier(c);
+                d.record(c, pipes.add, &.{ acc, s3 }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
+                d.barrier(c);
+            }
+            d.record(c, pipes.add, &.{ xr, acc }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
+        } else {
+            const d_f = Dims2{ .rows = @intCast(dd.dffn), .cols = @intCast(dim) };
+            const d_fd = Dims2{ .rows = @intCast(dim), .cols = @intCast(dd.dffn) };
+            const n_f = extern struct { n: u32 }{ .n = @intCast(dd.dffn) };
+            d.record(c, p.dqp[0], &.{ p.dqw[0], nb, s1 }, std.mem.asBytes(&d_f), @intCast(dd.dffn)) catch return false;
+            d.record(c, p.dqp[1], &.{ p.dqw[1], nb, s2 }, std.mem.asBytes(&d_f), @intCast(dd.dffn)) catch return false;
+            d.barrier(c);
+            d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_f), @intCast((dd.dffn + 63) / 64)) catch return false;
+            d.barrier(c);
+            d.record(c, p.dqp[2], &.{ p.dqw[2], s1, s3 }, std.mem.asBytes(&d_fd), @intCast(dim)) catch return false;
+            d.barrier(c);
+            d.record(c, pipes.add, &.{ xr, s3 }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
+        }
+        d.barrier(c);
+    }
+    // ---- final norm and lm_head ----
+    d.record(c, pipes.rmsnorm, &.{ xr, onw, nb }, std.mem.asBytes(&nd), 1) catch return false;
+    d.barrier(c);
+    const d_lm = Dims2{ .rows = @intCast(vocab), .cols = @intCast(dim) };
+    d.record(c, lmp, &.{ lmw, nb, ob }, std.mem.asBytes(&d_lm), @intCast(vocab)) catch return false;
+    d.submitWait(c) catch return false;
+    cmdbufs += 1;
+    @memcpy(x, xr.slice(f32)[0..dim]);
+    @memcpy(logits, ob.slice(f32)[0..vocab]);
+    return true;
+}
+
 test "vulkan moe_route agrees with the host route" {
     // The two silent-when-wrong details -- bias shifting selection but not
     // gates, and the f16-clamped renormalization -- are exactly what a
@@ -721,6 +984,7 @@ test "vulkan moe_route agrees with the host route" {
     const saved = use_gpu_ops;
     use_gpu_ops = true;
     defer use_gpu_ops = saved;
+    wcache.clearRetainingCapacity(); // test tensors may recycle freed addresses
 
     var prng = std.Random.DefaultPrng.init(0x0740E);
     const rnd = prng.random();
@@ -779,6 +1043,7 @@ test "vulkan routed moe block agrees with the exact reference" {
     const saved = use_gpu_ops;
     use_gpu_ops = true;
     defer use_gpu_ops = saved;
+    wcache.clearRetainingCapacity(); // test tensors may recycle freed addresses
 
     var prng = std.Random.DefaultPrng.init(0x0740F);
     const rnd = prng.random();
@@ -918,6 +1183,7 @@ test "vulkan mla attention agrees with the exact reference" {
     const saved = use_gpu_ops;
     use_gpu_ops = true;
     defer use_gpu_ops = saved;
+    wcache.clearRetainingCapacity(); // test tensors may recycle freed addresses
 
     var prng = std.Random.DefaultPrng.init(0x1207A);
     const rnd = prng.random();
@@ -928,6 +1194,8 @@ test "vulkan mla attention agrees with the exact reference" {
     while (b + 34 <= kvb.len) : (b += 34) std.mem.writeInt(u16, kvb[b..][0..2], 0x2C00, .little);
 
     try std.testing.expect(mlaInit(2, ctx, kvr, rope));
+    mla_cache = null;
+    mla_wk.clearRetainingCapacity();
     const wkbuf = try gpa.alloc(f32, n_heads * stride * kvr);
     defer gpa.free(wkbuf);
     for (0..n_heads * stride) |r| cpu.dequantRow(.q8_0, wkbuf[r * kvr ..][0..kvr], kvb, r, kvr);
@@ -1037,6 +1305,7 @@ test "vulkan mla layer tail agrees with its constituents" {
     const saved = use_gpu_ops;
     use_gpu_ops = true;
     defer use_gpu_ops = saved;
+    wcache.clearRetainingCapacity(); // test tensors may recycle freed addresses
 
     var prng = std.Random.DefaultPrng.init(0x1207B);
     const rnd = prng.random();
@@ -1164,6 +1433,453 @@ test "vulkan mla layer tail agrees with its constituents" {
     }
 }
 
+test "vulkan mla rope kernel matches the host ropeApply, plain and yarn, strided" {
+    // Rotates in place where q lives -- stride kd, offset nope, family base
+    // buf_off -- so a wrong stride rotates the wrong halves of the wrong
+    // heads, which is exactly as silent as every other rope bug.
+    const deepseek = @import("../gguf/deepseek.zig");
+    const gpa = std.testing.allocator;
+    const n_vec = 4;
+    const rope = 16;
+    const stride = 48;
+    const offset = 24;
+    const buf_off = 8;
+    const pos = 37;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    const d = &(dev orelse return error.SkipZigTest);
+    const saved = use_gpu_ops;
+    use_gpu_ops = true;
+    defer use_gpu_ops = saved;
+    wcache.clearRetainingCapacity(); // test tensors may recycle freed addresses
+
+    var prng = std.Random.DefaultPrng.init(0x1207E);
+    const rnd = prng.random();
+    const host = try gpa.alloc(f32, buf_off + n_vec * stride);
+    defer gpa.free(host);
+    for (host) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    inline for (.{ 1.0, 40.0 }) |yf| {
+        const dev_buf = d.alloc(host.len * 4) catch return error.SkipZigTest;
+        @memcpy(dev_buf.slice(f32)[0..host.len], host);
+        const want = try gpa.dupe(f32, host);
+        defer gpa.free(want);
+        var cfg: deepseek.Config = undefined;
+        cfg.rope_base = 10000.0;
+        cfg.yarn_factor = yf;
+        cfg.yarn_orig_ctx = 4096.0;
+        cfg.yarn_log_mul = 0;
+        for (0..n_vec) |k| deepseek.ropeApplyForTest(cfg, want[buf_off + k * stride + offset ..][0..rope], pos);
+
+        const push = RopePush{ .n_vec = n_vec, .rope = rope, .stride = stride, .offset = offset, .pos = pos, .buf_off = buf_off, .base = 10000.0, .yarn_factor = yf, .yarn_orig_ctx = 4096.0 };
+        d.dispatchWait(pipes.rope, &.{dev_buf}, std.mem.asBytes(&push), (n_vec * rope / 2 + 31) / 32) catch return error.SkipZigTest;
+
+        const got = dev_buf.slice(f32)[0..host.len];
+        for (want, got, 0..) |a, b, k| {
+            std.testing.expectApproxEqAbs(a, b, 1e-5) catch |e| {
+                std.debug.print("rope yf={d} idx {d}: host {d} vs gpu {d}\n", .{ yf, k, a, b });
+                return e;
+            };
+        }
+    }
+}
+
+test "vulkan whole-token frame agrees with the f64 constituents" {
+    // Two layers -- dense then MoE-with-shared-expert -- through the whole
+    // frame: head projections, norm-into-cache, rope on device, attention,
+    // FFN, final norm, q6_k lm_head. The reference recomputes the token in
+    // f64 from the quantized tensors, sharing nothing with the kernels; the
+    // cache rows the frame wrote are checked too, because a frame that
+    // attends correctly but caches garbage only fails on the NEXT token.
+    const deepseek = @import("../gguf/deepseek.zig");
+    const moe = @import("../gguf/moe.zig");
+    const gpa = std.testing.allocator;
+    const n_heads = 4;
+    const nope = 32;
+    const vd = 16;
+    const kd = nope + 16;
+    const kvr = 64;
+    const rope = 16;
+    const ctx = 64;
+    const pos = 3;
+    const dim = 512;
+    const dffn = 192;
+    const ffn = 256;
+    const shexp_ffn = 256;
+    const n_expert = 8;
+    const n_used = 3;
+    const vocab = 128;
+    const stride = nope + vd;
+    const eps: f32 = 1e-6;
+    const scale: f32 = 0.25;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (dev == null) return error.SkipZigTest;
+    const saved = use_gpu_ops;
+    use_gpu_ops = true;
+    defer use_gpu_ops = saved;
+    wcache.clearRetainingCapacity(); // test tensors may recycle freed addresses
+
+    var prng = std.Random.DefaultPrng.init(0x1207F);
+    const rnd = prng.random();
+    const pin = struct {
+        fn f(data: []u8, block: usize, d_off: usize, dmin: bool) void {
+            var b: usize = 0;
+            while (b + block <= data.len) : (b += block) {
+                std.mem.writeInt(u16, data[b + d_off ..][0..2], 0x2C00, .little);
+                if (dmin) std.mem.writeInt(u16, data[b + 2 ..][0..2], 0x2800, .little);
+            }
+        }
+    }.f;
+    const q8 = struct {
+        fn alloc(g: std.mem.Allocator, r: std.Random, cols: usize, rows: usize) ![]u8 {
+            const data = try g.alloc(u8, ggml.tensorBytes(.q8_0, cols, rows));
+            r.bytes(data);
+            var b: usize = 0;
+            while (b + 34 <= data.len) : (b += 34) std.mem.writeInt(u16, data[b..][0..2], 0x2C00, .little);
+            return data;
+        }
+    };
+
+    // Per-layer attention tensors, distinct so a cross-layer mixup cannot pass.
+    var kvb: [2][]u8 = undefined;
+    var wq: [2][]u8 = undefined;
+    var kva_w: [2][]u8 = undefined;
+    var attn_out: [2][]u8 = undefined;
+    var attn_norm: [2][]f32 = undefined;
+    var kva_norm: [2][]f32 = undefined;
+    var ffn_norm: [2][]f32 = undefined;
+    for (0..2) |l| {
+        kvb[l] = try q8.alloc(gpa, rnd, kvr, n_heads * stride);
+        wq[l] = try q8.alloc(gpa, rnd, dim, n_heads * kd);
+        kva_w[l] = try q8.alloc(gpa, rnd, dim, kvr + rope);
+        attn_out[l] = try q8.alloc(gpa, rnd, n_heads * vd, dim);
+        attn_norm[l] = try gpa.alloc(f32, dim);
+        kva_norm[l] = try gpa.alloc(f32, kvr);
+        ffn_norm[l] = try gpa.alloc(f32, dim);
+        for (attn_norm[l]) |*v| v.* = 0.5 + rnd.float(f32);
+        for (kva_norm[l]) |*v| v.* = 0.5 + rnd.float(f32);
+        for (ffn_norm[l]) |*v| v.* = 0.5 + rnd.float(f32);
+    }
+    defer for (0..2) |l| {
+        gpa.free(kvb[l]);
+        gpa.free(wq[l]);
+        gpa.free(kva_w[l]);
+        gpa.free(attn_out[l]);
+        gpa.free(attn_norm[l]);
+        gpa.free(kva_norm[l]);
+        gpa.free(ffn_norm[l]);
+    };
+    // Layer 0 dense FFN; layer 1 routed with shared expert.
+    const dgate = try q8.alloc(gpa, rnd, dim, dffn);
+    defer gpa.free(dgate);
+    const dup = try q8.alloc(gpa, rnd, dim, dffn);
+    defer gpa.free(dup);
+    const ddown = try q8.alloc(gpa, rnd, dffn, dim);
+    defer gpa.free(ddown);
+    const gw = try gpa.alloc(u8, n_expert * ggml.tensorBytes(.q4_k, dim, ffn));
+    defer gpa.free(gw);
+    rnd.bytes(gw);
+    pin(gw, 144, 0, true);
+    const uw = try q8.alloc(gpa, rnd, dim, n_expert * ffn);
+    defer gpa.free(uw);
+    const dw = try gpa.alloc(u8, n_expert * ggml.tensorBytes(.q5_0, ffn, dim));
+    defer gpa.free(dw);
+    rnd.bytes(dw);
+    pin(dw, 22, 0, false);
+    const sg = try gpa.alloc(u8, ggml.tensorBytes(.q4_k, dim, shexp_ffn));
+    defer gpa.free(sg);
+    const su = try gpa.alloc(u8, ggml.tensorBytes(.q4_k, dim, shexp_ffn));
+    defer gpa.free(su);
+    const sd = try gpa.alloc(u8, ggml.tensorBytes(.q4_k, shexp_ffn, dim));
+    defer gpa.free(sd);
+    for ([_][]u8{ sg, su, sd }) |data| {
+        rnd.bytes(data);
+        pin(data, 144, 0, true);
+    }
+    const router = try gpa.alloc(f32, n_expert * dim);
+    defer gpa.free(router);
+    for (router) |*v| v.* = (rnd.float(f32) - 0.5) * 0.05;
+    const out_norm = try gpa.alloc(f32, dim);
+    defer gpa.free(out_norm);
+    for (out_norm) |*v| v.* = 0.5 + rnd.float(f32);
+    const lmh = try gpa.alloc(u8, ggml.tensorBytes(.q6_k, dim, vocab));
+    defer gpa.free(lmh);
+    rnd.bytes(lmh);
+    pin(lmh, 210, 208, false);
+
+    try std.testing.expect(mlaInit(2, ctx, kvr, rope));
+    mla_cache = null;
+    mla_wk.clearRetainingCapacity();
+    const wkbuf = try gpa.alloc(f32, n_heads * stride * kvr);
+    defer gpa.free(wkbuf);
+    for (0..2) |l| {
+        for (0..n_heads * stride) |r| cpu.dequantRow(.q8_0, wkbuf[r * kvr ..][0..kvr], kvb[l], r, kvr);
+        try std.testing.expect(mlaSetWk(l, wkbuf));
+    }
+    // Prior positions, distinct per layer.
+    var hist_c: [2][pos][kvr]f32 = undefined;
+    var hist_r: [2][pos][rope]f32 = undefined;
+    for (0..2) |l| for (0..pos) |t| {
+        for (&hist_c[l][t]) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+        for (&hist_r[l][t]) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+        try std.testing.expect(mlaAppend(l, t, &hist_c[l][t], &hist_r[l][t]));
+    };
+
+    const x0 = try gpa.alloc(f32, dim);
+    defer gpa.free(x0);
+    for (x0) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    var descs: [2]MlaLayerDesc = undefined;
+    for (0..2) |l| {
+        descs[l] = .{
+            .attn_norm = attn_norm[l],
+            .wq = .{ .ty = .q8_0, .data = wq[l] },
+            .kv_a = .{ .ty = .q8_0, .data = kva_w[l] },
+            .kv_a_norm = kva_norm[l],
+            .kv_b = .{ .ty = .q8_0, .data = kvb[l] },
+            .attn_out = .{ .ty = .q8_0, .data = attn_out[l] },
+            .ffn_norm = ffn_norm[l],
+            .is_moe = l == 1,
+        };
+    }
+    descs[0].dgate = .{ .ty = .q8_0, .data = dgate };
+    descs[0].dup = .{ .ty = .q8_0, .data = dup };
+    descs[0].ddown = .{ .ty = .q8_0, .data = ddown };
+    descs[0].dffn = dffn;
+    descs[1].router = .{ .ty = .f32, .data = std.mem.sliceAsBytes(router) };
+    descs[1].gate = .{ .ty = .q4_k, .data = gw };
+    descs[1].up = .{ .ty = .q8_0, .data = uw };
+    descs[1].down = .{ .ty = .q5_0, .data = dw };
+    descs[1].ffn = ffn;
+    descs[1].shexp = .{ .{ .ty = .q4_k, .data = sg }, .{ .ty = .q4_k, .data = su }, .{ .ty = .q4_k, .data = sd } };
+    descs[1].shexp_ffn = shexp_ffn;
+    const fc = MlaFrameCfg{
+        .dim = dim,
+        .n_heads = n_heads,
+        .nope = nope,
+        .rope = rope,
+        .kvr = kvr,
+        .v_head_dim = vd,
+        .eps = eps,
+        .scale = scale,
+        .rope_base = 10000.0,
+        .yarn_factor = 1.0,
+        .yarn_orig_ctx = 4096.0,
+        .routed = .{ .n_expert = n_expert, .n_used = n_used, .gating_sigmoid = true, .weights_norm = true, .weights_scale = 1.0 },
+    };
+
+    const x_frame = try gpa.dupe(f32, x0);
+    defer gpa.free(x_frame);
+    const logits_frame = try gpa.alloc(f32, vocab);
+    defer gpa.free(logits_frame);
+    @memset(logits_frame, std.math.nan(f32));
+    const before = cmdbufs;
+    try std.testing.expect(mlaTokenFrame(&descs, fc, x_frame, pos, out_norm, .{ .ty = .q6_k, .data = lmh }, logits_frame));
+    try std.testing.expectEqual(before + 1, cmdbufs); // the whole token, one submission
+    // Determinism probe: the same token twice must be bit-identical --
+    // divergence here is a synchronization race, the exact failure mode the
+    // barrier comment in device.zig documents.
+    {
+        const x2 = try gpa.dupe(f32, x0);
+        defer gpa.free(x2);
+        const l2 = try gpa.alloc(f32, vocab);
+        defer gpa.free(l2);
+        try std.testing.expect(mlaTokenFrame(&descs, fc, x2, pos, out_norm, .{ .ty = .q6_k, .data = lmh }, l2));
+        var ndiff: usize = 0;
+        var first: usize = 0;
+        for (x_frame, x2, 0..) |a, b2, k| {
+            if (a != b2) {
+                if (ndiff == 0) first = k;
+                ndiff += 1;
+            }
+        }
+        std.debug.print("DBG determinism: {d}/{d} dims differ (first {d}); run1[0..4]={any}, run2[0..4]={any}\n", .{ ndiff, dim, first, x_frame[0..4], x2[0..4] });
+    }
+
+    // ---- f64 reference ----
+    const xr = try gpa.alloc(f64, dim);
+    defer gpa.free(xr);
+    for (xr, x0) |*a, v| a.* = v;
+    const nrm = struct {
+        fn f(out: []f64, in: []const f64, wgt: []const f32, e: f32) void {
+            var ss: f64 = 0;
+            for (in) |v| ss += v * v;
+            const inv = 1.0 / @sqrt(ss / @as(f64, @floatFromInt(in.len)) + e);
+            for (out, in, wgt) |*o, v, wv| o.* = v * @as(f64, wv) * inv;
+        }
+    }.f;
+    const mv64 = struct {
+        fn f(g: std.mem.Allocator, ty: ggml.Type, data: []const u8, xin: []const f64, rows: usize, cols: usize, out: []f64) !void {
+            const rbuf = try g.alloc(f32, cols);
+            defer g.free(rbuf);
+            for (0..rows) |r| {
+                cpu.dequantRow(ty, rbuf, data, r, cols);
+                var a: f64 = 0;
+                for (rbuf, xin[0..cols]) |wv, xv| a += @as(f64, wv) * xv;
+                out[r] = a;
+            }
+        }
+    }.f;
+    var rope_cfg: deepseek.Config = undefined;
+    rope_cfg.rope_base = 10000.0;
+    rope_cfg.yarn_factor = 1.0;
+    rope_cfg.yarn_orig_ctx = 4096.0;
+    rope_cfg.yarn_log_mul = 0;
+
+    const normed = try gpa.alloc(f64, dim);
+    defer gpa.free(normed);
+    const scratch = try gpa.alloc(f64, dim * 4);
+    defer gpa.free(scratch);
+    const rowbuf = try gpa.alloc(f32, dim);
+    defer gpa.free(rowbuf);
+    for (0..2) |l| {
+        nrm(normed, xr, attn_norm[l], eps);
+        // head: q, kv_a, cache row, rope (host rope runs in f32, as the engine's does)
+        const q64 = scratch[0 .. n_heads * kd];
+        try mv64(gpa, .q8_0, wq[l], normed, n_heads * kd, dim, q64);
+        var q32: [n_heads * kd]f32 = undefined;
+        for (&q32, q64) |*o, v| o.* = @floatCast(v);
+        for (0..n_heads) |h| deepseek.ropeApplyForTest(rope_cfg, q32[h * kd + nope ..][0..rope], pos);
+        var kva64: [kvr + rope]f64 = undefined;
+        try mv64(gpa, .q8_0, kva_w[l], normed, kvr + rope, dim, &kva64);
+        var c_new64: [kvr]f64 = undefined;
+        nrm(&c_new64, kva64[0..kvr], kva_norm[l], eps);
+        var c_new: [kvr]f32 = undefined;
+        for (&c_new, c_new64) |*o, v| o.* = @floatCast(v);
+        var r_new: [rope]f32 = undefined;
+        for (&r_new, kva64[kvr..]) |*o, v| o.* = @floatCast(v);
+        deepseek.ropeApplyForTest(rope_cfg, &r_new, pos);
+        // the cache rows the frame wrote must match these
+        var c_dev: [kvr]f32 = undefined;
+        var r_dev: [rope]f32 = undefined;
+        try std.testing.expect(mlaReadCache(l, pos, &c_dev, &r_dev));
+        for (c_new, c_dev) |a, b| try std.testing.expectApproxEqAbs(a, b, 2e-3);
+        for (r_new, r_dev) |a, b| try std.testing.expectApproxEqAbs(a, b, 2e-3);
+        // attention over pos+1 rows
+        const head_out = scratch[dim .. dim + n_heads * vd];
+        const wkrow = try gpa.alloc(f32, kvr);
+        defer gpa.free(wkrow);
+        for (0..n_heads) |h| {
+            var qa: [kvr]f64 = @splat(0);
+            for (0..nope) |r| {
+                cpu.dequantRow(.q8_0, wkrow, kvb[l], h * stride + r, kvr);
+                for (&qa, wkrow) |*a, wv| a.* += q64[h * kd + r] * wv;
+            }
+            var probs: [pos + 1]f64 = undefined;
+            var mx: f64 = -std.math.inf(f64);
+            for (0..pos + 1) |t| {
+                const ct: []const f32 = if (t < pos) &hist_c[l][t] else &c_new;
+                const rt: []const f32 = if (t < pos) &hist_r[l][t] else &r_new;
+                var sc: f64 = 0;
+                for (qa, ct) |a, cv| sc += a * cv;
+                for (0..rope) |i| sc += @as(f64, q32[h * kd + nope + i]) * rt[i];
+                probs[t] = sc * scale;
+                mx = @max(mx, probs[t]);
+            }
+            var sum: f64 = 0;
+            for (&probs) |*pv| {
+                pv.* = @exp(pv.* - mx);
+                sum += pv.*;
+            }
+            var ol: [kvr]f64 = @splat(0);
+            for (0..pos + 1) |t| {
+                const ct: []const f32 = if (t < pos) &hist_c[l][t] else &c_new;
+                for (&ol, ct) |*a, cv| a.* += (probs[t] / sum) * cv;
+            }
+            for (0..vd) |r| {
+                cpu.dequantRow(.q8_0, wkrow, kvb[l], h * stride + nope + r, kvr);
+                var o: f64 = 0;
+                for (wkrow, ol) |wv, av| o += @as(f64, wv) * av;
+                head_out[h * vd + r] = o;
+            }
+        }
+        const proj = scratch[dim * 2 .. dim * 3];
+        try mv64(gpa, .q8_0, attn_out[l], head_out, dim, n_heads * vd, proj);
+        for (xr, proj) |*a, v| a.* += v;
+        nrm(normed, xr, ffn_norm[l], eps);
+        const silu = struct {
+            fn f(g: f64) f64 {
+                return g / (1.0 + @exp(-g));
+            }
+        }.f;
+        if (l == 0) {
+            const g64 = try gpa.alloc(f64, dffn);
+            defer gpa.free(g64);
+            const u64_ = try gpa.alloc(f64, dffn);
+            defer gpa.free(u64_);
+            try mv64(gpa, .q8_0, dgate, normed, dffn, dim, g64);
+            try mv64(gpa, .q8_0, dup, normed, dffn, dim, u64_);
+            for (g64, u64_) |*g, u| g.* = silu(g.*) * u;
+            const down64 = scratch[dim * 3 ..];
+            try mv64(gpa, .q8_0, ddown, g64, dim, dffn, down64);
+            for (xr, down64) |*a, v| a.* += v;
+        } else {
+            var logits32: [n_expert]f32 = undefined;
+            for (0..n_expert) |e| {
+                var a: f64 = 0;
+                for (router[e * dim ..][0..dim], normed) |wv, nv| a += @as(f64, wv) * nv;
+                logits32[e] = @floatCast(a);
+            }
+            var sel: [n_used]moe.Selected = undefined;
+            moe.route(.{ .n_expert = n_expert, .n_used = n_used, .gating = .sigmoid, .weights_norm = true, .weights_scale = 1.0 }, &logits32, null, &sel);
+            const g64 = try gpa.alloc(f64, ffn);
+            defer gpa.free(g64);
+            const u64_ = try gpa.alloc(f64, ffn);
+            defer gpa.free(u64_);
+            const down64 = scratch[dim * 3 ..];
+            const gate_plane = gw.len / n_expert;
+            const up_plane = uw.len / n_expert;
+            const down_plane = dw.len / n_expert;
+            const ffn_acc = try gpa.alloc(f64, dim);
+            defer gpa.free(ffn_acc);
+            @memset(ffn_acc, 0);
+            for (sel) |se| {
+                try mv64(gpa, .q4_k, gw[se.expert * gate_plane ..][0..gate_plane], normed, ffn, dim, g64);
+                try mv64(gpa, .q8_0, uw[se.expert * up_plane ..][0..up_plane], normed, ffn, dim, u64_);
+                for (g64, u64_) |*g, u| g.* = silu(g.*) * u;
+                try mv64(gpa, .q5_0, dw[se.expert * down_plane ..][0..down_plane], g64, dim, ffn, down64);
+                for (ffn_acc, down64) |*a, v| a.* += @as(f64, se.gate) * v;
+            }
+            const sg64 = try gpa.alloc(f64, shexp_ffn);
+            defer gpa.free(sg64);
+            const su64 = try gpa.alloc(f64, shexp_ffn);
+            defer gpa.free(su64);
+            try mv64(gpa, .q4_k, sg, normed, shexp_ffn, dim, sg64);
+            try mv64(gpa, .q4_k, su, normed, shexp_ffn, dim, su64);
+            for (sg64, su64) |*g, u| g.* = silu(g.*) * u;
+            try mv64(gpa, .q4_k, sd, sg64, dim, shexp_ffn, down64);
+            for (ffn_acc, down64) |*a, v| a.* += v;
+            for (xr, ffn_acc) |*a, v| a.* += v;
+        }
+    }
+    nrm(normed, xr, out_norm, eps);
+    const logits_ref = try gpa.alloc(f64, vocab);
+    defer gpa.free(logits_ref);
+    try mv64(gpa, .q6_k, lmh, normed, vocab, dim, logits_ref);
+
+    var mass: f64 = 0;
+    for (xr) |v| mass += @abs(v);
+    const tol_x: f32 = @floatCast((mass / dim) * 2e-3);
+    for (xr, x_frame, 0..) |a, b, k| {
+        std.testing.expectApproxEqAbs(@as(f32, @floatCast(a)), b, tol_x) catch |e| {
+            std.debug.print("frame x dim {d}: reference {d} vs frame {d}\n", .{ k, a, b });
+            return e;
+        };
+    }
+    var lmass: f64 = 0;
+    for (logits_ref) |v| lmass += @abs(v);
+    const tol_l: f32 = @floatCast((lmass / vocab) * 2e-3);
+    for (logits_ref, logits_frame, 0..) |a, b, k| {
+        std.testing.expectApproxEqAbs(@as(f32, @floatCast(a)), b, tol_l) catch |e| {
+            std.debug.print("frame logit {d}: reference {d} vs frame {d}\n", .{ k, a, b });
+            return e;
+        };
+    }
+}
+
 test "vulkan dmmv family agrees with the exact cpu reference" {
     // The bring-up oracle, identical in intent to the Metal ones: pinned
     // block scales so f32 summation is conditioned, random quants, an f64
@@ -1180,6 +1896,7 @@ test "vulkan dmmv family agrees with the exact cpu reference" {
     const saved = use_gpu_ops;
     use_gpu_ops = true;
     defer use_gpu_ops = saved;
+    wcache.clearRetainingCapacity(); // test tensors may recycle freed addresses
     // The test tensors sit under the size cutover; pin it to zero so every
     // kernel actually runs (the submission-counter check would catch a
     // silent fallback as a failure, not a skip).
