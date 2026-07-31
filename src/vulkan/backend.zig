@@ -35,6 +35,8 @@ const dmmv_q5_0_id_raw = @embedFile("../shaders/vulkan/dmmv_q5_0_id.spv");
 const dmmv_q5_0_id_spv: [dmmv_q5_0_id_raw.len]u8 align(4) = dmmv_q5_0_id_raw.*;
 const dmmv_q8_0_id_raw = @embedFile("../shaders/vulkan/dmmv_q8_0_id.spv");
 const dmmv_q8_0_id_spv: [dmmv_q8_0_id_raw.len]u8 align(4) = dmmv_q8_0_id_raw.*;
+const dmmv_q4k_id_f16_raw = @embedFile("../shaders/vulkan/dmmv_q4k_id_f16.spv");
+const dmmv_q4k_id_f16_spv: [dmmv_q4k_id_f16_raw.len]u8 align(4) = dmmv_q4k_id_f16_raw.*;
 const moe_route_raw = @embedFile("../shaders/vulkan/moe_route.spv");
 const moe_route_spv: [moe_route_raw.len]u8 align(4) = moe_route_raw.*;
 const swiglu_slots_raw = @embedFile("../shaders/vulkan/swiglu_slots.spv");
@@ -115,6 +117,7 @@ const Pipes = struct {
     q4_k_id: u64 = 0,
     q5_0_id: u64 = 0,
     q8_0_id: u64 = 0,
+    q4_k_id_f16: u64 = 0,
     route: u64 = 0,
     swiglu_slots: u64 = 0,
     reduce_dev: u64 = 0,
@@ -170,6 +173,7 @@ pub fn parallelBegin(n: usize) void {
         .q4_k_id = d.pipeline(&dmmv_q4k_id_spv) catch return fail(),
         .q5_0_id = d.pipeline(&dmmv_q5_0_id_spv) catch return fail(),
         .q8_0_id = d.pipeline(&dmmv_q8_0_id_spv) catch return fail(),
+        .q4_k_id_f16 = d.pipeline(&dmmv_q4k_id_f16_spv) catch return fail(),
         .route = d.pipeline(&moe_route_spv) catch return fail(),
         .swiglu_slots = d.pipeline(&swiglu_slots_spv) catch return fail(),
         .reduce_dev = d.pipeline(&moe_reduce_dev_spv) catch return fail(),
@@ -261,6 +265,14 @@ pub fn matvec(t: ggml.Type, out: []f32, data: []const u8, x: []const f32, rows: 
     @memcpy(out, obuf.?.slice(f32)[0..out.len]);
 }
 
+/// The f16-product variant, legal ONLY for post-rmsnorm activations (the
+/// expert gate/up input). SwiGLU-scaled inputs overflow f16 -- the down
+/// projection and W_v must use idPipeFor.
+fn idPipeForNormed(t: ggml.Type, cols: usize) ?u64 {
+    if (t == .q4_k and cols % 256 == 0) return pipes.q4_k_id_f16;
+    return idPipeFor(t, cols);
+}
+
 fn idPipeFor(t: ggml.Type, cols: usize) ?u64 {
     return switch (t) {
         .q4_k => if (cols % 256 == 0) pipes.q4_k_id else null,
@@ -328,8 +340,8 @@ pub fn moeFfnBlockRouted(normed: []const f32, logits: []const f32, bias: ?[]cons
 
     // Resolve everything before dispatching anything: a decline halfway
     // through would leave stale slot buffers behind a `true`.
-    const gp = idPipeFor(gate_w.ty, dim) orelse return false;
-    const up = idPipeFor(up_w.ty, dim) orelse return false;
+    const gp = idPipeForNormed(gate_w.ty, dim) orelse return false;
+    const up = idPipeForNormed(up_w.ty, dim) orelse return false;
     const dp = idPipeFor(down_w.ty, ffn) orelse return false;
     var sh_pipes: [3]u64 = undefined;
     if (shexp) |sw| {
@@ -625,8 +637,8 @@ pub fn mlaLayerTail(li: usize, pos: usize, x: []f32, q_nope: []const f32, q_rope
     const rp = pipeFor(router_w.ty, dim) orelse return false;
     const rw = weightBuffer(d, router_w.data) orelse return false;
     // ...and the routed chain, same resolution as moeFfnBlockRouted.
-    const gp = idPipeFor(gate_w.ty, dim) orelse return false;
-    const up = idPipeFor(up_w.ty, dim) orelse return false;
+    const gp = idPipeForNormed(gate_w.ty, dim) orelse return false;
+    const up = idPipeForNormed(up_w.ty, dim) orelse return false;
     const dp = idPipeFor(down_w.ty, ffn) orelse return false;
     var sh_pipes: [3]u64 = undefined;
     var shw: [3]vk.Buffer = undefined;
@@ -807,9 +819,9 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         if (dd.is_moe) {
             p.rp = pipeFor(dd.router.ty, dim) orelse return false;
             p.rw = weightBuffer(d, dd.router.data) orelse return false;
-            p.gp = idPipeFor(dd.gate.ty, dim) orelse return false;
+            p.gp = idPipeForNormed(dd.gate.ty, dim) orelse return false;
             p.gw = weightBuffer(d, dd.gate.data) orelse return false;
-            p.up = idPipeFor(dd.up.ty, dim) orelse return false;
+            p.up = idPipeForNormed(dd.up.ty, dim) orelse return false;
             p.uw = weightBuffer(d, dd.up.data) orelse return false;
             p.dp = idPipeFor(dd.down.ty, dd.ffn) orelse return false;
             p.dw = weightBuffer(d, dd.down.data) orelse return false;
