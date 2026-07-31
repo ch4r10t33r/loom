@@ -1,0 +1,12 @@
+// a[i] += b[i], n floats -- the residual add, on the device so it can sit
+// inside a recorded layer instead of ending the submission.
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) buffer A { float a[]; };
+layout(std430, binding = 1) readonly buffer B { float b[]; };
+layout(push_constant) uniform PC { uint n; } pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid < pc.n) a[gid] += b[gid];
+}

@@ -1,0 +1,65 @@
+// Every head's MLA attention scores and softmax over the compressed cache --
+// the port of mla_attn_head in mla_attn.metal. One workgroup per head;
+// probabilities out, the weighted sum runs as its own kernel. The q buffer
+// is [n_heads][nope] gathered q_nope (read by the absorb kernel) followed at
+// qr_off by [n_heads][rope] gathered q_rope; the caches carry no head stride
+// (one compressed row per position) and this layer's rows start at c_base /
+// r_base.
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer QA { float q_abs[]; }; // [n_heads][kvr]
+layout(std430, binding = 1) readonly buffer Q { float q[]; };      // q_rope at qr_off
+layout(std430, binding = 2) readonly buffer C { float c_cache[]; };
+layout(std430, binding = 3) buffer P { float probs[]; };           // [n_heads][seq]; r_cache appended at rk_off
+layout(push_constant) uniform PC { uint n_heads; uint kvr; uint rope; uint seq; uint qr_off; uint c_base; uint r_base; float scale; } pc;
+
+// Scores live in shared memory, so the context this serves is bounded by it:
+// 4096 floats = 16 KB. The caller checks and declines rather than truncating.
+shared float scores[4096];
+shared float red[64];
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.n_heads) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint qa = h * pc.kvr;
+    uint qr = pc.qr_off + h * pc.rope;
+
+    for (uint t = tid; t < pc.seq; t += 64u) {
+        uint ct = pc.c_base + t * pc.kvr;
+        uint rt = pc.r_base + t * pc.rope;
+        float s = 0.0;
+        for (uint i = 0u; i < pc.kvr; i++) s += q_abs[qa + i] * c_cache[ct + i];
+        for (uint i = 0u; i < pc.rope; i++) s += q[qr + i] * c_cache[rt + i];
+        scores[t] = s * pc.scale;
+    }
+    barrier();
+
+    // Max first: attention logits reach magnitudes where a bare exp()
+    // overflows and the head becomes NaN.
+    float lm = -1.0 / 0.0;
+    for (uint t = tid; t < pc.seq; t += 64u) lm = max(lm, scores[t]);
+    red[tid] = lm;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] = max(red[tid], red[tid + s]);
+        barrier();
+    }
+    float mx = red[0];
+    barrier();
+
+    float ls = 0.0;
+    for (uint t = tid; t < pc.seq; t += 64u) {
+        float e = exp(scores[t] - mx);
+        scores[t] = e;
+        ls += e;
+    }
+    red[tid] = ls;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    float inv = 1.0 / red[0];
+    for (uint t = tid; t < pc.seq; t += 64u) probs[h * pc.seq + t] = scores[t] * inv;
+}
