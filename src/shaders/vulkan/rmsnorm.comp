@@ -1,0 +1,23 @@
+// out[i] = x[i] * w[i] / rms(x) -- one workgroup, shared reduction for the
+// sum of squares, then every thread writes strided.
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) readonly buffer W { float w[]; };
+layout(std430, binding = 2) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC { uint n; float eps; } pc;
+shared float red[64];
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    float ss = 0.0;
+    for (uint i = tid; i < pc.n; i += 64u) ss += x[i] * x[i];
+    red[tid] = ss;
+    barrier();
+    for (uint s = 32u; s > 0u; s >>= 1u) {
+        if (tid < s) red[tid] += red[tid + s];
+        barrier();
+    }
+    float inv = inversesqrt(red[0] / float(pc.n) + pc.eps);
+    for (uint i = tid; i < pc.n; i += 64u) o[i] = x[i] * w[i] * inv;
+}

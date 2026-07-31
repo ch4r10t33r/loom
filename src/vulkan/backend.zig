@@ -41,6 +41,16 @@ const swiglu_slots_raw = @embedFile("../shaders/vulkan/swiglu_slots.spv");
 const swiglu_slots_spv: [swiglu_slots_raw.len]u8 align(4) = swiglu_slots_raw.*;
 const moe_reduce_dev_raw = @embedFile("../shaders/vulkan/moe_reduce_dev.spv");
 const moe_reduce_dev_spv: [moe_reduce_dev_raw.len]u8 align(4) = moe_reduce_dev_raw.*;
+const mla_absorb_raw = @embedFile("../shaders/vulkan/mla_absorb.spv");
+const mla_absorb_spv: [mla_absorb_raw.len]u8 align(4) = mla_absorb_raw.*;
+const mla_attn_raw = @embedFile("../shaders/vulkan/mla_attn.spv");
+const mla_attn_spv: [mla_attn_raw.len]u8 align(4) = mla_attn_raw.*;
+const mla_wsum_raw = @embedFile("../shaders/vulkan/mla_wsum.spv");
+const mla_wsum_spv: [mla_wsum_raw.len]u8 align(4) = mla_wsum_raw.*;
+const rmsnorm_raw = @embedFile("../shaders/vulkan/rmsnorm.spv");
+const rmsnorm_spv: [rmsnorm_raw.len]u8 align(4) = rmsnorm_raw.*;
+const add_vec_raw = @embedFile("../shaders/vulkan/add_vec.spv");
+const add_vec_spv: [add_vec_raw.len]u8 align(4) = add_vec_raw.*;
 
 pub const ExpertRef = cpu.ExpertRef;
 pub const LayerSpec = cpu.LayerSpec;
@@ -67,18 +77,11 @@ pub const frameLoadX = cpu.frameLoadX;
 pub const frameOpen = cpu.frameOpen;
 pub const frameStoreX = cpu.frameStoreX;
 pub const hasKvCache = cpu.hasKvCache;
-pub const hasMlaCache = cpu.hasMlaCache;
 pub const kvAppend = cpu.kvAppend;
 pub const lastVerdict = cpu.lastVerdict;
 pub const layerBlock = cpu.layerBlock;
 pub const materializeArenas = cpu.materializeArenas;
 pub const matmul = cpu.matmul;
-pub const mlaAppend = cpu.mlaAppend;
-pub const mlaAttnHeads = cpu.mlaAttnHeads;
-pub const mlaInit = cpu.mlaInit;
-pub const mlaLayerTail = cpu.mlaLayerTail;
-pub const mlaReadCache = cpu.mlaReadCache;
-pub const mlaSetWk = cpu.mlaSetWk;
 pub const mlaTokenFrame = cpu.mlaTokenFrame;
 pub const moeFfnBlock = cpu.moeFfnBlock;
 pub const registerArena = cpu.registerArena;
@@ -95,6 +98,11 @@ pub const useGpuOps = &use_gpu_ops;
 var dev: ?vk.Device = null;
 const Pipes = struct {
     q4_k: u64 = 0,
+    absorb: u64 = 0,
+    attn: u64 = 0,
+    wsum: u64 = 0,
+    rmsnorm: u64 = 0,
+    add: u64 = 0,
     q5_0: u64 = 0,
     q8_0: u64 = 0,
     q6_k: u64 = 0,
@@ -157,6 +165,11 @@ pub fn parallelBegin(n: usize) void {
         .route = d.pipeline(&moe_route_spv) catch return fail(),
         .swiglu_slots = d.pipeline(&swiglu_slots_spv) catch return fail(),
         .reduce_dev = d.pipeline(&moe_reduce_dev_spv) catch return fail(),
+        .absorb = d.pipeline(&mla_absorb_spv) catch return fail(),
+        .attn = d.pipeline(&mla_attn_spv) catch return fail(),
+        .wsum = d.pipeline(&mla_wsum_spv) catch return fail(),
+        .rmsnorm = d.pipeline(&rmsnorm_spv) catch return fail(),
+        .add = d.pipeline(&add_vec_spv) catch return fail(),
     };
 }
 
@@ -253,7 +266,7 @@ fn ensure(buf: *?vk.Buffer, d: *vk.Device, len: usize) ?vk.Buffer {
 }
 
 const RoutePush = extern struct { n_expert: u32, n_used: u32, gating: u32, weights_norm: u32, has_bias: u32, weights_scale: f32 };
-const IdPush = extern struct { rows: u32, cols: u32, n_used: u32, plane_stride: u32, x_stride: u32 };
+const IdPush = extern struct { rows: u32, cols: u32, n_used: u32, plane_stride: u32, x_stride: u32, base: u32 = 0 };
 
 /// Stage logits (and bias, packed after them) and run the route kernel; ids
 /// and gates stay in their device buffers for the id kernels to read.
@@ -389,6 +402,307 @@ pub fn moeFfnBlockRouted(normed: []const f32, logits: []const f32, bias: ?[]cons
     if (shexp != null) {
         for (out, s3.slice(f32)[0..dim]) |*o, v| o.* += v;
     }
+    return true;
+}
+
+// ---- MLA attention on the device ------------------------------------------
+//
+// The port of the Metal backend's compressed-cache attention: absorb
+// (q_abs = W_k^T q_nope), scores+softmax, weighted sum in compressed space,
+// and W_v as an id-kernel dispatch with identity ids -- one submission for
+// the lot, and `mlaLayerTail` extends that same recording through the output
+// projection, residual, FFN norm, router and the routed MoE chain, so a
+// whole MoE layer's tail is one submit-and-wait.
+//
+// The c and k_rope caches share ONE buffer (c rows first, k_rope rows after
+// at `mla_r0`) because the attention kernel's four bindings are all taken;
+// per-layer rows are addressed by push-constant element offsets. The cache
+// is host-visible: the engine's host cache stays authoritative and mlaAppend
+// mirrors rows in with a memcpy, costing no submission.
+
+const MLA_MAX_SEQ = 4096; // the attention kernel's shared-memory bound
+
+const MlaWant = struct { layers: usize, ctx: usize, kvr: usize, rope: usize };
+var mla_want: ?MlaWant = null;
+var mla_cache: ?vk.Buffer = null;
+var mla_r0: usize = 0; // element offset of the k_rope region
+var mla_wk: std.ArrayListUnmanaged(vk.Buffer) = .empty; // per layer: full dequant kv_b, f32, device-local
+var vids: ?vk.Buffer = null; // identity ids for the W_v id dispatch
+
+// Attention working set, grow-only host-visible like the rest.
+var qbuf: ?vk.Buffer = null; // gathered [n_heads][nope] then [n_heads][rope]
+var qabs: ?vk.Buffer = null;
+var probs_buf: ?vk.Buffer = null;
+var olat: ?vk.Buffer = null;
+var hout: ?vk.Buffer = null;
+var projb: ?vk.Buffer = null;
+var xres: ?vk.Buffer = null;
+var normw: ?vk.Buffer = null;
+var normed_buf: ?vk.Buffer = null;
+var lbuf: ?vk.Buffer = null; // router logits (device-written) + bias (host-written)
+
+pub fn mlaInit(layers: usize, ctx_len: usize, kvr: usize, rope: usize) bool {
+    // Records the shape; buffers are made on first use. Declining a context
+    // the attention kernel cannot hold beats truncating one.
+    if (ctx_len > MLA_MAX_SEQ) {
+        mla_want = null;
+        return false;
+    }
+    mla_want = .{ .layers = layers, .ctx = ctx_len, .kvr = kvr, .rope = rope };
+    return true;
+}
+
+fn ensureMlaCache(d: *vk.Device) ?MlaWant {
+    const w = mla_want orelse return null;
+    if (mla_cache == null) {
+        const c_elems = w.layers * w.ctx * w.kvr;
+        const r_elems = w.layers * w.ctx * w.rope;
+        mla_cache = d.alloc((c_elems + r_elems) * 4) catch return null;
+        mla_r0 = c_elems;
+    }
+    return w;
+}
+
+pub fn hasMlaCache() bool {
+    const d = &(dev orelse return false);
+    return ensureMlaCache(d) != null;
+}
+
+/// Mirror one position's compressed row into the device cache. The engine's
+/// host cache stays authoritative: this can decline at any point and the
+/// host fallback must still be correct.
+pub fn mlaAppend(li: usize, pos: usize, c_kv: []const f32, k_rope: []const f32) bool {
+    const d = &(dev orelse return false);
+    const w = ensureMlaCache(d) orelse return false;
+    if (pos >= w.ctx or c_kv.len != w.kvr or k_rope.len != w.rope) return false;
+    const cache = mla_cache.?;
+    @memcpy(cache.slice(f32)[(li * w.ctx + pos) * w.kvr ..][0..w.kvr], c_kv);
+    @memcpy(cache.slice(f32)[mla_r0 + (li * w.ctx + pos) * w.rope ..][0..w.rope], k_rope);
+    return true;
+}
+
+pub fn mlaReadCache(li: usize, pos: usize, c_kv: []f32, k_rope: []f32) bool {
+    const d = &(dev orelse return false);
+    const w = ensureMlaCache(d) orelse return false;
+    if (pos >= w.ctx or c_kv.len != w.kvr or k_rope.len != w.rope) return false;
+    const cache = mla_cache.?;
+    @memcpy(c_kv, cache.slice(f32)[(li * w.ctx + pos) * w.kvr ..][0..w.kvr]);
+    @memcpy(k_rope, cache.slice(f32)[mla_r0 + (li * w.ctx + pos) * w.rope ..][0..w.rope]);
+    return true;
+}
+
+/// One layer's kv_b, dequantized to f32, onto the device -- the absorb
+/// kernel strides past the W_v rows, so the layout matches the tensor.
+/// Layers must arrive in order.
+pub fn mlaSetWk(li: usize, wk_f32: []const f32) bool {
+    const d = &(dev orelse return false);
+    if (li != mla_wk.items.len) return false;
+    const b = d.allocDevice(wk_f32.len * 4) catch return false;
+    d.upload(b, std.mem.sliceAsBytes(wk_f32)) catch return false;
+    mla_wk.append(std.heap.page_allocator, b) catch return false;
+    return true;
+}
+
+const AbsorbPush = extern struct { n_heads: u32, nope: u32, kvr: u32, stride: u32 };
+const AttnPush = extern struct { n_heads: u32, kvr: u32, rope: u32, seq: u32, qr_off: u32, c_base: u32, r_base: u32, scale: f32 };
+const WsumPush = extern struct { n_heads: u32, kvr: u32, seq: u32, c_base: u32 };
+
+/// Everything the attention recording needs resolved and staged, or null to
+/// decline before anything is recorded.
+const AttnPrep = struct {
+    w: MlaWant,
+    vp: u64,
+    vw: vk.Buffer,
+    row_bytes: usize,
+    seq: usize,
+};
+
+fn prepAttn(d: *vk.Device, li: usize, pos: usize, q_nope: []const f32, q_rope: []const f32, kv_b: WeightRef, n_heads: usize, nope: usize, v_head_dim: usize) ?AttnPrep {
+    if (!use_gpu_ops) return null;
+    const w = ensureMlaCache(d) orelse return null;
+    if (li >= mla_wk.items.len) return null;
+    const seq = pos + 1;
+    if (seq > w.ctx) return null;
+    if (q_nope.len != n_heads * nope or q_rope.len != n_heads * w.rope) return null;
+    const vp = idPipeFor(kv_b.ty, w.kvr) orelse return null;
+    const vw = weightBuffer(d, kv_b.data) orelse return null;
+    const row_bytes = kv_b.data.len / (n_heads * (nope + v_head_dim));
+    if (vids == null) {
+        const b = d.alloc(64 * 4) catch return null;
+        for (0..64) |k| b.slice(u32)[k] = @intCast(k);
+        vids = b;
+    }
+    _ = ensure(&qbuf, d, (q_nope.len + q_rope.len) * 4) orelse return null;
+    _ = ensure(&qabs, d, n_heads * w.kvr * 4) orelse return null;
+    _ = ensure(&probs_buf, d, n_heads * w.ctx * 4) orelse return null;
+    _ = ensure(&olat, d, n_heads * w.kvr * 4) orelse return null;
+    _ = ensure(&hout, d, n_heads * v_head_dim * 4) orelse return null;
+    @memcpy(qbuf.?.slice(f32)[0..q_nope.len], q_nope);
+    @memcpy(qbuf.?.slice(f32)[q_nope.len..][0..q_rope.len], q_rope);
+    return .{ .w = w, .vp = vp, .vw = vw, .row_bytes = row_bytes, .seq = seq };
+}
+
+/// Record absorb -> attention -> weighted sum -> W_v; the result lands in
+/// `hout` on the device.
+fn recordAttn(d: *vk.Device, c: vk.Device.Cmd, p: AttnPrep, li: usize, n_heads: usize, nope: usize, v_head_dim: usize, scale: f32) vk.Error!void {
+    const w = p.w;
+    const apush = AbsorbPush{ .n_heads = @intCast(n_heads), .nope = @intCast(nope), .kvr = @intCast(w.kvr), .stride = @intCast(nope + v_head_dim) };
+    try d.record(c, pipes.absorb, &.{ mla_wk.items[li], qbuf.?, qabs.? }, std.mem.asBytes(&apush), @intCast(n_heads * w.kvr));
+    d.barrier(c);
+    const tpush = AttnPush{
+        .n_heads = @intCast(n_heads),
+        .kvr = @intCast(w.kvr),
+        .rope = @intCast(w.rope),
+        .seq = @intCast(p.seq),
+        .qr_off = @intCast(n_heads * nope),
+        .c_base = @intCast(li * w.ctx * w.kvr),
+        .r_base = @intCast(mla_r0 + li * w.ctx * w.rope),
+        .scale = scale,
+    };
+    try d.record(c, pipes.attn, &.{ qabs.?, qbuf.?, mla_cache.?, probs_buf.? }, std.mem.asBytes(&tpush), @intCast(n_heads));
+    d.barrier(c);
+    const wpush = WsumPush{ .n_heads = @intCast(n_heads), .kvr = @intCast(w.kvr), .seq = @intCast(p.seq), .c_base = @intCast(li * w.ctx * w.kvr) };
+    try d.record(c, pipes.wsum, &.{ probs_buf.?, mla_cache.?, olat.? }, std.mem.asBytes(&wpush), @intCast(n_heads * w.kvr));
+    d.barrier(c);
+    // W_v with identity ids: head h's value rows are a plane at stride
+    // (nope + vd) rows, offset nope rows in, its input its own o_latent.
+    const vpush = IdPush{
+        .rows = @intCast(v_head_dim),
+        .cols = @intCast(w.kvr),
+        .n_used = @intCast(n_heads),
+        .plane_stride = @intCast((nope + v_head_dim) * p.row_bytes),
+        .x_stride = @intCast(w.kvr),
+        .base = @intCast(nope * p.row_bytes),
+    };
+    try d.record(c, p.vp, &.{ p.vw, olat.?, hout.?, vids.? }, std.mem.asBytes(&vpush), @intCast(n_heads * v_head_dim));
+}
+
+/// Every head's MLA attention over the compressed cache, W_v applied -- one
+/// submission. False declines to the engine's host loop.
+pub fn mlaAttnHeads(li: usize, pos: usize, q_nope: []const f32, q_rope: []const f32, kv_b: WeightRef, out: []f32, n_heads: usize, nope: usize, v_head_dim: usize, scale: f32) bool {
+    const d = &(dev orelse return false);
+    if (out.len != n_heads * v_head_dim) return false;
+    const p = prepAttn(d, li, pos, q_nope, q_rope, kv_b, n_heads, nope, v_head_dim) orelse return false;
+    const c = d.beginCmd() catch return false;
+    recordAttn(d, c, p, li, n_heads, nope, v_head_dim, scale) catch return false;
+    d.submitWait(c) catch return false;
+    cmdbufs += 1;
+    @memcpy(out, hout.?.slice(f32)[0..out.len]);
+    return true;
+}
+
+/// A whole MLA layer's tail as one submission: attention (absorb, scores,
+/// weighted sum, W_v), output projection, residual, FFN norm, router, and
+/// the routed MoE chain with shared expert. In: the residual stream and this
+/// position's queries; out: the residual stream after the layer. The
+/// attention head (projections, norms, rope, cache append) stays on the
+/// host, exactly as Metal's tail began.
+pub fn mlaLayerTail(li: usize, pos: usize, x: []f32, q_nope: []const f32, q_rope: []const f32, kv_b: WeightRef, attn_out_w: WeightRef, ffn_norm: []const f32, eps: f32, router_w: WeightRef, router_bias: ?[]const f32, gate_w: WeightRef, up_w: WeightRef, down_w: WeightRef, shexp: ?[3]WeightRef, ffn: usize, shexp_ffn: usize, cfg: RoutedCfg, n_heads: usize, nope: usize, v_head_dim: usize, scale: f32) bool {
+    const d = &(dev orelse return false);
+    const dim = x.len;
+    if (ffn_norm.len != dim or cfg.n_expert > 256) return false;
+    if (cfg.n_used == 0 or cfg.n_used > MAX_MOE_EXPERTS) return false;
+
+    // Resolve and stage everything before recording anything: attention...
+    const p = prepAttn(d, li, pos, q_nope, q_rope, kv_b, n_heads, nope, v_head_dim) orelse return false;
+    // ...the projections around it...
+    const ap = pipeFor(attn_out_w.ty, n_heads * v_head_dim) orelse return false;
+    const aw = weightBuffer(d, attn_out_w.data) orelse return false;
+    const rp = pipeFor(router_w.ty, dim) orelse return false;
+    const rw = weightBuffer(d, router_w.data) orelse return false;
+    // ...and the routed chain, same resolution as moeFfnBlockRouted.
+    const gp = idPipeFor(gate_w.ty, dim) orelse return false;
+    const up = idPipeFor(up_w.ty, dim) orelse return false;
+    const dp = idPipeFor(down_w.ty, ffn) orelse return false;
+    var sh_pipes: [3]u64 = undefined;
+    var shw: [3]vk.Buffer = undefined;
+    if (shexp) |sw| {
+        sh_pipes[0] = pipeFor(sw[0].ty, dim) orelse return false;
+        sh_pipes[1] = pipeFor(sw[1].ty, dim) orelse return false;
+        sh_pipes[2] = pipeFor(sw[2].ty, shexp_ffn) orelse return false;
+        for (sw, 0..) |w2, i| shw[i] = weightBuffer(d, w2.data) orelse return false;
+    }
+    const gw = weightBuffer(d, gate_w.data) orelse return false;
+    const uw = weightBuffer(d, up_w.data) orelse return false;
+    const dw = weightBuffer(d, down_w.data) orelse return false;
+    const widest = @max(ffn, shexp_ffn);
+    const s1 = ensure(&slots[0], d, @max(cfg.n_used * ffn, widest) * 4) orelse return false;
+    const s2 = ensure(&slots[1], d, @max(cfg.n_used * ffn, widest) * 4) orelse return false;
+    const s3 = ensure(&slots[2], d, @max(cfg.n_used, 1) * dim * 4) orelse return false;
+    const acc = ensure(&accbuf, d, dim * 4) orelse return false;
+    const idb = ensure(&ids_buf, d, MAX_MOE_EXPERTS * 4) orelse return false;
+    const gb = ensure(&gates_buf, d, MAX_MOE_EXPERTS * 4) orelse return false;
+    const xr = ensure(&xres, d, dim * 4) orelse return false;
+    const pj = ensure(&projb, d, dim * 4) orelse return false;
+    const nw = ensure(&normw, d, dim * 4) orelse return false;
+    const nb = ensure(&normed_buf, d, dim * 4) orelse return false;
+    const lb = ensure(&lbuf, d, cfg.n_expert * 2 * 4) orelse return false;
+    @memcpy(xr.slice(f32)[0..dim], x);
+    @memcpy(nw.slice(f32)[0..dim], ffn_norm);
+    // The router kernel writes logits into [0..n_expert); the bias rides in
+    // the same buffer at [n_expert..), host-written before submit.
+    if (router_bias) |b| @memcpy(lb.slice(f32)[cfg.n_expert..][0..cfg.n_expert], b);
+
+    const d_proj = extern struct { rows: u32, cols: u32 }{ .rows = @intCast(dim), .cols = @intCast(n_heads * v_head_dim) };
+    const d_router = extern struct { rows: u32, cols: u32 }{ .rows = @intCast(cfg.n_expert), .cols = @intCast(dim) };
+    const n_add = extern struct { n: u32 }{ .n = @intCast(dim) };
+    const d_norm = extern struct { n: u32, eps: f32 }{ .n = @intCast(dim), .eps = eps };
+    const rpush = RoutePush{
+        .n_expert = @intCast(cfg.n_expert),
+        .n_used = @intCast(cfg.n_used),
+        .gating = if (cfg.gating_sigmoid) 1 else 0,
+        .weights_norm = if (cfg.weights_norm) 1 else 0,
+        .has_bias = if (router_bias != null) 1 else 0,
+        .weights_scale = cfg.weights_scale,
+    };
+    const d_gate = IdPush{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(gate_w.data.len / cfg.n_expert), .x_stride = 0 };
+    const d_up = IdPush{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(up_w.data.len / cfg.n_expert), .x_stride = 0 };
+    const d_down = IdPush{ .rows = @intCast(dim), .cols = @intCast(ffn), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(down_w.data.len / cfg.n_expert), .x_stride = @intCast(ffn) };
+    const n_sw = extern struct { n: u32 }{ .n = @intCast(cfg.n_used * ffn) };
+    const n_red = extern struct { n: u32, dim: u32 }{ .n = @intCast(cfg.n_used), .dim = @intCast(dim) };
+
+    const c = d.beginCmd() catch return false;
+    recordAttn(d, c, p, li, n_heads, nope, v_head_dim, scale) catch return false;
+    d.barrier(c);
+    d.record(c, ap, &.{ aw, hout.?, pj }, std.mem.asBytes(&d_proj), @intCast(dim)) catch return false;
+    d.barrier(c);
+    d.record(c, pipes.add, &.{ xr, pj }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
+    d.barrier(c);
+    d.record(c, pipes.rmsnorm, &.{ xr, nw, nb }, std.mem.asBytes(&d_norm), 1) catch return false;
+    d.barrier(c);
+    d.record(c, rp, &.{ rw, nb, lb }, std.mem.asBytes(&d_router), @intCast(cfg.n_expert)) catch return false;
+    d.barrier(c);
+    // The routed chain, identical in shape to moeFfnBlockRouted's recording,
+    // reading its activation from the device-resident `nb`.
+    d.record(c, pipes.route, &.{ lb, idb, gb }, std.mem.asBytes(&rpush), 1) catch return false;
+    d.barrier(c);
+    d.record(c, gp, &.{ gw, nb, s1, idb }, std.mem.asBytes(&d_gate), @intCast(cfg.n_used * ffn)) catch return false;
+    d.record(c, up, &.{ uw, nb, s2, idb }, std.mem.asBytes(&d_up), @intCast(cfg.n_used * ffn)) catch return false;
+    d.barrier(c);
+    d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_sw), @intCast((cfg.n_used * ffn + 63) / 64)) catch return false;
+    d.barrier(c);
+    d.record(c, dp, &.{ dw, s1, s3, idb }, std.mem.asBytes(&d_down), @intCast(cfg.n_used * dim)) catch return false;
+    d.barrier(c);
+    d.record(c, pipes.reduce_dev, &.{ acc, s3, gb }, std.mem.asBytes(&n_red), @intCast((dim + 63) / 64)) catch return false;
+    d.barrier(c);
+    d.record(c, pipes.add, &.{ xr, acc }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
+    if (shexp != null) {
+        const d_sh = extern struct { rows: u32, cols: u32 }{ .rows = @intCast(shexp_ffn), .cols = @intCast(dim) };
+        const d_shd = extern struct { rows: u32, cols: u32 }{ .rows = @intCast(dim), .cols = @intCast(shexp_ffn) };
+        const n_shsw = extern struct { n: u32 }{ .n = @intCast(shexp_ffn) };
+        d.barrier(c);
+        d.record(c, sh_pipes[0], &.{ shw[0], nb, s1 }, std.mem.asBytes(&d_sh), @intCast(shexp_ffn)) catch return false;
+        d.record(c, sh_pipes[1], &.{ shw[1], nb, s2 }, std.mem.asBytes(&d_sh), @intCast(shexp_ffn)) catch return false;
+        d.barrier(c);
+        d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_shsw), @intCast((shexp_ffn + 63) / 64)) catch return false;
+        d.barrier(c);
+        d.record(c, sh_pipes[2], &.{ shw[2], s1, s3 }, std.mem.asBytes(&d_shd), @intCast(dim)) catch return false;
+        d.barrier(c);
+        d.record(c, pipes.add, &.{ xr, s3 }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
+    }
+    d.submitWait(c) catch return false;
+    cmdbufs += 1;
+    @memcpy(x, xr.slice(f32)[0..dim]);
     return true;
 }
 
@@ -575,6 +889,276 @@ test "vulkan routed moe block agrees with the exact reference" {
     for (want, got, 0..) |a, b, k| {
         std.testing.expectApproxEqAbs(@as(f32, @floatCast(a)), b, tol) catch |e| {
             std.debug.print("routed block dim {d}: reference {d} vs gpu {d}\n", .{ k, a, b });
+            return e;
+        };
+    }
+}
+
+test "vulkan mla attention agrees with the exact reference" {
+    // The whole compressed-cache attention -- absorb, scores, softmax,
+    // weighted sum, W_v -- against an f64 reference that shares nothing with
+    // the kernels but the cache contents and the quantized kv_b. Layer 1 of
+    // 2, with decoy rows in layer 0's cache region, so a wrong per-layer
+    // base offset cannot pass.
+    const gpa = std.testing.allocator;
+    const n_heads = 4;
+    const nope = 32;
+    const vd = 16;
+    const kvr = 64;
+    const rope = 16;
+    const ctx = 64;
+    const seq = 5;
+    const li = 1;
+    const scale: f32 = 0.25;
+    const stride = nope + vd;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (dev == null) return error.SkipZigTest;
+    const saved = use_gpu_ops;
+    use_gpu_ops = true;
+    defer use_gpu_ops = saved;
+
+    var prng = std.Random.DefaultPrng.init(0x1207A);
+    const rnd = prng.random();
+    const kvb = try gpa.alloc(u8, ggml.tensorBytes(.q8_0, kvr, n_heads * stride));
+    defer gpa.free(kvb);
+    rnd.bytes(kvb);
+    var b: usize = 0;
+    while (b + 34 <= kvb.len) : (b += 34) std.mem.writeInt(u16, kvb[b..][0..2], 0x2C00, .little);
+
+    try std.testing.expect(mlaInit(2, ctx, kvr, rope));
+    const wkbuf = try gpa.alloc(f32, n_heads * stride * kvr);
+    defer gpa.free(wkbuf);
+    for (0..n_heads * stride) |r| cpu.dequantRow(.q8_0, wkbuf[r * kvr ..][0..kvr], kvb, r, kvr);
+    try std.testing.expect(mlaSetWk(0, wkbuf));
+    try std.testing.expect(mlaSetWk(1, wkbuf));
+
+    const c_rows = try gpa.alloc(f32, seq * kvr);
+    defer gpa.free(c_rows);
+    const r_rows = try gpa.alloc(f32, seq * rope);
+    defer gpa.free(r_rows);
+    for (c_rows) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    for (r_rows) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    var decoy_c: [kvr]f32 = undefined;
+    var decoy_r: [rope]f32 = undefined;
+    for (0..seq) |t| {
+        for (&decoy_c) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+        for (&decoy_r) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+        try std.testing.expect(mlaAppend(0, t, &decoy_c, &decoy_r));
+        try std.testing.expect(mlaAppend(li, t, c_rows[t * kvr ..][0..kvr], r_rows[t * rope ..][0..rope]));
+    }
+
+    const q_nope = try gpa.alloc(f32, n_heads * nope);
+    defer gpa.free(q_nope);
+    const q_rope = try gpa.alloc(f32, n_heads * rope);
+    defer gpa.free(q_rope);
+    for (q_nope) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    for (q_rope) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    const got = try gpa.alloc(f32, n_heads * vd);
+    defer gpa.free(got);
+    @memset(got, std.math.nan(f32));
+    const before = cmdbufs;
+    try std.testing.expect(mlaAttnHeads(li, seq - 1, q_nope, q_rope, .{ .ty = .q8_0, .data = kvb }, got, n_heads, nope, vd, scale));
+    try std.testing.expectEqual(before + 1, cmdbufs);
+
+    // f64 reference off the dequantized rows.
+    const row = try gpa.alloc(f32, kvr);
+    defer gpa.free(row);
+    var mass: f64 = 0;
+    var worst: f64 = 0;
+    for (0..n_heads) |h| {
+        var qa: [kvr]f64 = @splat(0);
+        for (0..nope) |r| {
+            cpu.dequantRow(.q8_0, row, kvb, h * stride + r, kvr);
+            for (&qa, row) |*a, wv| a.* += @as(f64, q_nope[h * nope + r]) * wv;
+        }
+        var probs: [seq]f64 = undefined;
+        var mx: f64 = -std.math.inf(f64);
+        for (0..seq) |t| {
+            var s: f64 = 0;
+            for (qa, c_rows[t * kvr ..][0..kvr]) |a, cv| s += a * cv;
+            for (0..rope) |i| s += @as(f64, q_rope[h * rope + i]) * r_rows[t * rope + i];
+            probs[t] = s * scale;
+            mx = @max(mx, probs[t]);
+        }
+        var sum: f64 = 0;
+        for (&probs) |*pv| {
+            pv.* = @exp(pv.* - mx);
+            sum += pv.*;
+        }
+        var ol: [kvr]f64 = @splat(0);
+        for (0..seq) |t| {
+            for (&ol, c_rows[t * kvr ..][0..kvr]) |*a, cv| a.* += (probs[t] / sum) * cv;
+        }
+        for (0..vd) |r| {
+            cpu.dequantRow(.q8_0, row, kvb, h * stride + nope + r, kvr);
+            var o: f64 = 0;
+            for (row, ol) |wv, av| o += @as(f64, wv) * av;
+            mass += @abs(o);
+            worst = @max(worst, @abs(o - got[h * vd + r]));
+        }
+    }
+    const tol = (mass / @as(f64, n_heads * vd)) * 1e-3;
+    if (worst > tol) {
+        std.debug.print("mla attention worst diff {d} tol {d}\n", .{ worst, tol });
+        return error.MlaAttnMismatch;
+    }
+}
+
+test "vulkan mla layer tail agrees with its constituents" {
+    // Tail-in-one-submission against the same layer assembled from verified
+    // pieces: device attention, exact f64 projection, host norm and router,
+    // and the verified routed block. What this pins down is the plumbing --
+    // buffer reuse, barrier placement, residual order -- which is exactly
+    // where partial-output bugs lived on Metal.
+    const gpa = std.testing.allocator;
+    const n_heads = 4;
+    const nope = 32;
+    const vd = 16;
+    const kvr = 64;
+    const rope = 16;
+    const ctx = 64;
+    const seq = 4;
+    const li = 0;
+    const scale: f32 = 0.25;
+    const stride = nope + vd;
+    const dim = 512;
+    const ffn = 256;
+    const shexp_ffn = 256;
+    const n_expert = 8;
+    const n_used = 3;
+    const eps: f32 = 1e-6;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (dev == null) return error.SkipZigTest;
+    const saved = use_gpu_ops;
+    use_gpu_ops = true;
+    defer use_gpu_ops = saved;
+
+    var prng = std.Random.DefaultPrng.init(0x1207B);
+    const rnd = prng.random();
+    const pin = struct {
+        fn f(data: []u8, block: usize, d_off: usize, dmin: bool) void {
+            var b: usize = 0;
+            while (b + block <= data.len) : (b += block) {
+                std.mem.writeInt(u16, data[b + d_off ..][0..2], 0x2C00, .little);
+                if (dmin) std.mem.writeInt(u16, data[b + 2 ..][0..2], 0x2800, .little);
+            }
+        }
+    }.f;
+    const kvb = try gpa.alloc(u8, ggml.tensorBytes(.q8_0, kvr, n_heads * stride));
+    defer gpa.free(kvb);
+    const proj = try gpa.alloc(u8, ggml.tensorBytes(.q8_0, n_heads * vd, dim));
+    defer gpa.free(proj);
+    for ([_][]u8{ kvb, proj }) |data| {
+        rnd.bytes(data);
+        pin(data, 34, 0, false);
+    }
+    const gw = try gpa.alloc(u8, n_expert * ggml.tensorBytes(.q4_k, dim, ffn));
+    defer gpa.free(gw);
+    const uw = try gpa.alloc(u8, n_expert * ggml.tensorBytes(.q8_0, dim, ffn));
+    defer gpa.free(uw);
+    const dw = try gpa.alloc(u8, n_expert * ggml.tensorBytes(.q5_0, ffn, dim));
+    defer gpa.free(dw);
+    const sg = try gpa.alloc(u8, ggml.tensorBytes(.q4_k, dim, shexp_ffn));
+    defer gpa.free(sg);
+    const su = try gpa.alloc(u8, ggml.tensorBytes(.q4_k, dim, shexp_ffn));
+    defer gpa.free(su);
+    const sd = try gpa.alloc(u8, ggml.tensorBytes(.q4_k, shexp_ffn, dim));
+    defer gpa.free(sd);
+    for ([_][]u8{ gw, sg, su, sd }) |data| {
+        rnd.bytes(data);
+        pin(data, 144, 0, true);
+    }
+    rnd.bytes(uw);
+    pin(uw, 34, 0, false);
+    rnd.bytes(dw);
+    pin(dw, 22, 0, false);
+    const router = try gpa.alloc(f32, n_expert * dim);
+    defer gpa.free(router);
+    for (router) |*v| v.* = (rnd.float(f32) - 0.5) * 0.05;
+    const bias = try gpa.alloc(f32, n_expert);
+    defer gpa.free(bias);
+    for (bias) |*v| v.* = (rnd.float(f32) - 0.5) * 0.5;
+    const norm_w = try gpa.alloc(f32, dim);
+    defer gpa.free(norm_w);
+    for (norm_w) |*v| v.* = 1.0;
+
+    try std.testing.expect(mlaInit(1, ctx, kvr, rope));
+    // A fresh cache shape may follow an earlier test's: reset the recorded
+    // buffers so ensureMlaCache rebuilds for this geometry.
+    mla_cache = null;
+    mla_wk.clearRetainingCapacity();
+    const wkbuf = try gpa.alloc(f32, n_heads * stride * kvr);
+    defer gpa.free(wkbuf);
+    for (0..n_heads * stride) |r| cpu.dequantRow(.q8_0, wkbuf[r * kvr ..][0..kvr], kvb, r, kvr);
+    try std.testing.expect(mlaSetWk(0, wkbuf));
+    for (0..seq) |t| {
+        var c_row: [kvr]f32 = undefined;
+        var r_row: [rope]f32 = undefined;
+        for (&c_row) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+        for (&r_row) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+        try std.testing.expect(mlaAppend(li, t, &c_row, &r_row));
+    }
+
+    const q_nope = try gpa.alloc(f32, n_heads * nope);
+    defer gpa.free(q_nope);
+    const q_rope = try gpa.alloc(f32, n_heads * rope);
+    defer gpa.free(q_rope);
+    for (q_nope) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    for (q_rope) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    const x0 = try gpa.alloc(f32, dim);
+    defer gpa.free(x0);
+    for (x0) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    const cfg = RoutedCfg{ .n_expert = n_expert, .n_used = n_used, .gating_sigmoid = true, .weights_norm = true, .weights_scale = 1.0 };
+    const shexp: [3]WeightRef = .{ .{ .ty = .q4_k, .data = sg }, .{ .ty = .q4_k, .data = su }, .{ .ty = .q4_k, .data = sd } };
+
+    // ---- tail ----
+    const x_tail = try gpa.dupe(f32, x0);
+    defer gpa.free(x_tail);
+    const before = cmdbufs;
+    try std.testing.expect(mlaLayerTail(li, seq - 1, x_tail, q_nope, q_rope, .{ .ty = .q8_0, .data = kvb }, .{ .ty = .q8_0, .data = proj }, norm_w, eps, .{ .ty = .f32, .data = std.mem.sliceAsBytes(router) }, bias, .{ .ty = .q4_k, .data = gw }, .{ .ty = .q8_0, .data = uw }, .{ .ty = .q5_0, .data = dw }, shexp, ffn, shexp_ffn, cfg, n_heads, nope, vd, scale));
+    try std.testing.expectEqual(before + 1, cmdbufs);
+
+    // ---- constituents ----
+    const head_out = try gpa.alloc(f32, n_heads * vd);
+    defer gpa.free(head_out);
+    try std.testing.expect(mlaAttnHeads(li, seq - 1, q_nope, q_rope, .{ .ty = .q8_0, .data = kvb }, head_out, n_heads, nope, vd, scale));
+    const x_ref = try gpa.dupe(f32, x0);
+    defer gpa.free(x_ref);
+    const row = try gpa.alloc(f32, n_heads * vd);
+    defer gpa.free(row);
+    for (0..dim) |r| {
+        cpu.dequantRow(.q8_0, row, proj, r, n_heads * vd);
+        var acc64: f64 = 0;
+        for (row, head_out) |wv, hv| acc64 += @as(f64, wv) * @as(f64, hv);
+        x_ref[r] += @floatCast(acc64);
+    }
+    const normed = try gpa.alloc(f32, dim);
+    defer gpa.free(normed);
+    cpu.rmsnorm(normed, x_ref, norm_w, eps);
+    const logits = try gpa.alloc(f32, n_expert);
+    defer gpa.free(logits);
+    for (0..n_expert) |e| {
+        var acc64: f64 = 0;
+        for (router[e * dim ..][0..dim], normed) |wv, nv| acc64 += @as(f64, wv) * @as(f64, nv);
+        logits[e] = @floatCast(acc64);
+    }
+    const ffn_out = try gpa.alloc(f32, dim);
+    defer gpa.free(ffn_out);
+    try std.testing.expect(moeFfnBlockRouted(normed, logits, bias, .{ .ty = .q4_k, .data = gw }, .{ .ty = .q8_0, .data = uw }, .{ .ty = .q5_0, .data = dw }, shexp, ffn, shexp_ffn, cfg, ffn_out));
+    for (x_ref, ffn_out) |*a, v| a.* += v;
+
+    var mass: f32 = 0;
+    for (x_ref) |v| mass += @abs(v);
+    const tol = (mass / @as(f32, @floatFromInt(dim))) * 1e-3;
+    for (x_ref, x_tail, 0..) |a, bb, k| {
+        std.testing.expectApproxEqAbs(a, bb, tol) catch |e| {
+            std.debug.print("layer tail dim {d}: constituents {d} vs tail {d}\n", .{ k, a, bb });
             return e;
         };
     }
