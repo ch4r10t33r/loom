@@ -44,6 +44,10 @@ const V = struct {
     vkQueueSubmit: *const fn (Handle, u32, *const SubmitInfo, NDHandle) callconv(.c) VkResult,
     vkQueueWaitIdle: *const fn (Handle) callconv(.c) VkResult,
     vkResetCommandPool: *const fn (Handle, NDHandle, u32) callconv(.c) VkResult,
+    vkCreateQueryPool: *const fn (Handle, *const QueryPoolCreateInfo, ?*anyopaque, *NDHandle) callconv(.c) VkResult,
+    vkCmdResetQueryPool: *const fn (Handle, NDHandle, u32, u32) callconv(.c) void,
+    vkCmdWriteTimestamp: *const fn (Handle, u32, NDHandle, u32) callconv(.c) void,
+    vkGetQueryPoolResults: *const fn (Handle, NDHandle, u32, u32, usize, *anyopaque, u64, u32) callconv(.c) VkResult,
     vkResetDescriptorPool: *const fn (Handle, NDHandle, u32) callconv(.c) VkResult,
 };
 var v: V = undefined;
@@ -97,6 +101,7 @@ const DescriptorPoolCreateInfo = extern struct { sType: u32 = 33, pNext: ?*anyop
 const DescriptorSetAllocateInfo = extern struct { sType: u32 = 34, pNext: ?*anyopaque = null, descriptorPool: NDHandle, descriptorSetCount: u32 = 1, pSetLayouts: *const NDHandle };
 const DescriptorBufferInfo = extern struct { buffer: NDHandle, offset: u64 = 0, range: u64 };
 const WriteDescriptorSet = extern struct { sType: u32 = 35, pNext: ?*anyopaque = null, dstSet: NDHandle, dstBinding: u32, dstArrayElement: u32 = 0, descriptorCount: u32 = 1, descriptorType: u32 = 7, pImageInfo: ?*anyopaque = null, pBufferInfo: *const DescriptorBufferInfo, pTexelBufferView: ?*anyopaque = null };
+const QueryPoolCreateInfo = extern struct { sType: u32 = 11, pNext: ?*anyopaque = null, flags: u32 = 0, queryType: u32 = 2, queryCount: u32, pipelineStatistics: u32 = 0 };
 const CommandPoolCreateInfo = extern struct { sType: u32 = 39, pNext: ?*anyopaque = null, flags: u32 = 2, queueFamilyIndex: u32 };
 const CommandBufferAllocateInfo = extern struct { sType: u32 = 40, pNext: ?*anyopaque = null, commandPool: NDHandle, level: u32 = 0, commandBufferCount: u32 = 1 };
 const CommandBufferBeginInfo = extern struct { sType: u32 = 42, pNext: ?*anyopaque = null, flags: u32 = 1, pInheritanceInfo: ?*anyopaque = null };
@@ -129,6 +134,17 @@ pub const Device = struct {
     pipe_layout: NDHandle,
     mem_props: PhysicalDeviceMemoryProperties,
     staging: ?Buffer = null,
+    // LOOM_VK_KERNEL_PROF: a timestamp after every recorded dispatch. The
+    // stream is fully barriered, so consecutive timestamps are per-dispatch
+    // GPU durations -- the profiler Nsight cannot be for Vulkan compute on a
+    // headless box. Totals aggregate per pipeline across submissions.
+    prof: bool = false,
+    query_pool: NDHandle = 0,
+    qcount: u32 = 0,
+    qpipes: [2048]NDHandle = undefined,
+    prof_pipes: [64]NDHandle = @splat(0),
+    prof_ticks: [64]u64 = @splat(0),
+    prof_calls: [64]u64 = @splat(0),
 
     pub fn init() Error!Device {
         try loadVulkan();
@@ -196,7 +212,16 @@ pub const Device = struct {
         var dpool: NDHandle = 0;
         if (v.vkCreateDescriptorPool(dev, &dpci, null, &dpool) != VK_SUCCESS) return error.CreateFailed;
 
-        return .{ .instance = inst, .phys = phys, .dev = dev, .queue = queue, .family = family, .cmd_pool = pool, .desc_pool = dpool, .set_layout = slayout, .pipe_layout = playout, .mem_props = mp };
+        var self = Device{ .instance = inst, .phys = phys, .dev = dev, .queue = queue, .family = family, .cmd_pool = pool, .desc_pool = dpool, .set_layout = slayout, .pipe_layout = playout, .mem_props = mp };
+        if (std.c.getenv("LOOM_VK_KERNEL_PROF") != null) {
+            var qp: NDHandle = 0;
+            var qpci = QueryPoolCreateInfo{ .queryCount = 2048 };
+            if (v.vkCreateQueryPool(dev, &qpci, null, &qp) == VK_SUCCESS) {
+                self.query_pool = qp;
+                self.prof = true;
+            }
+        }
+        return self;
     }
 
     fn allocIn(self: *Device, len: usize, want_flags: u32) Error!Buffer {
@@ -288,6 +313,11 @@ pub const Device = struct {
         if (v.vkAllocateCommandBuffers(self.dev, &cbai, @ptrCast(&cmd)) != VK_SUCCESS) return error.CreateFailed;
         const begin = CommandBufferBeginInfo{};
         _ = v.vkBeginCommandBuffer(cmd, &begin);
+        if (self.prof) {
+            v.vkCmdResetQueryPool(cmd, self.query_pool, 0, 2048);
+            v.vkCmdWriteTimestamp(cmd, 0x2000, self.query_pool, 0); // BOTTOM_OF_PIPE baseline
+            self.qcount = 1;
+        }
         return .{ .cmd = cmd };
     }
 
@@ -306,6 +336,11 @@ pub const Device = struct {
         v.vkCmdBindDescriptorSets(c.cmd, 1, self.pipe_layout, 0, 1, @ptrCast(&set), 0, null);
         v.vkCmdPushConstants(c.cmd, self.pipe_layout, 0x20, 0, @intCast(push.len), push.ptr);
         v.vkCmdDispatch(c.cmd, groups_x, 1, 1);
+        if (self.prof and self.qcount < 2048) {
+            self.qpipes[self.qcount] = pipe;
+            v.vkCmdWriteTimestamp(c.cmd, 0x2000, self.query_pool, self.qcount);
+            self.qcount += 1;
+        }
     }
 
     /// Compute-to-compute execution and memory dependency: everything written
@@ -329,6 +364,23 @@ pub const Device = struct {
         var si = SubmitInfo{ .pCommandBuffers = &cmd };
         if (v.vkQueueSubmit(self.queue, 1, &si, 0) != VK_SUCCESS) return error.CreateFailed;
         _ = v.vkQueueWaitIdle(self.queue);
+        if (self.prof and self.qcount > 1) {
+            var ts: [2048]u64 = undefined;
+            if (v.vkGetQueryPoolResults(self.dev, self.query_pool, 0, self.qcount, self.qcount * 8, &ts, 8, 1 | 2) == VK_SUCCESS) {
+                for (1..self.qcount) |i| {
+                    const dur = ts[i] -% ts[i - 1];
+                    for (&self.prof_pipes, &self.prof_ticks, &self.prof_calls) |*ph, *pt, *pn| {
+                        if (ph.* == self.qpipes[i] or ph.* == 0) {
+                            ph.* = self.qpipes[i];
+                            pt.* += dur;
+                            pn.* += 1;
+                            break;
+                        }
+                    }
+                }
+            }
+            self.qcount = 0;
+        }
     }
 
     /// One dispatch as one submission -- `beginCmd`/`record`/`submitWait` for

@@ -1,33 +1,23 @@
-// Q4_K matvec, four rows per workgroup: the activation vector is loaded
-// once and dotted against all four rows, quartering x traffic and the
-// reduction overhead. Arithmetic per value unchanged: d*sc*q - dmin*m.
+// Q4_K matvec, 128-bit loads: the 16-byte block header (d, dmin, twelve
+// scale bytes) is one uvec4, the 32-byte quant run two more -- the load
+// width NVIDIA needs for full bandwidth. Four rows per workgroup.
 #version 450
 layout(local_size_x = 64) in;
-layout(std430, binding = 0) readonly buffer W { uint w4[]; };
+layout(std430, binding = 0) readonly buffer W { uvec4 w16[]; };
 layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };
 layout(std430, binding = 2) writeonly buffer O { float o[]; };
 layout(push_constant) uniform PC { uint rows; uint cols; } pc;
 shared vec4 red[64];
 
-// Unaligned 4-byte load: the 22/34/210-byte block formats put fields at
-// half-word offsets. The device layer pads every buffer by a word, so the
-// word+1 read at the tail stays in bounds.
-uint loadU32(uint byte_off) {
-    uint word = byte_off >> 2u;
-    uint sh = (byte_off & 3u) * 8u;
-    if (sh == 0u) return w4[word];
-    return (w4[word] >> sh) | (w4[word + 1u] << (32u - sh));
-}
-
 float sum4(vec4 v) { return v.x + v.y + v.z + v.w; }
 
-const uint QK_K = 256u;
-const uint BLK = 144u;
-
-void scale_min(uint j, uint u, out float sc, out float mn) {
-    uint a = (w4[u + 1u + (j >> 2u)] >> ((j & 3u) * 8u)) & 0xFFu;
-    uint b = (w4[u + 1u + ((j + 4u) >> 2u)] >> (((j + 4u) & 3u) * 8u)) & 0xFFu;
-    uint c = (w4[u + 1u] >> ((j & 3u) * 8u)) & 0xFFu;
+// 6-bit scale/min for sub-block j, from the block's 16-byte header uvec4
+// (d|dmin in .x, the twelve scale bytes in .y .z .w).
+void scale_min(uint j, uvec4 hdr, out float sc, out float mn) {
+    uint sh = (j & 3u) * 8u;
+    uint a = ((j < 4u ? hdr.y : hdr.z) >> sh) & 0xFFu;
+    uint b = ((j < 4u ? hdr.z : hdr.w) >> sh) & 0xFFu;
+    uint c = (hdr.y >> sh) & 0xFFu;
     if (j < 4u) {
         sc = float(a & 63u);
         mn = float(b & 63u);
@@ -46,15 +36,13 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
     uint row0 = gl_WorkGroupID.x * 4u;
     if (row0 >= pc.rows) return;
-    uint blocks = pc.cols / QK_K;
-    uint rb = blocks * BLK;
+    uint blocks = pc.cols / 256u;
+    uint rb16 = blocks * 9u; // 144 bytes = 9 uvec4 per super-block
     uint nr = min(4u, pc.rows - row0);
-    // A short tail group re-reads row0's bytes for its missing rows and
-    // discards the result -- valid memory, no divergent inner loop.
-    uint base0 = row0 * rb;
-    uint b1 = base0 + min(1u, nr - 1u) * rb;
-    uint b2 = base0 + min(2u, nr - 1u) * rb;
-    uint b3 = base0 + min(3u, nr - 1u) * rb;
+    uint base0 = row0 * rb16;
+    uint r1 = base0 + min(1u, nr - 1u) * rb16;
+    uint r2 = base0 + min(2u, nr - 1u) * rb16;
+    uint r3 = base0 + min(3u, nr - 1u) * rb16;
     uint x0 = 0u;
 
     vec4 acc = vec4(0.0);
@@ -62,36 +50,45 @@ void main() {
     uint h = sb >> 1u;
     bool hi = (sb & 1u) == 1u;
     for (uint b = tid >> 3u; b < blocks; b += 8u) {
-        uint u0 = (base0 + b * BLK) >> 2u;
-        uint u1 = (b1 + b * BLK) >> 2u;
-        uint u2 = (b2 + b * BLK) >> 2u;
-        uint u3 = (b3 + b * BLK) >> 2u;
-        vec2 dd0 = unpackHalf2x16(w4[u0]);
-        vec2 dd1 = unpackHalf2x16(w4[u1]);
-        vec2 dd2 = unpackHalf2x16(w4[u2]);
-        vec2 dd3 = unpackHalf2x16(w4[u3]);
+        uint u0 = base0 + b * 9u;
+        uint u1 = r1 + b * 9u;
+        uint u2 = r2 + b * 9u;
+        uint u3 = r3 + b * 9u;
+        uvec4 h0 = w16[u0];
+        uvec4 h1 = w16[u1];
+        uvec4 h2 = w16[u2];
+        uvec4 h3 = w16[u3];
         vec4 scv;
         vec4 mnv;
-        scale_min(sb, u0, scv.x, mnv.x);
-        scale_min(sb, u1, scv.y, mnv.y);
-        scale_min(sb, u2, scv.z, mnv.z);
-        scale_min(sb, u3, scv.w, mnv.w);
-        uint q0 = u0 + 4u + h * 8u;
-        uint q1 = u1 + 4u + h * 8u;
-        uint q2 = u2 + 4u + h * 8u;
-        uint q3 = u3 + 4u + h * 8u;
+        scale_min(sb, h0, scv.x, mnv.x);
+        scale_min(sb, h1, scv.y, mnv.y);
+        scale_min(sb, h2, scv.z, mnv.z);
+        scale_min(sb, h3, scv.w, mnv.w);
+        uint q0 = u0 + 1u + h * 2u;
+        uint q1 = u1 + 1u + h * 2u;
+        uint q2 = u2 + 1u + h * 2u;
+        uint q3 = u3 + 1u + h * 2u;
         uint xb4 = (x0 >> 2u) + b * 64u + sb * 8u;
         vec4 s_qx = vec4(0.0);
         float s_x = 0.0;
-        for (uint j = 0u; j < 8u; j++) {
-            vec4 xv = x4[xb4 + j];
-            s_x += sum4(xv);
-            s_qx.x += dot(nib(w4[q0 + j], hi), xv);
-            s_qx.y += dot(nib(w4[q1 + j], hi), xv);
-            s_qx.z += dot(nib(w4[q2 + j], hi), xv);
-            s_qx.w += dot(nib(w4[q3 + j], hi), xv);
+        for (uint jw = 0u; jw < 2u; jw++) {
+            uvec4 w0 = w16[q0 + jw];
+            uvec4 w1 = w16[q1 + jw];
+            uvec4 w2 = w16[q2 + jw];
+            uvec4 w3 = w16[q3 + jw];
+            uint xj = xb4 + jw * 4u;
+            vec4 xa = x4[xj];
+            vec4 xb = x4[xj + 1u];
+            vec4 xc = x4[xj + 2u];
+            vec4 xd = x4[xj + 3u];
+            s_x += sum4(xa) + sum4(xb) + sum4(xc) + sum4(xd);
+            s_qx.x += dot(nib(w0.x, hi), xa) + dot(nib(w0.y, hi), xb) + dot(nib(w0.z, hi), xc) + dot(nib(w0.w, hi), xd);
+            s_qx.y += dot(nib(w1.x, hi), xa) + dot(nib(w1.y, hi), xb) + dot(nib(w1.z, hi), xc) + dot(nib(w1.w, hi), xd);
+            s_qx.z += dot(nib(w2.x, hi), xa) + dot(nib(w2.y, hi), xb) + dot(nib(w2.z, hi), xc) + dot(nib(w2.w, hi), xd);
+            s_qx.w += dot(nib(w3.x, hi), xa) + dot(nib(w3.y, hi), xb) + dot(nib(w3.z, hi), xc) + dot(nib(w3.w, hi), xd);
         }
-        acc += vec4(dd0.x, dd1.x, dd2.x, dd3.x) * scv * s_qx - vec4(dd0.y, dd1.y, dd2.y, dd3.y) * mnv * s_x;
+        acc += vec4(unpackHalf2x16(h0.x).x, unpackHalf2x16(h1.x).x, unpackHalf2x16(h2.x).x, unpackHalf2x16(h3.x).x) * scv * s_qx
+             - vec4(unpackHalf2x16(h0.x).y, unpackHalf2x16(h1.x).y, unpackHalf2x16(h2.x).y, unpackHalf2x16(h3.x).y) * mnv * s_x;
     }
 
     red[tid] = acc;
