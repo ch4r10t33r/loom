@@ -1,0 +1,14 @@
+// out[out_off + i] = in[in_off + i], n floats. Exists for cache writes
+// inside a recorded frame: the k_rope section of kv_a lands in the device
+// cache before the rope kernel rotates it there, and a host memcpy
+// mid-frame would be a synchronization.
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer I { float src[]; };
+layout(std430, binding = 1) writeonly buffer O { float dst[]; };
+layout(push_constant) uniform PC { uint n; uint in_off; uint out_off; } pc;
+
+void main() {
+    uint gid = gl_GlobalInvocationID.x;
+    if (gid < pc.n) dst[pc.out_off + gid] = src[pc.in_off + gid];
+}

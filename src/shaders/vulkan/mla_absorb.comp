@@ -6,9 +6,9 @@
 #version 450
 layout(local_size_x = 64) in;
 layout(std430, binding = 0) readonly buffer W { float wk[]; };
-layout(std430, binding = 1) readonly buffer Q { float q[]; }; // gathered: [n_heads][nope]
+layout(std430, binding = 1) readonly buffer Q { float q[]; }; // head h nope section at q_off + h*q_stride
 layout(std430, binding = 2) writeonly buffer O { float o[]; };
-layout(push_constant) uniform PC { uint n_heads; uint nope; uint kvr; uint stride; } pc;
+layout(push_constant) uniform PC { uint n_heads; uint nope; uint kvr; uint stride; uint q_stride; uint q_off; } pc;
 shared float red[64];
 
 void main() {
@@ -19,7 +19,7 @@ void main() {
     uint tid = gl_LocalInvocationID.x;
 
     uint wh = h * pc.stride * pc.kvr;
-    uint qh = h * pc.nope;
+    uint qh = pc.q_off + h * pc.q_stride;
     float acc = 0.0;
     for (uint r = tid; r < pc.nope; r += 64u) acc += q[qh + r] * wk[wh + r * pc.kvr + i];
     red[tid] = acc;

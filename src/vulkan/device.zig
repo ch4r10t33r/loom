@@ -186,13 +186,13 @@ pub const Device = struct {
         var slci = DescriptorSetLayoutCreateInfo{ .bindingCount = binds.len, .pBindings = &binds };
         var slayout: NDHandle = 0;
         if (v.vkCreateDescriptorSetLayout(dev, &slci, null, &slayout) != VK_SUCCESS) return error.CreateFailed;
-        const pcr = PushConstantRange{ .size = 32 };
+        const pcr = PushConstantRange{ .size = 64 };
         var plci = PipelineLayoutCreateInfo{ .pSetLayouts = &slayout, .pPushConstantRanges = &pcr };
         var playout: NDHandle = 0;
         if (v.vkCreatePipelineLayout(dev, &plci, null, &playout) != VK_SUCCESS) return error.CreateFailed;
 
-        const ps = DescriptorPoolSize{ .descriptorCount = 256 };
-        var dpci = DescriptorPoolCreateInfo{ .maxSets = 64, .pPoolSizes = &ps };
+        const ps = DescriptorPoolSize{ .descriptorCount = 8192 };
+        var dpci = DescriptorPoolCreateInfo{ .maxSets = 2048, .pPoolSizes = &ps };
         var dpool: NDHandle = 0;
         if (v.vkCreateDescriptorPool(dev, &dpci, null, &dpool) != VK_SUCCESS) return error.CreateFailed;
 
@@ -308,6 +308,10 @@ pub const Device = struct {
 
     /// Compute-to-compute execution and memory dependency: everything written
     /// by dispatches recorded before it is visible to dispatches after it.
+    /// (An intermittent wrong-output hunt once blamed this barrier's scope
+    /// and widened it to ALL_COMMANDS; the real culprit was a stale entry in
+    /// the backend's pointer-keyed weight cache, and the soak that cleared
+    /// the barrier's name is in the frame test's history.)
     pub fn barrier(self: *Device, c: Cmd) void {
         _ = self;
         const mb = MemoryBarrier{ .srcAccessMask = 0x40, .dstAccessMask = 0x20 | 0x40 }; // SHADER_WRITE -> SHADER_READ|WRITE
