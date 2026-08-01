@@ -475,7 +475,29 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     defer peer_list.deinit(gpa);
     var peer_strs = std.ArrayList([]const u8).empty; // same peers, as strings for the gossip table
     defer peer_strs.deinit(gpa);
-    if (opts.bootstrap) |bs| {
+    // Named-network resolution happens up front: the registry supplies the
+    // default bootnode, so `loom node --network devnet` alone is a complete
+    // join command.
+    var preset: ?*const networks.Network = null;
+    if (opts.network_name) |nm| {
+        preset = networks.byName(nm) orelse {
+            try out.print("unknown --network '{s}' (want devnet | testnet | mainnet)\n", .{nm});
+            return;
+        };
+        if (opts.network_id != null and opts.network_id.? != preset.?.id) {
+            try out.print("--network {s} is id {d}; conflicting --network-id {d}\n", .{ nm, preset.?.id, opts.network_id.? });
+            return;
+        }
+    }
+    var eff_bootstrap: ?[]const u8 = opts.bootstrap;
+    if (preset) |p| {
+        if (eff_bootstrap == null and opts.gguf_path == null and p.bootnodes.len > 0) {
+            eff_bootstrap = p.bootnodes[0];
+            try out.print("  bootnode   {s} (registry default for {s})\n", .{ eff_bootstrap.?, p.name });
+        }
+    }
+
+    if (eff_bootstrap) |bs| {
         const a = sync.PeerAddr.parse(bs) catch {
             try out.print("bad --bootstrap address (want host:port): {s}\n", .{bs});
             return;
@@ -654,17 +676,6 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     // the manifest. Computed HERE, after the store is final -- the first
     // version ran before any store existed and every node silently derived
     // id 0, which the three-machine test caught.
-    var preset: ?*const networks.Network = null;
-    if (opts.network_name) |nm| {
-        preset = networks.byName(nm) orelse {
-            try out.print("unknown --network '{s}' (want devnet | testnet | mainnet)\n", .{nm});
-            return;
-        };
-        if (opts.network_id != null and opts.network_id.? != preset.?.id) {
-            try out.print("--network {s} is id {d}; conflicting --network-id {d}\n", .{ nm, preset.?.id, opts.network_id.? });
-            return;
-        }
-    }
     const network_id: u64 = if (preset) |p| p.id else (opts.network_id orelse
         (if (store) |*st| wire.networkIdFromManifest(st.manifest.version) else 0));
     if (preset) |p| {

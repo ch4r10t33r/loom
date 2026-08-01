@@ -28,10 +28,13 @@ pub const Network = struct {
     desc: []const u8,
     /// Refuse (true) or merely warn (false) on serving a mismatched arch.
     strict: bool,
+    /// Default bootnodes: `--network NAME` with no explicit --bootstrap
+    /// joins through these. Empty until a network is stood up.
+    bootnodes: []const []const u8 = &.{},
 };
 
 pub const registry = [_]Network{
-    .{ .name = "devnet", .id = 1337, .arch = "glm4moe", .model = "unsloth/GLM-4.5-Air-GGUF (Q4_K_M)", .desc = "PoC validation -- GLM-4.5-Air 106B-A12B", .strict = false },
+    .{ .name = "devnet", .id = 1337, .arch = "glm4moe", .model = "unsloth/GLM-4.5-Air-GGUF (Q4_K_M)", .desc = "PoC validation -- GLM-4.5-Air 106B-A12B", .strict = false, .bootnodes = &.{"REDACTED-IP:8771"} },
     .{ .name = "testnet", .id = 2, .arch = "glm4moe", .model = "unsloth/GLM-4.6-GGUF (Q4_K_M)", .desc = "performance tier -- GLM-4.6 357B-A32B", .strict = true },
     .{ .name = "mainnet", .id = 1, .arch = "glm-dsa", .model = "unsloth/GLM-5.2-GGUF (UD-Q4_K_XL)", .desc = "production -- GLM 5.2 744B-A40B", .strict = true },
 };
