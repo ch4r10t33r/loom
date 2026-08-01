@@ -2,15 +2,15 @@
 // buffer moe_route wrote -- the port of moe_reduce_dev in moe_acc.metal.
 #version 450
 layout(local_size_x = 64) in;
-layout(std430, binding = 0) writeonly buffer ACC { float acc[]; };
+layout(std430, binding = 0) buffer ACC { float acc[]; };
 layout(std430, binding = 1) readonly buffer OUTS { float outs[]; };
 layout(std430, binding = 2) readonly buffer G { float gates[]; };
-layout(push_constant) uniform PC { uint n; uint dim; } pc;
+layout(push_constant) uniform PC { uint n; uint dim; uint accum; } pc;
 
 void main() {
     uint gid = gl_GlobalInvocationID.x;
     if (gid >= pc.dim) return;
     float a = 0.0;
     for (uint e = 0u; e < pc.n; e++) a += gates[e] * outs[e * pc.dim + gid];
-    acc[gid] = a;
+    acc[gid] = (pc.accum == 1u ? acc[gid] : 0.0) + a; // accum=1 folds the residual add away
 }
