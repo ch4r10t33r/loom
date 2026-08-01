@@ -12,6 +12,10 @@
             .url = "https://github.com/google/brotli/archive/refs/tags/v1.1.0.tar.gz",
             .hash = "N-V-__8AAF_gIQDX2wVzXI-r96NyCgKuDj9W_Gab-TU7Qzoi",
         },
+        .vector_index = .{
+            .url = "https://github.com/zigstack/vector-index/archive/refs/tags/v0.1.0.tar.gz",
+            .hash = "vector_index-0.1.0-oFy4mxArAABY_Rh_p0oAOxJhCWE1GZ0ljlPQv_xsNFzK",
+        },
     },
     .paths = .{
         "build.zig",

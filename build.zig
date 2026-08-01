@@ -9,6 +9,7 @@ pub fn build(b: *std.Build) void {
     const optimize = b.standardOptimizeOption(.{});
 
     const snappy = b.dependency("zig_snappy", .{ .target = target, .optimize = optimize });
+    const vector_index = b.dependency("vector_index", .{ .target = target, .optimize = optimize });
 
     // `-Dcommit=<sha>` from CI; "unknown" for a plain local build, which is
     // itself useful information when someone reports a bug.
@@ -45,6 +46,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "snappyz", .module = snappy.module("snappyz") },
+            .{ .name = "vector_index", .module = vector_index.module("vector_index") },
             .{ .name = "build_info", .module = build_info.createModule() },
         },
     });
@@ -79,6 +81,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .imports = &.{
             .{ .name = "snappyz", .module = snappy.module("snappyz") },
+            .{ .name = "vector_index", .module = vector_index.module("vector_index") },
             .{ .name = "build_info", .module = build_info.createModule() },
         },
     });
@@ -107,17 +110,17 @@ fn addBrotli(b: *std.Build, m: *std.Build.Module) void {
     const dep = b.dependency("brotli", .{});
     m.addIncludePath(dep.path("c/include"));
     m.addCSourceFiles(.{ .root = dep.path("c"), .files = &.{
-        "common/constants.c",    "common/context.c",      "common/dictionary.c",
-        "common/platform.c",     "common/shared_dictionary.c", "common/transform.c",
-        "dec/bit_reader.c",      "dec/decode.c",          "dec/huffman.c",
-        "dec/state.c",
-        "enc/backward_references.c", "enc/backward_references_hq.c", "enc/bit_cost.c",
-        "enc/block_splitter.c",  "enc/brotli_bit_stream.c", "enc/cluster.c",
-        "enc/command.c",         "enc/compound_dictionary.c", "enc/compress_fragment.c",
-        "enc/compress_fragment_two_pass.c", "enc/dictionary_hash.c", "enc/encode.c",
-        "enc/encoder_dict.c",    "enc/entropy_encode.c",  "enc/fast_log.c",
-        "enc/histogram.c",       "enc/literal_cost.c",    "enc/memory.c",
-        "enc/metablock.c",       "enc/static_dict.c",     "enc/utf8_util.c",
+        "common/constants.c",      "common/context.c",                 "common/dictionary.c",
+        "common/platform.c",       "common/shared_dictionary.c",       "common/transform.c",
+        "dec/bit_reader.c",        "dec/decode.c",                     "dec/huffman.c",
+        "dec/state.c",             "enc/backward_references.c",        "enc/backward_references_hq.c",
+        "enc/bit_cost.c",          "enc/block_splitter.c",             "enc/brotli_bit_stream.c",
+        "enc/cluster.c",           "enc/command.c",                    "enc/compound_dictionary.c",
+        "enc/compress_fragment.c", "enc/compress_fragment_two_pass.c", "enc/dictionary_hash.c",
+        "enc/encode.c",            "enc/encoder_dict.c",               "enc/entropy_encode.c",
+        "enc/fast_log.c",          "enc/histogram.c",                  "enc/literal_cost.c",
+        "enc/memory.c",            "enc/metablock.c",                  "enc/static_dict.c",
+        "enc/utf8_util.c",
     }, .flags = &.{} });
 }
 
