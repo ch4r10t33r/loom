@@ -248,6 +248,41 @@ fn matvecMinBytes() usize {
     return min_bytes.?;
 }
 
+/// Q6_K device copies are repacked at upload: each 210-byte block padded to
+/// a word-aligned 224-byte stride, so the kernel's quant loads are direct
+/// word reads. Same pointer-keyed cache -- a tensor's type never changes,
+/// so a pointer is consistently padded or consistently raw.
+fn weightBufferQ6K(d: *vk.Device, data: []const u8) ?vk.Buffer {
+    const gop = wcache.getOrPut(std.heap.page_allocator, @intFromPtr(data.ptr)) catch return null;
+    if (gop.found_existing and gop.value_ptr.len == data.len) return gop.value_ptr.buf;
+    const blocks = data.len / 210;
+    const padded = std.heap.page_allocator.alloc(u8, blocks * 224) catch return null;
+    defer std.heap.page_allocator.free(padded);
+    for (0..blocks) |b| {
+        @memcpy(padded[b * 224 ..][0..210], data[b * 210 ..][0..210]);
+        @memset(padded[b * 224 + 210 ..][0..14], 0);
+    }
+    const buf = d.allocDevice(padded.len) catch {
+        if (!gop.found_existing) _ = wcache.remove(@intFromPtr(data.ptr));
+        return null;
+    };
+    d.upload(buf, padded) catch {
+        if (!gop.found_existing) _ = wcache.remove(@intFromPtr(data.ptr));
+        return null;
+    };
+    gop.value_ptr.* = .{ .buf = buf, .len = data.len };
+    return buf;
+}
+
+/// Type-aware fetch: q6_k tensors get the padded device copy, everything
+/// else the raw one. Every WeightRef that reaches a kernel goes through
+/// this -- the first padded build missed the attention tensors Q4_K_M
+/// stores as q6_K, and the oracle could not see it because the test path
+/// padded correctly; the generation read garbage.
+fn wbufFor(d: *vk.Device, w: WeightRef) ?vk.Buffer {
+    return if (w.ty == .q6_k) weightBufferQ6K(d, w.data) else weightBuffer(d, w.data);
+}
+
 /// The dmmv family (q4_k, q5_0, q8_0, q6_k, f32), one submission per call.
 /// Weights live on the device after their first use; activations stage
 /// through grow-only host-visible buffers. Anything without a kernel falls
@@ -256,7 +291,7 @@ pub fn matvec(t: ggml.Type, out: []f32, data: []const u8, x: []const f32, rows: 
     if (!use_gpu_ops or data.len < matvecMinBytes()) return cpu.matvec(t, out, data, x, rows, cols);
     const d = &(dev orelse return cpu.matvec(t, out, data, x, rows, cols));
     const pipe = pipeFor(t, cols) orelse return cpu.matvec(t, out, data, x, rows, cols);
-    const wb = weightBuffer(d, data) orelse return cpu.matvec(t, out, data, x, rows, cols);
+    const wb = (if (t == .q6_k) weightBufferQ6K(d, data) else weightBuffer(d, data)) orelse return cpu.matvec(t, out, data, x, rows, cols);
     if (xbuf == null or xbuf.?.len < x.len * 4) xbuf = d.alloc(x.len * 4) catch return cpu.matvec(t, out, data, x, rows, cols);
     if (obuf == null or obuf.?.len < out.len * 4) obuf = d.alloc(out.len * 4) catch return cpu.matvec(t, out, data, x, rows, cols);
     @memcpy(xbuf.?.slice(f32)[0..x.len], x);
@@ -360,9 +395,9 @@ pub fn moeFfnBlockRouted(normed: []const f32, logits: []const f32, bias: ?[]cons
         sh_pipes[1] = pipeFor(sw[1].ty, dim) orelse return false;
         sh_pipes[2] = pipeFor(sw[2].ty, shexp_ffn) orelse return false;
     }
-    const gw = weightBuffer(d, gate_w.data) orelse return false;
-    const uw = weightBuffer(d, up_w.data) orelse return false;
-    const dw = weightBuffer(d, down_w.data) orelse return false;
+    const gw = wbufFor(d, gate_w) orelse return false;
+    const uw = wbufFor(d, up_w) orelse return false;
+    const dw = wbufFor(d, down_w) orelse return false;
     const widest = @max(ffn, shexp_ffn);
     const s1 = ensureDev(&slots[0], d, @max(cfg.n_used * ffn, widest) * 4) orelse return false;
     const s2 = ensureDev(&slots[1], d, @max(cfg.n_used * ffn, widest) * 4) orelse return false;
@@ -375,7 +410,7 @@ pub fn moeFfnBlockRouted(normed: []const f32, logits: []const f32, bias: ?[]cons
     // transfer, so every weight must be resident before recording opens.
     var shw: [3]vk.Buffer = undefined;
     if (shexp) |sw| {
-        for (sw, 0..) |w, i| shw[i] = weightBuffer(d, w.data) orelse return false;
+        for (sw, 0..) |w, i| shw[i] = wbufFor(d, w) orelse return false;
     }
 
     // Route staging, packed [logits][bias] -- host writes to mapped memory,
@@ -576,7 +611,7 @@ fn prepAttn(d: *vk.Device, li: usize, pos: usize, q_nope: []const f32, q_rope: [
     if (seq > w.ctx) return null;
     if (q_nope.len != n_heads * nope or q_rope.len != n_heads * w.rope) return null;
     const vp = idPipeFor(kv_b.ty, w.kvr) orelse return null;
-    const vw = weightBuffer(d, kv_b.data) orelse return null;
+    const vw = wbufFor(d, kv_b) orelse return null;
     const row_bytes = kv_b.data.len / (n_heads * (nope + v_head_dim));
     if (vids == null) {
         const b = d.alloc(64 * 4) catch return null;
@@ -659,9 +694,9 @@ pub fn mlaLayerTail(li: usize, pos: usize, x: []f32, q_nope: []const f32, q_rope
     const p = prepAttn(d, li, pos, q_nope, q_rope, kv_b, n_heads, nope, v_head_dim) orelse return false;
     // ...the projections around it...
     const ap = pipeFor(attn_out_w.ty, n_heads * v_head_dim) orelse return false;
-    const aw = weightBuffer(d, attn_out_w.data) orelse return false;
+    const aw = wbufFor(d, attn_out_w) orelse return false;
     const rp = pipeFor(router_w.ty, dim) orelse return false;
-    const rw = weightBuffer(d, router_w.data) orelse return false;
+    const rw = wbufFor(d, router_w) orelse return false;
     // ...and the routed chain, same resolution as moeFfnBlockRouted.
     const gp = idPipeForNormed(gate_w.ty, dim) orelse return false;
     const up = idPipeForNormed(up_w.ty, dim) orelse return false;
@@ -672,11 +707,11 @@ pub fn mlaLayerTail(li: usize, pos: usize, x: []f32, q_nope: []const f32, q_rope
         sh_pipes[0] = pipeFor(sw[0].ty, dim) orelse return false;
         sh_pipes[1] = pipeFor(sw[1].ty, dim) orelse return false;
         sh_pipes[2] = pipeFor(sw[2].ty, shexp_ffn) orelse return false;
-        for (sw, 0..) |w2, i| shw[i] = weightBuffer(d, w2.data) orelse return false;
+        for (sw, 0..) |w2, i| shw[i] = wbufFor(d, w2) orelse return false;
     }
-    const gw = weightBuffer(d, gate_w.data) orelse return false;
-    const uw = weightBuffer(d, up_w.data) orelse return false;
-    const dw = weightBuffer(d, down_w.data) orelse return false;
+    const gw = wbufFor(d, gate_w) orelse return false;
+    const uw = wbufFor(d, up_w) orelse return false;
+    const dw = wbufFor(d, down_w) orelse return false;
     const widest = @max(ffn, shexp_ffn);
     const s1 = ensure(&slots[0], d, @max(cfg.n_used * ffn, widest) * 4) orelse return false;
     const s2 = ensure(&slots[1], d, @max(cfg.n_used * ffn, widest) * 4) orelse return false;
@@ -832,47 +867,47 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         var p: P = .{ .anw = undefined, .qp = undefined, .qw = undefined, .kap = undefined, .kaw = undefined, .kanw = undefined, .vp = undefined, .vw = undefined, .row_bytes = undefined, .pp = undefined, .pw = undefined, .fnw = undefined };
         p.anw = weightBuffer(d, std.mem.sliceAsBytes(dd.attn_norm)) orelse return false;
         p.qp = pipeFor(dd.wq.ty, dim) orelse return false;
-        p.qw = weightBuffer(d, dd.wq.data) orelse return false;
+        p.qw = wbufFor(d, dd.wq) orelse return false;
         p.kap = pipeFor(dd.kv_a.ty, dim) orelse return false;
-        p.kaw = weightBuffer(d, dd.kv_a.data) orelse return false;
+        p.kaw = wbufFor(d, dd.kv_a) orelse return false;
         p.kanw = weightBuffer(d, std.mem.sliceAsBytes(dd.kv_a_norm)) orelse return false;
         p.vp = idPipeFor(dd.kv_b.ty, fc.kvr) orelse return false;
-        p.vw = weightBuffer(d, dd.kv_b.data) orelse return false;
+        p.vw = wbufFor(d, dd.kv_b) orelse return false;
         p.row_bytes = dd.kv_b.data.len / (fc.n_heads * (fc.nope + fc.v_head_dim));
         p.pp = pipeFor(dd.attn_out.ty, fc.n_heads * fc.v_head_dim) orelse return false;
-        p.pw = weightBuffer(d, dd.attn_out.data) orelse return false;
+        p.pw = wbufFor(d, dd.attn_out) orelse return false;
         p.fnw = weightBuffer(d, std.mem.sliceAsBytes(dd.ffn_norm)) orelse return false;
         if (dd.is_moe) {
             p.rp = pipeFor(dd.router.ty, dim) orelse return false;
-            p.rw = weightBuffer(d, dd.router.data) orelse return false;
+            p.rw = wbufFor(d, dd.router) orelse return false;
             p.gp = idPipeForNormed(dd.gate.ty, dim) orelse return false;
-            p.gw = weightBuffer(d, dd.gate.data) orelse return false;
+            p.gw = wbufFor(d, dd.gate) orelse return false;
             p.up = idPipeForNormed(dd.up.ty, dim) orelse return false;
-            p.uw = weightBuffer(d, dd.up.data) orelse return false;
+            p.uw = wbufFor(d, dd.up) orelse return false;
             p.dp = idPipeFor(dd.down.ty, dd.ffn) orelse return false;
-            p.dw = weightBuffer(d, dd.down.data) orelse return false;
+            p.dw = wbufFor(d, dd.down) orelse return false;
             s12_len = @max(s12_len, fc.routed.n_used * dd.ffn);
             if (dd.shexp) |sw| {
                 p.sh_pipes[0] = pipeFor(sw[0].ty, dim) orelse return false;
                 p.sh_pipes[1] = pipeFor(sw[1].ty, dim) orelse return false;
                 p.sh_pipes[2] = pipeFor(sw[2].ty, dd.shexp_ffn) orelse return false;
-                for (sw, 0..) |w2, k| p.shw[k] = weightBuffer(d, w2.data) orelse return false;
+                for (sw, 0..) |w2, k| p.shw[k] = wbufFor(d, w2) orelse return false;
                 s12_len = @max(s12_len, dd.shexp_ffn);
             }
         } else {
             p.dqp[0] = pipeFor(dd.dgate.ty, dim) orelse return false;
             p.dqp[1] = pipeFor(dd.dup.ty, dim) orelse return false;
             p.dqp[2] = pipeFor(dd.ddown.ty, dd.dffn) orelse return false;
-            p.dqw[0] = weightBuffer(d, dd.dgate.data) orelse return false;
-            p.dqw[1] = weightBuffer(d, dd.dup.data) orelse return false;
-            p.dqw[2] = weightBuffer(d, dd.ddown.data) orelse return false;
+            p.dqw[0] = wbufFor(d, dd.dgate) orelse return false;
+            p.dqw[1] = wbufFor(d, dd.dup) orelse return false;
+            p.dqw[2] = wbufFor(d, dd.ddown) orelse return false;
             s12_len = @max(s12_len, dd.dffn);
         }
         plans[i] = p;
     }
     const onw = weightBuffer(d, std.mem.sliceAsBytes(out_norm)) orelse return false;
     const lmp = pipeFor(lm_head.ty, dim) orelse return false;
-    const lmw = weightBuffer(d, lm_head.data) orelse return false;
+    const lmw = wbufFor(d, lm_head) orelse return false;
     if (vids == null) {
         const b = d.alloc(64 * 4) catch return false;
         for (0..64) |k| b.slice(u32)[k] = @intCast(k);
