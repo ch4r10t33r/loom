@@ -61,26 +61,23 @@ while [ $# -gt 0 ]; do
 done
 
 # ---- platform ---------------------------------------------------------------
-# Note WSL reports Linux and is genuinely supported; only a native Windows
-# shell (Git Bash, MSYS, Cygwin) is rejected.
+# Note WSL reports Linux and is genuinely supported; a native Windows shell
+# (Git Bash, MSYS, Cygwin) is pointed at the prebuilt zip instead.
 uname_s=$(uname -s 2>/dev/null || echo unknown)
 case "$uname_s" in
     Darwin) os="macos" ;;
     Linux)  os="linux" ;;
     MINGW*|MSYS*|CYGWIN*|Windows_NT)
-        printf '%serror:%s Windows is not supported yet.\n' "$R" "$Z" >&2
+        printf '%serror:%s this installer is for macOS and Linux shells.\n' "$R" "$Z" >&2
         cat >&2 <<EOF
 
-loom currently ships binaries for macOS and Linux only. Windows support is
-planned but not built.
+On Windows, download the prebuilt zip instead:
 
-In the meantime, either:
+  https://github.com/${REPO}/releases/latest
+  (asset: loom-<version>-x86_64-windows.zip — unzip and run loom.exe)
 
-  - run it under WSL2, where the Linux build works and this script will
-    install it (open a WSL shell and re-run this command), or
-  - build from source with Zig 0.16.0:
-        git clone https://github.com/${REPO} && cd loom
-        zig build -Doptimize=ReleaseSafe
+Or run it under WSL2, where the Linux build works and this script will
+install it (open a WSL shell and re-run this command).
 
 EOF
         exit 1 ;;

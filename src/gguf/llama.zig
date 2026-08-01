@@ -739,13 +739,7 @@ pub fn calibrateGpuLayers(m: *Model, gpa: std.mem.Allocator) bool {
     var st = State.init(gpa, m.cfg) catch return false;
     defer st.deinit(gpa);
 
-    const now = struct {
-        fn f() i128 {
-            var ts: std.c.timespec = undefined;
-            _ = std.c.clock_gettime(.MONOTONIC, &ts);
-            return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
-        }
-    }.f;
+    const now = @import("../core/stats.zig").nowMonoNs;
 
     const REPS = 6;
 

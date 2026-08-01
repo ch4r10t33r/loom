@@ -737,7 +737,20 @@ pub const Store = struct {
         if (self.map != null) return;
         const len = self.manifest.file_size;
         if (len == 0) return;
-        const m = std.posix.mmap(
+        const m: []align(std.heap.page_size_min) const u8 = if (builtin.os.tag == .windows) blk: {
+            const w = struct {
+                extern "kernel32" fn CreateFileMappingW(hFile: *anyopaque, attrs: ?*anyopaque, prot: u32, max_hi: u32, max_lo: u32, name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+                extern "kernel32" fn MapViewOfFile(h: *anyopaque, access: u32, off_hi: u32, off_lo: u32, size: usize) callconv(.winapi) ?[*]align(std.heap.page_size_min) u8;
+                extern "kernel32" fn CloseHandle(h: *anyopaque) callconv(.winapi) c_int;
+            };
+            const PAGE_READONLY: u32 = 0x02;
+            const FILE_MAP_READ: u32 = 0x0004;
+            const hmap = w.CreateFileMappingW(self.file.handle, null, PAGE_READONLY, 0, 0, null) orelse return;
+            // The view keeps the mapping object alive; the handle can go now.
+            defer _ = w.CloseHandle(hmap);
+            const p = w.MapViewOfFile(hmap, FILE_MAP_READ, 0, 0, 0) orelse return;
+            break :blk p[0..@intCast(len)];
+        } else std.posix.mmap(
             null,
             @intCast(len),
             .{ .READ = true },
@@ -747,11 +760,20 @@ pub const Store = struct {
         ) catch return;
         self.map = m;
         self.verified = Holdings.initEmpty(self.gpa, self.manifest.nRanges()) catch {
-            std.posix.munmap(m);
+            unmapPages(m);
             self.map = null;
             return;
         };
         self.verified_seq = self.holdingsSeq();
+    }
+
+    fn unmapPages(m: []align(std.heap.page_size_min) const u8) void {
+        if (builtin.os.tag == .windows) {
+            const w = struct {
+                extern "kernel32" fn UnmapViewOfFile(p: *const anyopaque) callconv(.winapi) c_int;
+            };
+            _ = w.UnmapViewOfFile(m.ptr);
+        } else std.posix.munmap(m);
     }
 
     /// The whole read-only mapping, for a compute backend that wants to make
