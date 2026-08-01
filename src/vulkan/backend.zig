@@ -41,6 +41,10 @@ const quant_act_raw = @embedFile("../shaders/vulkan/quant_act.spv");
 const quant_act_spv: [quant_act_raw.len]u8 align(4) = quant_act_raw.*;
 const dmmv_q4k_id_i8_raw = @embedFile("../shaders/vulkan/dmmv_q4k_id_i8.spv");
 const dmmv_q4k_id_i8_spv: [dmmv_q4k_id_i8_raw.len]u8 align(4) = dmmv_q4k_id_i8_raw.*;
+const wsum_wv_q4k_raw = @embedFile("../shaders/vulkan/wsum_wv_q4k.spv");
+const wsum_wv_q4k_spv: [wsum_wv_q4k_raw.len]u8 align(4) = wsum_wv_q4k_raw.*;
+const wsum_wv_q8_0_raw = @embedFile("../shaders/vulkan/wsum_wv_q8_0.spv");
+const wsum_wv_q8_0_spv: [wsum_wv_q8_0_raw.len]u8 align(4) = wsum_wv_q8_0_raw.*;
 const moe_route_raw = @embedFile("../shaders/vulkan/moe_route.spv");
 const moe_route_spv: [moe_route_raw.len]u8 align(4) = moe_route_raw.*;
 const swiglu_slots_raw = @embedFile("../shaders/vulkan/swiglu_slots.spv");
@@ -124,6 +128,8 @@ const Pipes = struct {
     q4_k_id_f16: u64 = 0,
     quant: u64 = 0,
     q4_k_id_i8: u64 = 0,
+    wsum_wv_q4k: u64 = 0,
+    wsum_wv_q8_0: u64 = 0,
     route: u64 = 0,
     swiglu_slots: u64 = 0,
     reduce_dev: u64 = 0,
@@ -197,6 +203,8 @@ pub fn parallelBegin(n: usize) void {
         .rmsnorm = d.pipeline(&rmsnorm_spv) catch return fail(),
         .add = d.pipeline(&add_vec_spv) catch return fail(),
         .rope = d.pipeline(&mla_rope_spv) catch return fail(),
+        .wsum_wv_q4k = d.pipeline(&wsum_wv_q4k_spv) catch return fail(),
+        .wsum_wv_q8_0 = d.pipeline(&wsum_wv_q8_0_spv) catch return fail(),
         .copy = d.pipeline(&copy_f32_spv) catch return fail(),
     };
 }
@@ -648,6 +656,15 @@ pub fn mlaSetWk(li: usize, wk_f32: []const f32) bool {
 const AbsorbPush = extern struct { n_heads: u32, nope: u32, kvr: u32, stride: u32, q_stride: u32, q_off: u32 };
 const AttnPush = extern struct { n_heads: u32, kvr: u32, rope: u32, seq: u32, qr_stride: u32, qr_off: u32, c_base: u32, r_base: u32, scale: f32, nope: u32, wstride: u32, q_stride: u32, q_off: u32 };
 const WsumPush = extern struct { n_heads: u32, kvr: u32, seq: u32, c_base: u32 };
+const WsumWvPush = extern struct { n_heads: u32, kvr: u32, seq: u32, c_base: u32, nope: u32, stride: u32, vd: u32, row_bytes: u32 };
+
+fn wsumWvPipe(t: ggml.Type) ?u64 {
+    return switch (t) {
+        .q4_k => pipes.wsum_wv_q4k,
+        .q8_0 => pipes.wsum_wv_q8_0,
+        else => null,
+    };
+}
 const NormPush = extern struct { n: u32, eps: f32, x_off: u32 = 0, out_off: u32 = 0 };
 const RopePush = extern struct { n_vec: u32, rope: u32, stride: u32, offset: u32, pos: u32, buf_off: u32, base: f32, yarn_factor: f32, yarn_orig_ctx: f32 };
 const CopyPush = extern struct { n: u32, in_off: u32, out_off: u32 };
@@ -669,7 +686,7 @@ fn prepAttn(d: *vk.Device, li: usize, pos: usize, q_nope: []const f32, q_rope: [
     const seq = pos + 1;
     if (seq > w.ctx or w.kvr > 512) return null;
     if (q_nope.len != n_heads * nope or q_rope.len != n_heads * w.rope) return null;
-    const vp = idPipeFor(kv_b.ty, w.kvr) orelse return null;
+    const vp = wsumWvPipe(kv_b.ty) orelse return null;
     const vw = wbufFor(d, kv_b) orelse return null;
     const row_bytes = paddedLen(kv_b.ty, kv_b.data.len / (n_heads * (nope + v_head_dim)));
     if (vids == null) {
@@ -710,20 +727,10 @@ fn recordAttn(d: *vk.Device, c: vk.Device.Cmd, p: AttnPrep, li: usize, n_heads: 
     };
     try d.record(c, pipes.attn, &.{ mla_wk.items[li], qsrc, mla_cache.?, probs_buf.? }, std.mem.asBytes(&tpush), @intCast(n_heads));
     d.barrier(c);
-    const wpush = WsumPush{ .n_heads = @intCast(n_heads), .kvr = @intCast(w.kvr), .seq = @intCast(p.seq), .c_base = @intCast(li * w.ctx * w.kvr) };
-    try d.record(c, pipes.wsum, &.{ probs_buf.?, mla_cache.?, olat.? }, std.mem.asBytes(&wpush), @intCast(n_heads * ((w.kvr + 63) / 64)));
-    d.barrier(c);
-    // W_v with identity ids: head h's value rows are a plane at stride
-    // (nope + vd) rows, offset nope rows in, its input its own o_latent.
-    const vpush = IdPush{
-        .rows = @intCast(v_head_dim),
-        .cols = @intCast(w.kvr),
-        .n_used = @intCast(n_heads),
-        .plane_stride = @intCast((nope + v_head_dim) * p.row_bytes),
-        .x_stride = @intCast(w.kvr),
-        .base = @intCast(nope * p.row_bytes),
-    };
-    try d.record(c, p.vp, &.{ p.vw, olat.?, hout.?, vids.? }, std.mem.asBytes(&vpush), @intCast(n_heads * ((v_head_dim + 3) / 4)));
+    // Value side fused: o_latent lives in shared memory, W_v rows read the
+    // quantized plane directly -- one dispatch, one barrier fewer.
+    const wv = WsumWvPush{ .n_heads = @intCast(n_heads), .kvr = @intCast(w.kvr), .seq = @intCast(p.seq), .c_base = @intCast(li * w.ctx * w.kvr), .nope = @intCast(nope), .stride = @intCast(nope + v_head_dim), .vd = @intCast(v_head_dim), .row_bytes = @intCast(p.row_bytes) };
+    try d.record(c, p.vp, &.{ p.vw, probs_buf.?, mla_cache.?, hout.? }, std.mem.asBytes(&wv), @intCast(n_heads));
 }
 
 /// Every head's MLA attention over the compressed cache, W_v applied -- one
@@ -944,7 +951,7 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         p.kap = pipeFor(dd.kv_a.ty, dim) orelse return false;
         p.kaw = wbufFor(d, dd.kv_a) orelse return false;
         p.kanw = weightBuffer(d, std.mem.sliceAsBytes(dd.kv_a_norm)) orelse return false;
-        p.vp = idPipeFor(dd.kv_b.ty, fc.kvr) orelse return false;
+        p.vp = wsumWvPipe(dd.kv_b.ty) orelse return false;
         p.vw = wbufFor(d, dd.kv_b) orelse return false;
         p.row_bytes = paddedLen(dd.kv_b.ty, dd.kv_b.data.len / (fc.n_heads * (fc.nope + fc.v_head_dim)));
         p.pp = pipeFor(dd.attn_out.ty, fc.n_heads * fc.v_head_dim) orelse return false;
@@ -1084,11 +1091,8 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         const tpush = AttnPush{ .n_heads = @intCast(fc.n_heads), .kvr = @intCast(fc.kvr), .rope = @intCast(fc.rope), .seq = @intCast(seq), .qr_stride = @intCast(kd), .qr_off = @intCast(fc.nope), .c_base = @intCast(li * w.ctx * fc.kvr), .r_base = @intCast(mla_r0 + li * w.ctx * fc.rope), .scale = fc.scale, .nope = @intCast(fc.nope), .wstride = @intCast(fc.nope + fc.v_head_dim), .q_stride = @intCast(kd), .q_off = 0 };
         d.record(c, pipes.attn, &.{ mla_wk.items[li], qf, mla_cache.?, probs_buf.? }, std.mem.asBytes(&tpush), @intCast(fc.n_heads)) catch return false;
         d.barrier(c);
-        const wpush = WsumPush{ .n_heads = @intCast(fc.n_heads), .kvr = @intCast(fc.kvr), .seq = @intCast(seq), .c_base = @intCast(li * w.ctx * fc.kvr) };
-        d.record(c, pipes.wsum, &.{ probs_buf.?, mla_cache.?, olat.? }, std.mem.asBytes(&wpush), @intCast(fc.n_heads * ((fc.kvr + 63) / 64))) catch return false;
-        d.barrier(c);
-        const vpush = IdPush{ .rows = @intCast(fc.v_head_dim), .cols = @intCast(fc.kvr), .n_used = @intCast(fc.n_heads), .plane_stride = @intCast((fc.nope + fc.v_head_dim) * p.row_bytes), .x_stride = @intCast(fc.kvr), .base = @intCast(fc.nope * p.row_bytes) };
-        d.record(c, p.vp, &.{ p.vw, olat.?, hout.?, vids.? }, std.mem.asBytes(&vpush), @intCast(fc.n_heads * ((fc.v_head_dim + 3) / 4))) catch return false;
+        const wv = WsumWvPush{ .n_heads = @intCast(fc.n_heads), .kvr = @intCast(fc.kvr), .seq = @intCast(seq), .c_base = @intCast(li * w.ctx * fc.kvr), .nope = @intCast(fc.nope), .stride = @intCast(fc.nope + fc.v_head_dim), .vd = @intCast(fc.v_head_dim), .row_bytes = @intCast(p.row_bytes) };
+        d.record(c, p.vp, &.{ p.vw, probs_buf.?, mla_cache.?, hout.? }, std.mem.asBytes(&wv), @intCast(fc.n_heads)) catch return false;
         d.barrier(c);
         if (debug_split) {
             const t0 = nowf();
