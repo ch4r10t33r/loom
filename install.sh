@@ -7,7 +7,7 @@
 # Options (flags or environment):
 #   --version vX.Y.Z   LOOM_VERSION       release to install (default: latest)
 #   --dir PATH         LOOM_INSTALL_DIR   install location (default: /usr/local/bin)
-#                      GITHUB_TOKEN       needed while the repository is private
+#                      GITHUB_TOKEN       optional; raises GitHub API rate limits
 #
 # POSIX sh on purpose: this runs through `sh` from a pipe, on machines that may
 # have no bash, no jq and no gh.
@@ -45,7 +45,7 @@ usage: install.sh [--version vX.Y.Z] [--dir PATH]
 
 environment:
   LOOM_VERSION, LOOM_INSTALL_DIR   same as the flags above
-  GITHUB_TOKEN or GH_TOKEN         required while the repository is private
+  GITHUB_TOKEN or GH_TOKEN         optional; raises GitHub API rate limits
 EOF
 }
 
@@ -114,9 +114,8 @@ sha256_of() {
     fi
 }
 
-# The repository is private for now, so downloads need a token. Fall back to
-# the gh CLI's token when one is already signed in, which is the common case
-# for anyone with access.
+# The repository is public; a token is optional but raises the GitHub API
+# rate limit. Fall back to the gh CLI's token when one is already signed in.
 TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
 if [ -z "$TOKEN" ] && command -v gh >/dev/null 2>&1; then
     TOKEN=$(gh auth token 2>/dev/null || true)
@@ -142,12 +141,13 @@ EOF
         cat >&2 <<EOF
 ${R}error:${Z} could not read releases for ${REPO}.
 
-No token was supplied. If the repository is private, set one and retry:
+The requested version may not exist, or the anonymous GitHub API rate
+limit may be exhausted. Set a token and retry:
 
-    export GITHUB_TOKEN=<a token with 'repo' scope>
+    export GITHUB_TOKEN=<any GitHub token>
 
 or sign in with the GitHub CLI (\`gh auth login\`) and re-run this script.
-Otherwise the requested version may not exist:
+Available releases:
     https://github.com/${REPO}/releases
 EOF
     fi
@@ -181,9 +181,8 @@ step "Installing ${BIN} ${VERSION} ${D}(${asset})${Z}"
 # when the matching name field turns up. Stop at the first match, which is
 # always inside the assets array and never in the trailing body.
 #
-# The asset API URL is used rather than browser_download_url because it is the
-# only form that works for a private repository, and works for a public one
-# too -- one code path instead of two.
+# The asset API URL is used rather than browser_download_url; it works for
+# public and private repositories alike -- one code path instead of two.
 asset_url_of() { # filename -> url
     printf '%s' "$release_json" | tr ',' '\n' | awk -v want="$1" '
         /"url"[[:space:]]*:[[:space:]]*"[^"]*\/releases\/assets\/[0-9]+"/ {

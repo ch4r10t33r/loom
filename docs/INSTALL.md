@@ -23,8 +23,8 @@ curl -fsSL https://raw.githubusercontent.com/ch4r10t33r/loom/main/install.sh | s
 
 It takes `--version vX.Y.Z` and `--dir PATH`, or the same as `LOOM_VERSION` and
 `LOOM_INSTALL_DIR`. On Windows it stops with an explanation and points at WSL2,
-where the Linux build works. While the repository is private it needs a
-`GITHUB_TOKEN`, or a signed-in `gh`.
+where the Linux build works. A `GITHUB_TOKEN` (or signed-in `gh`) is
+optional and only raises the GitHub API rate limit.
 
 By hand instead:
 
