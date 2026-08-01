@@ -13,7 +13,7 @@
 //! must agree on any query, and the test asserts it when FAISS is loaded.
 const std = @import("std");
 const Io = std.Io;
-const faiss = @import("faiss.zig");
+const vi = @import("vector_index");
 const brotli = @import("brotli.zig");
 
 pub const MAX_CHUNKS: usize = 65536;
@@ -30,17 +30,16 @@ pub fn hashText(text: []const u8) Hash {
 
 pub const Chunk = struct {
     hash: Hash,
-    /// Raw text, or brotli-compressed when the library is present and it
-    /// pays. At-rest format is local-only: the hash is of the RAW text and
-    /// gossip always sends raw (the frame encoder snappy-compresses the
-    /// wire); FAISS holds the flat f32 vectors either way.
+    /// Raw text, or brotli-compressed when it pays. At-rest format is
+    /// local-only: the hash is of the RAW text and gossip always sends raw
+    /// (the frame encoder snappy-compresses the wire). Vectors live in the
+    /// zigstack/vector-index index, position-aligned with this list.
     text: []u8,
     raw_len: usize,
     compressed: bool,
-    vec: []f32, // L2-normalized, dim floats
 };
 
-pub const Hit = struct { idx: usize, score: f32 };
+pub const Hit = vi.Hit;
 
 /// An embedder turns text into a normalized vector. The node installs one
 /// backed by the model's token embeddings; tests install a deterministic
@@ -65,19 +64,19 @@ pub const Store = struct {
     mu: Io.Mutex = .init,
     chunks: std.ArrayListUnmanaged(Chunk) = .empty,
     seen: std.AutoHashMapUnmanaged(Hash, void) = .empty,
-    index: ?faiss.Index,
+    index: ?vi.Index = null,
     /// Bumped on every accepted insert; gossip uses it to skip idle rounds.
     seq: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, io: Io) Store {
-        return .{ .gpa = gpa, .io = io, .index = null };
+        return .{ .gpa = gpa, .io = io };
     }
 
     pub fn setEmbedder(self: *Store, emb: Embedder) void {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         self.emb = emb;
-        self.index = faiss.Index.init(emb.dim);
+        self.index = vi.Index.init(self.gpa, emb.dim);
     }
 
     pub fn dim(self: *Store) usize {
@@ -85,12 +84,10 @@ pub const Store = struct {
     }
 
     pub fn deinit(self: *Store) void {
-        for (self.chunks.items) |c| {
-            self.gpa.free(c.text);
-            self.gpa.free(c.vec);
-        }
+        for (self.chunks.items) |c| self.gpa.free(c.text);
         self.chunks.deinit(self.gpa);
         self.seen.deinit(self.gpa);
+        if (self.index) |*ix| ix.deinit();
     }
 
     pub fn count(self: *Store) usize {
@@ -118,40 +115,40 @@ pub const Store = struct {
         }
         const emb = self.emb orelse return false;
         const vec = self.gpa.alloc(f32, emb.dim) catch return false;
-        if (!emb.embed(self.gpa, text, vec)) {
-            self.gpa.free(vec);
-            return false;
-        }
+        defer self.gpa.free(vec); // the index copies; the chunk keeps only text
+        if (!emb.embed(self.gpa, text, vec)) return false;
         var compressed = false;
         const copy = blk: {
             if (brotli.compressAlloc(self.gpa, text)) |c| {
                 compressed = true;
                 break :blk c;
             }
-            break :blk self.gpa.dupe(u8, text) catch {
-                self.gpa.free(vec);
-                return false;
-            };
+            break :blk self.gpa.dupe(u8, text) catch return false;
         };
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         if (self.seen.contains(h)) { // raced another inserter
-            self.gpa.free(vec);
             self.gpa.free(copy);
             return false;
         }
         self.seen.put(self.gpa, h, {}) catch {
-            self.gpa.free(vec);
             self.gpa.free(copy);
             return false;
         };
-        self.chunks.append(self.gpa, .{ .hash = h, .text = copy, .raw_len = text.len, .compressed = compressed, .vec = vec }) catch {
+        self.chunks.append(self.gpa, .{ .hash = h, .text = copy, .raw_len = text.len, .compressed = compressed }) catch {
             _ = self.seen.remove(h);
-            self.gpa.free(vec);
             self.gpa.free(copy);
             return false;
         };
-        if (self.index) |*ix| _ = ix.add(vec);
+        const ix = &self.index.?; // embedder set implies index set
+        ix.add(vec) catch {
+            // Keep the two position-aligned: an index that cannot grow means
+            // the chunk cannot be searchable, so it does not stay either.
+            const c = self.chunks.pop().?;
+            self.gpa.free(c.text);
+            _ = self.seen.remove(h);
+            return false;
+        };
         self.seq += 1;
         return true;
     }
@@ -201,40 +198,14 @@ pub const Store = struct {
         return chunkTextAlloc(gpa, self.chunks.items[idx]);
     }
 
-    /// Top-k cosine hits for a query embedding, best first. FAISS when
-    /// available, the exact scan otherwise; both operate on the same
-    /// normalized vectors and agree.
+    /// Top-k cosine hits for a query embedding, best first -- delegated to
+    /// zigstack/vector-index (exact scan of record, FAISS acceleration when
+    /// the library is present).
     pub fn search(self: *Store, query: []const f32, k: usize, out: []Hit) usize {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
-        const items = self.chunks.items;
-        if (items.len == 0 or k == 0) return 0;
-        const kk = @min(k, @min(items.len, out.len));
-        if (self.index) |*ix| {
-            if (ix.count() == items.len) {
-                var scores: [16]f32 = undefined;
-                var ids: [16]i64 = undefined;
-                if (kk <= 16) {
-                    const n = ix.search(query, kk, scores[0..kk], ids[0..kk]);
-                    for (0..n) |i| out[i] = .{ .idx = @intCast(ids[i]), .score = scores[i] };
-                    if (n > 0) return n;
-                }
-            }
-        }
-        // Exact scan: insertion-sort the top k.
-        var n: usize = 0;
-        for (items, 0..) |c, idx| {
-            var s: f32 = 0;
-            for (c.vec, query) |a, b| s += a * b;
-            var pos = n;
-            while (pos > 0 and out[pos - 1].score < s) pos -= 1;
-            if (pos >= kk) continue;
-            if (n < kk) n += 1;
-            var j = n - 1;
-            while (j > pos) : (j -= 1) out[j] = out[j - 1];
-            out[pos] = .{ .idx = idx, .score = s };
-        }
-        return n;
+        const ix = &(self.index orelse return 0);
+        return ix.search(query, k, out);
     }
 
     /// Embed with the store's embedder into a caller buffer of dim floats.
