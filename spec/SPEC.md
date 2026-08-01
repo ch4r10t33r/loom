@@ -520,6 +520,26 @@ targets the seed set plus every table entry carrying my committee_id. This view
 (not the bootnode) is what members rely on after joining, so a dead bootnode still
 strands nothing.
 
+**RAG gossip, types 0x20/0x21/0x22 (optional, --rag).** A network may share
+retrieval chunks. Only TEXT travels: a loom network serves one model
+(network_id), so every node recomputes the same embedding -- mean-pooled
+`token_embd` rows, L2-normalized -- from the same text. Vectors are never
+accepted from the wire, which removes the vector-poisoning surface and any
+dimension mismatch by construction.
+
+```
+RagInv  (0x20): count u16 (<=512), then count x [32]u8 chunk hashes
+                (sha256 of chunk text; sender's most-recent first)
+RagWant (0x21): same shape (<=32): the hashes the receiver lacks
+RagPush (0x22): count u16 (<=32), then count x { len u32 (<=8192),
+                text [len]u8 }
+```
+
+The exchange piggybacks on the gossip round: Announce/AnnounceBatch first,
+then Inv -> Want -> Push on the same stream. Receivers insert by recomputing
+the embedding locally; duplicates dedup by text hash. Caps bound a round;
+convergence is eventual across rounds.
+
 **ExpertRequest, type 0x10.** Ask a remote peer (committee member first, then
 mesh) for one expert shard the requester does not hold.
 

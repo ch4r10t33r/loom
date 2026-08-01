@@ -41,6 +41,7 @@ const weights = @import("weights.zig");
 const peers = @import("peers.zig");
 const stats = @import("../core/stats.zig");
 const bootnode = @import("bootnode.zig");
+const rag_store = @import("../rag/store.zig");
 const wire = @import("wire.zig");
 const sockopt = @import("../core/sockopt.zig");
 
@@ -62,6 +63,7 @@ pub const Ctx = struct {
     /// This node's committee id (wire.NO_COMMITTEE when not in one).
     committee_id: u32 = 0xFFFF_FFFF,
     network_id: u64 = 0,
+    rag: ?*rag_store.Store = null,
     /// In-flight expert requests being served (the heartbeat load hint).
     load: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// Our own advertised "host:port" (what we tell peers to dial us on).
@@ -306,6 +308,28 @@ fn handleFrame(ctx: *Ctx, raw: []const u8, wi: *Io.Writer) !void {
             defer ctx.gpa.free(hhex);
             _ = table.merge(ann.addr, &vhex, hhex, ann.committee_id, ann.holdings_seq, stats.nowNs(ctx.io), .first_hand) catch {};
             try sendAnnounceBatch(ctx, wi);
+        },
+        .rag_inv => {
+            const st = ctx.rag orelse return wi.print("ERR no_rag\n", .{});
+            const inv = wire.RagHashes.parseBody(ctx.gpa, dec.body) catch return wi.print("ERR bad_frame\n", .{});
+            defer ctx.gpa.free(inv);
+            var want = std.ArrayList([32]u8).empty;
+            defer want.deinit(ctx.gpa);
+            for (inv) |h| {
+                if (want.items.len >= wire.RAG_PUSH_MAX) break;
+                if (!st.has(h)) try want.append(ctx.gpa, h);
+            }
+            var resp = wire.RagHashes{ .hashes = want.items };
+            const body = try resp.encodeBody(ctx.gpa);
+            defer ctx.gpa.free(body);
+            const frame = try wire.encodeFrame(ctx.gpa, .rag_want, body);
+            defer ctx.gpa.free(frame);
+            try wire.writeFrame(wi, frame);
+        },
+        .rag_push => {
+            const st = ctx.rag orelse return;
+            var it = wire.RagPush.iterate(dec.body) catch return;
+            while (it.next() catch null) |text| _ = st.add(text);
         },
         .expert_request => {
             const req = wire.ExpertRequest.parseBody(dec.body) catch {

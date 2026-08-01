@@ -32,6 +32,9 @@ pub const MsgType = enum(u8) {
     announce_batch = 0x04,
     expert_request = 0x10,
     expert_response = 0x11,
+    rag_inv = 0x20,
+    rag_want = 0x21,
+    rag_push = 0x22,
     _,
 };
 
@@ -507,6 +510,93 @@ test "readFrameBodyAlloc reads only the bytes delivered (issue #27)" {
     const got = try readFrameBodyAlloc(gpa, &r, body.len);
     defer gpa.free(got);
     try std.testing.expectEqualStrings(body, got);
+}
+
+pub const RAG_INV_MAX: usize = 512; // hashes per gossip round
+pub const RAG_PUSH_MAX: usize = 32; // chunks per gossip round
+pub const RAG_TEXT_MAX: usize = 8 * 1024;
+
+/// RagInv (0x20) and RagWant (0x21) share one shape: a bounded list of
+/// chunk hashes. Inv = "I hold these"; Want = "send me these".
+pub const RagHashes = struct {
+    hashes: []const [32]u8 = &.{},
+
+    pub fn encodeBody(self: *const RagHashes, gpa: std.mem.Allocator) ![]u8 {
+        var b = std.ArrayList(u8).empty;
+        errdefer b.deinit(gpa);
+        const n = @min(self.hashes.len, RAG_INV_MAX);
+        try appendU16(gpa, &b, @intCast(n));
+        for (self.hashes[0..n]) |h| try b.appendSlice(gpa, &h);
+        return b.toOwnedSlice(gpa);
+    }
+
+    /// The result aliases `body`.
+    pub fn parseBody(gpa: std.mem.Allocator, body: []const u8) ![][32]u8 {
+        var c = Cursor{ .buf = body };
+        const n = try c.u16v();
+        if (n > RAG_INV_MAX) return error.BadFrame;
+        const out = try gpa.alloc([32]u8, n);
+        errdefer gpa.free(out);
+        for (out) |*h| @memcpy(h, try c.need(32));
+        return out;
+    }
+};
+
+/// RagPush (0x22): whole chunks, TEXT ONLY -- the receiver recomputes the
+/// embedding with its own model, so vectors never travel and cannot be
+/// poisoned independently of the text.
+pub const RagPush = struct {
+    pub fn encodeBody(gpa: std.mem.Allocator, texts: []const []const u8) ![]u8 {
+        var b = std.ArrayList(u8).empty;
+        errdefer b.deinit(gpa);
+        const n = @min(texts.len, RAG_PUSH_MAX);
+        try appendU16(gpa, &b, @intCast(n));
+        for (texts[0..n]) |t| {
+            try appendU32(gpa, &b, @intCast(@min(t.len, RAG_TEXT_MAX)));
+            try b.appendSlice(gpa, t[0..@min(t.len, RAG_TEXT_MAX)]);
+        }
+        return b.toOwnedSlice(gpa);
+    }
+
+    pub const Iter = struct {
+        c: Cursor,
+        left: usize,
+        pub fn next(self: *Iter) !?[]const u8 {
+            if (self.left == 0) return null;
+            self.left -= 1;
+            const len = try self.c.u32v();
+            if (len > RAG_TEXT_MAX) return error.BadFrame;
+            return try self.c.need(len);
+        }
+    };
+
+    pub fn iterate(body: []const u8) !Iter {
+        var c = Cursor{ .buf = body };
+        const n = try c.u16v();
+        if (n > RAG_PUSH_MAX) return error.BadFrame;
+        return .{ .c = c, .left = n };
+    }
+};
+
+test "rag hash list and push roundtrip under their caps" {
+    const gpa = std.testing.allocator;
+    var hs: [3][32]u8 = undefined;
+    for (&hs, 0..) |*h, i| @memset(h, @intCast(i + 1));
+    var inv = RagHashes{ .hashes = &hs };
+    const ib = try inv.encodeBody(gpa);
+    defer gpa.free(ib);
+    const back = try RagHashes.parseBody(gpa, ib);
+    defer gpa.free(back);
+    try std.testing.expectEqual(@as(usize, 3), back.len);
+    try std.testing.expect(std.mem.eql(u8, &back[1], &hs[1]));
+
+    const texts = [_][]const u8{ "alpha", "beta" };
+    const pb = try RagPush.encodeBody(gpa, &texts);
+    defer gpa.free(pb);
+    var it = try RagPush.iterate(pb);
+    try std.testing.expectEqualStrings("alpha", (try it.next()).?);
+    try std.testing.expectEqualStrings("beta", (try it.next()).?);
+    try std.testing.expectEqual(@as(?[]const u8, null), try it.next());
 }
 
 test "network_id survives the announce and heartbeat roundtrip" {

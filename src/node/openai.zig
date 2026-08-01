@@ -26,6 +26,7 @@ const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
 const generator = @import("generator.zig");
+const rag_store = @import("../rag/store.zig");
 const sockopt = @import("../core/sockopt.zig");
 const chat_template = @import("../gguf/chat_template.zig");
 const meter_mod = @import("meter.zig");
@@ -35,6 +36,10 @@ const peers_mod = @import("../p2p/peers.zig");
 const chat_html = @embedFile("ui.html");
 
 pub const Ctx = struct {
+    /// Gossiped RAG chunks; null when --rag is off. Search runs before the
+    /// prompt reaches the engine.
+    rag: ?*rag_store.Store = null,
+    rag_k: usize = 3,
     gpa: std.mem.Allocator,
     io: Io,
     gen: *generator.Generator,
@@ -254,6 +259,7 @@ fn route(ctx: *Ctx, req: Request, wi: *Io.Writer, dl: ?usize) !?Response {
     if (eql(req.method, "GET") and eql(path, "/v1/models")) {
         return handleModels(ctx) catch fallback();
     }
+    if (eql(req.method, "POST") and eql(path, "/v1/rag/chunks")) return handleRagIngest(ctx, req);
     if (eql(req.method, "POST") and (eql(path, "/v1/chat/completions") or eql(path, "/v1/completions"))) {
         return handleCompletions(ctx, req, eql(path, "/v1/chat/completions"), wi, dl) catch fallback();
     }
@@ -276,11 +282,64 @@ fn handleHealth(ctx: *Ctx) !Response {
     return .{ .status = 200, .body = body };
 }
 
+/// POST /v1/rag/chunks {"chunks":["...","..."]} -- ingest text into the
+/// local store. Accepted chunks reach every peer on this network through
+/// the next gossip round; the response reports what was new here.
+fn handleRagIngest(ctx: *Ctx, req: Request) !?Response {
+    const gpa = ctx.gpa;
+    const st = ctx.rag orelse return .{ .status = 503, .body = try gpa.dupe(u8, "{\"error\":\"rag disabled\"}") };
+    var parsed = std.json.parseFromSlice(std.json.Value, gpa, req.body, .{}) catch
+        return .{ .status = 400, .body = try gpa.dupe(u8, "{\"error\":\"bad json\"}") };
+    defer parsed.deinit();
+    var added: usize = 0;
+    var seen: usize = 0;
+    if (parsed.value == .object) {
+        if (parsed.value.object.get("chunks")) |v| if (v == .array) {
+            for (v.array.items) |item| {
+                if (item != .string) continue;
+                seen += 1;
+                if (st.add(item.string)) added += 1;
+            }
+        };
+    }
+    const body = try std.fmt.allocPrint(gpa, "{{\"added\":{d},\"received\":{d},\"total\":{d}}}", .{ added, seen, st.count() });
+    return .{ .status = 200, .body = body };
+}
+
 fn handleModels(ctx: *Ctx) !Response {
     const body = try std.fmt.allocPrint(ctx.gpa,
         \\{{"object":"list","data":[{{"id":"{s}","object":"model","created":0,"owned_by":"loom"}}]}}
     , .{ctx.model_id});
     return .{ .status = 200, .body = body };
+}
+
+/// Prepend the top-k retrieved chunks, or return `prompt` unchanged when
+/// RAG is off, the store is empty, or the query will not embed.
+fn ragAugment(ctx: *Ctx, gpa: std.mem.Allocator, prompt: []const u8) ![]const u8 {
+    const st = ctx.rag orelse return prompt;
+    if (st.count() == 0 or ctx.rag_k == 0) return prompt;
+    const d = st.dim();
+    if (d == 0) return prompt;
+    const q = gpa.alloc(f32, d) catch return prompt;
+    defer gpa.free(q);
+    if (!st.embedQuery(gpa, prompt, q)) return prompt;
+    var hits: [8]rag_store.Hit = undefined;
+    const k = @min(ctx.rag_k, hits.len);
+    const n = st.search(q, k, hits[0..k]);
+    if (n == 0) return prompt;
+    var b = std.ArrayList(u8).empty;
+    errdefer b.deinit(gpa);
+    try b.appendSlice(gpa, "Context:\n");
+    for (hits[0..n]) |h| {
+        const t = st.textByIndexAlloc(gpa, h.idx) orelse continue;
+        defer gpa.free(t);
+        try b.appendSlice(gpa, "- ");
+        try b.appendSlice(gpa, t);
+        try b.append(gpa, '\n');
+    }
+    try b.appendSlice(gpa, "\n");
+    try b.appendSlice(gpa, prompt);
+    return b.toOwnedSlice(gpa);
 }
 
 fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer, dl: ?usize) !?Response {
@@ -330,11 +389,17 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer, dl:
 
     // Assemble the prompt: chat messages -> role-labeled text, or the raw
     // `prompt` field for the completions endpoint. Shared by both paths.
-    const prompt_text = if (is_chat)
+    const base_prompt = if (is_chat)
         try assembleChatPrompt(ctx, gpa, parsed)
     else
         try gpa.dupe(u8, promptField(parsed));
-    defer gpa.free(prompt_text);
+    defer gpa.free(base_prompt);
+
+    // Retrieval: the closest gossiped chunks are prepended as context. The
+    // model sees them; the metering charge counts them, because they are
+    // real prompt tokens.
+    const prompt_text = try ragAugment(ctx, gpa, base_prompt);
+    defer if (prompt_text.ptr != base_prompt.ptr) gpa.free(prompt_text);
 
     // Reserve the client's allowance up front: this both gates an exhausted
     // client and debits atomically, and it means an aborted request still pays

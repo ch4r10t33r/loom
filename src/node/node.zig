@@ -13,6 +13,7 @@ const sockopt = @import("../core/sockopt.zig");
 const openai = @import("openai.zig");
 const backend = @import("../compute/backend.zig");
 const generator = @import("generator.zig");
+const rag_store = @import("../rag/store.zig");
 const deepseek = @import("../gguf/deepseek.zig");
 const llama = @import("../gguf/llama.zig");
 const gguf_mod = @import("../gguf/gguf.zig");
@@ -65,6 +66,12 @@ pub const Options = struct {
     /// auto: derived from the weight manifest when a store is attached,
     /// 0 (the open default network) otherwise.
     network_id: ?u64 = null,
+    /// Retrieval-augmented generation: keep a gossiped chunk store and
+    /// prepend the closest chunks to every prompt. Off unless asked -- it
+    /// changes what the model sees.
+    rag: bool = false,
+    /// Chunks to retrieve per request when RAG is on.
+    rag_k: usize = 3,
     ram_bytes: u64,
     pin_bytes: u64,
     verify: bool,
@@ -493,6 +500,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         (if (store) |*st| wire.networkIdFromManifest(st.manifest.version) else 0);
     try out.print("  network    id {d}\n", .{network_id});
 
+    // RAG chunk store (text + locally computed embeddings); created before
+    // the p2p contexts that carry its pointer, embedder bound later.
+    var rag: ?rag_store.Store = if (opts.rag) rag_store.Store.init(gpa, io) else null;
+    defer if (rag) |*r| r.deinit();
+
     // gossip peer table, seeded with the statically configured peers
     var advertise_buf: [128]u8 = undefined;
     const advertise = opts.advertise orelse
@@ -652,6 +664,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .committee_id = joined_committee_id,
         .advertise = advertise,
         .network_id = network_id,
+        .rag = if (rag) |*r| r else null,
     };
     const p2p_handle = try std.Thread.spawn(.{}, p2pThread, .{&p2p_ctx});
     defer p2p_handle.join();
@@ -665,6 +678,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .advertise = advertise,
         .committee_id = joined_committee_id,
         .network_id = network_id,
+        .rag = if (rag) |*r| r else null,
     };
     {
         const t = try std.Thread.spawn(.{}, gossip.loop, .{&gossip_ctx});
@@ -899,6 +913,28 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         t.detach();
     }
 
+    // RAG: the store exists from startup (the p2p/gossip contexts hold its
+    // pointer), the embedder arrives once the serve path is chosen below.
+    // Embeddings come from THIS node's model and only text is gossiped, so
+    // every node on the network derives the same vector for the same chunk.
+    if (opts.rag) {
+        if (serve_gguf) {
+            rag.?.setEmbedder(.{
+                .ctx = @ptrCast(&gguf_gen.m),
+                .dim = gguf_gen.m.embedDim(),
+                .embedFn = struct {
+                    fn f(ectx: *anyopaque, g: std.mem.Allocator, text: []const u8, vec: []f32) bool {
+                        const m: *generator.GgufModel = @ptrCast(@alignCast(ectx));
+                        return m.embedText(g, text, vec);
+                    }
+                }.f,
+            });
+            try out.print("  rag        on (dim {d}, k {d})\n", .{ gguf_gen.m.embedDim(), opts.rag_k });
+        } else {
+            try out.print("  rag        inert: needs the GGUF serve path (no embedder)\n", .{});
+        }
+    }
+
     var meter = meter_mod.Meter.init(gpa, io, opts.free_quota);
     defer meter.deinit();
 
@@ -916,6 +952,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             .engine_lock = &engine_lock,
             .meter = &meter,
             .synthetic = synthetic,
+            .rag = if (rag) |*r| r else null,
+            .rag_k = opts.rag_k,
         };
         openai_ctx.peers = &table;
         const t = try std.Thread.spawn(.{}, openaiThread, .{&openai_ctx});

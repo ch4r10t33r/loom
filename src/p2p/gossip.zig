@@ -11,6 +11,7 @@ const Io = std.Io;
 const net = std.Io.net;
 const peers = @import("peers.zig");
 const weights = @import("weights.zig");
+const rag_store = @import("../rag/store.zig");
 const sync = @import("sync.zig");
 const dns = @import("dns.zig");
 const sockopt = @import("../core/sockopt.zig");
@@ -28,6 +29,7 @@ pub const Ctx = struct {
     advertise: []const u8,
     committee_id: u32 = wire.NO_COMMITTEE,
     network_id: u64 = 0,
+    rag: ?*rag_store.Store = null,
 };
 
 /// One gossip exchange with one peer: announce ourselves, merge their batch.
@@ -85,6 +87,46 @@ fn exchange(ctx: *Ctx, addr_str: []const u8) !void {
         // batch is what it has heard from others.
         const ev: peers.Evidence = if (std.mem.eql(u8, e.addr, addr_str)) .first_hand else .hearsay;
         _ = ctx.table.merge(e.addr, &vhex, hhex, e.committee_id, e.holdings_seq, now, ev) catch continue;
+    }
+
+    // RAG piggyback: inventory -> want -> push, all on this same stream.
+    // Text only; the peer recomputes embeddings with its own model.
+    if (ctx.rag) |st| {
+        if (st.count() > 0) {
+            var hashes: [wire.RAG_INV_MAX][32]u8 = undefined;
+            const n = st.recentHashes(hashes[0..]);
+            var inv = wire.RagHashes{ .hashes = hashes[0..n] };
+            const ibody = try inv.encodeBody(gpa);
+            defer gpa.free(ibody);
+            const iframe = try wire.encodeFrame(gpa, .rag_inv, ibody);
+            defer gpa.free(iframe);
+            try wire.writeFrame(&w.interface, iframe);
+
+            const want_raw = try wire.readFrameAlloc(gpa, &r.interface);
+            defer gpa.free(want_raw);
+            const wdec = try wire.decodeFrame(gpa, want_raw);
+            defer gpa.free(wdec.body);
+            if (wdec.ty == .rag_want) {
+                const wanted = wire.RagHashes.parseBody(gpa, wdec.body) catch return;
+                defer gpa.free(wanted);
+                var texts = std.ArrayList([]u8).empty;
+                defer {
+                    for (texts.items) |t| gpa.free(t);
+                    texts.deinit(gpa);
+                }
+                for (wanted) |h| {
+                    if (texts.items.len >= wire.RAG_PUSH_MAX) break;
+                    if (st.textByHashAlloc(gpa, h)) |t| try texts.append(gpa, t);
+                }
+                if (texts.items.len > 0) {
+                    const pbody = try wire.RagPush.encodeBody(gpa, @ptrCast(texts.items));
+                    defer gpa.free(pbody);
+                    const pframe = try wire.encodeFrame(gpa, .rag_push, pbody);
+                    defer gpa.free(pframe);
+                    try wire.writeFrame(&w.interface, pframe);
+                }
+            }
+        }
     }
 }
 
