@@ -1,0 +1,89 @@
+// Q8_0 id-indexed matvec with inline SwiGLU (the expert down projection);, four rows per workgroup; row arithmetic
+// identical to dmmv_q8_0.comp.
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer W { uint w4[]; };
+layout(std430, binding = 1) readonly buffer X { vec4 x4[]; };  // gate slots
+layout(std430, binding = 4) readonly buffer U { vec4 u4[]; };  // up slots
+layout(std430, binding = 2) writeonly buffer O { float o[]; };
+layout(std430, binding = 3) readonly buffer I { uint ids[]; };
+layout(push_constant) uniform PC { uint rows; uint cols; uint n_used; uint plane_stride; uint x_stride; uint base; } pc;
+shared vec4 red[16];
+
+// Unaligned 4-byte load: the 22/34/210-byte block formats put fields at
+// half-word offsets. The device layer pads every buffer by a word, so the
+// word+1 read at the tail stays in bounds.
+uint loadU32(uint byte_off) {
+    uint word = byte_off >> 2u;
+    uint sh = (byte_off & 3u) * 8u;
+    if (sh == 0u) return w4[word];
+    return (w4[word] >> sh) | (w4[word + 1u] << (32u - sh));
+}
+
+float sum4(vec4 v) { return v.x + v.y + v.z + v.w; }
+
+// x = silu(gate) * up, computed where it is consumed: the separate SwiGLU
+// dispatch and its full-pipeline drain fold away.
+vec4 xval(uint i) {
+    vec4 g = x4[i];
+    return (g / (1.0 + exp(-g))) * u4[i];
+}
+
+const uint QK = 32u;
+const uint BLK = 36u; // padded at upload: [32 quants][d half][2 pad], word-aligned
+
+vec4 sbytes(uint qw) {
+    int q = int(qw);
+    return vec4(float(bitfieldExtract(q, 0, 8)), float(bitfieldExtract(q, 8, 8)), float(bitfieldExtract(q, 16, 8)), float(bitfieldExtract(q, 24, 8)));
+}
+
+void main() {
+    uint tid = gl_LocalInvocationID.x;
+    uint rows_g = (pc.rows + 3u) / 4u;
+    uint g = gl_WorkGroupID.x;
+    uint slot = g / rows_g;
+    if (slot >= pc.n_used) return;
+    uint row0 = (g - slot * rows_g) * 4u;
+    uint blocks = pc.cols / QK;
+    uint rb = blocks * BLK;
+    uint nr = min(4u, pc.rows - row0);
+    uint plane = pc.base + ids[slot] * pc.plane_stride;
+    uint base0 = plane + row0 * rb;
+    uint b1 = base0 + min(1u, nr - 1u) * rb;
+    uint b2 = base0 + min(2u, nr - 1u) * rb;
+    uint b3 = base0 + min(3u, nr - 1u) * rb;
+    uint x0 = slot * pc.x_stride;
+
+    vec4 acc = vec4(0.0);
+    for (uint b = tid; b < blocks; b += 64u) {
+        uint k0 = base0 + b * BLK;
+        uint k1 = b1 + b * BLK;
+        uint k2 = b2 + b * BLK;
+        uint k3 = b3 + b * BLK;
+        vec4 d = vec4(unpackHalf2x16(w4[(k0 + 32u) >> 2u]).x, unpackHalf2x16(w4[(k1 + 32u) >> 2u]).x, unpackHalf2x16(w4[(k2 + 32u) >> 2u]).x, unpackHalf2x16(w4[(k3 + 32u) >> 2u]).x);
+        uint xb4 = (x0 >> 2u) + b * 8u;
+        vec4 s = vec4(0.0);
+        for (uint j = 0u; j < 8u; j++) {
+            vec4 xv = xval(xb4 + j);
+            uint off = 4u * j;
+            s.x += dot(sbytes(w4[(k0 + off) >> 2u]), xv);
+            s.y += dot(sbytes(w4[(k1 + off) >> 2u]), xv);
+            s.z += dot(sbytes(w4[(k2 + off) >> 2u]), xv);
+            s.w += dot(sbytes(w4[(k3 + off) >> 2u]), xv);
+        }
+        acc += d * s;
+    }
+
+    acc = subgroupAdd(acc);
+    if (subgroupElect()) red[gl_SubgroupID] = acc;
+    barrier();
+    if (tid == 0u) {
+        vec4 r = vec4(0.0);
+        for (uint s = 0u; s < gl_NumSubgroups; s++) r += red[s];
+        o[slot * pc.rows + row0] = r.x;
+        if (nr > 1u) o[slot * pc.rows + row0 + 1u] = r.y;
+        if (nr > 2u) o[slot * pc.rows + row0 + 2u] = r.z;
+        if (nr > 3u) o[slot * pc.rows + row0 + 3u] = r.w;
+    }
+}
