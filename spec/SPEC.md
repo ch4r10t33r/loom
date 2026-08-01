@@ -528,12 +528,17 @@ accepted from the wire, which removes the vector-poisoning surface and any
 dimension mismatch by construction.
 
 ```
-RagInv  (0x20): count u16 (<=512), then count x [32]u8 chunk hashes
-                (sha256 of chunk text; sender's most-recent first)
-RagWant (0x21): same shape (<=32): the hashes the receiver lacks
-RagPush (0x22): count u16 (<=32), then count x { len u32 (<=8192),
-                text [len]u8 }
+RagInv    (0x20): count u16 (<=512), then count x [32]u8 chunk hashes
+                  (sha256 of chunk text; a rotating window, newest first)
+RagWant   (0x21): same shape (<=32): the hashes the sender lacks
+RagPush   (0x22): count u16 (<=32), then count x { len u32 (<=8192),
+                  text [len]u8 }
+RagInvReq (0x23): empty body -- "send me your inventory window"
 ```
+
+Both directions converge on ONE outbound dial (NAT-friendly: a dial-out-only
+node still receives): push first (my Inv -> your Want -> my Push), then pull
+(my InvReq -> your Inv -> my Want -> your Push). All handlers are stateless.
 
 The exchange piggybacks on the gossip round: Announce/AnnounceBatch first,
 then Inv -> Want -> Push on the same stream. Receivers insert by recomputing

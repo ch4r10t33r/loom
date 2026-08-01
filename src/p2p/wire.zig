@@ -35,6 +35,7 @@ pub const MsgType = enum(u8) {
     rag_inv = 0x20,
     rag_want = 0x21,
     rag_push = 0x22,
+    rag_inv_req = 0x23,
     _,
 };
 
