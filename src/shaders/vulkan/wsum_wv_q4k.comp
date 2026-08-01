@@ -1,0 +1,71 @@
+// The MLA value side in ONE kernel per head: o_latent accumulates in shared
+// memory (its only consumer is here), then W_v rows read the quantized kv_b
+// plane directly -- no separate dispatch, no intermediate buffer, no
+// full-pipeline drain between them. Identity slots: head h reads rows
+// [h*stride + nope, +vd) of kv_b.
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer W { uvec4 w4[]; };
+layout(std430, binding = 1) readonly buffer P { float probs[]; };
+layout(std430, binding = 2) readonly buffer C { float c_cache[]; };
+layout(std430, binding = 3) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC { uint n_heads; uint kvr; uint seq; uint c_base; uint nope; uint stride; uint vd; uint row_bytes; } pc;
+shared float olat[512]; // kvr <= 512, callers decline above
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.n_heads) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint ph = h * pc.seq;
+    for (uint i = tid; i < pc.kvr; i += 64u) {
+        float acc = 0.0;
+        for (uint t = 0u; t < pc.seq; t++) acc += probs[ph + t] * c_cache[pc.c_base + t * pc.kvr + i];
+        olat[i] = acc;
+    }
+    barrier();
+    // W_v rows for this head, one or more per thread.
+    for (uint r = tid; r < pc.vd; r += 64u) {
+        uint row_base = (h * pc.stride + pc.nope + r) * pc.row_bytes;
+        // q4_k row walk: per super-block header uvec4 + eight 32-value runs.
+        float acc = 0.0;
+        uint blocks = pc.kvr / 256u;
+        for (uint b = 0u; b < blocks; b++) {
+            uint u = (row_base + b * 144u) >> 4u;
+            uvec4 hdr = uvec4(w4[u].x, w4[u].y, w4[u].z, w4[u].w);
+            vec2 dd = unpackHalf2x16(hdr.x);
+            for (uint sb = 0u; sb < 8u; sb++) {
+                uint sh = (sb & 3u) * 8u;
+                uint a = (((sb < 4u) ? hdr.y : hdr.z) >> sh) & 0xFFu;
+                uint bb = (((sb < 4u) ? hdr.z : hdr.w) >> sh) & 0xFFu;
+                uint cc = (hdr.y >> sh) & 0xFFu;
+                float sc;
+                float mn;
+                if (sb < 4u) {
+                    sc = float(a & 63u);
+                    mn = float(bb & 63u);
+                } else {
+                    sc = float((bb & 0xFu) | ((cc >> 6u) << 4u));
+                    mn = float((bb >> 4u) | ((a >> 6u) << 4u));
+                }
+                uint hh = sb >> 1u;
+                bool hi = (sb & 1u) == 1u;
+                uint qw0 = u * 4u + 4u + hh * 8u;
+                float s_qx = 0.0;
+                float s_x = 0.0;
+                uint xb = b * 256u + sb * 32u;
+                for (uint j = 0u; j < 8u; j++) {
+                    uint qw = w4[(qw0 + j) >> 2u][(qw0 + j) & 3u];
+                    for (uint k = 0u; k < 4u; k++) {
+                        uint byte_v = (qw >> (8u * k)) & 0xFFu;
+                        float q = float(hi ? (byte_v >> 4u) : (byte_v & 0xFu));
+                        float xv = olat[xb + j * 4u + k];
+                        s_qx += q * xv;
+                        s_x += xv;
+                    }
+                }
+                acc += dd.x * sc * s_qx - dd.y * mn * s_x;
+            }
+        }
+        o[h * pc.vd + r] = acc;
+    }
+}
