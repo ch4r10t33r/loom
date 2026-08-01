@@ -15,6 +15,8 @@ const backend = @import("../compute/backend.zig");
 const generator = @import("generator.zig");
 const rag_store = @import("../rag/store.zig");
 const networks = @import("../p2p/networks.zig");
+const alpha = @import("alpha.zig");
+const net = std.Io.net;
 const deepseek = @import("../gguf/deepseek.zig");
 const llama = @import("../gguf/llama.zig");
 const gguf_mod = @import("../gguf/gguf.zig");
@@ -38,6 +40,11 @@ const MBf: f64 = 1024.0 * 1024.0;
 
 pub const Options = struct {
     model: []const u8,
+    /// Opt-in alpha telemetry: report numeric operational metrics to the
+    /// bootstrap peer once a minute (docs/ALPHA.md lists every field).
+    report_metrics: bool = false,
+    /// Collect METRICS lines from consenting peers into this JSONL file.
+    alpha_ingest: ?[]const u8 = null,
     rpc_addr: []const u8,
     rpc_port: u16,
     openai_addr: []const u8, // OpenAI-compatible HTTP API bind addr
@@ -684,6 +691,24 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         try out.print("  network    id {d}\n", .{network_id});
     }
 
+    // A node's p2p port is an identity, not a load-balancing group, but the
+    // listener's reuse_address (needed for fast restarts) also sets
+    // SO_REUSEPORT on POSIX, which lets a second node bind the same port and
+    // silently split incoming connections with this one (issue #180, found
+    // when a stray process made a healthy bootnode answer ERR no_store on
+    // half its connections). Probe before binding and refuse instead.
+    {
+        const probe_host = if (std.mem.eql(u8, opts.p2p_addr, "0.0.0.0")) "127.0.0.1" else opts.p2p_addr;
+        if (net.IpAddress.parse(probe_host, opts.p2p_port)) |pa| {
+            if (pa.connect(io, .{ .mode = .stream })) |ps| {
+                ps.close(io);
+                try out.print("p2p port {d} is already serving (another loom node?); refusing to share it\n", .{opts.p2p_port});
+                try out.flush();
+                return;
+            } else |_| {}
+        } else |_| {}
+    }
+
     var p2p_ctx = p2p.Ctx{
         .gpa = gpa,
         .io = io,
@@ -698,6 +723,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .advertise = advertise,
         .network_id = network_id,
         .rag = if (rag) |*r| r else null,
+        .metrics_path = opts.alpha_ingest,
     };
     const p2p_handle = try std.Thread.spawn(.{}, p2pThread, .{&p2p_ctx});
     defer p2p_handle.join();
@@ -1056,6 +1082,33 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         t.detach();
     }
 
+    // Opt-in alpha telemetry: aggregate generation stats locally, report the
+    // numeric snapshot to the bootstrap peer once a minute. Reporting without
+    // a bootstrap peer is meaningless (there is nobody to tell), so it is
+    // silently inert for an origin.
+    var alpha_metrics = alpha.Metrics{ .io = io };
+    var alpha_ctx: alpha.ReporterCtx = undefined;
+    if (opts.report_metrics and peer_list.items.len > 0) {
+        alpha_ctx = .{
+            .gpa = gpa,
+            .io = io,
+            .metrics = &alpha_metrics,
+            .store = if (store) |*st| st else null,
+            .table = &table,
+            .target = peer_list.items[0],
+            .network_id = network_id,
+            .version = @import("build_info").version,
+            .hold_fraction = opts.hold_fraction,
+            .boot_id = @truncate(@as(u128, @bitCast(stats.nowNs(io)))),
+            .started_ns = stats.nowNs(io),
+        };
+        const t = try std.Thread.spawn(.{}, alpha.reporterLoop, .{&alpha_ctx});
+        t.detach();
+        try out.print("  metrics    reporting numeric telemetry to {s} every 60s (docs/ALPHA.md)\n", .{peer_strs.items[0]});
+        try out.flush();
+    }
+    if (opts.openai_port != 0) openai_ctx.alpha_metrics = &alpha_metrics;
+
     var rpc_ctx = rpc.Ctx{
         .gpa = gpa,
         .io = io,
@@ -1066,6 +1119,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .meter = &meter,
         .admin_token = opts.admin_token,
         .engine_lock = &engine_lock,
+        .alpha_metrics = &alpha_metrics,
     };
     rpc.serve(&rpc_ctx) catch |e| {
         // Do not return: the loops above are detached and still hold pointers

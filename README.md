@@ -117,6 +117,7 @@ worked examples with real output are in the
 
 ## Documentation
 
+- [Alpha testing guide](docs/ALPHA.md) — join the devnet, what to try, what telemetry is collected
 - [Command tour](docs/COMMANDS.md) — every command, worked examples, protocols (RPC, OpenAI, P2P wire)
 - [CLI reference](docs/CLI.md) — every flag, defaults, env overrides
 - [Install details](docs/INSTALL.md) — manual install, checksum verification, Gatekeeper

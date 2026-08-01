@@ -67,6 +67,11 @@ pub const Ctx = struct {
     rag_round: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// In-flight expert requests being served (the heartbeat load hint).
     load: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    /// Append-only JSONL sink for opt-in alpha telemetry (--alpha-ingest).
+    /// Null means this node declines METRICS lines. Writes serialize on
+    /// metrics_mu; the file is capped at 256 MB and then refused.
+    metrics_path: ?[]const u8 = null,
+    metrics_mu: Io.Mutex = .init,
     /// Our own advertised "host:port" (what we tell peers to dial us on).
     advertise: []const u8 = "",
 };
@@ -190,6 +195,15 @@ fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer) !void
         const e = ctx.entries[id];
         const hex = hashmod.toHex(e.digest);
         try wi.print("PRESENT {d} off={d} len={d} sha256={s}\n", .{ id, e.offset, e.len, hex });
+    } else if (std.mem.startsWith(u8, line, "METRICS ")) {
+        // Opt-in alpha telemetry ingest (SPEC.md). Only persisted when the
+        // operator passed --alpha-ingest; every other node declines, so a
+        // reporter never accumulates state on peers that did not ask for it.
+        const path = ctx.metrics_path orelse return wi.print("ERR no_ingest\n", .{});
+        const json = line["METRICS ".len..];
+        if (json.len == 0 or json.len > 8192) return wi.print("ERR bad_metrics\n", .{});
+        appendMetricsLine(ctx, path, json) catch return wi.print("ERR ingest_failed\n", .{});
+        try wi.print("OK\n", .{});
     } else if (std.mem.eql(u8, line, "MANIFEST")) {
         const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
         const m = &store.manifest;
@@ -416,6 +430,18 @@ pub fn selfHeartbeat(ctx: *Ctx) wire.Heartbeat {
         } else |_| {}
     }
     return hb;
+}
+
+fn appendMetricsLine(ctx: *Ctx, path: []const u8, json: []const u8) !void {
+    ctx.metrics_mu.lockUncancelable(ctx.io);
+    defer ctx.metrics_mu.unlock(ctx.io);
+    const f = Io.Dir.cwd().openFile(ctx.io, path, .{ .mode = .write_only }) catch
+        try Io.Dir.cwd().createFile(ctx.io, path, .{});
+    defer f.close(ctx.io);
+    const size = (try f.stat(ctx.io)).size;
+    if (size > 256 * 1024 * 1024) return error.IngestFull;
+    try f.writePositionalAll(ctx.io, json, size);
+    try f.writePositionalAll(ctx.io, "\n", size + json.len);
 }
 
 fn bytesToHexAlloc(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {

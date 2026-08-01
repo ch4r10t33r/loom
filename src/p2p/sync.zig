@@ -36,7 +36,7 @@ pub const PeerAddr = struct {
     }
 };
 
-const Peer = struct {
+pub const Peer = struct {
     stream: net.Stream,
     io: Io,
     r: net.Stream.Reader,
@@ -45,7 +45,7 @@ const Peer = struct {
     wbuf: []u8,
     deadline: ?usize = null,
 
-    fn connect(gpa: std.mem.Allocator, io: Io, addr: PeerAddr) !*Peer {
+    pub fn connect(gpa: std.mem.Allocator, io: Io, addr: PeerAddr) !*Peer {
         const address = try dns.resolve(io, addr.host, addr.port);
         const stream = try address.connect(io, .{ .mode = .stream });
         const p = try gpa.create(Peer);
@@ -60,7 +60,7 @@ const Peer = struct {
         return p;
     }
 
-    fn close(p: *Peer, gpa: std.mem.Allocator) void {
+    pub fn close(p: *Peer, gpa: std.mem.Allocator) void {
         sockopt.untrack(p.io, p.deadline); // before close: see sockopt fd-reuse note
         p.stream.close(p.io);
         gpa.free(p.rbuf);
@@ -68,12 +68,12 @@ const Peer = struct {
         gpa.destroy(p);
     }
 
-    fn send(p: *Peer, comptime fmt: []const u8, args: anytype) !void {
+    pub fn send(p: *Peer, comptime fmt: []const u8, args: anytype) !void {
         try p.w.interface.print(fmt, args);
         try p.w.interface.flush();
     }
 
-    fn recvLine(p: *Peer) ![]u8 {
+    pub fn recvLine(p: *Peer) ![]u8 {
         const raw = try p.r.interface.takeDelimiterInclusive('\n');
         return @constCast(std.mem.trimEnd(u8, raw, "\r\n"));
     }

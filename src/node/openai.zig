@@ -28,6 +28,7 @@ const net = std.Io.net;
 const generator = @import("generator.zig");
 const rag_store = @import("../rag/store.zig");
 const sockopt = @import("../core/sockopt.zig");
+const stats = @import("../core/stats.zig");
 const chat_template = @import("../gguf/chat_template.zig");
 const meter_mod = @import("meter.zig");
 const peers_mod = @import("../p2p/peers.zig");
@@ -36,6 +37,8 @@ const peers_mod = @import("../p2p/peers.zig");
 const chat_html = @embedFile("ui.html");
 
 pub const Ctx = struct {
+    /// Opt-in alpha telemetry aggregate (numeric only; docs/ALPHA.md).
+    alpha_metrics: ?*@import("alpha.zig").Metrics = null,
     /// Gossiped RAG chunks; null when --rag is off. Search runs before the
     /// prompt reaches the engine.
     rag: ?*rag_store.Store = null,
@@ -427,6 +430,7 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer, dl:
     const parse_special = is_chat and chat_template.usesSpecialMarkers(ctx.gen.chatFormat());
 
     // Generate under the shared engine mutex (rpc + openai serialize here).
+    const gen_t0 = stats.nowNs(ctx.io);
     ctx.engine_lock.lockUncancelable(ctx.io);
     var res = ctx.gen.generate(gpa, ctx.io, prompt_text, max_tokens, temp, seed, budget, null, parse_special) catch |e| {
         ctx.engine_lock.unlock(ctx.io);
@@ -434,8 +438,14 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer, dl:
         if (ctx.meter) |m| _ = m.settle(client, reserved, 0);
         return e;
     };
+    const gen_hit = ctx.gen.hitRate();
     ctx.engine_lock.unlock(ctx.io);
     defer res.deinit(gpa);
+    if (ctx.alpha_metrics) |am| {
+        const secs = @as(f64, @floatFromInt(stats.nowNs(ctx.io) - gen_t0)) / 1e9;
+        const tok_s = if (secs > 0) @as(f64, @floatFromInt(res.completion_tokens)) / secs else 0;
+        am.recordGen(tok_s, gen_hit);
+    }
 
     const content = try jsonEscapeAlloc(gpa, res.text);
     defer gpa.free(content);

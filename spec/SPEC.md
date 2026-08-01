@@ -83,6 +83,18 @@ input cannot inject a control token; it is on only for special-marker chat
 scaffolds (chatml/llama3/gemma), where making message content injection-safe too
 requires segment encoding (follow-up).
 
+## Alpha telemetry (optional)
+
+`METRICS <json>` carries one node's opt-in operational report to a peer that
+collects it. A node started with `--alpha-ingest <path>` appends the JSON
+payload as one line to that file and replies `OK`; every other node replies
+`ERR no_ingest` and stores nothing. Payloads over 8192 bytes are refused
+with `ERR bad_metrics`; a collector whose file exceeds 256 MB refuses with
+`ERR ingest_failed`. The payload is a single JSON object whose complete
+field list is documented in docs/ALPHA.md; it never contains prompts,
+generated text, or RAG content. Reports are fire-and-forget: a sender does
+not retry a failed report.
+
 ## Metering and compensation
 
 Full nodes are compensated by light nodes for serviced requests. Each full node
