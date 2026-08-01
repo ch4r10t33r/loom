@@ -476,7 +476,7 @@ pub fn moeFfnBlockRouted(normed: []const f32, logits: []const f32, bias: ?[]cons
     const d_up = IdPush{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(paddedLen(up_w.ty, up_w.data.len / cfg.n_expert)), .x_stride = 0 };
     const d_down = IdPush{ .rows = @intCast(dim), .cols = @intCast(ffn), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(paddedLen(down_w.ty, down_w.data.len / cfg.n_expert)), .x_stride = @intCast(ffn) };
     const n_sw = extern struct { n: u32 }{ .n = @intCast(cfg.n_used * ffn) };
-    const n_red = extern struct { n: u32, dim: u32 }{ .n = @intCast(cfg.n_used), .dim = @intCast(dim) };
+    const n_red = extern struct { n: u32, dim: u32, accum: u32 }{ .n = @intCast(cfg.n_used), .dim = @intCast(dim), .accum = 0 };
 
     // The whole chain as one submission, barriers where a stage reads what
     // the previous one wrote -- the shape Metal proved out, minus only the
@@ -787,7 +787,7 @@ pub fn mlaLayerTail(li: usize, pos: usize, x: []f32, q_nope: []const f32, q_rope
     const d_up = IdPush{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(paddedLen(up_w.ty, up_w.data.len / cfg.n_expert)), .x_stride = 0 };
     const d_down = IdPush{ .rows = @intCast(dim), .cols = @intCast(ffn), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(paddedLen(down_w.ty, down_w.data.len / cfg.n_expert)), .x_stride = @intCast(ffn) };
     const n_sw = extern struct { n: u32 }{ .n = @intCast(cfg.n_used * ffn) };
-    const n_red = extern struct { n: u32, dim: u32 }{ .n = @intCast(cfg.n_used), .dim = @intCast(dim) };
+    const n_red = extern struct { n: u32, dim: u32, accum: u32 }{ .n = @intCast(cfg.n_used), .dim = @intCast(dim), .accum = 0 };
 
     const c = d.beginCmd() catch return false;
     recordAttn(d, c, p, li, n_heads, nope, v_head_dim, scale, qbuf.?, nope, 0, p.w.rope, n_heads * nope) catch return false;
@@ -969,7 +969,6 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
     const s1 = ensureDev(&slots[0], d, s12_len * 4) orelse return false;
     const s2 = ensureDev(&slots[1], d, s12_len * 4) orelse return false;
     const s3 = ensureDev(&slots[2], d, @max(fc.routed.n_used, 1) * dim * 4) orelse return false;
-    const acc = ensureDev(&accbuf, d, dim * 4) orelse return false;
     const ob = ensure(&obuf, d, vocab * 4) orelse return false;
     @memcpy(xr.slice(f32)[0..dim], x);
 
@@ -1092,12 +1091,11 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
             d.barrier(c);
             d.record(c, p.dp, &.{ p.dw, s1, s3, idb }, std.mem.asBytes(&d_down), @intCast(fc.routed.n_used * ((dim + 3) / 4))) catch return false;
             d.barrier(c);
-            const n_red = extern struct { n: u32, dim: u32 }{ .n = @intCast(fc.routed.n_used), .dim = @intCast(dim) };
-            d.record(c, pipes.reduce_dev, &.{ acc, s3, gb }, std.mem.asBytes(&n_red), @intCast((dim + 63) / 64)) catch return false;
+            const n_red = extern struct { n: u32, dim: u32, accum: u32 }{ .n = @intCast(fc.routed.n_used), .dim = @intCast(dim), .accum = 1 };
+            d.record(c, pipes.reduce_dev, &.{ xr, s3, gb }, std.mem.asBytes(&n_red), @intCast((dim + 63) / 64)) catch return false;
             // No barrier: the shared expert's gate/up read nb and write
-            // s1/s2, disjoint from the reduce's s3 -> acc. The barrier after
-            // them orders everything before the shared expert's swiglu and
-            // before add(xr, acc).
+            // s1/s2, disjoint from the reduce's s3 -> xr accumulation. The
+            // barrier after them orders everything downstream.
             if (dd.shexp != null) {
                 const d_sh = Dims2{ .rows = @intCast(dd.shexp_ffn), .cols = @intCast(dim) };
                 const d_shd = Dims2{ .rows = @intCast(dim), .cols = @intCast(dd.shexp_ffn) };
@@ -1109,11 +1107,8 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
                 d.barrier(c);
                 d.record(c, p.sh_pipes[2], &.{ p.shw[2], s1, s3 }, std.mem.asBytes(&d_shd), @intCast((dim + 3) / 4)) catch return false;
                 d.barrier(c);
-                d.record(c, pipes.add, &.{ acc, s3 }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
-                d.barrier(c);
+                d.record(c, pipes.add, &.{ xr, s3 }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
             }
-            if (dd.shexp == null) d.barrier(c); // reduce -> add(xr, acc) when no shexp barriers intervened
-            d.record(c, pipes.add, &.{ xr, acc }, std.mem.asBytes(&n_add), @intCast((dim + 63) / 64)) catch return false;
         } else {
             const d_f = Dims2{ .rows = @intCast(dd.dffn), .cols = @intCast(dim) };
             const d_fd = Dims2{ .rows = @intCast(dim), .cols = @intCast(dd.dffn) };
