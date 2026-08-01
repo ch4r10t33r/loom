@@ -1051,13 +1051,7 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
     // only the ratios carry information. Diagnostic only.
     const debug_split = std.c.getenv("LOOM_FRAME_DEBUG") != null;
     var ph = [_]i128{0} ** 5;
-    const nowf = struct {
-        fn f() i128 {
-            var ts: std.c.timespec = undefined;
-            _ = std.c.clock_gettime(.MONOTONIC, &ts);
-            return @as(i128, ts.sec) * 1_000_000_000 + ts.nsec;
-        }
-    }.f;
+    const nowf = @import("../core/stats.zig").nowMonoNs;
     var c = d.beginCmd() catch return false;
     for (descs, 0..) |dd, li| {
         const p = &plans[li];
