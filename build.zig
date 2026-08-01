@@ -55,6 +55,7 @@ pub fn build(b: *std.Build) void {
     // linking libc is unremarkable; silently building for one platform only is
     // not.
     exe_mod.link_libc = true;
+    addBrotli(b, exe_mod);
     const exe = b.addExecutable(.{ .name = "loom", .root_module = exe_mod });
     // Metal needs one Objective-C translation unit and two system frameworks.
     // Only compiled when the backend is selected, so a CPU build never needs a
@@ -86,6 +87,7 @@ pub fn build(b: *std.Build) void {
     // stated as explicitly as the exe does — CI runs on Linux and caught this
     // when only the exe had been fixed.
     test_mod.link_libc = true;
+    addBrotli(b, test_mod);
     const unit_tests = b.addTest(.{ .root_module = test_mod });
     if (std.mem.eql(u8, gpu, "metal")) addMetal(b, unit_tests);
     const run_tests = b.addRunArtifact(unit_tests);
@@ -96,6 +98,29 @@ pub fn build(b: *std.Build) void {
 /// Compile the Metal shim and link the frameworks it needs. ARC is on so the
 /// shim can use ordinary Objective-C object lifetime; modules so it can
 /// `@import` the frameworks without a bridging header.
+/// Brotli, vendored: pure C, zero dependencies, MIT -- it compiles into the
+/// static binaries of every release target, so at-rest chunk compression is
+/// always available. (FAISS stays dlopen by explicit decision: C++ + BLAS +
+/// OpenMP does not belong in a 4-target musl-static cross build, and loom's
+/// exact scan is the same algorithm FAISS-Flat runs at loom's scale.)
+fn addBrotli(b: *std.Build, m: *std.Build.Module) void {
+    const dep = b.dependency("brotli", .{});
+    m.addIncludePath(dep.path("c/include"));
+    m.addCSourceFiles(.{ .root = dep.path("c"), .files = &.{
+        "common/constants.c",    "common/context.c",      "common/dictionary.c",
+        "common/platform.c",     "common/shared_dictionary.c", "common/transform.c",
+        "dec/bit_reader.c",      "dec/decode.c",          "dec/huffman.c",
+        "dec/state.c",
+        "enc/backward_references.c", "enc/backward_references_hq.c", "enc/bit_cost.c",
+        "enc/block_splitter.c",  "enc/brotli_bit_stream.c", "enc/cluster.c",
+        "enc/command.c",         "enc/compound_dictionary.c", "enc/compress_fragment.c",
+        "enc/compress_fragment_two_pass.c", "enc/dictionary_hash.c", "enc/encode.c",
+        "enc/encoder_dict.c",    "enc/entropy_encode.c",  "enc/fast_log.c",
+        "enc/histogram.c",       "enc/literal_cost.c",    "enc/memory.c",
+        "enc/metablock.c",       "enc/static_dict.c",     "enc/utf8_util.c",
+    }, .flags = &.{} });
+}
+
 fn addMetal(b: *std.Build, c: *std.Build.Step.Compile) void {
     const m = c.root_module;
     m.addCSourceFile(.{
