@@ -1,0 +1,47 @@
+// The MLA value side in ONE kernel per head: o_latent accumulates in shared
+// memory (its only consumer is here), then W_v rows read the quantized kv_b
+// plane directly -- no separate dispatch, no intermediate buffer, no
+// full-pipeline drain between them. Identity slots: head h reads rows
+// [h*stride + nope, +vd) of kv_b.
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer W { uint w4[]; };
+layout(std430, binding = 1) readonly buffer P { float probs[]; };
+layout(std430, binding = 2) readonly buffer C { float c_cache[]; };
+layout(std430, binding = 3) writeonly buffer O { float o[]; };
+layout(push_constant) uniform PC { uint n_heads; uint kvr; uint seq; uint c_base; uint nope; uint stride; uint vd; uint row_bytes; } pc;
+shared float olat[512]; // kvr <= 512, callers decline above
+
+void main() {
+    uint h = gl_WorkGroupID.x;
+    if (h >= pc.n_heads) return;
+    uint tid = gl_LocalInvocationID.x;
+    uint ph = h * pc.seq;
+    for (uint i = tid; i < pc.kvr; i += 64u) {
+        float acc = 0.0;
+        for (uint t = 0u; t < pc.seq; t++) acc += probs[ph + t] * c_cache[pc.c_base + t * pc.kvr + i];
+        olat[i] = acc;
+    }
+    barrier();
+    // W_v rows for this head, one or more per thread.
+    for (uint r = tid; r < pc.vd; r += 64u) {
+        uint row_base = (h * pc.stride + pc.nope + r) * pc.row_bytes;
+        // q8_0 padded row walk: quants-first 36-byte blocks, d at +32.
+        float acc = 0.0;
+        uint blocks = pc.kvr / 32u;
+        for (uint b = 0u; b < blocks; b++) {
+            uint blk = row_base + b * 36u;
+            float d = unpackHalf2x16(w4[(blk + 32u) >> 2u]).x;
+            float s = 0.0;
+            for (uint j = 0u; j < 8u; j++) {
+                int qw = int(w4[(blk + 4u * j) >> 2u]);
+                s += float(bitfieldExtract(qw, 0, 8)) * olat[b * 32u + j * 4u]
+                   + float(bitfieldExtract(qw, 8, 8)) * olat[b * 32u + j * 4u + 1u]
+                   + float(bitfieldExtract(qw, 16, 8)) * olat[b * 32u + j * 4u + 2u]
+                   + float(bitfieldExtract(qw, 24, 8)) * olat[b * 32u + j * 4u + 3u];
+            }
+            acc += d * s;
+        }
+        o[h * pc.vd + r] = acc;
+    }
+}
