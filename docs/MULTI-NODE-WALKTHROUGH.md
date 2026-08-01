@@ -41,7 +41,7 @@ out at plan time, not mid-token.
 
 ### Recommended model
 
-**DeepSeek-Coder-V2-Lite-Instruct**, Q4_K_S, **9.53 GB** — the smallest
+**DeepSeek-Coder-V2-Lite-Instruct**, Q4_K_S, 9.53 GB, the smallest
 Loom-compatible real MoE:
 
 ```
@@ -58,12 +58,12 @@ Q5_K_M (11.9 GB), Q6_K (14.1 GB), Q8_0 (16.7 GB).
 
 ### What you need on disk
 
-- **Origin:** the model file itself. It is opened **in place** and never
+- **Origin:** the model file itself. It is opened in place and never
   copied; its store directory holds only sidecars (~KB).
-- **Each joining node:** a **sparse** copy sized to the full file, where only
+- **Each joining node:** a sparse copy sized to the full file, where only
   held shards occupy real blocks. Measured on a 19 MB model at
-  `--hold-fraction 0.4`: 19,077,344 bytes logical, **6,496,256 bytes actually on
-  disk**. So a node at 30% of a 9.5 GB model uses roughly 3 GB, not 9.5 GB.
+  `--hold-fraction 0.4`: 19,077,344 bytes logical, 6,496,256 bytes actually on
+  disk. So a node at 30% of a 9.5 GB model uses roughly 3 GB, not 9.5 GB.
 
 RAM: `--ram-gb 4` is plenty for this model. The resident bundle (attention,
 shared experts, embeddings) is mmap'd and every node holds it in full.
@@ -100,8 +100,8 @@ curl -L -o /tmp/dsc-v2-lite.gguf \
 ./zig-out/bin/loom gguf check /tmp/dsc-v2-lite.gguf
 ```
 
-`gguf check` answers this in one line, and it takes a URL — so you can check a
-model *before* downloading it:
+`gguf check` answers this in one line, and it takes a URL, so you can check a
+model before downloading it:
 
 ```sh
 loom gguf check https://huggingface.co/.../model.gguf
@@ -160,8 +160,8 @@ serving    distributed GGUF (deepseek2): … chat=deepseek
 `mode=expert` is the one to check — that is expert-aligned sharding. If it says
 `mode=fixed`, the model is not MoE.
 
-The architecture in the `serving` line is read from the file, not assumed: it
-will say `deepseek2`, `llama`, `qwen2moe`, `qwen3moe` or `glm4moe`.
+The architecture in the `serving` line is read from the file: it will say
+`deepseek2`, `llama`, `qwen2moe`, `qwen3moe` or `glm4moe`.
 
 ## Step 6 — start a partial node
 
@@ -189,8 +189,8 @@ shards     mode=expert total=… held=… (…%)
 serving    distributed GGUF (deepseek2): …
 ```
 
-`--hold-fraction` picks an **exact** count (`round(fraction x expert_shards)`);
-only *which* shards is random, seeded by `--seed` so a restart re-picks the same
+`--hold-fraction` picks an exact count (`round(fraction x expert_shards)`);
+only which shards is random, seeded by `--seed` so a restart re-picks the same
 set.
 
 ## Step 7 — prove it serves using experts it does not hold
@@ -201,9 +201,9 @@ Query **node 2** (port 8780), the one holding only 30%:
 printf '{"prompt":"def fibonacci(n):","max_tokens":30,"seed":1}\n' | nc -w 120 127.0.0.1 8780
 ```
 
-The response carries `hit_rate`. **A value below 1.0 is the whole point** — it
-means some experts were not held locally and were fetched from the origin
-*inside the token loop*. On a 33% store of DeepSeek-V2-Lite an earlier run
+The response carries `hit_rate`. A value below 1.0 is what this step is for:
+it means some experts were not held locally and were fetched from the origin
+inside the token loop. On a 33% store of DeepSeek-V2-Lite an earlier run
 measured `hit_rate` around 0.90, streaming 641 experts (3.5 GB) from one peer
 with zero failures.
 
@@ -228,8 +228,8 @@ printf '{"prompt":"def fibonacci(n):","max_tokens":30,"seed":1}\n' | nc -w 120 1
 printf '{"prompt":"def fibonacci(n):","max_tokens":30,"seed":1}\n' | nc -w 120 127.0.0.1 8780
 ```
 
-The `text` fields must be **identical**. A partial node streaming experts must
-produce exactly what a full copy produces — anything else means the fetch path
+The `text` fields must be identical. A partial node streaming experts must
+produce exactly what a full copy produces; anything else means the fetch path
 is corrupting weights. (Every fetched shard is digest-verified against the
 manifest before it touches disk, so this should hold by construction.)
 
@@ -244,8 +244,8 @@ HOME=/tmp/node3 ./zig-out/bin/loom node \
   --ram-gb 4
 ```
 
-The bootnode assigns it the **least-covered** shards first, so coverage is
-achieved by construction rather than by luck. Watch for gossip and heartbeat
+The bootnode assigns it the least-covered shards first, so coverage is
+achieved by construction. Watch for gossip and heartbeat
 lines on the existing nodes as they discover it. Peer tables:
 
 ```sh

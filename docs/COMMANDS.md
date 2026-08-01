@@ -15,19 +15,19 @@ loom node [--model SPEC] [--rpc-addr A] [--rpc-port P] [--openai-addr A] [--open
           [--peers H:P,H:P,...] [--hold-fraction F] [--range-mb M] [--advertise HOST:PORT]
 ```
 
-Starts a long-running node that (a) loads a loom-format model and serves
-inference over the native **RPC** and an optional **OpenAI-compatible HTTP
-API**, (b) optionally participates in **GGUF weight distribution** over **P2P**,
-with gossip-based peer discovery and eager churn repair. Every flag has a
-default, so `loom node` alone works.
+Starts a long-running node. It loads a loom-format model and serves inference
+over the native RPC and an optional OpenAI-compatible HTTP API, and it can
+also take part in GGUF weight distribution over P2P, with gossip-based peer
+discovery and eager churn repair. Every flag has a default, so `loom node`
+alone works.
 
 ### Model & engine flags
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--model SPEC` | `tiny` | What to load for inference. `tiny` = auto-generated synthetic checkpoint (cached in `~/.cache/loom/models/tiny`); a **local directory** containing `manifest.loom`; or a **Hugging Face repo** `[hf:]org/repo[@rev]` holding a loom-format checkpoint — downloaded over HTTPS on first use, then served from the local cache (local-first resolution). |
+| `--model SPEC` | `tiny` | What to load for inference. `tiny` = auto-generated synthetic checkpoint (cached in `~/.cache/loom/models/tiny`); a local directory containing `manifest.loom`; or a Hugging Face repo `[hf:]org/repo[@rev]` holding a loom-format checkpoint, downloaded over HTTPS on first use and then served from the local cache (local-first resolution). |
 | `--ram-gb X` | `4.0` | RAM budget. After the resident dense weights + KV cache, the remainder is split between the pinned hot-set and the LRU expert cache. The node never allocates expert storage beyond this. |
-| `--pin-gb Y` | `0` | Portion of the budget for **pinning** the hottest experts, chosen from a prior `--stats` file (measure-then-pin; see `loom run`). |
+| `--pin-gb Y` | `0` | Portion of the budget for pinning the hottest experts, chosen from a prior `--stats` file (measure-then-pin; see `loom run`). |
 | `--seed S` | `42` | Sampling seed (also the seed for random range selection when bootstrapping). |
 | `--stats FILE` | off | Persist per-expert usage counts on exit; a later run with `--pin-gb` reads this file to choose the hot set. |
 | `--no-verify` | verify on | Skip SHA-256 verification of expert blocks on disk reads (trusted-storage fast path). With verification on, a corrupted/poisoned expert fails the read with `PoisonedExpert`. |
@@ -39,7 +39,7 @@ Env overrides (flags win): `MODEL`, `RAM_BUDGET_GB`, `PIN_GB`, `SEED`, `STATS`.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--rpc-addr` / `--rpc-port` | `127.0.0.1` / `8770` | Where the JSON inference RPC listens. Bind `0.0.0.0` to accept remote clients. |
-| `--openai-addr` / `--openai-port` | `<rpc-addr>` / `0` (off) | Where the **OpenAI-compatible HTTP API** listens. Set `--openai-port` to enable it (e.g. `8772`). Serves the same engine as the RPC, metered by `Authorization: Bearer` client id. |
+| `--openai-addr` / `--openai-port` | `<rpc-addr>` / `0` (off) | Where the OpenAI-compatible HTTP API listens. Set `--openai-port` to enable it (e.g. `8772`). Serves the same engine as the RPC, metered by `Authorization: Bearer` client id. |
 | `--ctx N` | `4096` | Context-length cap when serving a distributed GGUF engine. |
 | `--chat-format F` | auto | Override the chat template (`deepseek`/`chatml`/`llama2`/`llama3`/`gemma`/`mistral`/`generic`); default auto-detects from GGUF metadata. |
 | `--p2p-addr` / `--p2p-port` | `0.0.0.0` / `8771` | Where the P2P line protocol listens (expert directory, weight ranges, gossip). |
@@ -49,15 +49,15 @@ Env overrides (flags win): `MODEL`, `RAM_BUDGET_GB`, `PIN_GB`, `SEED`, `STATS`.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--gguf FILE` | off | Act as an **origin/full holder**: split `FILE` into ranges, compute the manifest (SHA-256 per range; Merkle root = **model version id**), hold and serve all ranges. Mutually exclusive with `--bootstrap`. |
-| `--bootstrap HOST:PORT` | off | Boot by **syncing ranges from a peer**: adopt its manifest (root-verified), pick a random subset of ranges, fetch each one digest-verified. Also seeds the gossip peer table. |
+| `--gguf FILE` | off | Act as an origin/full holder: split `FILE` into ranges, compute the manifest (SHA-256 per range; Merkle root = model version id), hold and serve all ranges. Mutually exclusive with `--bootstrap`. |
+| `--bootstrap HOST:PORT` | off | Boot by syncing ranges from a peer: adopt its manifest (root-verified), pick a random subset of ranges, fetch each one digest-verified. Also seeds the gossip peer table. |
 | `--peers H:P,H:P,...` | none | Additional known peers (seed the gossip table; used by bootstrap and repair). |
 | `--hold-fraction F` | `1.0` | Fraction of ranges this node wants to hold, chosen randomly (seeded by `--seed`, so a restart re-picks the same set). Independent random subsets across nodes overlap → emergent redundancy. |
 | `--range-mb M` | `4.0` | Range size when *building* a fresh manifest (origin only; bootstrappers adopt the peer's value). |
 | `--r-target N` | `2` | Committee redundancy target when acting as bootnode (expert-sharded origin). |
 
 **Committees (SPEC.md).** An expert-sharded origin automatically acts as the
-**bootnode**: `JOIN` assigns each connecting node to a **shard committee** and
+bootnode: `JOIN` assigns each connecting node to a shard committee and
 a least-covered-first want-set, so every committee converges to holding the
 complete shard set with redundancy `--r-target` (default 2) by construction.
 Joiners sync from committee members first, then the bootnode; committee
@@ -70,14 +70,15 @@ Two loops run alongside the servers:
 
 - **Gossip (every 3 s):** dial every known peer, exchange binary Announce /
   AnnounceBatch frames (addr, committee id, manifest version, holdings seq +
-  bitmap; snappy-compressed). Discovery is transitive, and because announces
-  carry committee ids the table doubles as the **gossip-derived committee
-  view** — earlier committee members discover later joiners automatically and
+  bitmap; snappy-compressed). Discovery is transitive. Announces carry
+  committee ids, so the table doubles as a gossip-derived committee view:
+  earlier committee members discover later joiners automatically and
   start heartbeating them.
 - **Eager churn repair (every 2 s):** whenever `wanted − held ≠ ∅`, retry every
-  peer in the live table (including ones discovered via gossip and ones
-  currently down — they're retried, not forgotten). Peers advertising a
-  different manifest version are refused wholesale (the hardfork guard).
+  peer in the live table, including ones discovered via gossip and ones
+  currently down (down peers stay in the table and get retried). Peers
+  advertising a different manifest version are refused wholesale (the
+  hardfork guard).
 
 ### RPC protocol (inference)
 
@@ -145,7 +146,7 @@ special-token matcher (`gguf/special.zig`) when the model's vocab defines them.
 | `MANIFEST` | `MANIFEST version=.. size=.. ranges=.. range_size=.. mode=<fixed\|expert> resident=<n>` | manifest summary (`ERR no_store` if no GGUF attached) |
 | `MANIFESTFILE` | `MANIFESTFILE len=<n>` + serialized manifest | full manifest (digests + extent lists) — what bootstrap adopts |
 | `DIGEST <i>` / `DIGESTS` | one / all range digests | verification data |
-| `HOLDINGS` | `HOLDINGS <hex bitmap>` | which ranges this node holds (bit i = range i) — the compact summary destined for ENR metadata |
+| `HOLDINGS` | `HOLDINGS <hex bitmap>` | which ranges this node holds (bit i = range i); the compact summary destined for ENR metadata |
 | `GETR <i>` | `DATA <i> len=<l> sha256=<hex>` + raw bytes \| `ERR not_held` | fetch one range |
 | `JOIN addr=.. fraction=..` | `COMMITTEE id=.. members=.. assign=<hex>` | bootnode: committee + assigned want-set |
 | `COMMITTEES` | per-committee coverage summary | bootnode debug |
@@ -198,7 +199,7 @@ loom run <dir> [--prompt STR] [--max-tokens N] [--ram-gb X] [--pin-gb Y]
                [--temp T] [--seed S] [--stats FILE] [--no-verify]
 ```
 
-Loads a loom checkpoint, generates, prints text + metrics, exits. No servers —
+Loads a loom checkpoint, generates, prints text + metrics, exits. No servers;
 this is the measurement harness for the expert-streaming engine.
 
 | Flag | Default | Meaning |
@@ -209,8 +210,8 @@ this is the measurement harness for the expert-streaming engine.
 | `--temp T` | `0` | `<=0` greedy; else temperature sampling |
 | `--ram-gb` / `--pin-gb` / `--seed` / `--stats` / `--no-verify` | as in `node` | same engine knobs |
 
-The **measure-then-pin** loop — run once recording usage, run again pinning the
-measured hot set:
+The measure-then-pin loop: run once recording usage, then run again pinning
+the measured hot set:
 
 ```sh
 loom gen /tmp/ckpt
@@ -236,14 +237,15 @@ loom light [--full-nodes H:RPC_PORT[,...]] [--openai-port P --openai-full-nodes 
 ```
 
 For low-memory devices: holds no weights, no store, no engine (megabytes of
-footprint). It exposes the native line-JSON RPC and/or an **OpenAI-compatible
-HTTP API**, and transparently delegates every request to a full node — round-robin
-with failover — forcing its `--client-id` so a caller cannot spend under another
-identity (a caller-supplied `client` field or `Authorization` bearer is dropped).
-Configure at least one surface: `--full-nodes` for the native RPC (default port
-8768), and/or `--openai-port` with `--openai-full-nodes` for the OpenAI surface.
+footprint). It exposes the native line-JSON RPC and/or an OpenAI-compatible
+HTTP API and delegates every request to a full node, round-robin with
+failover. It forces its `--client-id` on each request, so a caller cannot
+spend under another identity (a caller-supplied `client` field or
+`Authorization` bearer is dropped). Configure at least one surface:
+`--full-nodes` for the native RPC (default port 8768), and/or `--openai-port`
+with `--openai-full-nodes` for the OpenAI surface.
 
-Full nodes **meter** clients: the native RPC responses carry `cost` (prompt +
+Full nodes meter clients: the native RPC responses carry `cost` (prompt +
 generated tokens) and `balance`, the OpenAI responses carry the `usage` object;
 when a client's allowance (`--free-quota` on the full node + credits − usage)
 hits zero, requests get `payment_required` / HTTP `402` until credited via the
@@ -280,7 +282,7 @@ with a Merkle-rooted manifest.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--glm` | off | use the real GLM-5.2 shape (78 layers, 256 experts/layer, ~19 MB/expert — describes the real deployment; generating its ~370 GB corpus is not a laptop operation). Default is the runnable `tiny` shape (8 layers, 32 experts, ~245 KB/expert). |
+| `--glm` | off | use the real GLM-5.2 shape (78 layers, 256 experts/layer, ~19 MB/expert). This describes the real deployment; generating its ~370 GB corpus is impractical on a laptop. Default is the runnable `tiny` shape (8 layers, 32 experts, ~245 KB/expert). |
 | `--seed N` | `42` | RNG seed; same seed → bit-identical checkpoint |
 
 ```sh
@@ -296,7 +298,7 @@ loom info <dir>
 ```
 
 Prints the model shape, expert sizing (per-token working set), the manifest's
-Merkle root, and **verifies** it: recomputes the root over the expert index and
+Merkle root, and verifies it: recomputes the root over the expert index and
 spot-checks an expert block's digest against the blob on disk.
 
 ```sh
@@ -318,7 +320,7 @@ loom gguf gen <file> [--seed N] [--data-mb M] [--arch A]
 ```
 
 Writes a small valid GGUF v3 file. Default (`demo`): metadata + two f32 tensors
-of deterministic data — a distribution payload, **not** a runnable model.
+of deterministic data — a distribution payload, not a runnable model.
 
 `--arch deepseek2|llama|qwen2moe|qwen3moe|glm4moe` writes a structurally
 faithful tiny model of that architecture with random weights — runnable with
@@ -331,7 +333,7 @@ cover every branch of the shared engine:
 |---|---|
 | `deepseek2` | MLA with q-LoRA, 1 dense + 2 MoE layers, sigmoid gating, selection bias, shared expert |
 | `llama` | Mixtral shape: softmax routing, no bias, no Q/K norm, no shared expert, NORM RoPE |
-| `qwen2moe` | QKV biases, sigmoid-**gated** shared expert, and the one arch that does *not* renormalize gates |
+| `qwen2moe` | QKV biases, sigmoid-gated shared expert, and the one arch that does not renormalize gates |
 | `qwen3moe` | Q/K norm, and a head_dim that is deliberately not `dim / n_heads` |
 | `glm4moe` | QKV biases, Q/K norm, sigmoid routing with selection bias, plain shared expert, `post_attention_norm` in place of `ffn_norm`, a leading dense layer, partial RoPE, and a trailing NextN block the forward pass must skip |
 
@@ -343,7 +345,7 @@ loom gguf info <file> [--range-mb M]              # default range preview: 4 MB
 
 Prints version/alignment/data offset, all metadata KVs (including tokenizer
 array sizes), the tensor table (name/type/dims/offset), and the distribution
-manifest this file would get: range count + Merkle-root **version id**.
+manifest this file would get: range count + Merkle-root version id.
 
 ```sh
 loom gguf info stories15M-q4_0.gguf --range-mb 1
@@ -355,11 +357,12 @@ loom gguf info stories15M-q4_0.gguf --range-mb 1
 loom gguf shard <file>
 ```
 
-The sharding tool: parses the GGUF tensor table and builds the expert-aligned
-manifest — one shard per (layer, expert) as a 3-extent list over the
-`ffn_{gate,up,down}_exps` tensors, resident bundle chunked at 16 MB — then
-prints the summary. `loom node --gguf` runs the same split automatically
-(expert mode when the file has expert tensors, fixed ranges otherwise).
+The sharding tool. It parses the GGUF tensor table and builds the
+expert-aligned manifest: one shard per (layer, expert) as a 3-extent list over
+the `ffn_{gate,up,down}_exps` tensors, with the resident bundle chunked at
+16 MB. Then it prints the summary. `loom node --gguf` runs the same split
+automatically (expert mode when the file has expert tensors, fixed ranges
+otherwise).
 
 ```sh
 loom gguf shard DeepSeek-V2-Lite.Q4_K_M.gguf
@@ -370,7 +373,7 @@ loom gguf shard DeepSeek-V2-Lite.Q4_K_M.gguf
 ```
 
 For GLM 5.2 this yields the planned 19,200 expert shards (~19 MB each) + a
-~10 GB resident bundle. `--hold-fraction` applies to *expert* shards only —
+~10 GB resident bundle. `--hold-fraction` applies to expert shards only;
 resident shards are always in every node's want-set.
 
 ### `loom gguf run` — run a GGUF model
@@ -392,18 +395,18 @@ Two engines:
 - **`deepseek2`** (DeepSeek V2/V3, Kimi K2) — MLA attention (q-LoRA,
   compressed-KV latent cache, decoupled NORM-rope head), MoE FFN, YaRN
   context-extension scaling.
-  **Validated on real weights**: DeepSeek-V2-Lite Q4_K_M (15.7B MoE, 27 MLA
+  Validated on real weights: DeepSeek-V2-Lite Q4_K_M (15.7B MoE, 27 MLA
   layers, 64 experts) produces correct factual completions ("The capital of
   France is Paris.") on one CPU core.
 - **`llama` / `qwen2moe` / `qwen3moe` / `glm4moe`** — one shared GQA engine.
   These differ only in optional pieces bolted onto the same skeleton, so the
   engine detects them from the tensors the file contains rather than from a
-  table of per-architecture beliefs: QKV biases, per-head Q/K RMSNorm before
-  RoPE, a dense or mixture-of-experts FFN, a shared expert that may be
+  table of per-architecture assumptions: QKV biases, per-head Q/K RMSNorm
+  before RoPE, a dense or mixture-of-experts FFN, a shared expert that may be
   sigmoid-gated, leading dense layers, a post-attention norm standing in for
   `ffn_norm`, and trailing MTP/NextN blocks that are skipped. The one fact
-  pinned per architecture is the RoPE style — adjacent-pair NORM for `llama`,
-  split-half NEOX for the rest — because getting it wrong produces fluent but
+  pinned per architecture is the RoPE style (adjacent-pair NORM for `llama`,
+  split-half NEOX for the rest), because getting it wrong produces fluent but
   wrong output rather than an error.
 
 MoE routing is shared by both engines (`src/gguf/moe.zig`): sigmoid or softmax
@@ -425,12 +428,12 @@ Affine types (float/legacy/K) use a fused matvec on the raw mmap'd bytes, with
 no wholesale dequantization. `Q4_0`, `Q4_K`, `Q5_K`, `Q6_K` and `Q8_0`
 additionally quantize the activation vector to int8 once per matvec and dot it
 against the packed weights as integers, which removes the dequantize step
-entirely — worth 2x to 9x depending on the format. The IQ and MXFP4 types are *codebook* quants —
-a block stores an index into a static grid table rather than a value to scale —
-so they decode through `src/gguf/iq.zig` against tables transcribed from
-llama.cpp. Because a wrong table entry there would silently corrupt weights
-instead of failing, all ten decoders are checked **bit-for-bit against
-llama.cpp's own `dequantize_row_*` output** on golden vectors
+entirely and is worth 2x to 9x depending on the format. The IQ and MXFP4 types
+are codebook quants: a block stores an index into a static grid table rather
+than a value to scale, so they decode through `src/gguf/iq.zig` against tables
+transcribed from llama.cpp. Because a wrong table entry there would silently
+corrupt weights instead of failing, all ten decoders are checked bit-for-bit
+against llama.cpp's own `dequantize_row_*` output on golden vectors
 (`src/gguf/iq_vectors.zig`).
 Tokenizers: SentencePiece (score-merge, byte fallback) and byte-level BPE
 (merge ranks, gpt2 byte table), selected by `tokenizer.ggml.model`. Output
@@ -446,7 +449,7 @@ loom gguf run stories15M-q4_0.gguf --prompt "Once upon a time" --max-tokens 100
 ```
 
 Validated against real reference models (`ggml-org/models` tinyllamas:
-stories260K F32/GQA, stories15M Q4_0 and Q8_0, DeepSeek-V2-Lite Q4_K_M) —
+stories260K F32/GQA, stories15M Q4_0 and Q8_0, DeepSeek-V2-Lite Q4_K_M);
 coherent English confirms kernels, attention, RoPE convention, and tokenizer
 simultaneously. `loom node` can also serve the distributed GGUF (deepseek2)
 engine directly over its RPC and OpenAI surfaces — see [Serving a distributed
@@ -454,12 +457,12 @@ GGUF model through the node](#serving-a-distributed-gguf-model-through-the-node)
 
 ### Distributed run: inference from a partial store
 
-Point `gguf run` at a **store directory** (instead of a .gguf) and give it
-peers: held shards come from the local sparse file; missing experts are
-**fetched from peers inside the token loop** — in parallel per MoE layer,
-round-robin across holders, digest-verified before touching disk, then
-persisted (so the node's holdings grow with use and gossip advertises them:
-fetch-on-demand doubles as organic heat replication).
+Point `gguf run` at a store directory (instead of a .gguf) and give it peers.
+Held shards come from the local sparse file; missing experts are fetched from
+peers inside the token loop, in parallel per MoE layer, round-robin across
+holders, digest-verified before touching disk, then persisted. The node's
+holdings grow with use and gossip advertises them, so fetch-on-demand doubles
+as organic heat replication.
 
 ```sh
 # node A serves the full expert-sharded model
@@ -476,13 +479,13 @@ loom gguf run ~/.cache/loom/models/gguf-synced --peers 127.0.0.1:8771 \
 
 ### Serving a distributed GGUF model through the node
 
-`loom gguf run` above is a one-shot CLI. The **node** serves the same
-distributed engine as a long-running service over its RPC and OpenAI surfaces:
-when `loom node` is given an expert-sharded GGUF (`--gguf` origin, or
-`--bootstrap` to sync a partial store) and its resident bundle is complete, it
-serves the deepseek2 engine and **fetches missing experts from peers inside the
-token loop**. Otherwise it serves the loom-format `--model`. `--ctx N` caps the
-context length (default 4096).
+`loom gguf run` above is a one-shot CLI. The node serves the same distributed
+engine as a long-running service over its RPC and OpenAI surfaces: when
+`loom node` is given an expert-sharded GGUF (`--gguf` origin, or `--bootstrap`
+to sync a partial store) and its resident bundle is complete, it serves the
+deepseek2 engine and fetches missing experts from peers inside the token loop.
+Otherwise it serves the loom-format `--model`. `--ctx N` caps the context
+length (default 4096).
 
 ```sh
 # origin: holds the whole expert-sharded model, serves it + acts as bootnode
@@ -501,9 +504,9 @@ curl -s http://127.0.0.1:8782/v1/completions -d '{"prompt":"the","max_tokens":8}
 
 Store mutation from the token-loop fetch and the eager-repair loop is serialized
 on one engine mutex. The first request on a cold partial node is slow (many
-sequential cold expert fetches); it warms as fetched experts are persisted. This
-is the serving-first, latency-later behavior the design calls for. Chat requests
-are rendered with the model's detected chat template (`--chat-format` to
+sequential cold expert fetches); it warms as fetched experts are persisted.
+This is the serving-first behavior the design calls for. Chat requests are
+rendered with the model's detected chat template (`--chat-format` to
 override); `--ctx N` caps context length.
 
 ---
@@ -524,7 +527,7 @@ loom iobench <file> [--threads N] [--block-mb M] [--reads R]
 
 Measures the exact access pattern the engine issues on a cache miss (parallel
 large random reads) in GB/s. Per CLAUDE.md, the local-disk vs. network tier
-order must be **measured, not assumed** — this is the measuring tool.
+order must be measured rather than assumed; this is the measuring tool.
 
 ```sh
 loom iobench /tmp/ckpt/experts.blob --threads 8 --block-mb 1 --reads 64

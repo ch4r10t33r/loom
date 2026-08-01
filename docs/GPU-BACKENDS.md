@@ -20,8 +20,8 @@ Read out of its own enablement notes and source tree:
 | `src/vulkan/` | ~2,190 lines | the Linux equivalent |
 | `src/shaders/metal/` | **23,014 lines, 185 files** | the actual work |
 
-The ratio is the lesson. The abstraction is trivial; the shaders are the
-project. ZINC does not have one generic `matmul` kernel — it has
+The ratio is the point: the abstraction is trivial, and the shaders are most
+of the work. ZINC does not have one generic `matmul` kernel; it has
 `dmmv_q4k_lmhead_argmax.metal`, `dmmv_q4k_dense_gate_up_swiglu.metal`,
 `dmmv_mxfp4_moe_sg.metal`. Kernels are specialized per quantization, per fusion
 opportunity, and per shape, because that is where the performance is.
@@ -46,9 +46,9 @@ Five design decisions worth adopting wholesale:
 
 ## Where loom differs, and why it matters
 
-Loom is not a single-machine engine, and that changes one thing fundamentally.
+Loom is not a single-machine engine, and that changes one thing.
 
-**A fetched expert has to reach the GPU before the matmul can run.** In loom a
+A fetched expert has to reach the GPU before the matmul can run. In loom a
 routed expert may arrive from a peer *during* the token loop. On the CPU path
 that block is simply memory. On a GPU it is not:
 
@@ -57,7 +57,7 @@ that block is simply memory. On a GPU it is not:
   table entry. This is free, and it is why Metal comes first.
 - **Discrete GPU over Vulkan.** The block must be copied host→VRAM before use.
   At ~5 MB per expert and 6 experts per layer, that is a PCIe transfer sitting
-  *inside* the critical path of every token — a new tier the whitepaper's
+  inside the critical path of every token, a new tier the whitepaper's
   analysis does not currently account for.
 
 That second case is in direct tension with the whitepaper's principle that
@@ -67,17 +67,17 @@ is a smaller version of the same mistake.
 
 Consequences for the design:
 
-- **Metal first**, not because macOS matters more, but because unified memory
+- Metal first, not because macOS matters more but because unified memory
   is the case where the distributed thesis and GPU execution compose without a
   new bottleneck.
-- **On discrete GPUs, the resident set should live in VRAM and the hot expert
-  set should be pinned there**, with peer-fetched experts treated as a slow
+- On discrete GPUs, the resident set should live in VRAM and the hot expert
+  set should be pinned there, with peer-fetched experts treated as a slow
   tier that is uploaded once and cached — the same tiering logic loom already
   applies to disk versus peers, one level down. A node whose VRAM cannot hold
   the resident bundle should say so and fall back, the way the resident-gate
   check already does.
-- **The measured-tier-order principle extends to VRAM.** Which is faster for a
-  missing expert — a peer fetch plus upload, or a local disk read plus upload —
+- The measured-tier-order principle extends to VRAM. Whether a missing expert
+  comes faster from a peer fetch plus upload or a local disk read plus upload
   is again a per-deployment question, not a constant.
 
 ## Proposed shape
@@ -121,17 +121,16 @@ small and #12/#13 are not.
    | 65,536 | 75.5 MB | 1.212 | **0.919** | 1.30 |
    | 131,072 | 151.0 MB | 2.381 | **1.609** | 2.57 |
 
-   At 131,072 rows that is 63 GB/s before and **94 GB/s** after.
+   At 131,072 rows that is 63 GB/s before and 94 GB/s after.
 
-   **The earlier "bandwidth wall" reading was wrong, and the way it was wrong
-   is worth recording.** The first version of this table topped out at 61 GB/s
+   The earlier "bandwidth wall" reading was wrong, and the way it was wrong
+   is worth recording. The first version of this table topped out at 61 GB/s
    and was read as the machine's ceiling, on the reasoning that unified memory
-   makes the CPU and GPU share one bus. But 61 GB/s was *our kernel's*
+   makes the CPU and GPU share one bus. But 61 GB/s was our kernel's
    achieved bandwidth, and nothing had measured the hardware's. A kernel doing
-   nothing but streaming reads — sum a large f32 buffer, one float4 per lane —
-   reaches **~110 GB/s** on the same M5 (`LOOM_BW_PROBE=1 zig build test
-   -Dgpu=metal`). The ceiling was ours, not the machine's, and 61 was 55% of
-   it.
+   nothing but streaming reads (sum a large f32 buffer, one float4 per lane)
+   reaches ~110 GB/s on the same M5 (`LOOM_BW_PROBE=1 zig build test
+   -Dgpu=metal`). The ceiling was our kernel's, and 61 was 55% of it.
 
    Two changes closed most of the gap:
 
@@ -146,8 +145,8 @@ small and #12/#13 are not.
       per lane every lane had the same sub-block index and the `j < 4` test
       was uniform across the SIMD group. Widening the load makes the index
       vary with the lane, so the branch diverges and the group executes both
-      sides. Measured on its own, the widened kernel *without* this change was
-      **slower than the original at every size below 131,072 rows** — the win
+      sides. Measured on its own, the widened kernel without this change was
+      slower than the original at every size below 131,072 rows; the win
       only appeared once the branch was gone.
 
    Two things were tried and are not kept, both measured: unrolling the block
@@ -164,13 +163,13 @@ small and #12/#13 are not.
 
    `MIN_GPU_ROWS` drops from 100,000 to 65,536 accordingly — the crossover
    moved, but not far enough to reach a 1.1B model, whose largest tensor is
-   the 32,000-row output head. **Decode on this hardware is still CPU
-   territory**, and the reason is unchanged even though the number was wrong:
+   the 32,000-row output head. Decode on this hardware is still CPU
+   territory, and the reason is unchanged even though the number was wrong:
    the CPU sits at ~53 GB/s flat, and even a GPU at 94 GB/s cannot overcome a
    ~262 us fixed cost per command buffer when a tensor's worth of work is tens
    of microseconds.
 
-   **Where a GPU still earns its place**, and neither is decode on this
+   Where a GPU still earns its place, and neither is decode on this
    hardware:
 
    - **Prefill.** A batch of N tokens reuses each weight N times, which turns
@@ -214,29 +213,29 @@ per-dispatch command buffer:
 Two things follow, and the first corrects an earlier conclusion in this
 document.
 
-**The kernel is not the problem.** At 115 GB/s it is at the DRAM ceiling a pure
+The kernel is not the problem. At 115 GB/s it is at the DRAM ceiling a pure
 streaming-read probe measures on this machine (~110 GB/s), and level with
 ZINC's own microbenchmark, which reports 109 GB/s at 27 MB. An earlier
 comparison here concluded loom's kernel was ~3x slower; that was an artifact of
 comparing loom's per-dispatch timings against ZINC's amortized ones. ZINC
-reports 259.81 us for a 27 MB shape, which is *less* than a single command
-buffer costs here, so its numbers cannot include one. Measurements taken under
-different conditions are not a comparison.
+reports 259.81 us for a 27 MB shape, which is less than a single command
+buffer costs here, so its numbers cannot include one. Numbers taken under
+different conditions cannot be compared.
 
-**Submission is the gap.** At 32,000 rows the same kernel takes 0.504 ms with a
+Submission is the gap. At 32,000 rows the same kernel takes 0.504 ms with a
 command buffer per dispatch and 0.323 ms without — ~180 us of pure overhead,
 which is most of the difference between losing to the CPU and beating it 1.3x.
 Amortized, the GPU wins from 32,000 rows up; per-dispatch it does not win until
 131,072.
 
-**Where ZINC is genuinely ahead is small shapes.** It reports 239 GB/s at
+Where ZINC is genuinely ahead is small shapes. It reports 239 GB/s at
 2.25 MB where loom manages 67 GB/s at 2.4 MB. Cache-resident matvecs are
 latency- and occupancy-bound rather than bandwidth-bound, and that is what
 ZINC's register-level work buys: scales held in `ushort4` registers rather than
 a thread-private array, fully unrolled inner loops, the 16-byte block header
 read as one `packed_uint4`, nibbles extracted four at a time from a `ushort`.
 Porting the first three of those gave loom nothing at DRAM-bound sizes, which
-is consistent — there is no headroom left there — and they are the right thing
+is consistent, since there is no headroom left there. They are the right thing
 to revisit for models whose tensors sit in cache.
 
 ## Default: the recorded path, chosen by measurement
@@ -255,8 +254,8 @@ because nothing smaller can be trusted about submission cost. Timing one
 operation in a tight loop lets successive `commitAndWait` calls pipeline; in
 the engine each operation is separated by other work and pays the latency in
 full. The per-operation calibration this replaces reported the fused FFN block
-at 1.107 ms against a CPU 9.837 ms -- the same CPU block measured 0.489 ms
-elsewhere -- and acting on it took decode from 56 to 9.1 tok/s. The whole-token
+at 1.107 ms against a CPU 9.837 ms (the same CPU block measured 0.489 ms
+elsewhere), and acting on it took decode from 56 to 9.1 tok/s. The whole-token
 number predicts 119 tok/s where 109 is observed, which is the accuracy a
 default needs.
 
@@ -269,12 +268,12 @@ The same comparison on Mistral-7B Q4_K_M does not test what it looks like it
 tests. On this machine (M5, 16 GB) it runs at 0.27 tok/s, with the process at
 116% CPU and 2.75 GB resident against a 4.37 GB model: it is stalling on page
 faults, not computing. Calibration measured gpu 3442 ms/tok against cpu
-3414 ms/tok and correctly declined -- both paths are bound by paging, and a
+3414 ms/tok and correctly declined: both paths are bound by paging, and a
 ~262 us command buffer is invisible against 3.4 seconds.
 
 That is the right verdict and a useless benchmark. A 7B model plus its KV
 caches does not fit this box alongside anything else, so the 1.9x result stands
-only for TinyLlama-1.1B, whose tensors are 6.5 MB -- the cache-resident regime
+only for TinyLlama-1.1B, whose tensors are 6.5 MB, the cache-resident regime
 where ZINC's kernel is also 3.5x ahead of loom's. Confirming the win at
 DRAM-bound tensor sizes needs either a machine with more memory or a model
 around 2 GB.
@@ -282,7 +281,7 @@ around 2 GB.
 The measurement did produce one fix: the device KV cache is now released when
 calibration declines every path that would read it. It is hundreds of megabytes
 on a 7B model, and holding it after deciding not to use it adds exactly that
-much pressure to a machine whose verdict was "no win" *because* it is short of
+much pressure to a machine whose verdict was "no win" because it is short of
 memory.
 
 ## One command buffer per token: 1.9x, measured
@@ -301,8 +300,8 @@ The per-operation GPU path is not faster than the CPU and the recorded path is
 1.9x faster, with the same kernels behind both. That is the submission cost
 made visible: ~150 command buffers per token against one.
 
-`--gpu-layers` records a whole GQA layer -- norm, q/k/v, RoPE, KV append,
-attention, output projection, residual, FFN, residual -- into a shared command
+`--gpu-layers` records a whole GQA layer (norm, q/k/v, RoPE, KV append,
+attention, output projection, residual, FFN, residual) into a shared command
 buffer, with barriers between dependent dispatches and none between independent
 ones. The residual stream stays in device memory for the entire token.
 
@@ -318,8 +317,8 @@ dispatches do not run until the frame closes, so all twenty-two layers read
 whatever the *last* layer wrote. Fixed by giving each layer its own slot.
 
 **A fixture can switch off the thing it is meant to test.** The first
-layer-block test ran only `pos=0`, where the RoPE angle is zero -- the rotation
-is the identity -- and softmax over a single score is 1, so attention is a
+layer-block test ran only `pos=0`, where the RoPE angle is zero (the rotation
+is the identity) and softmax over a single score is 1, so attention is a
 passthrough. It passed while the engine produced garbage. The test now sweeps
 positions and records several layers per frame.
 
@@ -337,7 +336,7 @@ before measuring.
 
 Which optimized mode matters too, and by less than you might guess: ReleaseSafe
 costs about 11% against ReleaseFast on DeepSeek-V2-Lite decode (91.0-91.8 vs
-80.8-82.6 ms/token), and *none* of it lands in the GPU kernels -- the expert FFN
+80.8-82.6 ms/token), and none of it lands in the GPU kernels; the expert FFN
 block measures 41.1 ms in both. The difference is bounds checking on the host
 loops. Releases ship ReleaseSafe; quote which one a number came from.
 
@@ -351,14 +350,13 @@ report decode separately from prefill):
 | loom | **CPU** (Metal built in, declined by calibration) | 55.7, 56.0, 56.2 |
 | ZINC | **Metal** | 52.9, 53.0, 56.1 |
 
-Loom matches ZINC on this model **without using the GPU at all**.
+Loom matches ZINC on this model without using the GPU at all.
 
-That settles a question worth being precise about: matching tok/s against a
-Metal engine does *not* demonstrate that loom's Metal optimisations are
-complete. Here it demonstrates the opposite — loom's CPU path is already
-competitive with ZINC's Metal path, and loom's GPU path is not being used
-because calibration measured it and found it slower at every shape this model
-issues.
+Matching tok/s against a Metal engine does not demonstrate that loom's Metal
+optimisations are complete. Here it demonstrates the opposite: loom's CPU
+path is already competitive with ZINC's Metal path, and loom's GPU path is
+not being used because calibration measured it and found it slower at every
+shape this model issues.
 
 It also bounds what the remaining GPU work can win. On unified memory the CPU
 and GPU share one bus; measured on this machine the GPU beats the CPU by ~1.5x
@@ -368,7 +366,7 @@ is largest for big models and for prefill, not for small-model decode.
 
 ## What this means for the target, honestly
 
-For **decode** on unified memory, the ceiling is the memory bus and the CPU is
+For decode on unified memory, the ceiling is the memory bus and the CPU is
 already near it. Measured on this machine, for a 1.1B Q4_K_M model reading
 0.64 GB per token:
 
@@ -380,7 +378,7 @@ already near it. Measured on this machine, for a 1.1B Q4_K_M model reading
 
 So the next win for decode is not a GPU. It is closing the gap between the 36
 GB/s a full forward pass achieves and the 53 GB/s the kernels already reach on
-their own — the difference is attention, the elementwise ops and the types
+their own. The difference is attention, the elementwise ops and the types
 still on the slow dequantize path, not the matmuls.
 
 ## Scale, honestly
@@ -410,14 +408,14 @@ claims.
 **The bug.** `--ctx` is applied by the caller *after* `loadGgufEngine` returns,
 so everything inside sizes itself off the model's advertised context. Mistral
 advertises 32768, and a KV cache is `layers x ctx x kvd x 4 x 2` — for a 7B
-that is **8 GB**. Plus 4.07 GB of weights, that is over 12 GB committed on a
+that is 8 GB. Plus 4.07 GB of weights, that is over 12 GB committed on a
 16 GB machine before a token is generated, and the model then pages against its
 own cache. A `memory` line in the startup banner makes this visible:
 
     memory   weights 4.07 GB (mmap) + kv 8.00 GB
 
-The same run showed the GPU path measuring `gpu 45.85 ms/tok vs cpu 99.50` — a
-2.2x win — and then being refused, because 32768 exceeds what the attention
+The same run showed the GPU path measuring `gpu 45.85 ms/tok vs cpu 99.50`, a
+2.2x win, and then being refused, because 32768 exceeds what the attention
 kernel's threadgroup memory can serve. So the oversized context cost twice: the
 memory, and the GPU path.
 
@@ -427,25 +425,25 @@ walks rather than the full context. A first attempt at both hung the node
 during load and was reverted; it needs redoing carefully.
 
 **The category error.** Even fixed, Mistral-7B is the wrong model for loom's
-thesis. A *dense* model reads every weight on every token, so if the weights do
+thesis. A dense model reads every weight on every token, so if the weights do
 not fit in RAM it is disk-bound, and distribution cannot help — fetching 4 GB
 per token from a peer is worse than reading it from local NVMe. That is the
 whitepaper's own bandwidth table.
 
-The thesis is specifically about **MoE**: only the routed experts change from
+The thesis is specifically about MoE: only the routed experts change from
 token to token, roughly 11% of the weights, and the dense part stays resident
-everywhere. That is what makes the cluster's *collective* RAM the relevant
+everywhere. That is what makes the cluster's collective RAM the relevant
 quantity — the working set stays hot on some node even though no single box can
 hold it.
 
-**So proving it needs a different experiment**, and it is the v1 acceptance
-criterion that has never been measured:
+Proving it needs a different experiment, the v1 acceptance criterion that has
+never been measured:
 
 1. An MoE model larger than one node can comfortably hold.
    DeepSeek-Coder-V2-Lite (8.9 GB, ~2.4B active) on a 16 GB box is exactly
    right — single-node it already thrashes, measured at ~3 tok/s with 1.16 GB
    per token coming off disk.
-2. Two *physical* machines. Peers on one host share its RAM and page cache, so
+2. Two physical machines. Peers on one host share its RAM and page cache, so
    a localhost cluster proves nothing about capacity.
 3. The comparison: one node holding 100% and paging, against two nodes each
    holding ~60% with the union of their hot sets resident.
@@ -470,17 +468,17 @@ Five paired runs, DeepSeek-V2-Lite, decode tok/s:
 | heap LRU (`--ram-gb 8`) | 2.57 | 1.87–2.84 | 38% |
 | zero-copy mmap (`--mmap-weights`) | 2.56 | 2.49–2.93 | 17% |
 
-**The medians are identical.** The first pair measured 1.96 against 2.93 and
+The medians are identical. The first pair measured 1.96 against 2.93 and
 looked like a decisive 1.5x for mmap; the second reversed the totals. Neither
 was signal. On a machine that shares its cores and memory bandwidth with a
 desktop, a single pair cannot resolve a 20% effect, and this document has
 already recorded two conclusions that had to be withdrawn for exactly that
 reason.
 
-What *is* consistent is the spread: the heap path's worst run is 27% below its
-best, the mapped path's 15%. That matches the mechanism seen on Mistral-7B — an
+What is consistent is the spread: the heap path's worst run is 27% below its
+best, the mapped path's 15%. That matches the mechanism seen on Mistral-7B: an
 8 GB slab alongside a 10 GB model is enough memory pressure to make the bad
-runs bad — and for a serving system tail latency is worth as much as median.
+runs bad. For a serving system tail latency is worth as much as median.
 Not enough to change the default on, but enough to keep the flag and prefer it
 where memory is tight.
 

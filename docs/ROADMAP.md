@@ -37,9 +37,9 @@ through to the mesh and completed inference.
    file's weights are distributed across multiple nodes. **Live placement
    policy: least-covered-first committee assignment** (bootnode, R = 3 target /
    R = 2 floor) — see [../spec/SPEC.md](../spec/SPEC.md). Random
-   `--hold-fraction` subsets are the **legacy / no-bootnode fallback** only,
+   `--hold-fraction` subsets are the legacy / no-bootnode fallback only,
    not the primary policy. The same shard may be held by several nodes for
-   **redundancy**.
+   redundancy.
    Implemented: `gguf.zig` (v2/v3 parser + fixture writer), `weights.zig` (range
    manifest, SHA-256/range, Merkle-root version id, holdings bitmap), P2P ops
    `MANIFEST`/`DIGEST`/`DIGESTS`/`HOLDINGS`/`GETR`.
@@ -47,22 +47,22 @@ through to the mesh and completed inference.
    `loom node --bootstrap host:port`). A new node requests weight ranges from a
    peer via the request-response protocol; every range is digest-verified before
    touching disk and the digest set is verified against the advertised Merkle
-   root. Syncing from a *partial* holder takes what's available and reports the
+   root. Syncing from a partial holder takes what's available and reports the
    shortfall — the seam where multi-peer sync + churn repair (#6) plug in.
 4. **Hardfork upgrades.** A majority of nodes agreeing on a new version of the
    GGUF file triggers a hardfork — a coordinated model-version upgrade across
    the swarm.
 5. **ENR weight advertising** *(decided)*. Each peer reports the weights it holds
-   as part of its **ENR + metadata** — ENR is the discoverability mechanism, so
-   nodes can deliberately peer with nodes holding *different* ranges
-   (coverage-seeking peering). Constraint: ENR records are limited to **300
-   bytes**, so the ENR entry must be a compact summary (e.g. a range bitmap /
+   as part of its ENR + metadata — ENR is the discoverability mechanism, so
+   nodes can deliberately peer with nodes holding different ranges
+   (coverage-seeking peering). Constraint: ENR records are limited to 300
+   bytes, so the ENR entry must be a compact summary (e.g. a range bitmap /
    holdings-manifest hash + sequence number), not the full holdings list.
    *Progress:* the holdings bitmap + hex encoding used by the `HOLDINGS` P2P op
    is exactly this summary (1 bit/range); ENR integration itself still todo.
 6. **Churn repair** *(decided: maximally eager; ✅ first cut implemented)*. When a
    peer disconnects — or a node's wanted range set is unsatisfied for any
-   reason — the node seeks replacement holders **as eagerly as possible**: an
+   reason — the node seeks replacement holders as eagerly as possible: an
    always-on repair loop (2 s interval, `node.zig`) retries all known peers
    rather than waiting for a miss. Pairs with over-provisioning (random
    overlapping holdings) so single disconnects rarely leave a range with no
@@ -72,7 +72,7 @@ through to the mesh and completed inference.
    dead peer recovered to 9/9 within one repair tick of the peer returning.
    Still todo: peers discovered via ENR/gossip instead of a static list.
 7. **Gossip advertising** *(decided: alongside ENR; ✅ first cut implemented)*.
-   Per-node weight holdings are **also** advertised on a **global gossip topic**.
+   Per-node weight holdings are also advertised on a global gossip topic.
    Division of labor: ENR = the compact, discovery-time summary; gossip = live,
    detailed holdings updates (range acquisitions/drops) without waiting for ENR
    re-resolution. Implemented (LAN-scale epidemic form): a mutex-guarded peer
@@ -108,7 +108,7 @@ before disk, fetched shards persisted + advertised (organic heat replication).
 Verified on real DeepSeek-V2-Lite: a 33% store (573/1737 shards) produced the
 correct completion ("Paris."), streaming 641 experts / 3.5 GB from one peer
 with zero failures; token-identical to a full-copy run on the fixture. The
-distributed engine is now **also served through the node** (`loom node --gguf`
+distributed engine is now also served through the node (`loom node --gguf`
 origin or `--bootstrap` partial store) over both the RPC and OpenAI surfaces via
 a `Generator` abstraction, with the token-loop fetch and eager repair serialized
 on one engine mutex; a partial node's output is byte-identical to a full node's.
@@ -118,7 +118,7 @@ LRU for beyond-disk-budget caching.
 
 ### GGUF → inference (✅ first cut implemented)
 
-The engine runs llama-architecture and **deepseek2-architecture** GGUF models
+The engine runs llama-architecture and deepseek2-architecture GGUF models
 directly (`loom gguf run`), dispatched on `general.architecture`. GGML
 F32/F16/Q4_0/Q5_0/Q8_0/Q4_K/Q5_K/Q6_K fused kernels over the mmap'd file
 (`ggml.zig`); llama: GQA + NORM RoPE + SwiGLU (`llama.zig`); deepseek2 (the
@@ -138,7 +138,7 @@ a 15.7 B model on one core. The engine should select the best available compute
 path for the machine it runs on — CPU SIMD (NEON on Apple Silicon, AVX2/AVX-512
 on x86) and, where present, the platform GPU (Metal on Apple, Vulkan on
 AMD/others, CUDA on NVIDIA) — the way a platform-tuned GPU engine does.
-This is a **serving-throughput** requirement: the whole distribution story is
+This is a serving-throughput requirement: the whole distribution story is
 gated on per-node inference being fast enough to matter (see the §9 performance
 model in the whitepaper).
 
@@ -151,7 +151,7 @@ RDNA, simdgroup reductions + zero-copy mmap on Apple) — and reports beating
 llama.cpp on RDNA4. Two differences bound how much transfers to Loom: (1) ZINC
 is **GPU-only, single-stream** (no CPU fallback), whereas Loom keeps a scalar
 CPU path as correctness oracle and targets batched serving; (2) its catalog is
-Qwen / Gemma, not the DeepSeek/GLM **MLA + sparse-routing** shape Loom's
+Qwen / Gemma, not the DeepSeek/GLM MLA + sparse-routing shape Loom's
 deepseek2 engine needs, so MLA-attention and DeepSeek-router kernels do not come
 for free. Reuse its backend-selection and shader-tuning approach, not its
 GPU-or-nothing constraint.
@@ -206,7 +206,7 @@ is one direct addressed read, no assembly); per-layer shards (4.9 GB) are too
 lumpy for redundancy; metadata stays trivial (holdings bitmap 2.4 KB — gossip
 carries it whole, ENR carries its hash + seq; manifest ~1 MB).
 
-**16 GB feasibility.** Held shards are a *disk* budget (pread-served), not RAM.
+**16 GB feasibility.** Held shards are a disk budget (pread-served), not RAM.
 RAM: ~10 GB dense resident (mmap) + ~0.7 GB MLA KV (8k ctx) + 2–3 GB
 pinned/LRU expert cache + OS ≈ fits in 16 GB (floor; comfortable at 24–32 GB).
 Disk: contribution `--hold-gb`, default ~50 GB ≈ 2,600 shards.
@@ -215,10 +215,10 @@ Disk: contribution `--hold-gb`, default ~50 GB ≈ 2,600 shards.
 (principle 3). Swarm sizing: N × hold ≥ R × 370 GB → 16 nodes × 50 GB or
 8 × 100 GB reaches R=2; ~22 × 50 GB reaches R=3.
 
-**Bootnode.** An onboarding + coverage accountant, deliberately *not* in the
-inference path and *not* a permanent dependency (Ethereum-bootnode discipline):
+**Bootnode.** An onboarding + coverage accountant, deliberately not in the
+inference path and not a permanent dependency (Ethereum-bootnode discipline):
 1. serves the expert-aligned manifest + resident bundle to joining nodes;
-2. assigns each joiner the **most under-replicated shards first**
+2. assigns each joiner the most under-replicated shards first
    (capacity-aware, computed from live gossip holdings) — upgrading random
    holdings to guaranteed-coverage assignment;
 3. watches per-shard replica counts from the gossip table and nudges

@@ -4,7 +4,7 @@ Status: increment 1 merged (`decodeBatch`), increments 2 and 3 open.
 
 ## Why
 
-A MoE layer under a batch of `n` sequences needs the *union* of their routed
+A MoE layer under a batch of `n` sequences needs the union of their routed
 experts, not the sum. One 6 MB expert read then serves every sequence that
 routed to it. This is the whitepaper's "throughput hides latency" argument, and
 it is the only lever left that does not depend on kernel work: measured on
@@ -33,7 +33,7 @@ not yet called by anything.
 
 Its test (`decodeBatch agrees with sequential step, token for token`) builds a
 small MLA model in memory with `buildFixture` and requires logits and argmax to
-match sequential decoding. The two sequences carry *different* tokens
+match sequential decoding. The two sequences carry different tokens
 deliberately: identical ones pass even if the routing inversion collapses the
 batch to one sequence.
 
@@ -42,12 +42,12 @@ batch to one sequence.
 ### Increment 2 — batched `q5_0`
 
 `backend.matmul`'s batched set is `q4_k, q6_k, q8_0`. `ffn_down_exps` is `q5_0`
-in half of DeepSeek-V2-Lite's layers, and those fall back to one matvec per row
-— no amortization at all for roughly 38% of an expert's bytes.
+in half of DeepSeek-V2-Lite's layers, and those fall back to one matvec per
+row, with no amortization at all for roughly 38% of an expert's bytes.
 
 A batched `q5_0` kernel was written and rejected: every kernel in that set
 quantizes activations to int8, while `matvecQ50` dequantizes exactly in f32.
-`matmul` must equal `n` matvecs *exactly* — `matmul is bit-identical to repeated
+`matmul` must equal `n` matvecs exactly; `matmul is bit-identical to repeated
 matvec` enforces that with no tolerance, and caught it immediately.
 
 Two ways to close it, neither small:

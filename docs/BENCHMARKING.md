@@ -24,7 +24,7 @@ host, idle, on mains power. A shared CI runner has none of those properties.
 Those survive a noisy runner, so CI gates on them and merely reports the
 timings.
 
-They still need a threshold chosen for the *worst* environment they run in,
+They still need a threshold chosen for the worst environment they run in,
 not the best. "Batching beats unbatched" is a ratio of 0.70 on eight cores
 here and 0.96 on a single-core CI runner, where the batched path's larger
 working set costs back most of what the shared weight unpack saves. A gate set
@@ -37,7 +37,7 @@ comparison — so the ratio is 1.00, not 0.96. The gate separates "batching is
 less effective on this machine" from "batching is not happening".
 
 This is not theoretical. The two performance bugs found in this codebase were
-both *batched prefill wired into only one of the two prefill paths* — the
+both batched prefill wired into only one of the two prefill paths: the
 first measurement round showed no improvement at all, twice, and the cause was
 `runEngine` still on the per-token loop while `runStoreWith` had the new one.
 An absolute-time threshold on a shared runner would not reliably have caught
@@ -93,9 +93,9 @@ distinct experts so nothing sits in cache:
 | bench, 1 thread | 1.150 | 4.7 GB/s |
 | **in-engine, 8 threads** | **1.08** | **4.8 GB/s** |
 
-The in-engine figure is a whisker from the bench's *single-threaded* number.
-Threading in the engine is not absent — forcing `--threads 1` moves `expert ffn`
-from 168.3 to 276.2 ms — but that is 1.64x where the same kernels on the same
+The in-engine figure is a whisker from the bench's single-threaded number.
+Threading in the engine is not absent (forcing `--threads 1` moves `expert ffn`
+from 168.3 to 276.2 ms), but that is 1.64x where the same kernels on the same
 shapes get 4.52x.
 
 So roughly 4x of the expert FFN is being lost to something that is neither the
@@ -111,7 +111,7 @@ distinguished:
   are live for much of the forward pass, competing with the kernel pool for
   four cores.
 - **Residency.** With `--mmap-weights` the costs move between buckets rather
-  than shrinking — `get` 219 -> 316 ms and `ffn` 208 -> 107 ms — which says the
+  than shrinking (`get` 219 -> 316 ms and `ffn` 208 -> 107 ms), which says the
   page-touch cost is real and merely attributed to whoever reads the bytes
   first, not that either arrangement avoids it.
 

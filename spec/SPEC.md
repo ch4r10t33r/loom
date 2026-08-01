@@ -15,8 +15,7 @@ origin holder of the full GGUF. Responsibilities:
 2. Assign each connecting node to a shard committee, and within that committee
    assign it a shard want-set (least-covered shards first, up to the node's
    declared capacity).
-3. Track per-committee coverage so redundancy targets are met by construction,
-   not by probability.
+3. Track per-committee coverage so redundancy targets are met by construction.
 
 **Full node:** holds the resident bundle (mandatory) plus its assigned expert
 shards; serves them to peers; runs inference locally, fetching experts it lacks
@@ -32,8 +31,8 @@ the serving full node can meter it.
 
 A node exposes two request-serving surfaces over TCP. Both sit in front of the
 same engine and the same metering ledger; both are orthogonal to the p2p wire
-protocol (the south-facing expert-fetch frames), which is unchanged by anything
-here.
+protocol (the south-facing expert-fetch frames), which this section leaves
+unchanged.
 
 1. **Native JSON RPC** (`--rpc-port`, default 8770). The line-delimited
    `{"prompt":...}` protocol described under Metering below. This is the
@@ -42,10 +41,10 @@ here.
    HTTP/1.1 endpoint that speaks the OpenAI schema so existing clients
    (OpenWebUI, Continue, aider, the OpenAI SDKs, curl) talk to a Loom node with
    no adapter. Routes: `GET /v1/models`, `POST /v1/chat/completions`,
-   `POST /v1/completions`, `GET /health`. It is a thin translation over the same
-   `engine.generate` path and the same `Meter`, not a second engine.
+   `POST /v1/completions`, `GET /health`. It is a thin translation layer over the same
+   `engine.generate` path and the same `Meter`.
 
-**Why OpenAI-compatible and not MCP.** MCP is a tool/context protocol; a node
+**Choice of the OpenAI schema over MCP.** MCP is a tool/context protocol; a node
 serving completions is more naturally an MCP client (a model that can call
 tools) than an MCP server. The OpenAI HTTP schema is the de-facto local-inference
 serving contract (llama.cpp server, ollama, vLLM, ZINC all expose it), so it is
@@ -104,7 +103,7 @@ used unit         = prompt tokens processed + tokens generated
 - Light nodes tally their own spend from response `cost` fields, so both sides of
   the ledger exist independently.
 
-**v1 is a trusted-operator accounting demo, not a settlement system.** Hardened
+v1 is a trusted-operator accounting demo, not a settlement system. Hardened
 since the initial cut: `credit` is now admin-token gated (no token means the op is
 disabled; a payment rail replaces the token check), `max_tokens` is clamped to the
 client's remaining allowance (overdraw bounded to the prompt), the account map is
@@ -131,7 +130,7 @@ wrong bytes; a peer lying about holdings; RPC abuse. **Out of scope for v1**
 identities, coordinated availability attacks, an untrusted bootnode, payment
 fraud.
 
-**What content addressing buys.** Every shard is verified against its manifest
+**What content addressing provides.** Every shard is verified against its manifest
 digest before disk or matmul, so a wrong-bytes peer or corrupt disk is caught for
 free, given a trusted manifest. Version pinning (`manifest_version` on every
 ExpertRequest and on gossip/heartbeat) refuses cross-version peers, isolating
@@ -147,7 +146,7 @@ alternate root would verify against itself. v1 establishes the root by:
 2. **Trust-on-first-use (TOFU).** A bootstrapping node adopts the root from the
    first responsive peer's `MANIFESTFILE` and pins it; every subsequent peer must
    match (`PeerVersionMismatch` otherwise). A hostile first contact can pin a bad
-   root, the known v1 weakness.
+   root; this is a known v1 weakness.
 
 On root mismatch a node refuses the peer wholesale (it never mixes roots). Future
 hardening (not in v1): operator-signed roots distributed out-of-band, multiple
@@ -166,9 +165,9 @@ digests) are unverified claims with no proof of possession. A lying holder is
 detected only reactively: a `GETR`/ExpertRequest returns `not_held` or wrong
 bytes, and the requester falls through to the next peer (digest verification
 blocks the wrong bytes; availability degrades, integrity does not). There is no
-reputation, periodic challenge, or probe-on-suspicion yet, so **committee
+reputation, periodic challenge, or probe-on-suspicion yet, so committee
 completeness is a construction-time property under honest participation, not a
-cryptographic guarantee.** Adding a sampled-`GETR` challenge plus holder
+cryptographic guarantee. Adding a sampled-`GETR` challenge plus holder
 reputation is the planned mitigation.
 
 ## Resource governance and failure modes (v1 status)
@@ -177,14 +176,15 @@ Several safety limits are specified here but only partially enforced in v1. They
 are called out so implementations and readers do not assume protection that is
 absent.
 
-**Serving SLA under incomplete committees.** Completeness at R = 1 is one death
-from a hole, and heartbeat detection lags up to one interval (5 s). During a gap, a
-token-loop fetch for the missing shard first tries committee holders, then falls
-through to the mesh, and if no reachable holder exists anywhere the token-loop
-fetch errors (inference fails loudly, not silently wrong). "Can still serve via the
-mesh" and "the committee invariant holds" are distinct states: a node may serve
-while its committee is technically incomplete, and eager repair (2 s) works to
-restore the invariant. This is eventual, not synchronous with death.
+**Serving SLA under incomplete committees.** At R = 1 a single member death opens
+a coverage hole, and heartbeat detection lags up to one interval (5 s). During a
+gap, a token-loop fetch for the missing shard first tries committee holders, then
+falls through to the mesh; if no reachable holder exists anywhere the token-loop
+fetch errors, so inference fails with an error rather than producing wrong
+output. "Can still serve via the mesh" and "the committee invariant holds" are
+distinct states: a node may serve while its committee is incomplete, and the
+eager repair loop (2 s) restores the invariant eventually rather than
+synchronously with the death.
 
 **Weight integrity, end to end.** The version id now binds the shard layout
 (extents, file_size, n_resident, mode) into the Merkle root, and parse rejects any
@@ -241,9 +241,9 @@ backoff or probation on repeatedly-dead peers. v1 runs LAN-scale and
 operator-trusted.
 
 **Transport security.** The RPC and P2P transports are plaintext TCP with no TLS
-and no authentication, acceptable for a lab/LAN operator-run swarm, unacceptable
-for a public service economy. TLS plus peer authentication is a prerequisite for
-any untrusted deployment.
+and no authentication. This is acceptable for a lab/LAN operator-run swarm but
+not for a public service economy; TLS plus peer authentication is a prerequisite
+for any untrusted deployment.
 
 **Failure-mode catalog (v1 behavior):**
 
@@ -395,8 +395,8 @@ set: a self-sufficient serving cell for one model version.
 
 ## Global gossip network
 
-Independent of committees, **every node regularly announces the weights it holds
-on the global gossip topic** (addr plus manifest version plus holdings bitmap,
+Independent of committees, every node regularly announces the weights it holds
+on the global gossip topic (addr plus manifest version plus holdings bitmap,
 epidemic exchange, 3 s interval). Receiving peers merge these announcements into
 their peer table, the **mesh**.
 
@@ -423,7 +423,7 @@ expert fetch inside the token loop):
    (fetch-on-demand is organic heat replication).
 
 A request fails only when neither the committee nor the mesh has a reachable
-holder, and the eager repair loop keeps working to make that state transient.
+holder; the eager repair loop works to make that state transient.
 
 ## Wire messages v1 (binary frames, snappy)
 
@@ -465,15 +465,14 @@ addr_len:         u8
 addr:             [addr_len]u8   (sender's advertised host:port)
 ```
 
-Rationale: the full bitmap does NOT ride the heartbeat. `holdings_seq` plus
+Rationale: the full bitmap does not ride the heartbeat. `holdings_seq` plus
 `holdings_digest` let the receiver detect staleness cheaply; when they change, the
 fresh bitmap arrives via the next gossip announce (or a pull). A committee member
 is marked dead after missed heartbeats, and its shards become re-replication
 candidates.
 
-**Announce, type 0x03.** The global gossip record (every 3 s): what a node tells
-the network about the weights it holds. This is the record receivers merge into
-their mesh table.
+**Announce, type 0x03.** The global gossip record (every 3 s): the weights a
+node holds. Receivers merge this record into their mesh table.
 
 ```
 proto:            u8
@@ -492,18 +491,18 @@ Receivers keep the entry with the highest `holdings_seq` per addr. ENR (planned)
 carries `network_id + manifest_version + holdings_seq + holdings_digest` only
 (fits the 300-byte limit); the gossip announce carries the full bitmap.
 
-**network_id (proto v2).** One loom network serves ONE model, and `network_id`
-is that network's identity -- Ethereum's chainId, for LLMs. A node refuses to
-peer across networks: an inbound Heartbeat or Announce whose `network_id`
+**network_id (proto v2).** One loom network serves one model, and `network_id`
+is that network's identity (the analogue of Ethereum's chainId). A node refuses
+to peer across networks: an inbound Heartbeat or Announce whose `network_id`
 differs is answered `ERR wrong_network` and never merged into the mesh table,
 and gossip-learned records from other networks are dropped at merge. The id is
 configured with `--network-id N`; the default (`auto`) derives it from the
 weight manifest's leading eight bytes, so nodes sharding the same model agree
 without configuration, while an explicit id keeps one network together across
-model hardforks. `network_id` gates *membership*; `manifest_version` continues
-to gate *content* (expert fetch refuses other versions within a network).
+model hardforks. `network_id` gates membership; `manifest_version` continues
+to gate content (expert fetch refuses other versions within a network).
 Reserved ids: 1 = mainnet (GLM 5.2), 2 = testnet (GLM-4.6), 1337 = devnet
-(GLM-4.5-Air) -- see docs/NETWORKS.md; these are protocol constants.
+(GLM-4.5-Air); see docs/NETWORKS.md. These are protocol constants.
 
 **AnnounceBatch, type 0x04.** The gossip exchange response: the responder's own
 Announce followed by its whole table, so one round trip both announces and syncs
@@ -518,14 +517,14 @@ entries: count x { len: u32, body: [len]u8 }   (each an Announce body)
 Because announces carry `committee_id`, the mesh table doubles as the
 **gossip-derived committee view**: committee membership is not static-at-join.
 Earlier members learn later joiners from their announces, and the heartbeat loop
-targets the seed set plus every table entry carrying my committee_id. This view
-(not the bootnode) is what members rely on after joining, so a dead bootnode still
+targets the seed set plus every table entry carrying my committee_id. Members
+rely on this view rather than the bootnode after joining, so a dead bootnode
 strands nothing.
 
 **RAG gossip, types 0x20/0x21/0x22 (optional, --rag).** A network may share
-retrieval chunks. Only TEXT travels: a loom network serves one model
-(network_id), so every node recomputes the same embedding -- mean-pooled
-`token_embd` rows, L2-normalized -- from the same text. Vectors are never
+retrieval chunks. Only text travels: a loom network serves one model
+(network_id), so every node recomputes the same embedding (mean-pooled
+`token_embd` rows, L2-normalized) from the same text. Vectors are never
 accepted from the wire, which removes the vector-poisoning surface and any
 dimension mismatch by construction.
 
@@ -538,7 +537,7 @@ RagPush   (0x22): count u16 (<=32), then count x { len u32 (<=8192),
 RagInvReq (0x23): empty body -- "send me your inventory window"
 ```
 
-Both directions converge on ONE outbound dial (NAT-friendly: a dial-out-only
+Both directions converge on one outbound dial (NAT-friendly: a dial-out-only
 node still receives): push first (my Inv -> your Want -> my Push), then pull
 (my InvReq -> your Inv -> my Want -> your Push). All handlers are stateless.
 
@@ -546,14 +545,14 @@ The exchange piggybacks on the gossip round: Announce/AnnounceBatch first,
 then Inv -> Want -> Push on the same stream. Receivers insert by recomputing
 the embedding locally; duplicates dedup by text hash. Caps bound a round.
 When a store exceeds one round's inventory cap, the advertised window
-ROTATES round to round, so every hash is offered within ceil(count/cap)
-rounds -- the exchange with every known peer plus transitive re-gossip gives
+rotates round to round, so every hash is offered within ceil(count/cap)
+rounds; the exchange with every known peer plus transitive re-gossip gives
 global-topic semantics with eventual convergence, including for peers that
 rejoin after long absence. Compression: the wire applies the frame encoder's
 adaptive snappy (kept only when smaller) to every RAG frame; at-rest chunk
-text may additionally be brotli-compressed locally (dlopen, optional) --
-a purely per-node choice invisible to the protocol, since hashes are of raw
-text and Push always carries raw text.
+text may additionally be brotli-compressed locally (dlopen, optional), a
+per-node choice invisible to the protocol, since hashes are of raw text and
+Push always carries raw text.
 
 **ExpertRequest, type 0x10.** Ask a remote peer (committee member first, then
 mesh) for one expert shard the requester does not hold.
@@ -608,16 +607,16 @@ Derivation and the full deployment plan live in
 [../docs/ROADMAP.md](../docs/ROADMAP.md).
 
 19,200 expert shards (~19 MB each) plus a resident bundle. Committee sizing at
-50 GB/node: **completeness (R >= 1) needs at least 8 nodes** (~2,600 expert shards
-each), **R = 2 needs at least 15**, **R = 3 needs at least 22**. Holdings bitmap
+50 GB/node: completeness (R >= 1) needs at least 8 nodes (~2,600 expert shards
+each), R = 2 needs at least 15, R = 3 needs at least 22. Holdings bitmap
 2.4 KB; manifest ~1 MB.
 
-**The resident bundle is the real floor, and the 16 GB minimum is conditional on
-it.** Every node holds it in full, in RAM (mmap'd). It is not free: DeepSeek/GLM
-shared experts and embeddings dominate it, and MLA KV grows with context. A
-per-tensor-class breakdown for the target GGUF (embeddings, attention projections
-including q/kv-LoRA, shared-expert FFNs, router, norms) and a KV-bytes-vs-context
-table **must be published from the real converted GLM 5.2 GGUF before the 16 GB
-row in the deployment table is asserted as a default** rather than a conditional
+The resident bundle is the floor, and the 16 GB minimum is conditional on it.
+Every node holds it in full, in RAM (mmap'd). DeepSeek/GLM shared experts and
+embeddings dominate it, and MLA KV grows with context. A per-tensor-class
+breakdown for the target GGUF (embeddings, attention projections including
+q/kv-LoRA, shared-expert FFNs, router, norms) and a KV-bytes-vs-context table
+must be published from the real converted GLM 5.2 GGUF before the 16 GB row in
+the deployment table is asserted as a default rather than a conditional
 target. For DeepSeek-V2-Lite the measured resident bundle is 0.78 GB (73 chunks);
 the GLM 5.2 ~10 GB figure is an int4 estimate pending the real file.

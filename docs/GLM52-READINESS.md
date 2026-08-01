@@ -1,8 +1,8 @@
 # GLM 5.2 readiness audit (2026-08-02)
 
 Run with `loom gguf check` against live checkpoints plus the llama.cpp
-support trail. Verdict: **GO, with one bounded engine variant** — and a
-zero-work bridge model available immediately.
+support trail. Verdict: **GO**, with one bounded engine variant. A zero-work
+bridge model is available immediately.
 
 ## GLM 5.2 (the thesis model)
 
@@ -10,34 +10,35 @@ zero-work bridge model available immediately.
   1-bit, ~239 GB at 2-bit (fits a 256 GB box), 372–475 GB at 4-bit.
   Community REAP-pruned 504B variants halve the expert count (128 experts).
 - **`loom gguf check` on a real shard:** arch `glm-dsa`, 78 blocks,
-  expert-aligned — **loom's sharder already distributes it**. Two blockers:
+  expert-aligned; loom's sharder already distributes it. Two blockers:
   no engine for `glm-dsa`, and Q3_K decode for that particular quant
   (avoided by choosing a Q4_K-family quant; the V3 check below shows the
   existing decoder coverage suffices there).
-- **llama.cpp state:** mainline runs GLM 5.2 with a **dense-attention
-  fallback** — the DSA sparse-indexer path lives only in forks. The indexer
+- **llama.cpp state:** mainline runs GLM 5.2 with a dense-attention
+  fallback; the DSA sparse-indexer path lives only in forks. The indexer
   tensors ship on ~1 layer in 4; community GGUFs patch the rest by
   duplication.
 - **loom engine delta (dense fallback, llama.cpp's own approach):**
-  `glm-dsa` as a deepseek2-family variant — MLA attention (have it),
+  `glm-dsa` becomes a deepseek2-family variant: MLA attention (have it),
   noaux_tc sigmoid routing with `exp_probs_b` (have it), shared expert
   (have it). New work: tensor/metadata mapping, and skipping the DSA
   indexer + MTP tensors at load. DSA sparse attention itself is a later,
-  separate feature (it is a speed/long-context optimization, not a
-  correctness requirement).
+  separate feature (a speed/long-context optimization, not a correctness
+  requirement).
 
 ## Bridge model: DeepSeek-V3-0324 (671B)
 
 `loom gguf check` verdict: **"loads and runs."** deepseek2 arch, 61 blocks,
 256 experts / 8 active, MLA, Q4_K/Q6_K/F32 only, expert-aligned. Q4_K_M is
-~404 GB across 9 shards; 2-bit cuts to ~230 GB. Zero engine work: this is
-the thesis-scale deployment loom can run **today**, exercising the same
-sharding, gossip, network_id and churn machinery as GLM 5.2 will.
+~404 GB across 9 shards; 2-bit cuts to ~230 GB. Zero engine work: loom can
+run this thesis-scale deployment today, exercising the same sharding,
+gossip, network_id and churn machinery GLM 5.2 will use.
 
 ## Hardware gate (the open decision)
 
-Per-token expert working set at this scale makes WAN fetch useless (see the
-fabric table in CLAUDE.md, re-confirmed by the three-machine test). Options:
+The per-token expert working set at this scale makes WAN fetch useless (see
+the fabric table in CLAUDE.md, re-confirmed by the three-machine test).
+Options:
 
 | shape | fits | cost class |
 |---|---|---|
