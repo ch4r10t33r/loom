@@ -60,6 +60,11 @@ pub const Options = struct {
     prefill_batch: usize = 0, // 0 = kernel max; 1 disables batched prefill
     p2p_addr: []const u8,
     p2p_port: u16,
+    /// The LLM-network identity (Ethereum's chainId, for models): peers on a
+    /// different network are refused at the gossip and p2p layers. null =
+    /// auto: derived from the weight manifest when a store is attached,
+    /// 0 (the open default network) otherwise.
+    network_id: ?u64 = null,
     ram_bytes: u64,
     pin_bytes: u64,
     verify: bool,
@@ -480,6 +485,14 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         }
     }
 
+    // The LLM-network identity every peer must share (chainId semantics).
+    // Auto derives from the manifest so two nodes serving the same sharded
+    // model agree without configuration; an explicit --network-id keeps one
+    // network across model hardforks.
+    const network_id: u64 = opts.network_id orelse
+        (if (store) |*st| wire.networkIdFromManifest(st.manifest.version) else 0);
+    try out.print("  network    id {d}\n", .{network_id});
+
     // gossip peer table, seeded with the statically configured peers
     var advertise_buf: [128]u8 = undefined;
     const advertise = opts.advertise orelse
@@ -638,6 +651,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .boot = if (registry) |*r| r else null,
         .committee_id = joined_committee_id,
         .advertise = advertise,
+        .network_id = network_id,
     };
     const p2p_handle = try std.Thread.spawn(.{}, p2pThread, .{&p2p_ctx});
     defer p2p_handle.join();
@@ -650,6 +664,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .store = if (store) |*st| st else null,
         .advertise = advertise,
         .committee_id = joined_committee_id,
+        .network_id = network_id,
     };
     {
         const t = try std.Thread.spawn(.{}, gossip.loop, .{&gossip_ctx});
