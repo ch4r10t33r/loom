@@ -7,7 +7,15 @@ const std = @import("std");
 const snappy = @import("snappyz");
 
 pub const MAGIC = [2]u8{ 'L', 'M' };
-pub const PROTO: u8 = 1;
+pub const PROTO: u8 = 2; // v2: network_id joins Announce/Heartbeat (chainId semantics)
+
+/// The network identity a node will only peer within -- Ethereum's chainId,
+/// for LLM networks: one loom network serves one model. Derived from the
+/// manifest by default (`--network-id auto`), or set explicitly so several
+/// quantizations of one model can share a network across hardforks.
+pub fn networkIdFromManifest(version: [32]u8) u64 {
+    return std.mem.readInt(u64, version[0..8], .little);
+}
 pub const HEADER_LEN: usize = 8;
 pub const FLAG_SNAPPY: u8 = 0x01;
 
@@ -138,6 +146,7 @@ fn appendU64(gpa: std.mem.Allocator, b: *std.ArrayList(u8), v: u64) !void {
 
 pub const Heartbeat = struct {
     proto: u8 = PROTO,
+    network_id: u64 = 0,
     committee_id: u32 = NO_COMMITTEE,
     manifest_version: [32]u8 = [_]u8{0} ** 32,
     holdings_seq: u64 = 0,
@@ -150,6 +159,7 @@ pub const Heartbeat = struct {
         var b = std.ArrayList(u8).empty;
         errdefer b.deinit(gpa);
         try b.append(gpa, self.proto);
+        try appendU64(gpa, &b, self.network_id);
         try appendU32(gpa, &b, self.committee_id);
         try b.appendSlice(gpa, &self.manifest_version);
         try appendU64(gpa, &b, self.holdings_seq);
@@ -166,6 +176,7 @@ pub const Heartbeat = struct {
         var c = Cursor{ .buf = body };
         var hb = Heartbeat{};
         hb.proto = try c.u8v();
+        hb.network_id = try c.u64v();
         hb.committee_id = try c.u32v();
         @memcpy(&hb.manifest_version, try c.need(32));
         hb.holdings_seq = try c.u64v();
@@ -182,6 +193,7 @@ pub const Heartbeat = struct {
 
 pub const Announce = struct {
     proto: u8 = PROTO,
+    network_id: u64 = 0,
     committee_id: u32 = NO_COMMITTEE,
     manifest_version: [32]u8 = [_]u8{0} ** 32,
     holdings_seq: u64 = 0,
@@ -192,6 +204,7 @@ pub const Announce = struct {
         var b = std.ArrayList(u8).empty;
         errdefer b.deinit(gpa);
         try b.append(gpa, self.proto);
+        try appendU64(gpa, &b, self.network_id);
         try appendU32(gpa, &b, self.committee_id);
         try b.appendSlice(gpa, &self.manifest_version);
         try appendU64(gpa, &b, self.holdings_seq);
@@ -207,6 +220,7 @@ pub const Announce = struct {
         var c = Cursor{ .buf = body };
         var a = Announce{};
         a.proto = try c.u8v();
+        a.network_id = try c.u64v();
         a.committee_id = try c.u32v();
         @memcpy(&a.manifest_version, try c.need(32));
         a.holdings_seq = try c.u64v();
@@ -493,4 +507,26 @@ test "readFrameBodyAlloc reads only the bytes delivered (issue #27)" {
     const got = try readFrameBodyAlloc(gpa, &r, body.len);
     defer gpa.free(got);
     try std.testing.expectEqualStrings(body, got);
+}
+
+test "network_id survives the announce and heartbeat roundtrip" {
+    const gpa = std.testing.allocator;
+    var ann = Announce{ .network_id = 0xDEADBEEF12345678, .addr = "1.2.3.4:9" };
+    const ab = try ann.encodeBody(gpa);
+    defer gpa.free(ab);
+    const back = try Announce.parseBody(ab);
+    try std.testing.expectEqual(ann.network_id, back.network_id);
+
+    var hb = Heartbeat{ .network_id = 42, .addr = "5.6.7.8:1" };
+    const hbb = try hb.encodeBody(gpa);
+    defer gpa.free(hbb);
+    const hback = try Heartbeat.parseBody(hbb);
+    try std.testing.expectEqual(@as(u64, 42), hback.network_id);
+}
+
+test "networkIdFromManifest is the manifest's leading eight bytes" {
+    var v: [32]u8 = [_]u8{0} ** 32;
+    v[0] = 0x11;
+    v[7] = 0x22;
+    try std.testing.expectEqual(std.mem.readInt(u64, v[0..8], .little), networkIdFromManifest(v));
 }

@@ -27,6 +27,7 @@ pub const Ctx = struct {
     store: ?*weights.Store,
     advertise: []const u8,
     committee_id: u32 = wire.NO_COMMITTEE,
+    network_id: u64 = 0,
 };
 
 /// One gossip exchange with one peer: announce ourselves, merge their batch.
@@ -46,7 +47,7 @@ fn exchange(ctx: *Ctx, addr_str: []const u8) !void {
     var w = stream.writer(io, &wbuf);
 
     // self announce (SPEC.md Announce container)
-    var ann = wire.Announce{ .committee_id = ctx.committee_id, .addr = ctx.advertise };
+    var ann = wire.Announce{ .network_id = ctx.network_id, .committee_id = ctx.committee_id, .addr = ctx.advertise };
     // atomic snapshot: reading `bits` directly races the repair/fetch threads'
     // RMWs and advertises a torn bitmap (security issue #31)
     var snap: ?[]u8 = null;
@@ -74,6 +75,9 @@ fn exchange(ctx: *Ctx, addr_str: []const u8) !void {
     var it = try wire.AnnounceBatch.iterate(dec.body);
     while (try it.next()) |entry_body| {
         const e = wire.Announce.parseBody(entry_body) catch continue;
+        // chainId semantics: a record from another LLM network never enters
+        // the peer table, however it arrived.
+        if (e.network_id != ctx.network_id) continue;
         const vhex = hashmod.toHex(e.manifest_version);
         const hhex = bytesToHexAlloc(gpa, e.holdings_bitmap) catch continue;
         defer gpa.free(hhex);

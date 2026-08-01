@@ -61,6 +61,7 @@ pub const Ctx = struct {
     boot: ?*bootnode.Registry = null,
     /// This node's committee id (wire.NO_COMMITTEE when not in one).
     committee_id: u32 = 0xFFFF_FFFF,
+    network_id: u64 = 0,
     /// In-flight expert requests being served (the heartbeat load hint).
     load: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// Our own advertised "host:port" (what we tell peers to dial us on).
@@ -282,6 +283,12 @@ fn handleFrame(ctx: *Ctx, raw: []const u8, wi: *Io.Writer) !void {
     defer ctx.gpa.free(dec.body);
     switch (dec.ty) {
         .heartbeat => {
+            // A heartbeat from another LLM network is refused outright --
+            // the caller learns it dialed the wrong network instead of
+            // silently exchanging state across it.
+            if (wire.Heartbeat.parseBody(dec.body)) |hb| {
+                if (hb.network_id != ctx.network_id) return wi.print("ERR wrong_network\n", .{});
+            } else |_| return wi.print("ERR bad_frame\n", .{});
             // respond with our own state: one exchange refreshes both sides
             const resp = selfHeartbeat(ctx);
             const body = try resp.encodeBody(ctx.gpa);
@@ -293,6 +300,7 @@ fn handleFrame(ctx: *Ctx, raw: []const u8, wi: *Io.Writer) !void {
         .announce => {
             const table = ctx.table orelse return wi.print("ERR no_gossip\n", .{});
             const ann = wire.Announce.parseBody(dec.body) catch return wi.print("ERR bad_frame\n", .{});
+            if (ann.network_id != ctx.network_id) return wi.print("ERR wrong_network\n", .{});
             const vhex = hashmod.toHex(ann.manifest_version);
             const hhex = try bytesToHexAlloc(ctx.gpa, ann.holdings_bitmap);
             defer ctx.gpa.free(hhex);
@@ -328,6 +336,7 @@ fn handleFrame(ctx: *Ctx, raw: []const u8, wi: *Io.Writer) !void {
 /// Our own heartbeat/announce state snapshot.
 pub fn selfHeartbeat(ctx: *Ctx) wire.Heartbeat {
     var hb = wire.Heartbeat{
+        .network_id = ctx.network_id,
         .committee_id = ctx.committee_id,
         .load = @intCast(@min(ctx.load.load(.monotonic), std.math.maxInt(u16))),
         .sent_at_ns = @intCast(@mod(stats.nowNs(ctx.io), std.math.maxInt(i64))),

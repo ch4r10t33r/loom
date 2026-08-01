@@ -453,7 +453,8 @@ version drift detection, holdings freshness, and a load hint for client-side
 spreading. One exchange refreshes both sides (the response is the same container).
 
 ```
-proto:            u8       (= 1)
+proto:            u8       (= 2)
+network_id:       u64      (the LLM-network identity; see below)
 committee_id:     u32      (0xFFFFFFFF = not in a committee)
 manifest_version: [32]u8   (Merkle root; zeros = no store)
 holdings_seq:     u64      (monotonic; bumps on every holdings change)
@@ -476,6 +477,7 @@ their mesh table.
 
 ```
 proto:            u8
+network_id:       u64
 committee_id:     u32
 manifest_version: [32]u8
 holdings_seq:     u64
@@ -487,8 +489,19 @@ holdings_bitmap:  [bitmap_len]u8   (1 bit per shard; frame-level snappy
 ```
 
 Receivers keep the entry with the highest `holdings_seq` per addr. ENR (planned)
-carries `manifest_version + holdings_seq + holdings_digest` only (fits the 300-byte
-limit); the gossip announce carries the full bitmap.
+carries `network_id + manifest_version + holdings_seq + holdings_digest` only
+(fits the 300-byte limit); the gossip announce carries the full bitmap.
+
+**network_id (proto v2).** One loom network serves ONE model, and `network_id`
+is that network's identity -- Ethereum's chainId, for LLMs. A node refuses to
+peer across networks: an inbound Heartbeat or Announce whose `network_id`
+differs is answered `ERR wrong_network` and never merged into the mesh table,
+and gossip-learned records from other networks are dropped at merge. The id is
+configured with `--network-id N`; the default (`auto`) derives it from the
+weight manifest's leading eight bytes, so nodes sharding the same model agree
+without configuration, while an explicit id keeps one network together across
+model hardforks. `network_id` gates *membership*; `manifest_version` continues
+to gate *content* (expert fetch refuses other versions within a network).
 
 **AnnounceBatch, type 0x04.** The gossip exchange response: the responder's own
 Announce followed by its whole table, so one round trip both announces and syncs
