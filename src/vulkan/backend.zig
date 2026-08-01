@@ -646,7 +646,7 @@ pub fn mlaSetWk(li: usize, wk_f32: []const f32) bool {
 }
 
 const AbsorbPush = extern struct { n_heads: u32, nope: u32, kvr: u32, stride: u32, q_stride: u32, q_off: u32 };
-const AttnPush = extern struct { n_heads: u32, kvr: u32, rope: u32, seq: u32, qr_stride: u32, qr_off: u32, c_base: u32, r_base: u32, scale: f32 };
+const AttnPush = extern struct { n_heads: u32, kvr: u32, rope: u32, seq: u32, qr_stride: u32, qr_off: u32, c_base: u32, r_base: u32, scale: f32, nope: u32, wstride: u32, q_stride: u32, q_off: u32 };
 const WsumPush = extern struct { n_heads: u32, kvr: u32, seq: u32, c_base: u32 };
 const NormPush = extern struct { n: u32, eps: f32, x_off: u32 = 0, out_off: u32 = 0 };
 const RopePush = extern struct { n_vec: u32, rope: u32, stride: u32, offset: u32, pos: u32, buf_off: u32, base: f32, yarn_factor: f32, yarn_orig_ctx: f32 };
@@ -667,7 +667,7 @@ fn prepAttn(d: *vk.Device, li: usize, pos: usize, q_nope: []const f32, q_rope: [
     const w = ensureMlaCache(d) orelse return null;
     if (li >= mla_wk.items.len) return null;
     const seq = pos + 1;
-    if (seq > w.ctx) return null;
+    if (seq > w.ctx or w.kvr > 512) return null;
     if (q_nope.len != n_heads * nope or q_rope.len != n_heads * w.rope) return null;
     const vp = idPipeFor(kv_b.ty, w.kvr) orelse return null;
     const vw = wbufFor(d, kv_b) orelse return null;
@@ -691,9 +691,8 @@ fn prepAttn(d: *vk.Device, li: usize, pos: usize, q_nope: []const f32, q_rope: [
 /// `hout` on the device.
 fn recordAttn(d: *vk.Device, c: vk.Device.Cmd, p: AttnPrep, li: usize, n_heads: usize, nope: usize, v_head_dim: usize, scale: f32, qsrc: vk.Buffer, q_stride: usize, q_off: usize, qr_stride: usize, qr_off: usize) vk.Error!void {
     const w = p.w;
-    const apush = AbsorbPush{ .n_heads = @intCast(n_heads), .nope = @intCast(nope), .kvr = @intCast(w.kvr), .stride = @intCast(nope + v_head_dim), .q_stride = @intCast(q_stride), .q_off = @intCast(q_off) };
-    try d.record(c, pipes.absorb, &.{ mla_wk.items[li], qsrc, qabs.? }, std.mem.asBytes(&apush), @intCast(n_heads * ((w.kvr + 63) / 64)));
-    d.barrier(c);
+    // Absorption is fused into the attention kernel (shared-memory q_abs):
+    // one dispatch and one drain fewer per layer.
     const tpush = AttnPush{
         .n_heads = @intCast(n_heads),
         .kvr = @intCast(w.kvr),
@@ -704,8 +703,12 @@ fn recordAttn(d: *vk.Device, c: vk.Device.Cmd, p: AttnPrep, li: usize, n_heads: 
         .c_base = @intCast(li * w.ctx * w.kvr),
         .r_base = @intCast(mla_r0 + li * w.ctx * w.rope),
         .scale = scale,
+        .nope = @intCast(nope),
+        .wstride = @intCast(nope + v_head_dim),
+        .q_stride = @intCast(q_stride),
+        .q_off = @intCast(q_off),
     };
-    try d.record(c, pipes.attn, &.{ qabs.?, qsrc, mla_cache.?, probs_buf.? }, std.mem.asBytes(&tpush), @intCast(n_heads));
+    try d.record(c, pipes.attn, &.{ mla_wk.items[li], qsrc, mla_cache.?, probs_buf.? }, std.mem.asBytes(&tpush), @intCast(n_heads));
     d.barrier(c);
     const wpush = WsumPush{ .n_heads = @intCast(n_heads), .kvr = @intCast(w.kvr), .seq = @intCast(p.seq), .c_base = @intCast(li * w.ctx * w.kvr) };
     try d.record(c, pipes.wsum, &.{ probs_buf.?, mla_cache.?, olat.? }, std.mem.asBytes(&wpush), @intCast(n_heads * ((w.kvr + 63) / 64)));
@@ -899,7 +902,7 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
     const vocab = logits.len;
     if (x.len != dim or out_norm.len != dim) return false;
     if (fc.routed.n_used == 0 or fc.routed.n_used > MAX_MOE_EXPERTS or fc.routed.n_expert > 256) return false;
-    if (fc.kvr != w.kvr or fc.rope != w.rope) return false;
+    if (fc.kvr != w.kvr or fc.rope != w.rope or fc.kvr > 512) return false;
 
     // Resolve every layer -- pipelines, device weights, uploaded norms --
     // before a single dispatch is recorded. Norms go through the same
@@ -1016,7 +1019,6 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         .has_bias = 0, // buildFrameDescs declines biased-router models
         .weights_scale = fc.routed.weights_scale,
     };
-    const apush = AbsorbPush{ .n_heads = @intCast(fc.n_heads), .nope = @intCast(fc.nope), .kvr = @intCast(fc.kvr), .stride = @intCast(fc.nope + fc.v_head_dim), .q_stride = @intCast(kd), .q_off = 0 };
     const rope_q = RopePush{ .n_vec = @intCast(fc.n_heads), .rope = @intCast(fc.rope), .stride = @intCast(kd), .offset = @intCast(fc.nope), .pos = @intCast(pos), .buf_off = 0, .base = fc.rope_base, .yarn_factor = fc.yarn_factor, .yarn_orig_ctx = fc.yarn_orig_ctx };
 
     // LOOM_FRAME_DEBUG: emit each layer as four waited sub-buffers -- head,
@@ -1055,6 +1057,11 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         // row vs qf -> qabs), both ordered before attention by one barrier --
         // Metal's schedule, one drain fewer per layer.
         d.record(c, pipes.rope, &.{mla_cache.?}, std.mem.asBytes(&rope_k), @intCast((fc.rope / 2 + 31) / 32)) catch return false;
+        // The absorb dispatch that used to sit here (and order this rope
+        // before attention) is fused into the attention kernel now, so the
+        // barrier is explicit again: attention and the mirror copies read
+        // the r row this rope writes.
+        d.barrier(c);
         if (debug_split) {
             const t0 = nowf();
             d.submitWait(c) catch return false;
@@ -1067,17 +1074,15 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         // but the c-row copy must follow the norm-into-cache, so it rides
         // after this group's barrier -- wait: c row was written before the
         // rope barrier, r row rotated just above; both copies are safe here.
-        d.record(c, pipes.absorb, &.{ mla_wk.items[li], qf, qabs.? }, std.mem.asBytes(&apush), @intCast(fc.n_heads * ((fc.kvr + 63) / 64))) catch return false;
-        d.barrier(c);
         // Mirror the finished cache row to the host-visible strip alongside
-        // the attention dispatch: both only READ the cache, and the rope that
-        // finished the r row is ordered by the barrier above.
+        // the (absorb-fused) attention dispatch: all only READ the cache,
+        // ordered by the barrier above.
         const mcp_c = CopyPush{ .n = @intCast(fc.kvr), .in_off = @intCast(c_pos), .out_off = @intCast(li * (fc.kvr + fc.rope)) };
         d.record(c, pipes.copy, &.{ mla_cache.?, mla_mirror.? }, std.mem.asBytes(&mcp_c), @intCast((fc.kvr + 63) / 64)) catch return false;
         const mcp_r = CopyPush{ .n = @intCast(fc.rope), .in_off = @intCast(r_pos), .out_off = @intCast(li * (fc.kvr + fc.rope) + fc.kvr) };
         d.record(c, pipes.copy, &.{ mla_cache.?, mla_mirror.? }, std.mem.asBytes(&mcp_r), @intCast((fc.rope + 63) / 64)) catch return false;
-        const tpush = AttnPush{ .n_heads = @intCast(fc.n_heads), .kvr = @intCast(fc.kvr), .rope = @intCast(fc.rope), .seq = @intCast(seq), .qr_stride = @intCast(kd), .qr_off = @intCast(fc.nope), .c_base = @intCast(li * w.ctx * fc.kvr), .r_base = @intCast(mla_r0 + li * w.ctx * fc.rope), .scale = fc.scale };
-        d.record(c, pipes.attn, &.{ qabs.?, qf, mla_cache.?, probs_buf.? }, std.mem.asBytes(&tpush), @intCast(fc.n_heads)) catch return false;
+        const tpush = AttnPush{ .n_heads = @intCast(fc.n_heads), .kvr = @intCast(fc.kvr), .rope = @intCast(fc.rope), .seq = @intCast(seq), .qr_stride = @intCast(kd), .qr_off = @intCast(fc.nope), .c_base = @intCast(li * w.ctx * fc.kvr), .r_base = @intCast(mla_r0 + li * w.ctx * fc.rope), .scale = fc.scale, .nope = @intCast(fc.nope), .wstride = @intCast(fc.nope + fc.v_head_dim), .q_stride = @intCast(kd), .q_off = 0 };
+        d.record(c, pipes.attn, &.{ mla_wk.items[li], qf, mla_cache.?, probs_buf.? }, std.mem.asBytes(&tpush), @intCast(fc.n_heads)) catch return false;
         d.barrier(c);
         const wpush = WsumPush{ .n_heads = @intCast(fc.n_heads), .kvr = @intCast(fc.kvr), .seq = @intCast(seq), .c_base = @intCast(li * w.ctx * fc.kvr) };
         d.record(c, pipes.wsum, &.{ probs_buf.?, mla_cache.?, olat.? }, std.mem.asBytes(&wpush), @intCast(fc.n_heads * ((fc.kvr + 63) / 64))) catch return false;
