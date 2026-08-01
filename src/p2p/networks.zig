@@ -34,7 +34,7 @@ pub const Network = struct {
 };
 
 pub const registry = [_]Network{
-    .{ .name = "devnet", .id = 1337, .arch = "glm4moe", .model = "unsloth/GLM-4.5-Air-GGUF (Q4_K_M)", .desc = "PoC validation -- GLM-4.5-Air 106B-A12B", .strict = false, .bootnodes = &.{"65.21.7.174:8771"} },
+    .{ .name = "devnet", .id = 1337, .arch = "glm4moe", .model = "unsloth/GLM-4.5-Air-GGUF (Q4_K_M)", .desc = "PoC validation -- GLM-4.5-Air 106B-A12B", .strict = false, .bootnodes = &.{"168.119.167.242:8771"} },
     .{ .name = "testnet", .id = 2, .arch = "glm4moe", .model = "unsloth/GLM-4.6-GGUF (Q4_K_M)", .desc = "performance tier -- GLM-4.6 357B-A32B", .strict = true },
     .{ .name = "mainnet", .id = 1, .arch = "glm-dsa", .model = "unsloth/GLM-5.2-GGUF (UD-Q4_K_XL)", .desc = "production -- GLM 5.2 744B-A40B", .strict = true },
 };
