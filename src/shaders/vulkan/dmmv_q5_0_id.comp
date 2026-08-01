@@ -23,7 +23,7 @@ uint loadU32(uint byte_off) {
 float sum4(vec4 v) { return v.x + v.y + v.z + v.w; }
 
 const uint QK = 32u;
-const uint BLK = 22u;
+const uint BLK = 24u; // padded at upload: [16 qs][4 qh][d half][2 pad], word-aligned
 
 vec4 q5lo(uint qw, uint qh, uint i) {
     return vec4(float((qw & 15u) | (((qh >> i) & 1u) << 4u)),
@@ -62,24 +62,24 @@ void main() {
         uint k1 = b1 + b * BLK;
         uint k2 = b2 + b * BLK;
         uint k3 = b3 + b * BLK;
-        vec4 d = vec4(unpackHalf2x16(loadU32(k0)).x, unpackHalf2x16(loadU32(k1)).x, unpackHalf2x16(loadU32(k2)).x, unpackHalf2x16(loadU32(k3)).x);
-        uint h0 = loadU32(k0 + 2u);
-        uint h1 = loadU32(k1 + 2u);
-        uint h2 = loadU32(k2 + 2u);
-        uint h3 = loadU32(k3 + 2u);
+        vec4 d = vec4(unpackHalf2x16(w4[(k0 + 20u) >> 2u]).x, unpackHalf2x16(w4[(k1 + 20u) >> 2u]).x, unpackHalf2x16(w4[(k2 + 20u) >> 2u]).x, unpackHalf2x16(w4[(k3 + 20u) >> 2u]).x);
+        uint h0 = w4[(k0 + 16u) >> 2u];
+        uint h1 = w4[(k1 + 16u) >> 2u];
+        uint h2 = w4[(k2 + 16u) >> 2u];
+        uint h3 = w4[(k3 + 16u) >> 2u];
         uint xb4 = (x0 >> 2u) + b * 8u;
         vec4 s_qx = vec4(0.0);
         float s_x = 0.0;
         for (uint j = 0u; j < 4u; j++) {
             uint i = 4u * j;
-            uint off = 6u + i;
+            uint off = i;
             vec4 xlo = x4[xb4 + j];
             vec4 xhi = x4[xb4 + 4u + j];
             s_x += sum4(xlo) + sum4(xhi);
-            uint w0 = loadU32(k0 + off);
-            uint w1 = loadU32(k1 + off);
-            uint w2 = loadU32(k2 + off);
-            uint w3 = loadU32(k3 + off);
+            uint w0 = w4[(k0 + off) >> 2u];
+            uint w1 = w4[(k1 + off) >> 2u];
+            uint w2 = w4[(k2 + off) >> 2u];
+            uint w3 = w4[(k3 + off) >> 2u];
             s_qx.x += dot(q5lo(w0, h0, i), xlo) + dot(q5hi(w0, h0, i), xhi);
             s_qx.y += dot(q5lo(w1, h1, i), xlo) + dot(q5hi(w1, h1, i), xhi);
             s_qx.z += dot(q5lo(w2, h2, i), xlo) + dot(q5hi(w2, h2, i), xhi);
