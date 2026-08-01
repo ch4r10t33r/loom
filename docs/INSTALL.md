@@ -2,7 +2,7 @@
 
 Prebuilt binaries are attached to each
 [release](https://github.com/ch4r10t33r/loom/releases). No runtime
-dependencies — the Linux builds are statically linked against musl, so they run
+dependencies; the Linux builds are statically linked against musl, so they run
 on any distro.
 
 | platform | asset suffix |
@@ -39,7 +39,7 @@ loom version
 ```
 
 `loom version` reports the version, the commit it was built from, and its
-target triple — worth quoting in any bug report.
+target triple. Include that output in any bug report.
 
 On macOS, Gatekeeper quarantines unsigned downloads. Clear it with
 `xattr -d com.apple.quarantine /usr/local/bin/loom`, or right-click and Open

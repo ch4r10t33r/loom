@@ -34,7 +34,7 @@ SHA-256, so neither a moved tag nor a swapped release asset can change what is
 built. The compose demo additionally drops all capabilities, sets
 `no-new-privileges`, and caps memory/PIDs.
 
-**Distributed swarm** — [`docker-compose.yml`](docker-compose.yml) brings up a
+**Distributed swarm.** [`docker-compose.yml`](docker-compose.yml) brings up a
 two-node swarm (an origin that generates + serves a synthetic deepseek2 GGUF, and
 a partial node that holds ~30% of the experts and fetches the rest from the
 origin at token time), no external model needed:
@@ -45,7 +45,7 @@ docker compose up --build
 curl -s localhost:8782/v1/completions -d '{"prompt":"the","max_tokens":8}'
 ```
 
-Peers can be addressed by IP **or hostname** — the p2p layer resolves names via a
+Peers can be addressed by IP or hostname. The p2p layer resolves names via a
 minimal DNS client ([`src/p2p/dns.zig`](src/p2p/dns.zig): IP literal, then
 `/etc/hosts`, then a UDP A-query to `/etc/resolv.conf`'s first nameserver), so the
 compose demo addresses peers by Compose service name (`origin`), and Kubernetes

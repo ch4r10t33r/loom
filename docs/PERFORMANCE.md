@@ -24,14 +24,14 @@ token. A 145-token prefill on the same model, best of three:
 | **8** | **1.87 s** |
 
 That is 1.4x rather than the 2.4x the kernel microbenchmark shows in
-isolation, because attention is quadratic in prompt length and is not batched
-— it is bound by the KV cache rather than by weight reads, so there is nothing
+isolation, because attention is quadratic in prompt length and is not batched.
+It is bound by the KV cache rather than by weight reads, so there is nothing
 to amortize there.
 
-The last step is the one worth understanding. Profiling the kernels showed
-**76-92% of a quantized matvec was the dequantize, not the dot** — each block
-was expanded into a 256-float scratch buffer and pushed through L1 only to be
-read straight back. Quantizing the *activation* vector to int8 once per matvec
+The last step needs some explanation. Profiling the kernels showed 76-92% of
+a quantized matvec was the dequantize, not the dot: each block was expanded
+into a 256-float scratch buffer and pushed through L1 only to be read straight
+back. Quantizing the activation vector to int8 once per matvec
 and dotting it against the packed weights as integers removes that buffer
 entirely and uses lanes four times as wide.
 
@@ -40,7 +40,7 @@ carries roughly 0.4% per-element error, so results are no longer bit-identical
 to the dequantize path. Over a long dot those errors are independent and
 largely cancel, and it is what every production CPU inference engine does.
 
-Row-splitting is exact, not approximate: each output row is one independent
+Row-splitting is exact: each output row is one independent
 dot product, so there is no reassociation and results are bit-identical to the
 serial path at any thread count. The tests assert that rather than assuming it.
 
@@ -49,16 +49,16 @@ threads running during a generation, and past that point oversubscription
 costs more than the extra cores return. Override with `--threads N`;
 `--threads 1` disables the pool.
 
-The CPU path is not exhausted — Q4_K runs at about 5.8 GB/s against roughly
-70 GB/s of achievable bandwidth — but the GPU backends below have overtaken
+The CPU path is not exhausted (Q4_K runs at about 5.8 GB/s against roughly
+70 GB/s of achievable bandwidth), but the GPU backends below have overtaken
 it on every machine that has one.
 
 ## GPU: Metal (Apple Silicon)
 
 DeepSeek-Coder-V2-Lite-Instruct Q4_K_M (16B MoE, ~10 GB), single-stream
 decode on an Apple M5, `--gpu-ops`. The reference bar was llama.cpp's
-reported 38 tok/s on an M3. The chain that got there — each step merged only
-after a differential test against the exact reference:
+reported 38 tok/s on an M3. Each step was merged only after a differential
+test against the exact reference:
 
 | step | tok/s |
 |---|---|
@@ -69,8 +69,8 @@ after a differential test against the exact reference:
 | whole-token command buffer, 1.8 cb/token | 42 |
 | **+ attention re-grids, f16 W_k** | **39.7–44.4** |
 
-The recurring lesson: submission count is the number that never lies. The
-same work in fewer `commitAndWait`s is where every large jump came from.
+Every large jump came from doing the same work in fewer `commitAndWait`s;
+submission count was the number to watch.
 
 ## GPU: Vulkan (NVIDIA / anything with a driver)
 
@@ -100,8 +100,8 @@ cutover for re-measurement on other hardware.
 
 The decisive fix was memory placement, not kernel shape: ten kernel-level
 experiments measured neutral before the profiler's uniform per-kernel deficit
-identified host-visible intermediates -- every dispatch paying PCIe
-first-touch latency -- as the real cost. With the working set in VRAM the
+pointed at host-visible intermediates as the real cost: every dispatch was
+paying PCIe first-touch latency. With the working set in VRAM the
 3060 passes the M5's Metal path (44 tok/s) at 63.7 tok/s marginal decode.
 Backend design notes are in [`docs/GPU-BACKENDS.md`](GPU-BACKENDS.md).
 
@@ -112,13 +112,13 @@ loom bench          # kernel timings plus invariant checks
 loom bench --check  # non-zero exit if an invariant fails; CI runs this
 ```
 
-CI gates on **invariants** ("batching beats unbatched", "threads beat one
+CI gates on invariants ("batching beats unbatched", "threads beat one
 thread", "the selected path beats the alternative") rather than on wall-clock,
 because a shared runner's absolute timings are noise while those relationships
 are properties of the code. See [`docs/BENCHMARKING.md`](BENCHMARKING.md).
 
-Continuous batching — where a MoE layer costs the *union* of a batch's experts
-rather than the sum — is partly built: the batched decode step is in and
-verified, the scheduler that would use it is not. Design, remaining work and the
+Continuous batching, where a MoE layer costs the union of a batch's experts
+rather than the sum, is partly built: the batched decode step is in and
+verified, but the scheduler that would use it is not. Design, remaining work and the
 measurement rules are in
 [`docs/CONTINUOUS-BATCHING.md`](CONTINUOUS-BATCHING.md).

@@ -1,21 +1,21 @@
 # What ZINC actually does, and what loom has to change
 
 Analysis of [zolotukhin/zinc](https://github.com/zolotukhin/zinc) as a Metal
-reference, written before porting anything, because the first attempt at
-porting went the other way round — a kernel was read, techniques were copied,
-none of them moved the number, and the reason only surfaced afterwards.
+reference, written before porting anything. The first attempt at porting went
+the other way round: a kernel was read and its techniques copied, none of them
+moved the number, and the reason only surfaced afterwards.
 
 ## The headline: it is not the kernels
 
 Loom's Q4_K matvec, measured with submission amortized, reaches 114–116 GB/s
 from 32k rows up. ZINC's own microbenchmark reports 109 GB/s at 27 MB. A
-streaming-read probe puts this machine's DRAM ceiling at ~110 GB/s. **The two
-kernels are at parity and both are at the memory ceiling**, so there is nothing
+streaming-read probe puts this machine's DRAM ceiling at ~110 GB/s. The two
+kernels are at parity and both sit at the memory ceiling, so there is nothing
 to win by copying kernel technique at DRAM-bound sizes.
 
 The one place ZINC is genuinely faster is cache-resident shapes: 239 GB/s at
 2.25 MB against loom's 67 GB/s at 2.4 MB. There a matvec is latency- and
-occupancy-bound, and their register discipline pays — see "Kernel technique"
+occupancy-bound, and their register discipline pays; see "Kernel technique"
 below. That matters for small models (TinyLlama's tensors are 6.5 MB) and not
 for large ones (Mistral-7B's are 33 MB).
 
@@ -31,8 +31,9 @@ loom gets wrong:
 | ZINC, normal | 18.9 | 53.0 |
 | ZINC, commit+wait per dispatch | 84.8 | 11.8 |
 
-**4.5x.** Loom's Metal path today issues one command buffer per operation —
-roughly 150 per token for a 22-layer model — which is the 84.8 ms/token regime.
+A 4.5x difference. Loom's Metal path today issues one command buffer per
+operation, roughly 150 per token for a 22-layer model, which is the
+84.8 ms/token regime.
 
 Their code says the same thing explicitly. `dense_cmd_group_layers = 60` puts
 up to sixty layers in a single command buffer, and the comment records the
@@ -44,12 +45,11 @@ measurements behind it:
   submissions.
 - Raising the per-chunk layer count took cmds/step from 2.89 to 1.89 with
   byte-identical output.
-- Going all the way to one chunk measured 43.87 vs 44.32 tok/s — **flat within
-  noise**.
+- Going all the way to one chunk measured 43.87 vs 44.32 tok/s, flat within
+  noise.
 
 So the target is ~2 command buffers per token, and the last step from 2 to 1 is
-worth nothing. The entire prize is in getting from *per-operation* down to
-*per-token*.
+worth nothing. The gain is in getting from per-operation down to per-token.
 
 ## How they hold that shape
 
@@ -87,9 +87,9 @@ Worth copying only for cache-resident shapes, where loom is 3.5x behind:
   separately so the min term is applied once per block, not per element.
 - The 16-byte block header (`d`, `dmin`, 12 scale bytes) read as one
   `packed_uint4`.
-- Scales kept in `ushort4` **registers**. Their comments are explicit that a
+- Scales kept in `ushort4` registers. Their comments are explicit that a
   local `uchar[12]` forces the array into thread-private memory and costs more
-  than the technique gains — loom reproduced exactly that regression when
+  than the technique gains; loom reproduced exactly that regression when
   porting this naively.
 - Nibbles extracted four at a time from a `ushort` with one vector AND against
   `ushort4(0x000F, 0x0F00, 0x00F0, 0xF000)`.
@@ -100,10 +100,10 @@ consistent with there being no headroom there.
 
 ## What loom has to change
 
-The seam is the problem. `src/compute/backend.zig` exposes one-shot calls —
-`matvec`, `ffnBlock`, `attnHeads` — each of which internally creates a command
+The seam is the problem. `src/compute/backend.zig` exposes one-shot calls
+(`matvec`, `ffnBlock`, `attnHeads`), each of which internally creates a command
 buffer, dispatches, commits, waits, and copies the result back to the host.
-That shape *cannot* express a per-token command buffer no matter how good the
+That shape cannot express a per-token command buffer no matter how good the
 kernels behind it are.
 
 What is needed, in order:
@@ -114,18 +114,18 @@ What is needed, in order:
 
 2. **Device-resident activations for a whole token.** Loom already has
    `act[4]` device buffers but copies host↔device around every operation.
-   Those copies are what force the commits.
+   Those copies force the commits.
 
 3. **Barriers instead of commits** between dependent dispatches, which
-   `ffnBlock` already does correctly *within* a block — the pattern exists and
+   `ffnBlock` already does correctly within a block; the pattern exists and
    needs extending to the token.
 
 4. **A kernel for every operation on the path.** Any CPU fallback mid-token
-   splits the buffer and gives back the win. This is what makes the remaining
-   quant kernels (Q5_K, Q5_1) matter — not their own speed, but that their
+   splits the buffer and gives back the win. That is why the remaining quant
+   kernels (Q5_K, Q5_1) matter: not for their own speed, but because their
    absence forces a split.
 
 5. Only then, fusion.
 
-The measured prize: 4.5x on the GPU path, against a kernel already at parity
+The measured upside is 4.5x on the GPU path, with a kernel already at parity
 with ZINC's and at the machine's memory ceiling.

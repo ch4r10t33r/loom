@@ -1,14 +1,14 @@
 # Running Loom across two physical machines
 
 The single-host walkthrough ([MULTI-NODE-WALKTHROUGH.md](MULTI-NODE-WALKTHROUGH.md))
-proves the mechanics. Two real machines prove the thing that actually matters:
-whether fetching experts across *your* network is viable, on *your* fabric.
+proves the mechanics. Two real machines answer the question that matters:
+whether fetching experts across your network is viable, on your fabric.
 
 > **What is verified here and what is not.** The model facts below were read
 > out of the published GGUF headers over HTTP range requests, and the shard
 > arithmetic is computed from them. The Loom behaviour was verified on
 > multi-node runs on one host. The cross-machine numbers are predictions from
-> measured bandwidth, not results — producing them is the point of the
+> measured bandwidth, not results; producing them is the point of the
 > exercise.
 
 ## Step 0 — measure the link before you download anything
@@ -43,22 +43,22 @@ partial node holds; only the misses cross the wire.
 | ~2.5 Gb/s | ~1.8 s/tok | ~1.5 s/tok | ~0.9 s/tok | usable |
 | ~10 Gb/s | ~0.46 s/tok | ~0.37 s/tok | ~0.23 s/tok | genuinely good |
 
-Gigabit is fine for *this* test — you are measuring the fetch path, not
+Gigabit is fine for this test: you are measuring the fetch path, not
 chasing tokens per second. Just expect seconds per token and size your
 patience accordingly. If you want it faster, raise `--hold-fraction`: it moves
 the miss rate directly.
 
 ## The model
 
-**Qwen3-30B-A3B**, `Q4_K_M`, **18.56 GB**.
+**Qwen3-30B-A3B**, `Q4_K_M`, 18.56 GB.
 
 ```
 repo: Qwen/Qwen3-30B-A3B-GGUF
 file: Qwen3-30B-A3B-Q4_K_M.gguf
 ```
 
-Verified from its GGUF header, not assumed: `general.architecture = qwen3moe`,
-48 blocks, **128 experts, 8 used**, no shared expert, gpt2-style BPE tokenizer,
+Verified from its GGUF header: `general.architecture = qwen3moe`,
+48 blocks, 128 experts, 8 used, no shared expert, gpt2-style BPE tokenizer,
 a chat template, and tensor types `Q4_K` / `Q6_K` / `F32` — all of which Loom
 reads.
 
@@ -83,7 +83,7 @@ Why this one for a two-machine test:
 | Mixtral 8x7B `Q4_K_M` | `TheBloke`/others | ~26 GB | `llama` | Only 256 shards of ~99 MB, and **~6.3 GB per token** — a poor fit for anything under 10 GbE |
 
 Avoid `Q2_K`, `Q3_K`, `IQ2_M`, `IQ3_M` and similar mixes: llama.cpp's quant
-*mixes* combine several tensor types, and those particular ones fold in `Q2_K`
+mixes combine several tensor types, and those particular ones fold in `Q2_K`
 or `Q3_K` tensors that Loom does not implement. Step 2 below checks this
 directly rather than guessing from the filename.
 
@@ -96,7 +96,7 @@ directly rather than guessing from the filename.
 | Disk at `--hold-fraction 0.5` | 18.6 GB | ~10.5 GB |
 | RAM | `--ram-gb` sets the cache budget; 8 GB is comfortable | same |
 
-**Machine B never downloads the model.** It syncs the resident bundle plus its
+Machine B never downloads the model. It syncs the resident bundle plus its
 assigned shards from A over your LAN, digest-verified against the manifest
 root. That is the interesting part of the boot path, and on a gigabit link
 expect a few minutes for ~10 GB.
@@ -197,7 +197,7 @@ A holds every shard and acts as the bootnode that assigns committees.
   --ram-gb 8
 ```
 
-`--advertise` must be A's **LAN address**, not `127.0.0.1`. It is the address B
+`--advertise` must be A's LAN address, not `127.0.0.1`. It is the address B
 will dial; the default only works on one host and is the single most common
 reason two machines never see each other.
 
@@ -209,8 +209,8 @@ shards     mode=expert total=6289 (resident=145, expert=6144) held=6289 (100.0%)
 serving    distributed GGUF (qwen3moe): ctx=... chat=chatml
 ```
 
-`mode=expert` is the one to check — that is expert-aligned sharding. The
-architecture on the `serving` line is read from the file, not assumed.
+`mode=expert` is the one to check; that is expert-aligned sharding. The
+architecture on the `serving` line is read from the file.
 
 ## Step 7 — start the partial node (machine B)
 
@@ -234,8 +234,8 @@ shards     mode=expert total=6289 held=... (~51%)
 serving    distributed GGUF (qwen3moe): ...
 ```
 
-On gigabit this takes a few minutes. `--hold-fraction` selects an **exact**
-count — `round(fraction x expert_shards)` — and only *which* shards is random,
+On gigabit this takes a few minutes. `--hold-fraction` selects an exact
+count, `round(fraction x expert_shards)`, and only which shards is random,
 seeded by `--seed`, so a restart re-picks the same set.
 
 ## Step 8 — the measurement that matters
@@ -247,8 +247,8 @@ printf '{"prompt":"Write a haiku about distributed systems.","max_tokens":40,"se
   | nc -w 600 127.0.0.1 8780
 ```
 
-The response carries **`hit_rate`**. A value below 1.0 is the entire point: it
-means experts B does not hold were fetched from A **inside the token loop**,
+The response carries `hit_rate`. A value below 1.0 is what this test is for:
+it means experts B does not hold were fetched from A inside the token loop,
 across your network, mid-inference. At `--hold-fraction 0.5` expect roughly
 0.5 to 0.6, climbing as fetched shards are persisted — fetch-on-demand doubles
 as organic replication, so `held=` grows as you use it.
@@ -261,11 +261,11 @@ Then the correctness check. Same prompt and seed, against A:
 ssh <A_IP> "printf '{\"prompt\":\"Write a haiku about distributed systems.\",\"max_tokens\":40,\"seed\":1}\n' | nc -w 600 127.0.0.1 8770"
 ```
 
-**The two `text` fields must be identical.** A node streaming half its weights
+The two `text` fields must be identical. A node streaming half its weights
 over a network must produce exactly what a full copy produces; anything else
 means the fetch path is corrupting weights. Every fetched shard is
 digest-verified against the manifest before it touches disk, so this should
-hold by construction — which is exactly why it is worth confirming.
+hold by construction, which is why it is worth confirming.
 
 ## Step 9 — get real throughput numbers
 
@@ -279,8 +279,8 @@ time (printf '{"prompt":"Explain consistent hashing.","max_tokens":100,"seed":1}
 ```
 
 The gap between them is the cost of the network tier on your fabric. Sweep
-`--hold-fraction` (0.3, 0.5, 0.75) and plot it — that curve is the honest
-answer for your hardware, and it is the number worth having.
+`--hold-fraction` (0.3, 0.5, 0.75) and plot it; that curve is the answer for
+your hardware.
 
 ## Step 10 — churn
 
@@ -293,7 +293,7 @@ heartbeat: committee member <A_IP>:8771 DEAD
 heartbeat: adopted N shard(s) from dead <A_IP>:8771 into wanted
 ```
 
-With only two machines there is no other holder, so repair will keep trying —
+With only two machines there is no other holder, so repair will keep trying,
 which is the correct behaviour and a useful thing to see. Requests to B for
 experts it does not hold will now fail loudly rather than return quietly wrong
 output. Restart A and watch it recover.
@@ -302,14 +302,14 @@ output. Restart A and watch it recover.
 
 ## Two machines and the `R target 2` caveat
 
-Loom targets **at least two sources per expert**. With two nodes, one of which
+Loom targets at least two sources per expert. With two nodes, one of which
 is the origin holding everything, a shard B does not hold has exactly one
-source. So this topology demonstrates the *fetch path* honestly, but not the
-*fault tolerance* the design aims at — for that you need a third machine, or
+source. So this topology demonstrates the fetch path, but not the fault
+tolerance the design aims at; for that you need a third machine, or
 two partial nodes plus a seed.
 
-If you want to see genuine mutual dependence on two boxes, run **two nodes on
-each machine**: one origin plus one partial per host, with the partials at
+If you want to see genuine mutual dependence on two boxes, run two nodes on
+each machine: one origin plus one partial per host, with the partials at
 `--hold-fraction 0.4`. Then no single node holds the model, the union covers
 it, and pulling either machine exercises real repair.
 
@@ -344,7 +344,7 @@ little-endian. None of that depends on the host — a shard hashed on Linux
 verifies on macOS and vice versa. Compute is node-local by design, so a peer
 never sees another node's activations, only its expert bytes.
 
-**What is not.** The two nodes will not produce *identical* text. A Mac
+**What is not.** The two nodes will not produce identical text. A Mac
 defaults to the recorded Metal path (f32 activations) while a Linux node runs
 the CPU kernels (int8 activations, approximate by ~0.4% per element). Both are
 valid forward passes and each node answers its own requests, so this is fine
@@ -363,8 +363,8 @@ explicitly specified". Since the release workflow ships
 too. libc is now linked for every target; all four release targets verified.
 
 **Why a Linux box helps the experiment.** The point is pooling RAM across nodes
-that individually cannot hold the model. A second machine with *different* RAM
-makes the result stronger, not weaker: it shows the capacity argument does not
+that individually cannot hold the model. A second machine with different RAM
+makes the result stronger: it shows the capacity argument does not
 depend on two identical boxes. And a Linux box with a discrete GPU is the only
 hardware that can eventually test the Vulkan backend, where discrete VRAM
 removes the shared-bus ceiling that caps the Metal win at ~1.9x.
@@ -372,6 +372,6 @@ removes the shared-bus ceiling that caps the Metal win at ~1.9x.
 **One caveat to plan around.** Loom has no Vulkan backend yet, so a Linux node
 runs on CPU. If that machine is also the one holding most of the shards, its
 serving throughput will be the CPU number, not the Metal number. For the
-capacity experiment that is fine — what is being measured is cold-miss-to-disk
-rate and whether the working set stays resident somewhere — but do not read a
-mixed-cluster tok/s figure as a per-node performance result.
+capacity experiment that is fine, since what is being measured is
+cold-miss-to-disk rate and whether the working set stays resident somewhere.
+Do not read a mixed-cluster tok/s figure as a per-node performance result.
