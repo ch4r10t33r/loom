@@ -59,8 +59,15 @@ pub fn main(init: std.process.Init) !void {
     const out = &out_file.interface;
     defer out.flush() catch {};
 
-    const args = try argsToSlice(gpa, init.minimal.args.vector);
-    defer gpa.free(args);
+    // The Args iterator is the one portable surface: Windows hands the
+    // command line over as WTF-16 and the iterator decodes it; POSIX yields
+    // the argv strings as-is.
+    var args_it = try std.process.Args.Iterator.initAllocator(init.minimal.args, gpa);
+    defer args_it.deinit();
+    var args_list = std.ArrayList([]const u8).empty;
+    defer args_list.deinit(gpa);
+    while (args_it.next()) |a| try args_list.append(gpa, a);
+    const args = args_list.items;
 
     if (args.len < 2) {
         try usage(out);
@@ -970,12 +977,6 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
 }
 
 // ---- arg helpers -----------------------------------------------------------
-
-fn argsToSlice(gpa: std.mem.Allocator, vector: []const [*:0]const u8) ![][]const u8 {
-    const out = try gpa.alloc([]const u8, vector.len);
-    for (vector, 0..) |a, i| out[i] = std.mem.span(a);
-    return out;
-}
 
 fn hasFlag(args: [][]const u8, name: []const u8) bool {
     for (args) |a| if (std.mem.eql(u8, a, name)) return true;

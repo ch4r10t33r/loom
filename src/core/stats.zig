@@ -6,8 +6,31 @@ const builtin = @import("builtin");
 const Io = std.Io;
 
 /// Resident set size in bytes (peak). macOS reports ru_maxrss in bytes; most
-/// other Unixes report kilobytes.
+/// other Unixes report kilobytes. Windows has no rusage; peak working set is
+/// the equivalent figure.
 pub fn rssBytes() u64 {
+    if (builtin.os.tag == .windows) {
+        const PMC = extern struct {
+            cb: u32,
+            PageFaultCount: u32,
+            PeakWorkingSetSize: usize,
+            WorkingSetSize: usize,
+            QuotaPeakPagedPoolUsage: usize,
+            QuotaPagedPoolUsage: usize,
+            QuotaPeakNonPagedPoolUsage: usize,
+            QuotaNonPagedPoolUsage: usize,
+            PagefileUsage: usize,
+            PeakPagefileUsage: usize,
+        };
+        const k32 = struct {
+            extern "kernel32" fn GetCurrentProcess() callconv(.winapi) *anyopaque;
+            extern "kernel32" fn K32GetProcessMemoryInfo(h: *anyopaque, pmc: *PMC, cb: u32) callconv(.winapi) c_int;
+        };
+        var pmc: PMC = undefined;
+        pmc.cb = @sizeOf(PMC);
+        if (k32.K32GetProcessMemoryInfo(k32.GetCurrentProcess(), &pmc, @sizeOf(PMC)) == 0) return 0;
+        return pmc.PeakWorkingSetSize;
+    }
     const ru = std.posix.getrusage(std.posix.rusage.SELF);
     const maxrss: i64 = @intCast(ru.maxrss);
     if (maxrss <= 0) return 0;
@@ -15,6 +38,26 @@ pub fn rssBytes() u64 {
         .macos, .ios, .tvos, .watchos => @intCast(maxrss),
         else => @as(u64, @intCast(maxrss)) * 1024,
     };
+}
+
+/// Monotonic nanoseconds without an Io, for timing paths (decode profiling,
+/// GPU calibration) that have no Io in reach. CLOCK_MONOTONIC via libc on
+/// POSIX; QueryPerformanceCounter on Windows, where std.c has no
+/// clock_gettime.
+pub fn nowMonoNs() i128 {
+    if (builtin.os.tag == .windows) {
+        const k32 = struct {
+            extern "kernel32" fn QueryPerformanceCounter(count: *i64) callconv(.winapi) c_int;
+            extern "kernel32" fn QueryPerformanceFrequency(freq: *i64) callconv(.winapi) c_int;
+        };
+        var c: i64 = 0;
+        var fq: i64 = 0;
+        if (k32.QueryPerformanceCounter(&c) == 0 or k32.QueryPerformanceFrequency(&fq) == 0 or fq == 0) return 0;
+        return @divTrunc(@as(i128, c) * std.time.ns_per_s, fq);
+    }
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
 }
 
 pub fn nowNs(io: Io) i128 {

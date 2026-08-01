@@ -713,13 +713,11 @@ pub const Profile = struct {
         return on.?;
     }
     /// 0.16 has no std.time.Timer or nanoTimestamp; the monotonic clock is
-    /// reached through Io, and a decode step has no Io. CLOCK_MONOTONIC via
-    /// libc is the cheapest thing that works from here, and this is a
-    /// diagnostic path anyway.
+    /// reached through Io, and a decode step has no Io. stats.nowMonoNs is
+    /// the cheapest thing that works from here, and this is a diagnostic
+    /// path anyway.
     fn now() i128 {
-        var ts: std.c.timespec = undefined;
-        _ = std.c.clock_gettime(.MONOTONIC, &ts);
-        return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+        return @import("../core/stats.zig").nowMonoNs();
     }
     /// Straight to stderr: this is a diagnostic, and routing it through the
     /// node's status thread made it depend on plumbing that was itself under

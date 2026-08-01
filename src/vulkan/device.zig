@@ -9,6 +9,7 @@
 //! the surface actually used is ~25 functions, and a full binding is another
 //! dependency for no reach.
 const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Error = error{ NoVulkan, NoDevice, NoMemoryType, CreateFailed, MapFailed };
 
@@ -56,9 +57,23 @@ var v_loaded = false;
 
 fn loadVulkan() Error!void {
     if (v_loaded) return;
-    var lib = std.DynLib.open("libvulkan.so.1") catch return error.NoVulkan;
-    inline for (@typeInfo(V).@"struct".fields) |f| {
-        @field(v, f.name) = lib.lookup(f.type, f.name) orelse return error.NoVulkan;
+    if (builtin.os.tag == .windows) {
+        // std.DynLib has no Windows implementation in this std snapshot;
+        // LoadLibrary/GetProcAddress is the whole surface we need anyway.
+        const w = struct {
+            extern "kernel32" fn LoadLibraryA(name: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+            extern "kernel32" fn GetProcAddress(mod: *anyopaque, name: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
+        };
+        const mod = w.LoadLibraryA("vulkan-1.dll") orelse return error.NoVulkan;
+        inline for (@typeInfo(V).@"struct".fields) |f| {
+            const p = w.GetProcAddress(mod, f.name) orelse return error.NoVulkan;
+            @field(v, f.name) = @ptrCast(@alignCast(p));
+        }
+    } else {
+        var lib = std.DynLib.open("libvulkan.so.1") catch return error.NoVulkan;
+        inline for (@typeInfo(V).@"struct".fields) |f| {
+            @field(v, f.name) = lib.lookup(f.type, f.name) orelse return error.NoVulkan;
+        }
     }
     v_loaded = true;
 }

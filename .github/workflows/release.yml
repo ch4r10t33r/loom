@@ -36,6 +36,9 @@ jobs:
           # device without unified memory rather than push pages over PCIe.
           - { target: aarch64-macos,      runner: macos-latest,  asset: aarch64-macos, anyzig: aarch64-macos,  sha: c7d0d77dd5f21e44d67b09717b60435bc7b90b81873f543040f0bc4dd8622109, native: true, build_native: true }
           - { target: x86_64-macos,       runner: macos-latest,  asset: x86_64-macos,  anyzig: aarch64-macos,  sha: c7d0d77dd5f21e44d67b09717b60435bc7b90b81873f543040f0bc4dd8622109, native: false }
+          # Cross-compiled like aarch64-linux; executed for real by the
+          # smoke-windows job below, which gates publishing.
+          - { target: x86_64-windows-gnu, runner: ubuntu-latest, asset: x86_64-windows, anyzig: x86_64-linux,   sha: f9d5a09fbd7c019eecef1a397613ce5baec22872a1c3eb5ab4b1132e917c3d71, native: false, windows: true }
 
     steps:
       - uses: actions/checkout@v4
@@ -94,21 +97,62 @@ jobs:
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then VER="${GITHUB_REF_NAME}"; else VER="dev-${GITHUB_SHA::7}"; fi
           NAME="loom-${VER}-${{ matrix.asset }}"
           mkdir -p "dist/${NAME}"
-          cp out/bin/loom "dist/${NAME}/"
           cp README.md "dist/${NAME}/"
-          tar -C dist -czf "${NAME}.tar.gz" "${NAME}"
+          # Windows gets a zip because that is what the platform unpacks
+          # natively; everything else keeps the tarball.
+          if [ "${{ matrix.windows }}" = "true" ]; then
+            cp out/bin/loom.exe "dist/${NAME}/"
+            (cd dist && zip -qr "../${NAME}.zip" "${NAME}")
+            echo "file=${NAME}.zip" >> "$GITHUB_OUTPUT"
+          else
+            cp out/bin/loom "dist/${NAME}/"
+            tar -C dist -czf "${NAME}.tar.gz" "${NAME}"
+            echo "file=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
           echo "name=${NAME}" >> "$GITHUB_OUTPUT"
           echo "version=${VER}" >> "$GITHUB_OUTPUT"
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.pkg.outputs.name }}
-          path: ${{ steps.pkg.outputs.name }}.tar.gz
+          path: ${{ steps.pkg.outputs.file }}
           if-no-files-found: error
+
+  # The Windows artifact is cross-compiled, so linking proved nothing about
+  # running. Execute the same smoke sequence the native builds get, on a
+  # real Windows runner, before anything is published.
+  smoke-windows:
+    name: smoke x86_64-windows
+    needs: build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem artifacts -Filter *x86_64-windows*.zip | Select-Object -First 1
+          Expand-Archive $zip.FullName -DestinationPath smoke
+          $exe = (Get-ChildItem smoke -Recurse -Filter loom.exe | Select-Object -First 1).FullName
+          & $exe version
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          (& $exe version) -match $env:GITHUB_SHA | Out-Null
+          if (-not $?) { exit 1 }
+          & $exe gguf gen smoke.gguf --arch qwen3moe --seed 1
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $shard = & $exe gguf shard smoke.gguf
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not ($shard -match "mode=expert|expert-aligned")) { exit 1 }
+          $out = & $exe gguf run smoke.gguf --prompt hi --max-tokens 4
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          if (-not ($out -match "output:")) { exit 1 }
 
   publish:
     name: publish release
-    needs: build
+    needs: [build, smoke-windows]
     runs-on: ubuntu-latest
     # Only a tag publishes. A manual run stops after building, so the whole
     # path can be rehearsed without creating a release.
@@ -128,7 +172,7 @@ jobs:
           set -eux
           cd artifacts
           ls -l
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum *.tar.gz *.zip > SHA256SUMS
           cat SHA256SUMS
 
       # `gh` is preinstalled on the runner, so the release is cut without a
@@ -152,8 +196,7 @@ jobs:
           | macOS, Intel | \`loom-${V}-x86_64-macos.tar.gz\` |
           | Linux, x86-64 | \`loom-${V}-x86_64-linux.tar.gz\` |
           | Linux, arm64 | \`loom-${V}-aarch64-linux.tar.gz\` |
-
-          Windows is not built yet.
+          | Windows, x86-64 | \`loom-${V}-x86_64-windows.zip\` |
 
           ### Install
 
