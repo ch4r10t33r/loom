@@ -61,14 +61,19 @@ reference checkpoints: the tinyllamas models, and DeepSeek-V2-Lite, a
 15.7-billion-parameter MoE, at Q4_K_M quantization. A node holding 33% of that
 model's shards produced the expected, token-identical completion while fetching
 the missing experts from a single LAN peer during inference, with every block
-digest-verified before use. This is a correctness-and-integration result on
-localhost with scalar CPU kernels (about 0.3 tokens/sec on one core), not a
-throughput or wide-area result (Section 10).
+digest-verified before use. The same
+partial-store loop has since been demonstrated across real machines: a
+two-machine run over a wide-area link (25.8 ms RTT), and a three-machine
+swarm spanning two continents with nodes holding 100%, 33%, and 20% of the
+shards -- including a NAT'd laptop -- serving through the node's RPC path
+with every block digest-verified (Section 10).
 
 *What is targeted, and not yet demonstrated.* The design goal is serving
 GLM-5.2-class models (744 billion parameters, about 19,200 experts) on swarms of
-16 to 32 GB machines. That model has not been run, kernels are not yet vectorized,
-and there is no batching. One caveat governs expectations throughout (Section 9):
+16 to 32 GB machines. That model has not been run, and there is no
+continuous batching yet; the kernels themselves are no longer the boundary --
+the CPU path is SIMD with int8 activations, and Metal and Vulkan GPU
+backends have been measured on real silicon (Section 10). One caveat governs expectations throughout (Section 9):
 on ordinary gigabit Ethernet, distribution buys capacity, meaning the model fits
 where it otherwise could not, but not speed. Competitive throughput additionally
 requires 10-gigabit-class fabric, a pinned hot set, and batched serving.
@@ -463,14 +468,20 @@ differentiator against single-box streaming is aggregate capacity.
 
 ## 10. Preliminary results
 
-These are early results, a case study plus live single-machine and localhost
-multi-node runs, not a throughput evaluation. The evidence and its boundaries:
+These are early results, not a full throughput evaluation, but they now span
+real machines and real links: single-machine runs, localhost multi-node runs, a
+two-machine wide-area run, and a three-machine swarm across two continents. The
+evidence and its boundaries:
 
 | Claim | Configuration | Evidence | Boundary |
 |---|---|---|---|
-| Engine correctness | DeepSeek-V2-Lite Q4_K_M; tinyllamas F32/Q4_0/Q8_0 | Coherent, expected completions on real weights (validates kernels, MLA, RoPE convention, K-quants, BPE, YaRN) | Not a factual-accuracy benchmark; single-sequence; scalar kernels |
+| Engine correctness | DeepSeek-V2-Lite Q4_K_M; tinyllamas F32/Q4_0/Q8_0 | Coherent, expected completions on real weights (validates kernels, MLA, RoPE convention, K-quants, BPE, YaRN) | Not a factual-accuracy benchmark; single-sequence |
+| CPU kernel performance | TinyLlama 1.1B Q4_K_M, 10-core M5 | 57.8 tok/s -- 53x the original scalar path (SIMD, 8 threads, int8 activations, vectorized attention); row-splitting bit-identical by test | One model size; one machine |
+| GPU backends | DeepSeek-Coder-V2-Lite Q4_K_M | Metal (Apple M5): 39.7-44.4 tok/s single-stream decode, ~1.8 command buffers/token. Vulkan (RTX 3060): ~32-34 tok/s end-to-end, ~70 marginal, every kernel oracle-pinned; the remaining gap to llama.cpp's 112 is localized to barrier drains (117 tok/s no-barrier ceiling proven) | Single-stream; two devices measured |
 | Expert-aligned sharding | Real 10.4 GB model | Round-trips to 1,664 expert shards plus 73 resident chunks; layout partition property-tested | Fully covered |
-| Partial-store inference | 33% store (573 of 1,737 shards), localhost, one peer, scalar | Token-identical to a full-copy run while fetching 641 experts (3.5 GB, about 29 ms/fetch, 0 failures); grew to 1,214 shards held | Not NIC throughput or failover under WAN-like RTT and loss |
+| Partial-store inference | 33% store (573 of 1,737 shards), localhost, one peer | Token-identical to a full-copy run while fetching 641 experts (3.5 GB, about 29 ms/fetch, 0 failures); grew to 1,214 shards held | Loopback link |
+| Wide-area partial store | Two machines (Mac <-> Hetzner), 25.8 ms RTT, 29 MB/s | A node holding 3.6% of shards produced token-identical output, fetching 1,063 experts across the WAN, each digest-verified; also surfaced a bulk-sync framing failure that only a real link exposes | Throughput is what Section 9's bandwidth table predicts -- WAN buys capacity, not speed |
+| Three-machine swarm | Origin (100%), GPU node (33%), NAT'd laptop (20%); two continents; served through the node RPC path | Expert-sharded serving with manifest-root verification on all three; wrong-network-id node refused for the full 45 s it kept dialing; RAG chunks gossiped in every direction including the NAT pull path; facts ingested only on the laptop answered correctly by the origin (28 -> 81 prompt tokens with retrieved context) where the same question minutes earlier hallucinated; origin OOM-killed mid-test and both joiners re-formed the network unaided | Three nodes; not adversarial; not a throughput evaluation |
 | Committee and repair behavior | Live multi-node runs | Observed: bootstrap, gossip discovery, committee formation and saturation, heartbeat death detection, eager repair, mesh fallback | Not adversarial availability |
 | Weight-integrity defenses | Live | A corrupted on-disk shard is caught on store-open, cleared, and re-fetched; malicious non-partition manifests rejected on parse | Fully covered |
 | Metering | Live, two full nodes and one light node | Transparent delegation with cost and balance; per-provider ledgers; deterministic `payment_required` on exhaustion; resume after credit | Trusted-operator only (Section 11) |
@@ -482,9 +493,9 @@ fetch-verify-persist loop and engine correctness, not as a factual-accuracy
 evaluation.
 
 **Measurement agenda (not yet done).** Tokens per second as a function of miss
-rate and NIC tier; repair time after killing a sole holder; the
-committee-saturation join sequence at scale; and end-to-end throughput once
-hardware-tailored kernels land.
+rate and NIC tier on a fast LAN fabric; repair time after killing a sole
+holder; the committee-saturation join sequence at scale; multi-stream serving
+under continuous batching.
 
 ---
 
@@ -493,10 +504,15 @@ hardware-tailored kernels land.
 Consolidated so a reader sees the full picture in one place.
 
 **Compute and coverage.**
-- Kernels are scalar (no SIMD or GPU), about 0.3 tokens/sec on a 15.7B model on one core.
 - Single-sequence only; no continuous batching.
-- GLM 5.2 itself has not been run; the deepseek2 path is the architectural proxy.
-- No wide-area or contended-network measurements exist.
+- GLM 5.2 itself has not been run: its `glm-dsa` attention variant (sparse
+  indexer, MTP head) is not implemented; deepseek2/glm4moe are the
+  architectural proxies. Split (multi-file) GGUF checkpoints are not yet
+  readable, which any frontier-scale download will be.
+- The Vulkan path is ~60-65% of llama.cpp on the same card; the remaining gap
+  is localized (barrier drains) but not yet closed.
+- Wide-area behavior is measured for correctness, not under contention or
+  churn at scale; only three simultaneous machines have been run.
 
 **Trust (v1 is operator-trusted).**
 - Manifest choice is trust-on-first-use; a hostile bootstrap can pin a poisoned root.
@@ -512,8 +528,8 @@ Consolidated so a reader sees the full picture in one place.
 - Prerequisites for real compensation: cryptographic client identity, payment-proof verification, signed usage receipts.
 
 **Operational.**
-- The distributed engine is exercised via `loom gguf run`, not yet the node's RPC path.
-- Persisted organic replicas have no disk cap or eviction yet, so a hot node's disk grows.
+- The RAG chunk store is memory-only; a crash or OOM discards every chunk
+  (persistence is queued).
 - ENR advertising and hardfork coordination are designed but unimplemented.
 
 ---
@@ -547,9 +563,10 @@ expert corpus once across a swarm, verify it cryptographically, and page it into
 node-local computation on demand. The consequences (soft failure, a compounding
 cache, and self-healing committee membership) follow from moving immutable weights
 rather than mutable activations. The implementation demonstrates the core loop
-end-to-end on real weights under a partial store, and is explicit about the
-boundary: today's result is correctness and integration on localhost with scalar
-kernels, and the pitch is capacity, not speed. Pooling ordinary machines lets a
+end-to-end on real weights under a partial store -- now across real machines
+and a wide-area link, with GPU-rate local decode -- and is explicit about the
+boundary: cross-node distribution is validated for correctness and capacity,
+not yet for throughput at scale. Pooling ordinary machines lets a
 frontier MoE model fit where it otherwise could not. Making it fast is a separate
 problem, bound by network and kernels, and the roadmap treats it as such.
 
@@ -678,6 +695,7 @@ the spec governs the p2p protocol and the roadmap governs status.
 | 2026-08-02 | **RAG storage and convergence, answered precisely**: (1) FAISS stores nothing compressed here -- the flat inner-product index holds raw f32 vectors by design (its PQ/SQ compressed families are unwired), and chunk *text* never enters FAISS at all. (2) Compression now exists at both layers where it pays: the wire already ran every RAG frame through the frame encoder's adaptive snappy (kept only when smaller); at-rest chunk text is now brotli-compressed when `libbrotlienc/dec` are present -- dlopen, the FAISS/Vulkan loader trade -- with raw storage as the fallback. At-rest format is purely local: hashes are of raw text and Push carries raw text, so mixed-library networks interoperate unchanged. (3) Chunk additions ARE a global topic: the Inv/Want/Push exchange runs against every known peer each gossip round plus transitive re-gossip -- and the inventory window now ROTATES when a store exceeds the 512-hash round cap, closing the hole where a rejoining peer could never learn chunks older than the newest window. Every hash is advertised within ceil(count/cap) rounds; a test pins the full-coverage property | Brotli over snappy for at-rest text is the right split: snappy stays the wire codec (speed, already adaptive), brotli's ratio wins on stored prose, and neither becomes a dependency -- both decline to raw cleanly. The rotation bug is worth its whitepaper line: "gossip to all peers" was true per-round from day one, but eventual convergence for late joiners needed the window to move |
 | 2026-08-02 | **Gossiped RAG chunks with FAISS-accelerated retrieval** (`--rag`): nodes keep a chunk store searched by cosine before every prompt reaches the engine (top-k prepended as context); new chunks -- ingested via `POST /v1/rag/chunks` or learned from peers -- reach the whole network through an Inv/Want/Push exchange piggybacked on the gossip round. FAISS rides behind dlopen (`libfaiss_c`, the Vulkan-loader trade: no build dep, no runtime requirement) with an exact-scan fallback that is the reference implementation and the CI-tested path. The load-bearing design choice: **only text travels**. One network serves one model (network_id), so every node recomputes the identical embedding -- mean-pooled token_embd rows, L2-normalized -- from the same text; vectors are never accepted from the wire | The two features lock together deliberately: network_id is what makes text-only RAG gossip sound, because embedding equality across nodes is exactly the same-model guarantee the membership gate enforces. Poisoning reduces to what it should be -- a peer can contribute bad *text*, visible and dedupable, never a bad vector behind good text. Caps bound every round (512-hash inventory, 32-chunk push, 8 KB chunks, 64 K store); eventual convergence across rounds. Embedder quality is the known v1 trade: mean-pooled input embeddings are crude, and swapping in a real embedding model later changes only `setEmbedder` |
 | 2026-08-02 | **network_id: chainId semantics for LLM networks** (wire proto v2): one loom network serves one model, and every Heartbeat/Announce now carries a u64 network identity. Peers on a different network are refused (`ERR wrong_network`) at the p2p surface and dropped at gossip merge, so a record from another LLM network can never enter the mesh table, however it arrived. `--network-id N` configures it; the default derives from the weight manifest's leading eight bytes, so nodes sharding the same model agree with zero configuration | The split of duties is deliberate and mirrors Ethereum: network_id gates *membership* (stable across hardforks when set explicitly), manifest_version keeps gating *content* (expert fetch already refused cross-version requests). The planned ENR record gains network_id alongside the manifest fields. SPEC.md updated as the governing document |
+| 2026-08-01 | **Results sections brought up to measured reality** (Abstract, Section 10, Section 11, Conclusion): the paper no longer describes scalar-kernel localhost validation. Recorded as evidence: 57.8 tok/s CPU (53x scalar), Metal 39.7-44.4 tok/s, Vulkan ~32-34 tok/s (RTX 3060, gap to llama.cpp localized), the two-machine WAN run (25.8 ms RTT, 3.6% store, token-identical, 1,063 digest-verified fetches), and the three-machine two-continent swarm (100/33/20% stores via node RPC, wrong-network rejection, RAG gossip including the NAT pull path, retrieval correcting a hallucination, unaided churn recovery after an origin OOM kill) | A whitepaper that understates its own evidence is as stale as one that overstates it; the limitations section now lists the real ones (no continuous batching, glm-dsa unimplemented, split GGUF unread, RAG store memory-only, three-node scale) instead of ones already fixed |
 | 2026-08-01 | **License: Apache 2.0 with a NOTICE file** | Chosen for the attribution requirement: every redistribution must retain the copyright notices and carry the NOTICE attribution text forward, which MIT does not provide; the explicit patent grant matters for an inference engine; and it stays compatible with the MIT-licensed ecosystem (GLM weights, llama.cpp, all deps). Visible in-product credit is deliberately not required -- badgeware-style clauses deter adoption |
 | 2026-08-01 | **The network registry carries default bootnodes, and joining the devnet is one command**: each named network entry may list bootnodes; `--network <name>` with no explicit `--bootstrap` and no local GGUF dials the registry default (printed as such), so `scripts/join-devnet.sh` reduces to install-if-missing plus `loom node --network devnet` with NAT-safe defaults (hold-fraction 0.2, RAG on, advertise unset). Explicit `--bootstrap` and origin mode (`--gguf`) always win over the registry default | A network whose id, model, and entry point all live in the binary makes "join the devnet" a zero-configuration act, which is what a PoC network needs to grow; keeping the override order (explicit flag > registry) preserves every existing workflow. Devnet's registry bootnode is the Hetzner box (REDACTED-IP:8771) |
 | 2026-08-01 | **Windows becomes a release target** (`x86_64-windows-gnu` cross-build, published as a zip and smoke-gated on a real Windows runner before publish; Docker images stay linux/amd64 + linux/arm64): five portability seams closed -- argv arrives as WTF-16 and is decoded through the std `Args` iterator; RSS reads peak working set; the store's read-only weight map uses `CreateFileMappingW`/`MapViewOfFile`; monotonic timing goes through a shared `nowMonoNs` (`QueryPerformanceCounter` on Windows, `clock_gettime` elsewhere); and both dlopen probes grow `LoadLibrary` branches (`vulkan-1.dll` here, `faiss_c.dll` in vector-index v0.1.1) | The port touched only OS seams the code had already isolated -- no engine, wire, or storage logic changed, which is the design working as intended. The pread fallback that covers an unmappable store now also covers nothing: Windows maps too. WSL2 remains the documented route for anyone wanting the Linux build |
