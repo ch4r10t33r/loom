@@ -1,0 +1,31 @@
+// Quantize an activation vector to q8_1-style blocks: per 32 values an int8
+// vector, its f32 scale d, and the integer sum (as f32) for the dmin term.
+// Output layout in one uint buffer: [q bytes 0..cols) [d f32 array] [s f32
+// array], the float arrays at word offsets from the push constants.
+#version 450
+layout(local_size_x = 64) in;
+layout(std430, binding = 0) readonly buffer X { float x[]; };
+layout(std430, binding = 1) writeonly buffer Q { uint q[]; };
+layout(push_constant) uniform PC { uint cols; uint d_off; uint s_off; } pc;
+
+void main() {
+    uint b = gl_GlobalInvocationID.x;
+    if (b * 32u >= pc.cols) return;
+    uint x0 = b * 32u;
+    float amax = 0.0;
+    for (uint i = 0u; i < 32u; i++) amax = max(amax, abs(x[x0 + i]));
+    float d = amax / 127.0;
+    float id = d > 0.0 ? 1.0 / d : 0.0;
+    int s = 0;
+    for (uint w = 0u; w < 8u; w++) {
+        uint packd = 0u;
+        for (uint k = 0u; k < 4u; k++) {
+            int qi = clamp(int(round(x[x0 + w * 4u + k] * id)), -127, 127);
+            s += qi;
+            packd |= uint(qi & 0xFF) << (8u * k);
+        }
+        q[b * 8u + w] = packd;
+    }
+    q[pc.d_off + b] = floatBitsToUint(d);
+    q[pc.s_off + b] = floatBitsToUint(float(s));
+}

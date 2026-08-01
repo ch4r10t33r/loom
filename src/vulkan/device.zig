@@ -17,6 +17,7 @@ const V = struct {
     vkEnumeratePhysicalDevices: *const fn (Handle, *u32, ?[*]Handle) callconv(.c) VkResult,
     vkGetPhysicalDeviceQueueFamilyProperties: *const fn (Handle, *u32, ?[*]QueueFamilyProperties) callconv(.c) void,
     vkGetPhysicalDeviceMemoryProperties: *const fn (Handle, *PhysicalDeviceMemoryProperties) callconv(.c) void,
+    vkGetPhysicalDeviceFeatures2: *const fn (Handle, *Features2) callconv(.c) void,
     vkCreateDevice: *const fn (Handle, *const DeviceCreateInfo, ?*anyopaque, *Handle) callconv(.c) VkResult,
     vkGetDeviceQueue: *const fn (Handle, u32, u32, *Handle) callconv(.c) void,
     vkCreateBuffer: *const fn (Handle, *const BufferCreateInfo, ?*anyopaque, *NDHandle) callconv(.c) VkResult,
@@ -79,6 +80,8 @@ const ApplicationInfo = extern struct { sType: u32 = 0, pNext: ?*anyopaque = nul
 const QueueFamilyProperties = extern struct { queueFlags: u32, queueCount: u32, timestampValidBits: u32, minImageTransferGranularity: [3]u32 };
 const PhysicalDeviceMemoryProperties = extern struct { memoryTypeCount: u32, memoryTypes: [32]extern struct { propertyFlags: u32, heapIndex: u32 }, memoryHeapCount: u32, memoryHeaps: [16]extern struct { size: u64, flags: u32 } };
 const DeviceQueueCreateInfo = extern struct { sType: u32 = 2, pNext: ?*anyopaque = null, flags: u32 = 0, queueFamilyIndex: u32, queueCount: u32 = 1, pQueuePriorities: *const f32 };
+const Features2 = extern struct { sType: u32 = 1000059000, pNext: ?*anyopaque = null, features: [55]u32 = @splat(0) }; // VkPhysicalDeviceFeatures body, unused
+const FeaturesIntDot = extern struct { sType: u32 = 1000280000, pNext: ?*anyopaque = null, shaderIntegerDotProduct: u32 = 0 };
 const Features8Bit = extern struct { sType: u32 = 1000177000, pNext: ?*anyopaque = null, storageBuffer8BitAccess: u32 = 1, uniformAndStorageBuffer8BitAccess: u32 = 0, storagePushConstant8: u32 = 0 };
 const FeaturesInt8 = extern struct { sType: u32 = 1000082000, pNext: ?*anyopaque = null, shaderFloat16: u32 = 1, shaderInt8: u32 = 1 };
 const DeviceCreateInfo = extern struct { sType: u32 = 3, pNext: ?*anyopaque = null, flags: u32 = 0, queueCreateInfoCount: u32 = 1, pQueueCreateInfos: *const DeviceQueueCreateInfo, enabledLayerCount: u32 = 0, ppEnabledLayerNames: ?*anyopaque = null, enabledExtensionCount: u32 = 0, ppEnabledExtensionNames: ?*const [*:0]const u8 = null, pEnabledFeatures: ?*anyopaque = null };
@@ -139,6 +142,7 @@ pub const Device = struct {
     // GPU durations -- the profiler Nsight cannot be for Vulkan compute on a
     // headless box. Totals aggregate per pipeline across submissions.
     prof: bool = false,
+    int_dot: bool = false, // VK_KHR_shader_integer_dot_product available
     query_pool: NDHandle = 0,
     qcount: u32 = 0,
     qpipes: [2048]NDHandle = undefined,
@@ -179,13 +183,22 @@ pub const Device = struct {
 
         // The q4_k kernel reads bytes, so 8-bit storage + int8 are required
         // features, chained; a driver without them fails device creation and
-        // the backend falls back to CPU cleanly.
+        // the backend falls back to CPU cleanly. Integer dot product is
+        // PROBED, not assumed: the int8-activation kernels are optional and
+        // llvmpipe must keep working without them.
+        var idp_probe = FeaturesIntDot{};
+        var f2 = Features2{ .pNext = &idp_probe };
+        v.vkGetPhysicalDeviceFeatures2(phys, &f2);
+        const has_idp = idp_probe.shaderIntegerDotProduct == 1;
         var f8 = Features8Bit{};
         var fi8 = FeaturesInt8{ .pNext = &f8 };
+        var fidp = FeaturesIntDot{ .shaderIntegerDotProduct = 1 };
+        if (has_idp) f8.pNext = &fidp;
         const prio: f32 = 1.0;
         const qci = DeviceQueueCreateInfo{ .queueFamilyIndex = family, .pQueuePriorities = &prio };
-        const ext: [1][*:0]const u8 = .{"VK_KHR_8bit_storage"};
-        var dci = DeviceCreateInfo{ .pNext = &fi8, .pQueueCreateInfos = &qci, .enabledExtensionCount = 1, .ppEnabledExtensionNames = @ptrCast(&ext) };
+        const ext1: [1][*:0]const u8 = .{"VK_KHR_8bit_storage"};
+        const ext2: [2][*:0]const u8 = .{ "VK_KHR_8bit_storage", "VK_KHR_shader_integer_dot_product" };
+        var dci = DeviceCreateInfo{ .pNext = &fi8, .pQueueCreateInfos = &qci, .enabledExtensionCount = if (has_idp) 2 else 1, .ppEnabledExtensionNames = if (has_idp) @ptrCast(&ext2) else @ptrCast(&ext1) };
         var dev: Handle = null;
         if (v.vkCreateDevice(phys, &dci, null, &dev) != VK_SUCCESS) return error.NoDevice;
         var queue: Handle = null;
@@ -213,6 +226,7 @@ pub const Device = struct {
         if (v.vkCreateDescriptorPool(dev, &dpci, null, &dpool) != VK_SUCCESS) return error.CreateFailed;
 
         var self = Device{ .instance = inst, .phys = phys, .dev = dev, .queue = queue, .family = family, .cmd_pool = pool, .desc_pool = dpool, .set_layout = slayout, .pipe_layout = playout, .mem_props = mp };
+        self.int_dot = has_idp;
         if (std.c.getenv("LOOM_VK_KERNEL_PROF") != null) {
             var qp: NDHandle = 0;
             var qpci = QueryPoolCreateInfo{ .queryCount = 2048 };
