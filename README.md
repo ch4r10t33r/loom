@@ -26,8 +26,10 @@ Install (macOS/Linux; detects your platform, verifies checksums, installs to
 curl -fsSL https://raw.githubusercontent.com/ch4r10t33r/loom/main/install.sh | sh
 ```
 
-Join the devnet (installs loom if missing, syncs its share of expert shards
-from peers — no model download — and serves an OpenAI API on `:8772`):
+Join the devnet (installs loom if missing, then starts a node that **downloads
+its share of the model's GGUF shards from peers to local disk** — about a
+fifth of the ~73 GB GLM-4.5-Air checkpoint by default — and serves an OpenAI
+API on `:8772`):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ch4r10t33r/loom/main/scripts/join-devnet.sh | sh
@@ -47,6 +49,23 @@ loom gguf run stories15M-q4_0.gguf --prompt "Once upon a time"
 
 A chat UI is compiled into the binary: run `loom node` and open
 `http://127.0.0.1:8555` ([details](docs/CHAT-UI.md)).
+
+## Requirements
+
+- **CPU**: any 64-bit x86-64 or arm64; the kernels are portable SIMD. A GPU
+  is optional and used automatically where present — Metal on Apple silicon,
+  Vulkan (`-Dgpu=vulkan` builds) on Linux/Windows.
+- **RAM**: 8 GB minimum, 16 GB comfortable. The expert-cache budget is set
+  with `--ram-gb` (default 4) and caps the weight cache, not the whole
+  process.
+- **Disk**: joining a network **downloads a shard of the model's GGUF file to
+  the local machine** (under the node's home directory) and serves it back to
+  peers. Space scales with `--hold-fraction`: your fraction of the routed
+  experts plus the resident chunks every node holds (~10% of the model). For
+  the devnet's ~73 GB GLM-4.5-Air at the default hold-fraction 0.2, budget
+  **~25 GB free**.
+- **Network**: any. A faster link only shortens cold-miss expert fetches and
+  the initial sync; peers behind NAT work (dial-out only).
 
 ## Build from source
 
@@ -102,15 +121,7 @@ defaults: [CLI reference](docs/CLI.md). Worked examples with real output:
 - [Repository layout & source map](docs/SOURCE-MAP.md)
 - [Roadmap](docs/ROADMAP.md) · [p2p spec](spec/SPEC.md) · [whitepaper](whitepaper/WHITEPAPER.md)
 
-## Status & honest gaps
+## License
 
-- **v0 (single-node expert streaming): done**, except token-exact validation
-  against a `transformers` oracle on real GLM-5.2 weights — that needs the
-  real converted weights (~370 GB). The synthetic model exercises every code
-  path; a real checkpoint drops in without engine changes.
-- **v1 (distributed weight sharing): first cuts working** — GGUF range
-  sharding, multi-peer boot sync, gossip discovery, eager churn repair,
-  network ids, RAG chunk gossip. Remaining: ENR integration, real gossipsub
-  transport, majority-hardfork coordination. See the
-  [roadmap](docs/ROADMAP.md).
-- **v2 (untrusted peers)** is design-only.
+[Apache 2.0](LICENSE). Redistributions must retain the copyright and
+attribution notices in [NOTICE](NOTICE).
