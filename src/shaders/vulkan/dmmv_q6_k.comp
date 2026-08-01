@@ -1,4 +1,7 @@
-// Q6_K matvec, four rows per workgroup, the matvecQ6K run layout.
+// Q6_K matvec over 224-byte-padded blocks: the on-disk 210-byte block
+// defeats aligned loads, so the upload pads each block to 224 and every
+// quant load becomes a direct word read. Offsets within a block are
+// unchanged; only the stride is. Was: Q6_K matvec, four rows per workgroup, the matvecQ6K run layout.
 // Value = d*sc*(q-32).
 #version 450
 #extension GL_KHR_shader_subgroup_arithmetic : require
@@ -22,7 +25,7 @@ uint loadU32(uint byte_off) {
 float sum4(vec4 v) { return v.x + v.y + v.z + v.w; }
 
 const uint QK_K = 256u;
-const uint BLK = 210u;
+const uint BLK = 224u; // 210-byte blocks, padded to word-aligned stride at upload
 
 vec4 q6v(uint qlw, uint qhw, uint k) {
     vec4 lo4 = (k < 2u) ? vec4(float(qlw & 15u), float((qlw >> 8u) & 15u), float((qlw >> 16u) & 15u), float((qlw >> 24u) & 15u))
@@ -59,7 +62,7 @@ void main() {
         uint k1 = b1 + b * BLK;
         uint k2 = b2 + b * BLK;
         uint k3 = b3 + b * BLK;
-        vec4 d = vec4(unpackHalf2x16(loadU32(k0 + 208u)).x, unpackHalf2x16(loadU32(k1 + 208u)).x, unpackHalf2x16(loadU32(k2 + 208u)).x, unpackHalf2x16(loadU32(k3 + 208u)).x);
+        vec4 d = vec4(unpackHalf2x16(w4[(k0 + 208u) >> 2u]).x, unpackHalf2x16(w4[(k1 + 208u) >> 2u]).x, unpackHalf2x16(w4[(k2 + 208u) >> 2u]).x, unpackHalf2x16(w4[(k3 + 208u) >> 2u]).x);
         int c0 = int(loadU32(k0 + soff));
         int c1 = int(loadU32(k1 + soff));
         int c2 = int(loadU32(k2 + soff));
@@ -73,10 +76,10 @@ void main() {
             vec4 xv = x4[xb4 + j];
             uint qo = qoff + 4u * j;
             uint ho = hoff + 4u * j;
-            vec4 v = vec4(dot(q6v(loadU32(k0 + qo), loadU32(k0 + ho), k), xv),
-                          dot(q6v(loadU32(k1 + qo), loadU32(k1 + ho), k), xv),
-                          dot(q6v(loadU32(k2 + qo), loadU32(k2 + ho), k), xv),
-                          dot(q6v(loadU32(k3 + qo), loadU32(k3 + ho), k), xv));
+            vec4 v = vec4(dot(q6v(w4[(k0 + qo) >> 2u], w4[(k0 + ho) >> 2u], k), xv),
+                          dot(q6v(w4[(k1 + qo) >> 2u], w4[(k1 + ho) >> 2u], k), xv),
+                          dot(q6v(w4[(k2 + qo) >> 2u], w4[(k2 + ho) >> 2u], k), xv),
+                          dot(q6v(w4[(k3 + qo) >> 2u], w4[(k3 + ho) >> 2u], k), xv));
             if (j < 4u) s0 += v; else s1 += v;
         }
         acc += d * (sc0 * s0 + sc1 * s1);
