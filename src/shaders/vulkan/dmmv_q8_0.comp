@@ -22,7 +22,7 @@ uint loadU32(uint byte_off) {
 float sum4(vec4 v) { return v.x + v.y + v.z + v.w; }
 
 const uint QK = 32u;
-const uint BLK = 34u;
+const uint BLK = 36u; // padded at upload: [32 quants][d half][2 pad], word-aligned
 
 vec4 sbytes(uint qw) {
     int q = int(qw);
@@ -50,16 +50,16 @@ void main() {
         uint k1 = b1 + b * BLK;
         uint k2 = b2 + b * BLK;
         uint k3 = b3 + b * BLK;
-        vec4 d = vec4(unpackHalf2x16(loadU32(k0)).x, unpackHalf2x16(loadU32(k1)).x, unpackHalf2x16(loadU32(k2)).x, unpackHalf2x16(loadU32(k3)).x);
+        vec4 d = vec4(unpackHalf2x16(w4[(k0 + 32u) >> 2u]).x, unpackHalf2x16(w4[(k1 + 32u) >> 2u]).x, unpackHalf2x16(w4[(k2 + 32u) >> 2u]).x, unpackHalf2x16(w4[(k3 + 32u) >> 2u]).x);
         uint xb4 = (x0 >> 2u) + b * 8u;
         vec4 s = vec4(0.0);
         for (uint j = 0u; j < 8u; j++) {
             vec4 xv = x4[xb4 + j];
-            uint off = 2u + 4u * j;
-            s.x += dot(sbytes(loadU32(k0 + off)), xv);
-            s.y += dot(sbytes(loadU32(k1 + off)), xv);
-            s.z += dot(sbytes(loadU32(k2 + off)), xv);
-            s.w += dot(sbytes(loadU32(k3 + off)), xv);
+            uint off = 4u * j;
+            s.x += dot(sbytes(w4[(k0 + off) >> 2u]), xv);
+            s.y += dot(sbytes(w4[(k1 + off) >> 2u]), xv);
+            s.z += dot(sbytes(w4[(k2 + off) >> 2u]), xv);
+            s.w += dot(sbytes(w4[(k3 + off) >> 2u]), xv);
         }
         acc += d * s;
     }
