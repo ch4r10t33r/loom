@@ -211,7 +211,7 @@ pub const Device = struct {
         const cpci = CommandPoolCreateInfo{ .queueFamilyIndex = family };
         if (v.vkCreateCommandPool(dev, &cpci, null, &pool) != VK_SUCCESS) return error.CreateFailed;
 
-        const binds = [_]DescriptorSetLayoutBinding{ .{ .binding = 0 }, .{ .binding = 1 }, .{ .binding = 2 }, .{ .binding = 3 } };
+        const binds = [_]DescriptorSetLayoutBinding{ .{ .binding = 0 }, .{ .binding = 1 }, .{ .binding = 2 }, .{ .binding = 3 }, .{ .binding = 4 } };
         var slci = DescriptorSetLayoutCreateInfo{ .bindingCount = binds.len, .pBindings = &binds };
         var slayout: NDHandle = 0;
         if (v.vkCreateDescriptorSetLayout(dev, &slci, null, &slayout) != VK_SUCCESS) return error.CreateFailed;
@@ -384,8 +384,8 @@ pub const Device = struct {
         var set: NDHandle = 0;
         var dsai = DescriptorSetAllocateInfo{ .descriptorPool = self.desc_pool, .pSetLayouts = &self.set_layout };
         if (v.vkAllocateDescriptorSets(self.dev, &dsai, @ptrCast(&set)) != VK_SUCCESS) return error.CreateFailed;
-        var infos: [4]DescriptorBufferInfo = undefined;
-        var writes: [4]WriteDescriptorSet = undefined;
+        var infos: [5]DescriptorBufferInfo = undefined;
+        var writes: [5]WriteDescriptorSet = undefined;
         for (bufs, 0..) |b, i| {
             infos[i] = .{ .buffer = b.handle, .range = b.len };
             writes[i] = .{ .dstSet = set, .dstBinding = @intCast(i), .pBufferInfo = &infos[i] };
