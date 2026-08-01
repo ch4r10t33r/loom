@@ -57,7 +57,7 @@ loom node [--model SPEC] [--rpc-addr A] [--rpc-port P]
           [--seed S] [--stats FILE] [--no-verify]
           [--gguf FILE | --bootstrap HOST:PORT]
           [--peers H:P,...] [--hold-fraction F] [--range-mb M]
-          [--advertise HOST:PORT] [--network-id N] [--r-target N]
+          [--advertise HOST:PORT] [--network-id N] [--rag] [--rag-k N] [--r-target N]
           [--free-quota TOKENS] [--admin-token TOK]
 ```
 
@@ -99,6 +99,8 @@ The startup banner tells you which one you got.
 | `--status-secs N` | `30` | Interval for the periodic console status line (peers, committee size, shards held, local-hit rate, uptime). Membership and holdings change without any request arriving, so an event-only log makes a churning node look idle. `0` disables it. |
 | `--openai-addr A` / `--openai-port P` | `<rpc-addr>` / `0` (**off**) | The OpenAI-compatible HTTP API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health`). Off until you set a port. Serves the same engine and the same ledger as the RPC; client identity comes from `Authorization: Bearer`. |
 | `--p2p-addr A` / `--p2p-port P` | `0.0.0.0` / `8771` | Where the P2P protocol listens: shard serving, gossip, heartbeats, and bootnode `JOIN`. |
+| `--rag` | off | Retrieval-augmented generation: keep a gossiped chunk store (FAISS-accelerated when `libfaiss_c` is present, exact scan otherwise) and prepend the closest chunks to every prompt. Ingest with `POST /v1/rag/chunks {"chunks":["..."]}`; chunks reach every peer through gossip. Needs the GGUF serve path (embeddings come from the model's own token embeddings). |
+| `--rag-k N` | 3 | Chunks retrieved per request when `--rag` is on. |
 | `--network-id N` | derived from the manifest | The LLM-network identity (Ethereum's chainId, for models). Peers on a different network are refused. The default derives from the weight manifest, so nodes sharding the same model agree automatically; set it explicitly to keep one network across model hardforks. |
 | `--advertise HOST:PORT` | `127.0.0.1:<p2p-port>` | The address this node tells peers to dial it on. **Set this whenever peers are on other machines** — the default only works on one box. Accepts an IP or a hostname (Compose service names and Kubernetes Service DNS both work). |
 

@@ -97,6 +97,43 @@ pub const GgufModel = union(enum) {
             inline else => |*m| m.generalName(),
         };
     }
+
+    pub fn embedDim(self: *const GgufModel) usize {
+        return switch (self.*) {
+            inline else => |*m| m.cfg.dim,
+        };
+    }
+
+    /// Mean-pooled token-embedding vector for `text`, L2-normalized into
+    /// `out` (embedDim floats). Every node on a network runs the same model,
+    /// so this is identical everywhere -- the property the RAG store's
+    /// text-only gossip relies on. Returns false for untokenizable text.
+    pub fn embedText(self: *const GgufModel, gpa: std.mem.Allocator, text: []const u8, out: []f32) bool {
+        switch (self.*) {
+            inline else => |*m| {
+                const toks = m.encodePrompt(gpa, text, false) catch return false;
+                defer gpa.free(toks);
+                if (toks.len == 0) return false;
+                @memset(out, 0);
+                const row = gpa.alloc(f32, m.cfg.dim) catch return false;
+                defer gpa.free(row);
+                var used: usize = 0;
+                for (toks) |t| {
+                    if (t >= m.cfg.vocab) continue;
+                    backend.dequantRow(m.token_embd.ty, row, m.token_embd.data, t, m.cfg.dim);
+                    for (out, row) |*o, v| o.* += v;
+                    used += 1;
+                }
+                if (used == 0) return false;
+                var norm: f32 = 0;
+                for (out) |v| norm += v * v;
+                if (norm == 0) return false;
+                const inv = 1.0 / @sqrt(norm);
+                for (out) |*o| o.* *= inv;
+                return true;
+            },
+        }
+    }
 };
 
 /// Distributed GGUF generator: the model plus its token-loop expert fetch
