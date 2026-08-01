@@ -30,6 +30,7 @@ pub const Ctx = struct {
     committee_id: u32 = wire.NO_COMMITTEE,
     network_id: u64 = 0,
     rag: ?*rag_store.Store = null,
+    rag_round: u64 = 0,
 };
 
 /// One gossip exchange with one peer: announce ourselves, merge their batch.
@@ -94,7 +95,8 @@ fn exchange(ctx: *Ctx, addr_str: []const u8) !void {
     if (ctx.rag) |st| {
         if (st.count() > 0) {
             var hashes: [wire.RAG_INV_MAX][32]u8 = undefined;
-            const n = st.recentHashes(hashes[0..]);
+            ctx.rag_round +%= 1;
+            const n = st.invWindow(ctx.rag_round, hashes[0..]);
             var inv = wire.RagHashes{ .hashes = hashes[0..n] };
             const ibody = try inv.encodeBody(gpa);
             defer gpa.free(ibody);

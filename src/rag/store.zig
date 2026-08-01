@@ -14,6 +14,7 @@
 const std = @import("std");
 const Io = std.Io;
 const faiss = @import("faiss.zig");
+const brotli = @import("brotli.zig");
 
 pub const MAX_CHUNKS: usize = 65536;
 pub const MAX_TEXT: usize = 8 * 1024;
@@ -29,7 +30,13 @@ pub fn hashText(text: []const u8) Hash {
 
 pub const Chunk = struct {
     hash: Hash,
+    /// Raw text, or brotli-compressed when the library is present and it
+    /// pays. At-rest format is local-only: the hash is of the RAW text and
+    /// gossip always sends raw (the frame encoder snappy-compresses the
+    /// wire); FAISS holds the flat f32 vectors either way.
     text: []u8,
+    raw_len: usize,
+    compressed: bool,
     vec: []f32, // L2-normalized, dim floats
 };
 
@@ -115,9 +122,16 @@ pub const Store = struct {
             self.gpa.free(vec);
             return false;
         }
-        const copy = self.gpa.dupe(u8, text) catch {
-            self.gpa.free(vec);
-            return false;
+        var compressed = false;
+        const copy = blk: {
+            if (brotli.compressAlloc(self.gpa, text)) |c| {
+                compressed = true;
+                break :blk c;
+            }
+            break :blk self.gpa.dupe(u8, text) catch {
+                self.gpa.free(vec);
+                return false;
+            };
         };
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
@@ -131,7 +145,7 @@ pub const Store = struct {
             self.gpa.free(copy);
             return false;
         };
-        self.chunks.append(self.gpa, .{ .hash = h, .text = copy, .vec = vec }) catch {
+        self.chunks.append(self.gpa, .{ .hash = h, .text = copy, .raw_len = text.len, .compressed = compressed, .vec = vec }) catch {
             _ = self.seen.remove(h);
             self.gpa.free(vec);
             self.gpa.free(copy);
@@ -148,23 +162,33 @@ pub const Store = struct {
         return self.seen.contains(h);
     }
 
-    /// Copy out up to `max` most-recent chunk hashes (gossip inventory).
-    pub fn recentHashes(self: *Store, out: []Hash) usize {
+    /// The gossip inventory for one round: newest-first, and when the store
+    /// exceeds one round's cap the window ROTATES with `round`, so every
+    /// chunk hash is advertised within ceil(count/cap) rounds -- without
+    /// this, a rejoining peer would never hear about anything older than
+    /// the newest `cap` chunks (global-topic convergence, eventually).
+    pub fn invWindow(self: *Store, round: u64, out: []Hash) usize {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         const items = self.chunks.items;
+        if (items.len == 0 or out.len == 0) return 0;
         const n = @min(out.len, items.len);
-        for (0..n) |i| out[i] = items[items.len - 1 - i].hash;
+        const start = if (items.len > out.len) (round * out.len) % items.len else 0;
+        for (0..n) |i| out[i] = items[items.len - 1 - ((start + i) % items.len)].hash;
         return n;
     }
 
-    /// Borrow a chunk's text by hash under the lock; caller copies before
-    /// releasing via the returned dupe.
+    fn chunkTextAlloc(gpa: std.mem.Allocator, c: Chunk) ?[]u8 {
+        if (!c.compressed) return gpa.dupe(u8, c.text) catch null;
+        return brotli.decompressAlloc(gpa, c.text, c.raw_len);
+    }
+
+    /// Copy a chunk's raw text by hash (decompressing at-rest storage).
     pub fn textByHashAlloc(self: *Store, gpa: std.mem.Allocator, h: Hash) ?[]u8 {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         for (self.chunks.items) |c| {
-            if (std.mem.eql(u8, &c.hash, &h)) return gpa.dupe(u8, c.text) catch null;
+            if (std.mem.eql(u8, &c.hash, &h)) return chunkTextAlloc(gpa, c);
         }
         return null;
     }
@@ -174,7 +198,7 @@ pub const Store = struct {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         if (idx >= self.chunks.items.len) return null;
-        return gpa.dupe(u8, self.chunks.items[idx].text) catch null;
+        return chunkTextAlloc(gpa, self.chunks.items[idx]);
     }
 
     /// Top-k cosine hits for a query embedding, best first. FAISS when
@@ -280,4 +304,48 @@ test "caps hold: empty and oversized chunks are refused" {
     defer gpa.free(big);
     @memset(big, 'x');
     try std.testing.expect(!st.add(big));
+}
+
+test "chunk text round-trips through at-rest storage (raw or brotli)" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var dim: usize = 32;
+    var st = Store.init(gpa, threaded.io());
+    st.setEmbedder(fixtureEmbedder(&dim));
+    defer st.deinit();
+    // Repetitive prose compresses when brotli is present; either way the
+    // retrieved text must equal the raw input.
+    const text = "the weaver wove and wove and wove and wove the same thread " ** 8;
+    try std.testing.expect(st.add(text));
+    const got = st.textByIndexAlloc(gpa, 0).?;
+    defer gpa.free(got);
+    try std.testing.expectEqualStrings(text, got);
+    const byh = st.textByHashAlloc(gpa, hashText(text)).?;
+    defer gpa.free(byh);
+    try std.testing.expectEqualStrings(text, byh);
+}
+
+test "the inventory window rotates so every hash is eventually advertised" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var dim: usize = 16;
+    var st = Store.init(gpa, threaded.io());
+    st.setEmbedder(fixtureEmbedder(&dim));
+    defer st.deinit();
+    var buf: [32]u8 = undefined;
+    for (0..7) |i| {
+        const t = std.fmt.bufPrint(&buf, "chunk number {d}", .{i}) catch unreachable;
+        try std.testing.expect(st.add(t));
+    }
+    // window of 3 over 7 chunks: three rounds must cover all seven hashes
+    var seen = std.AutoHashMapUnmanaged(Hash, void).empty;
+    defer seen.deinit(gpa);
+    var w: [3]Hash = undefined;
+    for (0..3) |round| {
+        const n = st.invWindow(round, &w);
+        for (w[0..n]) |h| try seen.put(gpa, h, {});
+    }
+    try std.testing.expectEqual(@as(usize, 7), seen.count());
 }

@@ -537,8 +537,16 @@ RagPush (0x22): count u16 (<=32), then count x { len u32 (<=8192),
 
 The exchange piggybacks on the gossip round: Announce/AnnounceBatch first,
 then Inv -> Want -> Push on the same stream. Receivers insert by recomputing
-the embedding locally; duplicates dedup by text hash. Caps bound a round;
-convergence is eventual across rounds.
+the embedding locally; duplicates dedup by text hash. Caps bound a round.
+When a store exceeds one round's inventory cap, the advertised window
+ROTATES round to round, so every hash is offered within ceil(count/cap)
+rounds -- the exchange with every known peer plus transitive re-gossip gives
+global-topic semantics with eventual convergence, including for peers that
+rejoin after long absence. Compression: the wire applies the frame encoder's
+adaptive snappy (kept only when smaller) to every RAG frame; at-rest chunk
+text may additionally be brotli-compressed locally (dlopen, optional) --
+a purely per-node choice invisible to the protocol, since hashes are of raw
+text and Push always carries raw text.
 
 **ExpertRequest, type 0x10.** Ask a remote peer (committee member first, then
 mesh) for one expert shard the requester does not hold.
