@@ -53,6 +53,12 @@ loom gguf run stories15M-q4_0.gguf --prompt "Once upon a time"
 A chat UI is compiled into the binary: run `loom node` and open
 `http://127.0.0.1:8555` ([details](docs/CHAT-UI.md)).
 
+Nodes can also share retrieval context. With `--rag`, a text chunk ingested
+on any node (`POST /v1/rag/chunks`) gossips to every peer on the network,
+and each node searches the shared store before generating, prepending what
+it finds to the prompt. Ingest a fact once, and the whole swarm answers
+with it.
+
 ## Requirements
 
 - **CPU**: any 64-bit x86-64 or arm64. The kernels are portable SIMD. A GPU
