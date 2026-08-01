@@ -64,6 +64,7 @@ pub const Ctx = struct {
     committee_id: u32 = 0xFFFF_FFFF,
     network_id: u64 = 0,
     rag: ?*rag_store.Store = null,
+    rag_round: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// In-flight expert requests being served (the heartbeat load hint).
     load: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     /// Our own advertised "host:port" (what we tell peers to dial us on).
@@ -330,6 +331,39 @@ fn handleFrame(ctx: *Ctx, raw: []const u8, wi: *Io.Writer) !void {
             const st = ctx.rag orelse return;
             var it = wire.RagPush.iterate(dec.body) catch return;
             while (it.next() catch null) |text| _ = st.add(text);
+        },
+        .rag_inv_req => {
+            const st = ctx.rag orelse return wi.print("ERR no_rag\n", .{});
+            var hashes: [wire.RAG_INV_MAX][32]u8 = undefined;
+            const round = ctx.rag_round.fetchAdd(1, .monotonic);
+            const n = st.invWindow(round, hashes[0..]);
+            var inv = wire.RagHashes{ .hashes = hashes[0..n] };
+            const body = try inv.encodeBody(ctx.gpa);
+            defer ctx.gpa.free(body);
+            const frame = try wire.encodeFrame(ctx.gpa, .rag_inv, body);
+            defer ctx.gpa.free(frame);
+            try wire.writeFrame(wi, frame);
+        },
+        .rag_want => {
+            // A dialer asking US for chunks it lacks (the pull direction; a
+            // NAT'd node can only ever dial out).
+            const st = ctx.rag orelse return;
+            const wanted = wire.RagHashes.parseBody(ctx.gpa, dec.body) catch return;
+            defer ctx.gpa.free(wanted);
+            var texts = std.ArrayList([]u8).empty;
+            defer {
+                for (texts.items) |t| ctx.gpa.free(t);
+                texts.deinit(ctx.gpa);
+            }
+            for (wanted) |h| {
+                if (texts.items.len >= wire.RAG_PUSH_MAX) break;
+                if (st.textByHashAlloc(ctx.gpa, h)) |t| try texts.append(ctx.gpa, t);
+            }
+            const body = try wire.RagPush.encodeBody(ctx.gpa, @ptrCast(texts.items));
+            defer ctx.gpa.free(body);
+            const frame = try wire.encodeFrame(ctx.gpa, .rag_push, body);
+            defer ctx.gpa.free(frame);
+            try wire.writeFrame(wi, frame);
         },
         .expert_request => {
             const req = wire.ExpertRequest.parseBody(dec.body) catch {
