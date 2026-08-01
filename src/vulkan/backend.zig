@@ -252,15 +252,56 @@ fn matvecMinBytes() usize {
 /// a word-aligned 224-byte stride, so the kernel's quant loads are direct
 /// word reads. Same pointer-keyed cache -- a tensor's type never changes,
 /// so a pointer is consistently padded or consistently raw.
-fn weightBufferQ6K(d: *vk.Device, data: []const u8) ?vk.Buffer {
+/// Original and padded block geometry per type; null when a type is served raw.
+fn padGeom(ty: ggml.Type) ?[2]usize {
+    return switch (ty) {
+        .q6_k => .{ 210, 224 },
+        .q5_0 => .{ 22, 24 },
+        .q8_0 => .{ 34, 36 },
+        else => null,
+    };
+}
+
+/// Byte length of the padded device copy for a span of original bytes.
+fn paddedLen(ty: ggml.Type, bytes: usize) usize {
+    const g = padGeom(ty) orelse return bytes;
+    return bytes / g[0] * g[1];
+}
+
+var repack_scratch: []u8 = &.{}; // grow-only; repack is startup-only work
+
+fn weightBufferPadded(d: *vk.Device, data: []const u8, ty: ggml.Type) ?vk.Buffer {
+    const g = padGeom(ty).?;
     const gop = wcache.getOrPut(std.heap.page_allocator, @intFromPtr(data.ptr)) catch return null;
     if (gop.found_existing and gop.value_ptr.len == data.len) return gop.value_ptr.buf;
-    const blocks = data.len / 210;
-    const padded = std.heap.page_allocator.alloc(u8, blocks * 224) catch return null;
-    defer std.heap.page_allocator.free(padded);
-    for (0..blocks) |b| {
-        @memcpy(padded[b * 224 ..][0..210], data[b * 210 ..][0..210]);
-        @memset(padded[b * 224 + 210 ..][0..14], 0);
+    const blocks = data.len / g[0];
+    if (repack_scratch.len < blocks * g[1]) {
+        if (repack_scratch.len > 0) std.heap.page_allocator.free(repack_scratch);
+        repack_scratch = std.heap.page_allocator.alloc(u8, blocks * g[1]) catch return null;
+    }
+    const padded = repack_scratch[0 .. blocks * g[1]];
+    // Fixed-size copies (the compiler unrolls them); padding bytes stay
+    // uninitialized -- no kernel reads them, and the buffer itself is
+    // allocated one word long for the tail-overread guard.
+    switch (ty) {
+        .q6_k => for (0..blocks) |b| {
+            const dst = padded[b * 224 ..];
+            @memcpy(dst[0..210], data[b * 210 ..][0..210]);
+        },
+        .q5_0 => for (0..blocks) |b| {
+            const src = data[b * 22 ..];
+            const dst = padded[b * 24 ..];
+            dst[0..16].* = src[6..22].*;
+            dst[16..20].* = src[2..6].*;
+            dst[20..22].* = src[0..2].*;
+        },
+        .q8_0 => for (0..blocks) |b| {
+            const src = data[b * 34 ..];
+            const dst = padded[b * 36 ..];
+            dst[0..32].* = src[2..34].*;
+            dst[32..34].* = src[0..2].*;
+        },
+        else => unreachable,
     }
     const buf = d.allocDevice(padded.len) catch {
         if (!gop.found_existing) _ = wcache.remove(@intFromPtr(data.ptr));
@@ -280,7 +321,7 @@ fn weightBufferQ6K(d: *vk.Device, data: []const u8) ?vk.Buffer {
 /// stores as q6_K, and the oracle could not see it because the test path
 /// padded correctly; the generation read garbage.
 fn wbufFor(d: *vk.Device, w: WeightRef) ?vk.Buffer {
-    return if (w.ty == .q6_k) weightBufferQ6K(d, w.data) else weightBuffer(d, w.data);
+    return if (padGeom(w.ty) != null) weightBufferPadded(d, w.data, w.ty) else weightBuffer(d, w.data);
 }
 
 /// The dmmv family (q4_k, q5_0, q8_0, q6_k, f32), one submission per call.
@@ -291,7 +332,7 @@ pub fn matvec(t: ggml.Type, out: []f32, data: []const u8, x: []const f32, rows: 
     if (!use_gpu_ops or data.len < matvecMinBytes()) return cpu.matvec(t, out, data, x, rows, cols);
     const d = &(dev orelse return cpu.matvec(t, out, data, x, rows, cols));
     const pipe = pipeFor(t, cols) orelse return cpu.matvec(t, out, data, x, rows, cols);
-    const wb = (if (t == .q6_k) weightBufferQ6K(d, data) else weightBuffer(d, data)) orelse return cpu.matvec(t, out, data, x, rows, cols);
+    const wb = (if (padGeom(t) != null) weightBufferPadded(d, data, t) else weightBuffer(d, data)) orelse return cpu.matvec(t, out, data, x, rows, cols);
     if (xbuf == null or xbuf.?.len < x.len * 4) xbuf = d.alloc(x.len * 4) catch return cpu.matvec(t, out, data, x, rows, cols);
     if (obuf == null or obuf.?.len < out.len * 4) obuf = d.alloc(out.len * 4) catch return cpu.matvec(t, out, data, x, rows, cols);
     @memcpy(xbuf.?.slice(f32)[0..x.len], x);
@@ -431,9 +472,9 @@ pub fn moeFfnBlockRouted(normed: []const f32, logits: []const f32, bias: ?[]cons
         .weights_scale = cfg.weights_scale,
     };
 
-    const d_gate = IdPush{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(gate_w.data.len / cfg.n_expert), .x_stride = 0 };
-    const d_up = IdPush{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(up_w.data.len / cfg.n_expert), .x_stride = 0 };
-    const d_down = IdPush{ .rows = @intCast(dim), .cols = @intCast(ffn), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(down_w.data.len / cfg.n_expert), .x_stride = @intCast(ffn) };
+    const d_gate = IdPush{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(paddedLen(gate_w.ty, gate_w.data.len / cfg.n_expert)), .x_stride = 0 };
+    const d_up = IdPush{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(paddedLen(up_w.ty, up_w.data.len / cfg.n_expert)), .x_stride = 0 };
+    const d_down = IdPush{ .rows = @intCast(dim), .cols = @intCast(ffn), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(paddedLen(down_w.ty, down_w.data.len / cfg.n_expert)), .x_stride = @intCast(ffn) };
     const n_sw = extern struct { n: u32 }{ .n = @intCast(cfg.n_used * ffn) };
     const n_red = extern struct { n: u32, dim: u32 }{ .n = @intCast(cfg.n_used), .dim = @intCast(dim) };
 
@@ -612,7 +653,7 @@ fn prepAttn(d: *vk.Device, li: usize, pos: usize, q_nope: []const f32, q_rope: [
     if (q_nope.len != n_heads * nope or q_rope.len != n_heads * w.rope) return null;
     const vp = idPipeFor(kv_b.ty, w.kvr) orelse return null;
     const vw = wbufFor(d, kv_b) orelse return null;
-    const row_bytes = kv_b.data.len / (n_heads * (nope + v_head_dim));
+    const row_bytes = paddedLen(kv_b.ty, kv_b.data.len / (n_heads * (nope + v_head_dim)));
     if (vids == null) {
         const b = d.alloc(64 * 4) catch return null;
         for (0..64) |k| b.slice(u32)[k] = @intCast(k);
@@ -742,9 +783,9 @@ pub fn mlaLayerTail(li: usize, pos: usize, x: []f32, q_nope: []const f32, q_rope
         .has_bias = if (router_bias != null) 1 else 0,
         .weights_scale = cfg.weights_scale,
     };
-    const d_gate = IdPush{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(gate_w.data.len / cfg.n_expert), .x_stride = 0 };
-    const d_up = IdPush{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(up_w.data.len / cfg.n_expert), .x_stride = 0 };
-    const d_down = IdPush{ .rows = @intCast(dim), .cols = @intCast(ffn), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(down_w.data.len / cfg.n_expert), .x_stride = @intCast(ffn) };
+    const d_gate = IdPush{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(paddedLen(gate_w.ty, gate_w.data.len / cfg.n_expert)), .x_stride = 0 };
+    const d_up = IdPush{ .rows = @intCast(ffn), .cols = @intCast(dim), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(paddedLen(up_w.ty, up_w.data.len / cfg.n_expert)), .x_stride = 0 };
+    const d_down = IdPush{ .rows = @intCast(dim), .cols = @intCast(ffn), .n_used = @intCast(cfg.n_used), .plane_stride = @intCast(paddedLen(down_w.ty, down_w.data.len / cfg.n_expert)), .x_stride = @intCast(ffn) };
     const n_sw = extern struct { n: u32 }{ .n = @intCast(cfg.n_used * ffn) };
     const n_red = extern struct { n: u32, dim: u32 }{ .n = @intCast(cfg.n_used), .dim = @intCast(dim) };
 
@@ -873,7 +914,7 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         p.kanw = weightBuffer(d, std.mem.sliceAsBytes(dd.kv_a_norm)) orelse return false;
         p.vp = idPipeFor(dd.kv_b.ty, fc.kvr) orelse return false;
         p.vw = wbufFor(d, dd.kv_b) orelse return false;
-        p.row_bytes = dd.kv_b.data.len / (fc.n_heads * (fc.nope + fc.v_head_dim));
+        p.row_bytes = paddedLen(dd.kv_b.ty, dd.kv_b.data.len / (fc.n_heads * (fc.nope + fc.v_head_dim)));
         p.pp = pipeFor(dd.attn_out.ty, fc.n_heads * fc.v_head_dim) orelse return false;
         p.pw = wbufFor(d, dd.attn_out) orelse return false;
         p.fnw = weightBuffer(d, std.mem.sliceAsBytes(dd.ffn_norm)) orelse return false;
@@ -1040,9 +1081,9 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
             d.barrier(c);
             d.record(c, pipes.route, &.{ lb, idb, gb }, std.mem.asBytes(&rpush), 1) catch return false;
             d.barrier(c);
-            const d_gate = IdPush{ .rows = @intCast(dd.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(dd.gate.data.len / fc.routed.n_expert), .x_stride = 0 };
-            const d_up = IdPush{ .rows = @intCast(dd.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(dd.up.data.len / fc.routed.n_expert), .x_stride = 0 };
-            const d_down = IdPush{ .rows = @intCast(dim), .cols = @intCast(dd.ffn), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(dd.down.data.len / fc.routed.n_expert), .x_stride = @intCast(dd.ffn) };
+            const d_gate = IdPush{ .rows = @intCast(dd.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(paddedLen(dd.gate.ty, dd.gate.data.len / fc.routed.n_expert)), .x_stride = 0 };
+            const d_up = IdPush{ .rows = @intCast(dd.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(paddedLen(dd.up.ty, dd.up.data.len / fc.routed.n_expert)), .x_stride = 0 };
+            const d_down = IdPush{ .rows = @intCast(dim), .cols = @intCast(dd.ffn), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(paddedLen(dd.down.ty, dd.down.data.len / fc.routed.n_expert)), .x_stride = @intCast(dd.ffn) };
             d.record(c, p.gp, &.{ p.gw, nb, s1, idb }, std.mem.asBytes(&d_gate), @intCast(fc.routed.n_used * ((dd.ffn + 3) / 4))) catch return false;
             d.record(c, p.up, &.{ p.uw, nb, s2, idb }, std.mem.asBytes(&d_up), @intCast(fc.routed.n_used * ((dd.ffn + 3) / 4))) catch return false;
             d.barrier(c);
