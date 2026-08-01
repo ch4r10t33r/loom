@@ -45,6 +45,10 @@ const wsum_wv_q4k_raw = @embedFile("../shaders/vulkan/wsum_wv_q4k.spv");
 const wsum_wv_q4k_spv: [wsum_wv_q4k_raw.len]u8 align(4) = wsum_wv_q4k_raw.*;
 const wsum_wv_q8_0_raw = @embedFile("../shaders/vulkan/wsum_wv_q8_0.spv");
 const wsum_wv_q8_0_spv: [wsum_wv_q8_0_raw.len]u8 align(4) = wsum_wv_q8_0_raw.*;
+const dmmv_q5_0_id_sw_raw = @embedFile("../shaders/vulkan/dmmv_q5_0_id_sw.spv");
+const dmmv_q5_0_id_sw_spv: [dmmv_q5_0_id_sw_raw.len]u8 align(4) = dmmv_q5_0_id_sw_raw.*;
+const dmmv_q8_0_id_sw_raw = @embedFile("../shaders/vulkan/dmmv_q8_0_id_sw.spv");
+const dmmv_q8_0_id_sw_spv: [dmmv_q8_0_id_sw_raw.len]u8 align(4) = dmmv_q8_0_id_sw_raw.*;
 const moe_route_raw = @embedFile("../shaders/vulkan/moe_route.spv");
 const moe_route_spv: [moe_route_raw.len]u8 align(4) = moe_route_raw.*;
 const swiglu_slots_raw = @embedFile("../shaders/vulkan/swiglu_slots.spv");
@@ -129,6 +133,8 @@ const Pipes = struct {
     quant: u64 = 0,
     q4_k_id_i8: u64 = 0,
     wsum_wv_q4k: u64 = 0,
+    q5_0_id_sw: u64 = 0,
+    q8_0_id_sw: u64 = 0,
     wsum_wv_q8_0: u64 = 0,
     route: u64 = 0,
     swiglu_slots: u64 = 0,
@@ -204,6 +210,8 @@ pub fn parallelBegin(n: usize) void {
         .add = d.pipeline(&add_vec_spv) catch return fail(),
         .rope = d.pipeline(&mla_rope_spv) catch return fail(),
         .wsum_wv_q4k = d.pipeline(&wsum_wv_q4k_spv) catch return fail(),
+        .q5_0_id_sw = d.pipeline(&dmmv_q5_0_id_sw_spv) catch return fail(),
+        .q8_0_id_sw = d.pipeline(&dmmv_q8_0_id_sw_spv) catch return fail(),
         .wsum_wv_q8_0 = d.pipeline(&wsum_wv_q8_0_spv) catch return fail(),
         .copy = d.pipeline(&copy_f32_spv) catch return fail(),
     };
@@ -657,6 +665,15 @@ const AbsorbPush = extern struct { n_heads: u32, nope: u32, kvr: u32, stride: u3
 const AttnPush = extern struct { n_heads: u32, kvr: u32, rope: u32, seq: u32, qr_stride: u32, qr_off: u32, c_base: u32, r_base: u32, scale: f32, nope: u32, wstride: u32, q_stride: u32, q_off: u32 };
 const WsumPush = extern struct { n_heads: u32, kvr: u32, seq: u32, c_base: u32 };
 const WsumWvPush = extern struct { n_heads: u32, kvr: u32, seq: u32, c_base: u32, nope: u32, stride: u32, vd: u32, row_bytes: u32 };
+
+fn downSwPipe(t: ggml.Type, cols: usize) ?u64 {
+    if (cols % 32 != 0) return null;
+    return switch (t) {
+        .q5_0 => pipes.q5_0_id_sw,
+        .q8_0 => pipes.q8_0_id_sw,
+        else => null,
+    };
+}
 
 fn wsumWvPipe(t: ggml.Type) ?u64 {
     return switch (t) {
@@ -1140,10 +1157,16 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
                 d.record(c, p.up, &.{ p.uw, nb, s2, idb }, std.mem.asBytes(&d_up), @intCast(fc.routed.n_used * ((dd.ffn + 3) / 4))) catch return false;
             }
             d.barrier(c);
-            const n_sw = extern struct { n: u32 }{ .n = @intCast(fc.routed.n_used * dd.ffn) };
-            d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_sw), @intCast((fc.routed.n_used * dd.ffn + 63) / 64)) catch return false;
-            d.barrier(c);
-            d.record(c, p.dp, &.{ p.dw, s1, s3, idb }, std.mem.asBytes(&d_down), @intCast(fc.routed.n_used * ((dim + 3) / 4))) catch return false;
+            if (downSwPipe(dd.down.ty, dd.ffn)) |dsw| {
+                // SwiGLU folds into the down read: one dispatch and one full
+                // drain fewer per layer.
+                d.record(c, dsw, &.{ p.dw, s1, s3, idb, s2 }, std.mem.asBytes(&d_down), @intCast(fc.routed.n_used * ((dim + 3) / 4))) catch return false;
+            } else {
+                const n_sw = extern struct { n: u32 }{ .n = @intCast(fc.routed.n_used * dd.ffn) };
+                d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_sw), @intCast((fc.routed.n_used * dd.ffn + 63) / 64)) catch return false;
+                d.barrier(c);
+                d.record(c, p.dp, &.{ p.dw, s1, s3, idb }, std.mem.asBytes(&d_down), @intCast(fc.routed.n_used * ((dim + 3) / 4))) catch return false;
+            }
             d.barrier(c);
             const n_red = extern struct { n: u32, dim: u32, accum: u32 }{ .n = @intCast(fc.routed.n_used), .dim = @intCast(dim), .accum = 1 };
             d.record(c, pipes.reduce_dev, &.{ xr, s3, gb }, std.mem.asBytes(&n_red), @intCast((dim + 63) / 64)) catch return false;
