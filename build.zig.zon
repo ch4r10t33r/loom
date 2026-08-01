@@ -8,6 +8,10 @@
             .url = "git+https://github.com/blockblaz/zig-snappy?ref=v0.0.5#050f529bc5fa11242140312ecf550c186f05af1e",
             .hash = "zig_snappy-0.0.5-bDFzXlh4AADPRkDi2swDMAf8shH39Fc1g5oYRAhFQfTt",
         },
+        .brotli = .{
+            .url = "https://github.com/google/brotli/archive/refs/tags/v1.1.0.tar.gz",
+            .hash = "N-V-__8AAF_gIQDX2wVzXI-r96NyCgKuDj9W_Gab-TU7Qzoi",
+        },
     },
     .paths = .{
         "build.zig",
