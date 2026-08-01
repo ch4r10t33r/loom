@@ -231,4 +231,4 @@ jobs:
             --notes-file /tmp/notes.md \
             --generate-notes \
             --verify-tag \
-            artifacts/*.tar.gz artifacts/SHA256SUMS
+            artifacts/*.tar.gz artifacts/*.zip artifacts/SHA256SUMS
