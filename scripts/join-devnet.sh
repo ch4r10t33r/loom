@@ -17,6 +17,9 @@
 #   LOOM_ADVERTISE  host:port peers can dial you on        (default unset:
 #                   fine behind NAT; set it if you are publicly reachable
 #                   so you can serve shards to others)
+#   LOOM_NO_METRICS set to 1 to disable the alpha telemetry report
+#                   (numeric operational stats only -- never prompts or
+#                   text; the full field list is in docs/ALPHA.md)
 set -eu
 
 if ! command -v loom >/dev/null 2>&1; then
@@ -27,6 +30,13 @@ fi
 ADV=""
 [ -n "${LOOM_ADVERTISE:-}" ] && ADV="--advertise ${LOOM_ADVERTISE}"
 
+METRICS="--report-metrics"
+if [ "${LOOM_NO_METRICS:-}" = "1" ]; then
+    METRICS=""
+else
+    echo "alpha metrics: on (numeric stats only; opt out with LOOM_NO_METRICS=1; docs/ALPHA.md)"
+fi
+
 echo "joining devnet (GLM-4.5-Air, network id 1337)..."
 exec loom node \
     --network devnet \
@@ -36,4 +46,5 @@ exec loom node \
     --rpc-port "${LOOM_RPC_PORT:-8770}" \
     --openai-port "${LOOM_API_PORT:-8772}" \
     --rag \
+    $METRICS \
     $ADV

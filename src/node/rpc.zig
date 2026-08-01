@@ -19,6 +19,8 @@ const stats = @import("../core/stats.zig");
 const meter_mod = @import("meter.zig");
 
 pub const Ctx = struct {
+    /// Opt-in alpha telemetry aggregate (numeric only; docs/ALPHA.md).
+    alpha_metrics: ?*@import("alpha.zig").Metrics = null,
     gpa: std.mem.Allocator,
     io: Io,
     gen: *generator.Generator,
@@ -214,6 +216,7 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
         if (i != 0) try wi.print(",", .{});
         try wi.print("{d}", .{tok});
     }
+    if (ctx.alpha_metrics) |am| am.recordGen(tok_s, hit_rate);
     try wi.print("],\"tok_per_s\":{d:.2},\"hit_rate\":{d:.4}", .{ tok_s, hit_rate });
     if (ctx.meter) |m| {
         // cost = prompt tokens processed + tokens generated; the rest of the

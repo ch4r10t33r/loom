@@ -363,7 +363,47 @@ fn defaultRamGb() f64 {
     return std.math.clamp(gb / 4.0, 0.5, 8.0);
 }
 
+const NODE_FLAGS = [_][]const u8{
+    "--model",       "--rpc-addr",   "--rpc-port",     "--openai-addr",  "--openai-port",
+    "--p2p-addr",    "--p2p-port",   "--ram-gb",       "--pin-gb",       "--seed",
+    "--stats",       "--no-verify",  "--gguf",         "--bootstrap",    "--hold-fraction",
+    "--range-mb",    "--peers",      "--advertise",    "--network-id",   "--network",
+    "--rag",         "--rag-k",      "--r-target",     "--free-quota",   "--admin-token",
+    "--ctx",         "--ui-addr",    "--ui-port",      "--status-secs",  "--threads",
+    "--mmap-weights", "--gpu-ops",   "--no-gpu-layers", "--batch",       "--chat-format",
+    "--report-metrics", "--alpha-ingest",
+};
+
+/// A flag-shaped argument this command does not know is an error, not a
+/// no-op: `loom node --help` over ssh once started a stray synthetic node
+/// that shared the bootnode's port (issues #179/#180).
+fn checkNodeFlags(out: *Io.Writer, args: [][]const u8) !bool {
+    for (args) |a| {
+        if (std.mem.eql(u8, a, "--help") or std.mem.eql(u8, a, "-h")) {
+            try out.print("usage: loom node [flags]\n\nflags:\n", .{});
+            for (NODE_FLAGS) |f| try out.print("  {s}\n", .{f});
+            try out.print("\nEvery flag, with defaults and when to change it: docs/CLI.md\n", .{});
+            return false;
+        }
+    }
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        const a = args[i];
+        if (!std.mem.startsWith(u8, a, "-")) continue;
+        var known = false;
+        for (NODE_FLAGS) |f| {
+            if (std.mem.eql(u8, a, f)) known = true;
+        }
+        if (!known) {
+            try out.print("node: unknown flag {s} (try --help, or docs/CLI.md)\n", .{a});
+            return false;
+        }
+    }
+    return true;
+}
+
 fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, env: *std.process.Environ.Map) !void {
+    if (!try checkNodeFlags(out, args)) return;
     const model_spec = flagStr(args, "--model") orelse env.get("MODEL") orelse "tiny";
     const rpc_addr = flagStr(args, "--rpc-addr") orelse "127.0.0.1";
     const rpc_port = try flagU16(args, "--rpc-port", 8770);
@@ -429,6 +469,8 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .no_gpu_layers = hasFlag(args, "--no-gpu-layers"),
         .prefill_batch = try flagUsize(args, "--batch", 0),
         .chat_format = flagStr(args, "--chat-format"),
+        .report_metrics = hasFlag(args, "--report-metrics"),
+        .alpha_ingest = flagStr(args, "--alpha-ingest"),
     });
 }
 

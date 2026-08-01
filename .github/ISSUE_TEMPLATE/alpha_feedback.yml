@@ -1,0 +1,26 @@
+name: Alpha feedback
+description: Experience notes from the devnet alpha
+labels: [alpha]
+body:
+  - type: input
+    id: setup
+    attributes:
+      label: Your setup
+      placeholder: "M2 MacBook Air 16 GB, 100 Mbit home fibre, hold 0.2"
+    validations:
+      required: true
+  - type: textarea
+    id: numbers
+    attributes:
+      label: Numbers you saw
+      description: Sync time, tok/s, hit rate from the status line — whatever you have.
+  - type: textarea
+    id: good
+    attributes:
+      label: What worked
+  - type: textarea
+    id: bad
+    attributes:
+      label: What was confusing or broken
+    validations:
+      required: true

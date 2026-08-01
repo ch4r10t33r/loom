@@ -1,0 +1,32 @@
+name: Bug report
+description: Something broke
+labels: [bug]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: loom version
+      description: Paste the first line of `loom version`
+      placeholder: loom 0.15.0 (abc1234)
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: Platform
+      placeholder: macOS 15 / Apple M2, Ubuntu 24.04 / x86-64, Windows 11
+    validations:
+      required: true
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you ran, what you expected, what you got.
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Node output
+      description: The last ~20 lines of node output (it contains no secrets).
+      render: text
