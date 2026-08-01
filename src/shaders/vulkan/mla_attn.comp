@@ -1,35 +1,47 @@
-// Every head's MLA attention scores and softmax over the compressed cache --
-// the port of mla_attn_head in mla_attn.metal. One workgroup per head;
-// probabilities out, the weighted sum runs as its own kernel. The q buffer
-// is [n_heads][nope] gathered q_nope (read by the absorb kernel) followed at
-// qr_off by [n_heads][rope] gathered q_rope; the caches carry no head stride
-// (one compressed row per position) and this layer's rows start at c_base /
-// r_base.
+// Every head's MLA attention -- absorption, scores, softmax -- in ONE
+// kernel. The absorb stage (q_abs = W_k^T q_nope) lands in shared memory:
+// its consumers are exactly this workgroup, so a separate dispatch and a
+// full-pipeline barrier bought nothing but ~15 us of drain per layer. One
+// workgroup per head; probabilities out; the weighted sum stays its own
+// kernel. W_k is the full dequantized kv_b (f32); the kernel strides past
+// the W_v rows. The c and k_rope caches share one buffer, rows addressed by
+// push-constant offsets.
 #version 450
 layout(local_size_x = 64) in;
-layout(std430, binding = 0) readonly buffer QA { vec4 q_abs4[]; }; // [n_heads][kvr]
-layout(std430, binding = 1) readonly buffer Q { vec4 q4[]; };      // q_rope at qr_off
-layout(std430, binding = 2) readonly buffer C { vec4 c4[]; };      // every offset here is 16-byte aligned
-layout(std430, binding = 3) buffer P { float probs[]; };           // [n_heads][seq]; r_cache appended at rk_off
-layout(push_constant) uniform PC { uint n_heads; uint kvr; uint rope; uint seq; uint qr_stride; uint qr_off; uint c_base; uint r_base; float scale; } pc;
+layout(std430, binding = 0) readonly buffer W { float wk[]; };
+layout(std430, binding = 1) readonly buffer Q { vec4 q4[]; }; // nope at q_off + h*q_stride, rope at qr_off + h*qr_stride (all /4-aligned)
+layout(std430, binding = 2) readonly buffer C { vec4 c4[]; };
+layout(std430, binding = 3) buffer P { float probs[]; };
+layout(push_constant) uniform PC { uint n_heads; uint kvr; uint rope; uint seq; uint qr_stride; uint qr_off; uint c_base; uint r_base; float scale; uint nope; uint wstride; uint q_stride; uint q_off; } pc;
 
-// Scores live in shared memory, so the context this serves is bounded by it:
-// 4096 floats = 16 KB. The caller checks and declines rather than truncating.
 shared float scores[4096];
 shared float red[64];
+shared vec4 qa_sh[128]; // q_abs, kvr <= 512 floats -- the caller declines above
 
 void main() {
     uint h = gl_WorkGroupID.x;
     if (h >= pc.n_heads) return;
     uint tid = gl_LocalInvocationID.x;
-    uint qa4 = (h * pc.kvr) >> 2u;
-    uint qr4 = (pc.qr_off + h * pc.qr_stride) >> 2u;
 
+    // ---- absorb: q_abs[i] = sum_r q_nope[r] * W_k[r][i], threads own i ----
+    uint wh = h * pc.wstride * pc.kvr;
+    uint qn4 = (pc.q_off + h * pc.q_stride) >> 2u;
+    for (uint i = tid; i < pc.kvr; i += 64u) {
+        float acc = 0.0;
+        for (uint r = 0u; r < pc.nope; r += 4u) {
+            vec4 qv = q4[qn4 + (r >> 2u)];
+            acc += qv.x * wk[wh + r * pc.kvr + i] + qv.y * wk[wh + (r + 1u) * pc.kvr + i] + qv.z * wk[wh + (r + 2u) * pc.kvr + i] + qv.w * wk[wh + (r + 3u) * pc.kvr + i];
+        }
+        qa_sh[i >> 2u][i & 3u] = acc;
+    }
+    barrier();
+
+    uint qr4 = (pc.qr_off + h * pc.qr_stride) >> 2u;
     for (uint t = tid; t < pc.seq; t += 64u) {
         uint ct4 = (pc.c_base + t * pc.kvr) >> 2u;
         uint rt4 = (pc.r_base + t * pc.rope) >> 2u;
         vec4 sv = vec4(0.0);
-        for (uint i = 0u; i < pc.kvr >> 2u; i++) sv += q_abs4[qa4 + i] * c4[ct4 + i];
+        for (uint i = 0u; i < pc.kvr >> 2u; i++) sv += qa_sh[i] * c4[ct4 + i];
         for (uint i = 0u; i < pc.rope >> 2u; i++) sv += q4[qr4 + i] * c4[rt4 + i];
         scores[t] = (sv.x + sv.y + sv.z + sv.w) * pc.scale;
     }
