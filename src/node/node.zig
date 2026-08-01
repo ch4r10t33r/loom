@@ -492,14 +492,6 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         }
     }
 
-    // The LLM-network identity every peer must share (chainId semantics).
-    // Auto derives from the manifest so two nodes serving the same sharded
-    // model agree without configuration; an explicit --network-id keeps one
-    // network across model hardforks.
-    const network_id: u64 = opts.network_id orelse
-        (if (store) |*st| wire.networkIdFromManifest(st.manifest.version) else 0);
-    try out.print("  network    id {d}\n", .{network_id});
-
     // RAG chunk store (text + locally computed embeddings); created before
     // the p2p contexts that carry its pointer, embedder bound later.
     var rag: ?rag_store.Store = if (opts.rag) rag_store.Store.init(gpa, io) else null;
@@ -650,6 +642,16 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     }
     try out.print("  serving... (Ctrl-C to stop)\n", .{});
     try out.flush();
+
+    // The LLM-network identity every peer must share (chainId semantics).
+    // Auto derives from the manifest so two nodes serving the same sharded
+    // model agree without configuration; an explicit --network-id keeps one
+    // network across model hardforks. Computed HERE, after the store is
+    // final -- the first version ran before any store existed and every
+    // node silently derived id 0, which the three-machine test caught.
+    const network_id: u64 = opts.network_id orelse
+        (if (store) |*st| wire.networkIdFromManifest(st.manifest.version) else 0);
+    try out.print("  network    id {d}\n", .{network_id});
 
     var p2p_ctx = p2p.Ctx{
         .gpa = gpa,
