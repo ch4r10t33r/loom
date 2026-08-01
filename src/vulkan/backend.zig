@@ -37,6 +37,10 @@ const dmmv_q8_0_id_raw = @embedFile("../shaders/vulkan/dmmv_q8_0_id.spv");
 const dmmv_q8_0_id_spv: [dmmv_q8_0_id_raw.len]u8 align(4) = dmmv_q8_0_id_raw.*;
 const dmmv_q4k_id_f16_raw = @embedFile("../shaders/vulkan/dmmv_q4k_id_f16.spv");
 const dmmv_q4k_id_f16_spv: [dmmv_q4k_id_f16_raw.len]u8 align(4) = dmmv_q4k_id_f16_raw.*;
+const quant_act_raw = @embedFile("../shaders/vulkan/quant_act.spv");
+const quant_act_spv: [quant_act_raw.len]u8 align(4) = quant_act_raw.*;
+const dmmv_q4k_id_i8_raw = @embedFile("../shaders/vulkan/dmmv_q4k_id_i8.spv");
+const dmmv_q4k_id_i8_spv: [dmmv_q4k_id_i8_raw.len]u8 align(4) = dmmv_q4k_id_i8_raw.*;
 const moe_route_raw = @embedFile("../shaders/vulkan/moe_route.spv");
 const moe_route_spv: [moe_route_raw.len]u8 align(4) = moe_route_raw.*;
 const swiglu_slots_raw = @embedFile("../shaders/vulkan/swiglu_slots.spv");
@@ -118,6 +122,8 @@ const Pipes = struct {
     q5_0_id: u64 = 0,
     q8_0_id: u64 = 0,
     q4_k_id_f16: u64 = 0,
+    quant: u64 = 0,
+    q4_k_id_i8: u64 = 0,
     route: u64 = 0,
     swiglu_slots: u64 = 0,
     reduce_dev: u64 = 0,
@@ -166,6 +172,12 @@ pub fn parallelBegin(n: usize) void {
     // All pipelines or none: a partial set would make one quantization
     // silently slower or, worse, mask a broken kernel behind its fallback.
     const d = &dev.?;
+    // The integer-dot pair is OPTIONAL: capability-probed, created outside
+    // the all-or-nothing block, zero when unavailable (llvmpipe stays f32).
+    defer if (dev != null and dev.?.int_dot) {
+        pipes.quant = dev.?.pipeline(&quant_act_spv) catch 0;
+        pipes.q4_k_id_i8 = dev.?.pipeline(&dmmv_q4k_id_i8_spv) catch 0;
+    };
     pipes = .{
         .q4_k = d.pipeline(&dmmv_q4k_spv) catch return fail(),
         .q5_0 = d.pipeline(&dmmv_q5_0_spv) catch return fail(),
@@ -191,6 +203,12 @@ pub fn parallelBegin(n: usize) void {
 
 fn fail() void {
     dev = null;
+    // The integer-dot pair is OPTIONAL: capability-probed, created outside
+    // the all-or-nothing block, zero when unavailable (llvmpipe stays f32).
+    defer if (dev != null and dev.?.int_dot) {
+        pipes.quant = dev.?.pipeline(&quant_act_spv) catch 0;
+        pipes.q4_k_id_i8 = dev.?.pipeline(&dmmv_q4k_id_i8_spv) catch 0;
+    };
     pipes = .{};
 }
 
@@ -843,6 +861,17 @@ fn pipeName(h: u64) []const u8 {
     return "?";
 }
 
+var xqbuf: ?vk.Buffer = null; // quantized activations: [q bytes][d f32][s f32]
+var int8_env: ?bool = null;
+
+/// LOOM_VK_INT8=1 opts the gate/up expert matvecs into integer-quantized
+/// activations (the CPU path's standing int8 trade, on the GPU). Requires
+/// the integer-dot capability; experimental until its oracle lands.
+fn int8On() bool {
+    if (int8_env == null) int8_env = std.c.getenv("LOOM_VK_INT8") != null;
+    return int8_env.?;
+}
+
 var qfull: ?vk.Buffer = null; // [n_heads][kd] straight from the q projection
 var kva_buf: ?vk.Buffer = null; // kvr + rope, the kv_a projection
 
@@ -1075,16 +1104,32 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
             ph[2] += nowf() - t0;
             c = d.beginCmd() catch return false;
         }
+        const use_i8 = int8On() and pipes.q4_k_id_i8 != 0 and pipes.quant != 0 and dd.is_moe and dd.gate.ty == .q4_k and dd.up.ty == .q4_k and dim % 128 == 0;
         if (dd.is_moe) {
             d.record(c, p.rp, &.{ p.rw, nb, lb }, std.mem.asBytes(&d_router), @intCast((fc.routed.n_expert + 3) / 4)) catch return false;
+            if (use_i8) {
+                // Quantize the normed activations alongside the router read
+                // -- disjoint outputs, one barrier covers both.
+                const xq = ensureDev(&xqbuf, d, dim + (dim / 32) * 8 + 4) orelse return false;
+                const qpush = extern struct { cols: u32, d_off: u32, s_off: u32 }{ .cols = @intCast(dim), .d_off = @intCast(dim / 4), .s_off = @intCast(dim / 4 + dim / 32) };
+                d.record(c, pipes.quant, &.{ nb, xq }, std.mem.asBytes(&qpush), @intCast((dim / 32 + 63) / 64)) catch return false;
+            }
             d.barrier(c);
             d.record(c, pipes.route, &.{ lb, idb, gb }, std.mem.asBytes(&rpush), 1) catch return false;
             d.barrier(c);
             const d_gate = IdPush{ .rows = @intCast(dd.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(paddedLen(dd.gate.ty, dd.gate.data.len / fc.routed.n_expert)), .x_stride = 0 };
             const d_up = IdPush{ .rows = @intCast(dd.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(paddedLen(dd.up.ty, dd.up.data.len / fc.routed.n_expert)), .x_stride = 0 };
             const d_down = IdPush{ .rows = @intCast(dim), .cols = @intCast(dd.ffn), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(paddedLen(dd.down.ty, dd.down.data.len / fc.routed.n_expert)), .x_stride = @intCast(dd.ffn) };
-            d.record(c, p.gp, &.{ p.gw, nb, s1, idb }, std.mem.asBytes(&d_gate), @intCast(fc.routed.n_used * ((dd.ffn + 3) / 4))) catch return false;
-            d.record(c, p.up, &.{ p.uw, nb, s2, idb }, std.mem.asBytes(&d_up), @intCast(fc.routed.n_used * ((dd.ffn + 3) / 4))) catch return false;
+            if (use_i8) {
+                const I8Push = extern struct { rows: u32, cols: u32, n_used: u32, plane_stride: u32, x_stride: u32, base: u32, d_off: u32, s_off: u32 };
+                const gi8 = I8Push{ .rows = @intCast(dd.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(dd.gate.data.len / fc.routed.n_expert), .x_stride = 0, .base = 0, .d_off = @intCast(dim / 4), .s_off = @intCast(dim / 4 + dim / 32) };
+                const ui8 = I8Push{ .rows = @intCast(dd.ffn), .cols = @intCast(dim), .n_used = @intCast(fc.routed.n_used), .plane_stride = @intCast(dd.up.data.len / fc.routed.n_expert), .x_stride = 0, .base = 0, .d_off = @intCast(dim / 4), .s_off = @intCast(dim / 4 + dim / 32) };
+                d.record(c, pipes.q4_k_id_i8, &.{ p.gw, xqbuf.?, s1, idb }, std.mem.asBytes(&gi8), @intCast(fc.routed.n_used * ((dd.ffn + 3) / 4))) catch return false;
+                d.record(c, pipes.q4_k_id_i8, &.{ p.uw, xqbuf.?, s2, idb }, std.mem.asBytes(&ui8), @intCast(fc.routed.n_used * ((dd.ffn + 3) / 4))) catch return false;
+            } else {
+                d.record(c, p.gp, &.{ p.gw, nb, s1, idb }, std.mem.asBytes(&d_gate), @intCast(fc.routed.n_used * ((dd.ffn + 3) / 4))) catch return false;
+                d.record(c, p.up, &.{ p.uw, nb, s2, idb }, std.mem.asBytes(&d_up), @intCast(fc.routed.n_used * ((dd.ffn + 3) / 4))) catch return false;
+            }
             d.barrier(c);
             const n_sw = extern struct { n: u32 }{ .n = @intCast(fc.routed.n_used * dd.ffn) };
             d.record(c, pipes.swiglu_slots, &.{ s1, s2 }, std.mem.asBytes(&n_sw), @intCast((fc.routed.n_used * dd.ffn + 63) / 64)) catch return false;
