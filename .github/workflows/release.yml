@@ -97,7 +97,7 @@ jobs:
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then VER="${GITHUB_REF_NAME}"; else VER="dev-${GITHUB_SHA::7}"; fi
           NAME="loom-${VER}-${{ matrix.asset }}"
           mkdir -p "dist/${NAME}"
-          cp README.md "dist/${NAME}/"
+          cp README.md LICENSE NOTICE "dist/${NAME}/"
           # Windows gets a zip because that is what the platform unpacks
           # natively; everything else keeps the tarball.
           if [ "${{ matrix.windows }}" = "true" ]; then
