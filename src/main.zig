@@ -120,7 +120,8 @@ fn usage(out: *Io.Writer) !void {
         \\            [--seed S] [--stats FILE] [--no-verify]
         \\            [--gguf FILE | --bootstrap HOST:PORT]
         \\            [--peers H:P,H:P,...] [--hold-fraction F] [--range-mb M]
-        \\            [--advertise HOST:PORT] [--network-id N] [--rag] [--rag-k N] [--r-target N] [--free-quota TOKENS] [--admin-token TOK]
+        \\            [--advertise HOST:PORT] [--network devnet|testnet|mainnet] [--network-id N]
+        \\            [--rag] [--rag-k N] [--r-target N] [--free-quota TOKENS] [--admin-token TOK]
         \\            [--ui-addr A] [--ui-port P] [--status-secs N] [--threads N] [--batch N]
         \\  loom light [--full-nodes H:P[,...]] [--openai-port P --openai-full-nodes H:P[,...]]
         \\             [--rpc-addr A] [--rpc-port P] [--openai-addr A] [--client-id ID]
@@ -403,6 +404,7 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .peers = flagStr(args, "--peers"),
         .advertise = flagStr(args, "--advertise"),
         .network_id = if (flagStr(args, "--network-id")) |v| (std.fmt.parseInt(u64, v, 10) catch null) else null,
+        .network_name = flagStr(args, "--network"),
         .rag = hasFlag(args, "--rag"),
         .rag_k = try flagUsize(args, "--rag-k", 3),
         .r_target = @intCast(try flagU64(args, "--r-target", 2)),

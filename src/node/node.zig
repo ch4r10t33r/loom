@@ -14,6 +14,7 @@ const openai = @import("openai.zig");
 const backend = @import("../compute/backend.zig");
 const generator = @import("generator.zig");
 const rag_store = @import("../rag/store.zig");
+const networks = @import("../p2p/networks.zig");
 const deepseek = @import("../gguf/deepseek.zig");
 const llama = @import("../gguf/llama.zig");
 const gguf_mod = @import("../gguf/gguf.zig");
@@ -66,6 +67,10 @@ pub const Options = struct {
     /// auto: derived from the weight manifest when a store is attached,
     /// 0 (the open default network) otherwise.
     network_id: ?u64 = null,
+    /// Named pre-configured network (devnet | testnet | mainnet): resolves
+    /// to a stable network id and the canonical model. Conflicts with an
+    /// explicit --network-id.
+    network_name: ?[]const u8 = null,
     /// Retrieval-augmented generation: keep a gossiped chunk store and
     /// prepend the closest chunks to every prompt. Off unless asked -- it
     /// changes what the model sees.
@@ -644,14 +649,29 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     try out.flush();
 
     // The LLM-network identity every peer must share (chainId semantics).
-    // Auto derives from the manifest so two nodes serving the same sharded
-    // model agree without configuration; an explicit --network-id keeps one
-    // network across model hardforks. Computed HERE, after the store is
-    // final -- the first version ran before any store existed and every
-    // node silently derived id 0, which the three-machine test caught.
-    const network_id: u64 = opts.network_id orelse
-        (if (store) |*st| wire.networkIdFromManifest(st.manifest.version) else 0);
-    try out.print("  network    id {d}\n", .{network_id});
+    // Resolution order: a named network (devnet/testnet/mainnet -- stable
+    // registry constants), else an explicit --network-id, else derived from
+    // the manifest. Computed HERE, after the store is final -- the first
+    // version ran before any store existed and every node silently derived
+    // id 0, which the three-machine test caught.
+    var preset: ?*const networks.Network = null;
+    if (opts.network_name) |nm| {
+        preset = networks.byName(nm) orelse {
+            try out.print("unknown --network '{s}' (want devnet | testnet | mainnet)\n", .{nm});
+            return;
+        };
+        if (opts.network_id != null and opts.network_id.? != preset.?.id) {
+            try out.print("--network {s} is id {d}; conflicting --network-id {d}\n", .{ nm, preset.?.id, opts.network_id.? });
+            return;
+        }
+    }
+    const network_id: u64 = if (preset) |p| p.id else (opts.network_id orelse
+        (if (store) |*st| wire.networkIdFromManifest(st.manifest.version) else 0));
+    if (preset) |p| {
+        try out.print("  network    {s} (id {d}) -- {s}\n", .{ p.name, p.id, p.desc });
+    } else {
+        try out.print("  network    id {d}\n", .{network_id});
+    }
 
     var p2p_ctx = p2p.Ctx{
         .gpa = gpa,
@@ -913,6 +933,21 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         };
         const t = try std.Thread.spawn(.{}, repairThread, .{&repair_ctx});
         t.detach();
+    }
+
+    // Named-network arch policy: one network serves one model. Production
+    // networks refuse a mismatched architecture; devnet warns -- a PoC
+    // network is where mismatches get discovered on purpose.
+    if (preset) |p| {
+        const served_arch: []const u8 = if (serve_gguf) gguf_gen.m.archName() else "loom-checkpoint";
+        if (!std.mem.eql(u8, served_arch, p.arch)) {
+            if (p.strict) {
+                try out.print("REFUSING: network '{s}' serves arch '{s}', this node loaded '{s}'\n", .{ p.name, p.arch, served_arch });
+                try out.print("          the canonical model is {s}\n", .{p.model});
+                return;
+            }
+            try out.print("  WARNING    network '{s}' expects arch '{s}', serving '{s}' ({s})\n", .{ p.name, p.arch, served_arch, p.model });
+        }
     }
 
     // RAG: the store exists from startup (the p2p/gossip contexts hold its
