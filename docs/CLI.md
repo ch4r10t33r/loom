@@ -1,7 +1,7 @@
 # Loom CLI reference
 
 Every command and every flag, with what it does and why you would change it.
-The [README](../README.md) is the tour; this is the detail.
+The [command tour](COMMANDS.md) has worked examples; this is the flag-by-flag detail.
 
 One binary, `loom`, with seven commands:
 
@@ -323,7 +323,8 @@ Only these are read, and a flag always wins:
 
 ## See also
 
-- [README](../README.md) — overview, quick start, protocol examples
+- [README](../README.md) — overview and quick start
+- [Command tour](COMMANDS.md) — worked examples and protocol detail
 - [spec/SPEC.md](../spec/SPEC.md) — the p2p layer: roles, committees, wire messages, trust model
 - [docs/ROADMAP.md](ROADMAP.md) — status and what is planned
 
