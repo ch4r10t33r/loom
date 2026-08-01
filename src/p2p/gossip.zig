@@ -128,6 +128,43 @@ fn exchange(ctx: *Ctx, addr_str: []const u8) !void {
                     try wire.writeFrame(&w.interface, pframe);
                 }
             }
+
+            // Pull direction: ask for the peer's window and fetch what we
+            // lack. Without this a dial-out-only node (NAT) sends chunks but
+            // never receives any.
+            const qframe = try wire.encodeFrame(gpa, .rag_inv_req, "");
+            defer gpa.free(qframe);
+            try wire.writeFrame(&w.interface, qframe);
+            const pinv_raw = try wire.readFrameAlloc(gpa, &r.interface);
+            defer gpa.free(pinv_raw);
+            const pdec = try wire.decodeFrame(gpa, pinv_raw);
+            defer gpa.free(pdec.body);
+            if (pdec.ty == .rag_inv) {
+                const theirs = wire.RagHashes.parseBody(gpa, pdec.body) catch return;
+                defer gpa.free(theirs);
+                var lacks = std.ArrayList([32]u8).empty;
+                defer lacks.deinit(gpa);
+                for (theirs) |h| {
+                    if (lacks.items.len >= wire.RAG_PUSH_MAX) break;
+                    if (!st.has(h)) try lacks.append(gpa, h);
+                }
+                if (lacks.items.len > 0) {
+                    var wnt = wire.RagHashes{ .hashes = lacks.items };
+                    const wbody = try wnt.encodeBody(gpa);
+                    defer gpa.free(wbody);
+                    const wframe = try wire.encodeFrame(gpa, .rag_want, wbody);
+                    defer gpa.free(wframe);
+                    try wire.writeFrame(&w.interface, wframe);
+                    const push_raw = try wire.readFrameAlloc(gpa, &r.interface);
+                    defer gpa.free(push_raw);
+                    const push_dec = try wire.decodeFrame(gpa, push_raw);
+                    defer gpa.free(push_dec.body);
+                    if (push_dec.ty == .rag_push) {
+                        var it2 = wire.RagPush.iterate(push_dec.body) catch return;
+                        while (it2.next() catch null) |text| _ = st.add(text);
+                    }
+                }
+            }
         }
     }
 }
