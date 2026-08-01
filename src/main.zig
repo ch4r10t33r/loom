@@ -364,13 +364,13 @@ fn defaultRamGb() f64 {
 }
 
 const NODE_FLAGS = [_][]const u8{
-    "--model",       "--rpc-addr",   "--rpc-port",     "--openai-addr",  "--openai-port",
-    "--p2p-addr",    "--p2p-port",   "--ram-gb",       "--pin-gb",       "--seed",
-    "--stats",       "--no-verify",  "--gguf",         "--bootstrap",    "--hold-fraction",
-    "--range-mb",    "--peers",      "--advertise",    "--network-id",   "--network",
-    "--rag",         "--rag-k",      "--r-target",     "--free-quota",   "--admin-token",
-    "--ctx",         "--ui-addr",    "--ui-port",      "--status-secs",  "--threads",
-    "--mmap-weights", "--gpu-ops",   "--no-gpu-layers", "--batch",       "--chat-format",
+    "--model",          "--rpc-addr",     "--rpc-port",      "--openai-addr", "--openai-port",
+    "--p2p-addr",       "--p2p-port",     "--ram-gb",        "--pin-gb",      "--seed",
+    "--stats",          "--no-verify",    "--gguf",          "--bootstrap",   "--hold-fraction",
+    "--range-mb",       "--peers",        "--advertise",     "--network-id",  "--network",
+    "--rag",            "--rag-k",        "--r-target",      "--free-quota",  "--admin-token",
+    "--ctx",            "--ui-addr",      "--ui-port",       "--status-secs", "--threads",
+    "--mmap-weights",   "--gpu-ops",      "--no-gpu-layers", "--batch",       "--chat-format",
     "--report-metrics", "--alpha-ingest",
 };
 
