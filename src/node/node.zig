@@ -302,6 +302,20 @@ fn p2pThread(ctx: *p2p.Ctx) void {
     p2p.serve(ctx) catch |e| fatal("p2p server failed: {s}\n", .{@errorName(e)});
 }
 
+/// Reopen a previously synced store when no peer answers at boot. A node
+/// that already holds verified shards has no reason to die because the
+/// bootnode is mid-restart: it serves what it holds, and the eager-repair
+/// loop keeps dialing until the swarm returns.
+fn reopenLocalStore(gpa: std.mem.Allocator, io: Io, store_dir: []const u8, out: *Io.Writer) ?weights.Store {
+    const st = weights.openDir(gpa, io, store_dir) catch return null;
+    out.print("peers unreachable; starting from the existing local store ({d}/{d} shards held)\n", .{
+        st.holdings.count(), st.manifest.nRanges(),
+    }) catch {};
+    out.print("eager repair keeps dialing and reconnects when a peer returns\n", .{}) catch {};
+    out.flush() catch {};
+    return st;
+}
+
 fn openaiThread(ctx: *openai.Ctx) void {
     openai.serve(ctx) catch |e| fatal("openai server failed: {s}\n", .{@errorName(e)});
 }
@@ -582,7 +596,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                 opts.r_target,
             );
         }
-    } else if (peer_list.items.len > 0) {
+    } else if (peer_list.items.len > 0) sync_block: {
         const store_dir = try std.fmt.allocPrint(gpa, "{s}/gguf-synced", .{opts.cache_root});
         defer gpa.free(store_dir);
 
@@ -590,11 +604,25 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         // want-set. Falls back to random hold-fraction if the peer is not a
         // bootnode (legacy swarms, fixed-mode manifests).
         var joined: ?sync.JoinInfo = null;
-        if (sync.joinSwarm(gpa, io, peer_list.items[0], advertise, opts.hold_fraction)) |ji| {
-            joined = ji;
-        } else |e| {
-            try out.print("join declined ({s}); using random hold-fraction\n", .{@errorName(e)});
-            try out.flush();
+        var join_try: usize = 0;
+        while (join_try < 4) : (join_try += 1) {
+            if (sync.joinSwarm(gpa, io, peer_list.items[0], advertise, opts.hold_fraction)) |ji| {
+                joined = ji;
+                break;
+            } else |e| {
+                // A refused dial is usually a bootnode mid-restart (a big
+                // origin takes minutes to reopen its store), so wait it out
+                // briefly before falling back.
+                if (e == error.ConnectionRefused and join_try < 3) {
+                    try out.print("bootnode not answering (attempt {d}/4); retrying in 30s...\n", .{join_try + 1});
+                    try out.flush();
+                    Io.sleep(io, .{ .nanoseconds = 30 * std.time.ns_per_s }, .awake) catch {};
+                    continue;
+                }
+                try out.print("join declined ({s}); using random hold-fraction\n", .{@errorName(e)});
+                try out.flush();
+                break;
+            }
         }
 
         if (joined) |*ji| {
@@ -615,10 +643,15 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
 
             // hand manifest+wanted to the store; keep members for heartbeats
             const res = sync.bootstrapWithWanted(gpa, io, srcs.items, store_dir, ji.manifest, ji.wanted, out) catch |e| {
-                try out.print("bootstrap failed: {s}\n", .{@errorName(e)});
                 for (ji.members) |m| gpa.free(m);
                 gpa.free(ji.members);
-                return;
+                if (reopenLocalStore(gpa, io, store_dir, out)) |st| {
+                    store = st;
+                } else {
+                    try out.print("bootstrap failed: {s}\n", .{@errorName(e)});
+                    return;
+                }
+                break :sync_block;
             };
             store = res.store;
             committee_members = ji.members; // ownership moves (freed at exit)
@@ -631,8 +664,13 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             try out.flush();
             try out.flush();
             const res = sync.bootstrap(gpa, io, peer_list.items, store_dir, opts.hold_fraction, opts.seed, out) catch |e| {
-                try out.print("bootstrap failed: {s}\n", .{@errorName(e)});
-                return;
+                if (reopenLocalStore(gpa, io, store_dir, out)) |st| {
+                    store = st;
+                } else {
+                    try out.print("bootstrap failed: {s}\n", .{@errorName(e)});
+                    return;
+                }
+                break :sync_block;
             };
             store = res.store;
             try out.print("  synced {d}/{d} wanted ranges, {d:.1} MB, verified against manifest root\n", .{
