@@ -92,8 +92,9 @@ zig build -Dtarget=x86_64-linux-musl -Doptimize=ReleaseSafe -p out   # cross-com
 Releases are built ReleaseSafe rather than ReleaseFast. Loom is a daemon
 that writes peer-supplied weight shards into buffers, and the roughly 11%
 speed difference between the two modes is the difference between catching
-an out-of-bounds write and executing it. Releases are cut by pushing a tag;
-see [`.github/workflows/release.yml`](.github/workflows/release.yml).
+an out-of-bounds write and executing it. Releases are cut by pushing a tag; the tag names the version (no bump
+commit needed) — see
+[`.github/workflows/release.yml`](.github/workflows/release.yml).
 Docker images (linux/amd64 and arm64) publish to
 `ghcr.io/ch4r10t33r/loom:latest` ([docker guide](docs/DOCKER.md)).
 
