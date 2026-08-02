@@ -269,7 +269,7 @@ fn repairThread(ctx: *RepairCtx) void {
         for (addrs) |addr_str| {
             if (ctx.store.missingCount() == 0) break;
             const addr = sync.PeerAddr.parse(addr_str) catch continue;
-            const s = sync.fetchFromPeer(ctx.gpa, ctx.io, ctx.store, addr) catch continue;
+            const s = sync.fetchFromPeer(ctx.gpa, ctx.io, ctx.store, addr, null) catch continue;
             repaired += s.fetched;
         }
         if (repaired > 0) {
@@ -501,6 +501,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         if (eff_bootstrap == null and opts.gguf_path == null and p.bootnodes.len > 0) {
             eff_bootstrap = p.bootnodes[0];
             try out.print("  bootnode   {s} (registry default for {s})\n", .{ eff_bootstrap.?, p.name });
+            try out.flush();
         }
     }
 
@@ -547,12 +548,15 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         for (peer_strs.items) |ps| {
             if (!std.mem.startsWith(u8, ps, "127.0.0.1") and !std.mem.startsWith(u8, ps, "localhost")) external = true;
         }
-        if (external) try out.print(
-            "  WARNING    advertising {s} to non-local peers; they cannot dial back.\n" ++
-                "             Pass --advertise <reachable-host>:{d} or this node can never\n" ++
-                "             serve a shard it holds, and redundancy targets will not be met.\n",
-            .{ advertise, opts.p2p_port },
-        );
+        if (external) {
+            try out.print(
+                "  WARNING    advertising {s} to non-local peers; they cannot dial back.\n" ++
+                    "             Pass --advertise <reachable-host>:{d} or this node can never\n" ++
+                    "             serve a shard it holds, and redundancy targets will not be met.\n",
+                .{ advertise, opts.p2p_port },
+            );
+            try out.flush();
+        }
     }
     var table = peers.Table.init(gpa, io, advertise);
     defer table.deinit();
@@ -590,11 +594,13 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             joined = ji;
         } else |e| {
             try out.print("join declined ({s}); using random hold-fraction\n", .{@errorName(e)});
+            try out.flush();
         }
 
         if (joined) |*ji| {
             joined_committee_id = @intCast(ji.committee_id);
             try out.print("joined committee {d} ({d} member(s) already in it)\n", .{ ji.committee_id, ji.members.len });
+            try out.flush();
             // sync preference: committee members first, then the bootnode
             var srcs = std.ArrayList(sync.PeerAddr).empty;
             defer srcs.deinit(gpa);
@@ -622,6 +628,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             });
         } else {
             try out.print("bootstrapping weight ranges from {d} peer(s) (hold-fraction {d:.2})...\n", .{ peer_list.items.len, opts.hold_fraction });
+            try out.flush();
             try out.flush();
             const res = sync.bootstrap(gpa, io, peer_list.items, store_dir, opts.hold_fraction, opts.seed, out) catch |e| {
                 try out.print("bootstrap failed: {s}\n", .{@errorName(e)});
