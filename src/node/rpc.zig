@@ -103,10 +103,17 @@ fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
         const raw = ri.takeDelimiterInclusive('\n') catch return;
         const line = std.mem.trimEnd(u8, raw, "\r\n");
         if (line.len == 0) continue;
+        // The request line is fully read, so the slowloris risk is gone and
+        // the connection is doing work: switch to the generation deadline
+        // (the OpenAI surface makes the same phase change; without it every
+        // distributed generation longer than 30 s died with an empty reply).
+        sockopt.refreshServe(ctx.io, dl);
         handleRequest(ctx, line, wi) catch |e| {
             try wi.print("{{\"ok\":false,\"error\":\"{s}\"}}\n", .{@errorName(e)});
             try wi.flush();
         };
+        // back to the strict read deadline while waiting for the next request
+        sockopt.refresh(ctx.io, dl, sockopt.SERVE_TIMEOUT_S);
     }
 }
 
