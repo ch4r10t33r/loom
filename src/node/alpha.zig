@@ -24,6 +24,7 @@ pub const Metrics = struct {
     gens: u64 = 0,
     tok_s_sum: f64 = 0,
     hit_sum: f64 = 0,
+    last_tok_s: f64 = 0,
 
     pub fn recordGen(self: *Metrics, tok_s: f64, hit_rate: f64) void {
         self.mu.lockUncancelable(self.io);
@@ -31,6 +32,14 @@ pub const Metrics = struct {
         self.gens += 1;
         self.tok_s_sum += tok_s;
         self.hit_sum += hit_rate;
+        self.last_tok_s = tok_s;
+    }
+
+    /// For the status line: how many generations, and the latest speed.
+    pub fn lastGen(self: *Metrics) struct { gens: u64, tok_s: f64 } {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        return .{ .gens = self.gens, .tok_s = self.last_tok_s };
     }
 
     fn snapshot(self: *Metrics) struct { gens: u64, tok_s_avg: f64, hit_avg: f64 } {

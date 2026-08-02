@@ -20,6 +20,7 @@ const Io = std.Io;
 const peers_mod = @import("../p2p/peers.zig");
 const weights = @import("../p2p/weights.zig");
 const generator = @import("generator.zig");
+const alpha_mod = @import("alpha.zig");
 const stats = @import("../core/stats.zig");
 const deepseek = @import("../gguf/deepseek.zig");
 
@@ -31,6 +32,9 @@ pub const Reporter = struct {
     table: ?*peers_mod.Table,
     store: ?*weights.Store,
     gen: *generator.Generator,
+    /// Rolling generation aggregates shared with the serving surfaces; the
+    /// status line shows the latest speed once anything has been served.
+    alpha: ?*alpha_mod.Metrics = null,
     /// Members of this node's committee, as configured at join.
     committee: usize,
     /// Redundancy target, for the under-replication warning. 0 disables it.
@@ -83,6 +87,11 @@ pub const Reporter = struct {
         // the first request reads as a fault rather than as "no data yet".
         const hit = self.gen.hitRate();
         if (hit > 0) self.out.print("  local-hit {d:.1}%", .{hit * 100.0}) catch return;
+
+        if (self.alpha) |am| {
+            const g = am.lastGen();
+            if (g.gens > 0) self.out.print("  gens {d} ({d:.2} tok/s last)", .{ g.gens, g.tok_s }) catch return;
+        }
 
         self.out.print("  up {s}\n", .{fmtUptime(self.uptimeSecs())}) catch return;
         if (deepseek.Profile.enabled()) deepseek.Profile.report(self.out) catch {};
