@@ -45,7 +45,13 @@ pub const SERVE_TIMEOUT_S: i64 = 30;
 /// Refreshing per token is not enough on its own, because there is no token to
 /// refresh on until prefill completes. So the phase change is explicit: parsed
 /// request -> generous deadline, then each token pushes it out again.
-pub const GENERATE_TIMEOUT_S: i64 = 900;
+///
+/// An hour, not 900 s: a cold prefill against the devnet's 106B model at a
+/// 20% hold fraction moves gigabytes of experts over a home link before the
+/// first token exists, and 900 s killed real requests. The bound is a
+/// last-resort reaper for wedged connections, not a performance target;
+/// concurrency stays bounded by the connection cap either way.
+pub const GENERATE_TIMEOUT_S: i64 = 3600;
 
 /// Outbound peer dials: a peer that accepts and then goes silent must not hang
 /// gossip, repair, heartbeat, or the token-loop expert fetch.
