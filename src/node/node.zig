@@ -249,11 +249,17 @@ const RepairCtx = struct {
     /// Candidate holders come from the live gossip table, so repair reaches
     /// peers this node was never explicitly told about.
     table: *peers.Table,
+    /// While a generation is in flight its expert fetches share the same
+    /// downlink; repair waits so the interactive request gets the whole pipe.
+    alpha: ?*alpha.Metrics = null,
 };
 
 fn repairThread(ctx: *RepairCtx) void {
     while (true) {
         Io.sleep(ctx.io, .{ .nanoseconds = REPAIR_INTERVAL_NS }, .awake) catch return;
+        if (ctx.alpha) |am| {
+            if (am.inflightSecs(stats.nowNs(ctx.io)) != null) continue;
+        }
         if (ctx.store.missingCount() == 0) continue;
         const addrs = ctx.table.snapshotAddrs(ctx.gpa) catch continue;
         defer {
@@ -574,6 +580,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     }
     var table = peers.Table.init(gpa, io, advertise);
     defer table.deinit();
+
+    // Shared generation aggregates: the status line reads them, the serving
+    // surfaces write them, the opt-in alpha reporter ships them, and the
+    // repair loop yields to them.
+    var alpha_metrics = alpha.Metrics{ .io = io };
     const zero_version = "0" ** 64;
     for (peer_strs.items) |ps| {
         _ = table.merge(ps, zero_version, "", peers.NO_COMMITTEE, 0, stats.nowNs(io), .hearsay) catch {};
@@ -754,6 +765,14 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         } else |_| {}
     }
 
+    var heat_counts: ?[]std.atomic.Value(u32) = null;
+    if (store) |*st| {
+        const h = try gpa.alloc(std.atomic.Value(u32), st.manifest.nRanges());
+        for (h) |*cnt| cnt.* = std.atomic.Value(u32).init(0);
+        heat_counts = h;
+    }
+    defer if (heat_counts) |h| gpa.free(h);
+
     var p2p_ctx = p2p.Ctx{
         .gpa = gpa,
         .io = io,
@@ -769,6 +788,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .network_id = network_id,
         .rag = if (rag) |*r| r else null,
         .metrics_path = opts.alpha_ingest,
+        .heat = heat_counts,
     };
     const p2p_handle = try std.Thread.spawn(.{}, p2pThread, .{&p2p_ctx});
     defer p2p_handle.join();
@@ -1012,6 +1032,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             .io = io,
             .store = &store.?,
             .table = &table,
+            .alpha = &alpha_metrics,
         };
         const t = try std.Thread.spawn(.{}, repairThread, .{&repair_ctx});
         t.detach();
@@ -1058,10 +1079,6 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     defer meter.deinit();
 
     // OpenAI-compatible HTTP surface (SPEC.md client API), off unless a port is set.
-    // Shared generation aggregates: the status line reads them, the serving
-    // surfaces write them, and the opt-in alpha reporter ships them.
-    var alpha_metrics = alpha.Metrics{ .io = io };
-
     var openai_ctx: openai.Ctx = undefined;
     if (opts.openai_port != 0) {
         openai_ctx = .{
