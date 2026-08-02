@@ -21,6 +21,11 @@ const meter_mod = @import("meter.zig");
 pub const Ctx = struct {
     /// Opt-in alpha telemetry aggregate (numeric only; docs/ALPHA.md).
     alpha_metrics: ?*@import("alpha.zig").Metrics = null,
+    /// Node console, shared with the status thread. Every request prints an
+    /// arrival line and a completion line, so a long generation is visible
+    /// work rather than silence.
+    console: ?*Io.Writer = null,
+    console_lock: ?*Io.Mutex = null,
     gpa: std.mem.Allocator,
     io: Io,
     gen: *generator.Generator,
@@ -117,6 +122,15 @@ fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
     }
 }
 
+fn consoleLine(ctx: *Ctx, comptime fmt: []const u8, args: anytype) void {
+    const cw = ctx.console orelse return;
+    const lk = ctx.console_lock orelse return;
+    lk.lockUncancelable(ctx.io);
+    defer lk.unlock(ctx.io);
+    cw.print(fmt ++ "\n", args) catch {};
+    cw.flush() catch {};
+}
+
 fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
     const gpa = ctx.gpa;
     var parsed = std.json.parseFromSlice(std.json.Value, gpa, line, .{}) catch {
@@ -200,11 +214,15 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
         budget = reserved;
     }
 
+    consoleLine(ctx, "request  rpc: {d} prompt byte(s), max_tokens {d}", .{ prompt_str.len, max_tokens });
+    if (ctx.alpha_metrics) |am| am.beginGen(stats.nowNs(ctx.io));
     ctx.engine_lock.lockUncancelable(ctx.io);
     const t0 = stats.nowNs(ctx.io);
     // raw user prompt: do not parse special tokens (no injection of control ids)
     var res = ctx.gen.generate(gpa, ctx.io, prompt_str, max_tokens, temp, seed, budget, null, false) catch |e| {
         ctx.engine_lock.unlock(ctx.io);
+        if (ctx.alpha_metrics) |am| am.endGen();
+        consoleLine(ctx, "failed   rpc: {s}", .{@errorName(e)});
         if (ctx.meter) |m| _ = m.settle(client, reserved, 0);
         return e;
     };
@@ -223,7 +241,11 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
         if (i != 0) try wi.print(",", .{});
         try wi.print("{d}", .{tok});
     }
-    if (ctx.alpha_metrics) |am| am.recordGen(tok_s, hit_rate);
+    if (ctx.alpha_metrics) |am| {
+        am.recordGen(tok_s, hit_rate);
+        am.endGen();
+    }
+    consoleLine(ctx, "served   rpc: {d} token(s) in {d:.1}s ({d:.2} tok/s, hit {d:.3})", .{ res.completion_tokens, secs, tok_s, hit_rate });
     try wi.print("],\"tok_per_s\":{d:.2},\"hit_rate\":{d:.4}", .{ tok_s, hit_rate });
     if (ctx.meter) |m| {
         // cost = prompt tokens processed + tokens generated; the rest of the

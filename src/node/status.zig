@@ -91,6 +91,9 @@ pub const Reporter = struct {
         if (self.alpha) |am| {
             const g = am.lastGen();
             if (g.gens > 0) self.out.print("  gens {d} ({d:.2} tok/s last)", .{ g.gens, g.tok_s }) catch return;
+            if (am.inflightSecs(stats.nowNs(self.io))) |secs| {
+                self.out.print("  GENERATING ({d}s)", .{secs}) catch return;
+            }
         }
 
         self.out.print("  up {s}\n", .{fmtUptime(self.uptimeSecs())}) catch return;

@@ -53,6 +53,8 @@ results = []
 for i in range(n_prompts):
     prompt = PROMPTS[i % len(PROMPTS)]
     req = json.dumps({"prompt": prompt, "max_tokens": max_tokens}) + "\n"
+    print(f"[{i+1}/{n_prompts}] sent \"{prompt}\" -- waiting (a cold node fetches experts", flush=True)
+    print(f"          from peers first; this can take many minutes; timeout {timeout}s)", flush=True)
     t0 = time.time()
     try:
         s = socket.create_connection((host, port), timeout=timeout)
