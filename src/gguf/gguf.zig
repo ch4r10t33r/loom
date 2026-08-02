@@ -356,6 +356,10 @@ pub fn writeFixture(gpa: std.mem.Allocator, io: Io, path: []const u8, seed: u64,
 /// gating, selection bias, shared expert, and a byte-fallback SPM vocab. Used
 /// to validate the deepseek2 engine end-to-end without a multi-GB download.
 pub fn writeDeepseekFixture(gpa: std.mem.Allocator, io: Io, path: []const u8, seed: u64) !void {
+    return writeMlaFixture(gpa, io, path, seed, "deepseek2");
+}
+
+pub fn writeMlaFixture(gpa: std.mem.Allocator, io: Io, path: []const u8, seed: u64, arch: []const u8) !void {
     const alignment: u64 = 32;
     // tiny but structurally faithful shape
     const dim: u64 = 64;
@@ -375,35 +379,51 @@ pub fn writeDeepseekFixture(gpa: std.mem.Allocator, io: Io, path: []const u8, se
     const moe_ffn: u64 = 48;
     const vocab: u64 = 3 + 256; // <unk>, <s>, </s>, <0x00>..<0xFF>
 
+    const is_dsa = std.mem.eql(u8, arch, "glm-dsa");
+    var kfb: [96]u8 = undefined;
+    const kfx = struct {
+        fn f(buf: []u8, a: []const u8, comptime k: []const u8) []const u8 {
+            return std.fmt.bufPrint(buf, "{s}." ++ k, .{a}) catch unreachable;
+        }
+    }.f;
     var kv = std.ArrayList(u8).empty;
     defer kv.deinit(gpa);
     var kv_count: u64 = 0;
 
     // -- metadata --
-    try kvStr(gpa, &kv, &kv_count, "general.architecture", "deepseek2");
+    try kvStr(gpa, &kv, &kv_count, "general.architecture", arch);
     try kvStr(gpa, &kv, &kv_count, "general.name", "loom deepseek2 fixture");
     try kvU32v(gpa, &kv, &kv_count, "general.alignment", @intCast(alignment));
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.block_count", @intCast(n_layers));
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.context_length", 256);
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.embedding_length", @intCast(dim));
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.feed_forward_length", @intCast(ffn));
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.attention.head_count", @intCast(n_heads));
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.attention.head_count_kv", @intCast(n_heads));
-    try kvF32v(gpa, &kv, &kv_count, "deepseek2.attention.layer_norm_rms_epsilon", 1e-6);
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.rope.dimension_count", @intCast(rope_dim));
-    try kvF32v(gpa, &kv, &kv_count, "deepseek2.rope.freq_base", 10000.0);
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.attention.q_lora_rank", @intCast(q_lora));
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.attention.kv_lora_rank", @intCast(kv_lora));
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.attention.key_length", @intCast(key_len));
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.attention.value_length", @intCast(v_len));
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.leading_dense_block_count", @intCast(n_dense));
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.expert_count", @intCast(n_expert));
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.expert_used_count", @intCast(n_used));
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.expert_shared_count", @intCast(n_shared));
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.expert_feed_forward_length", @intCast(moe_ffn));
-    try kvF32v(gpa, &kv, &kv_count, "deepseek2.expert_weights_scale", 1.0);
-    try kvBool(gpa, &kv, &kv_count, "deepseek2.expert_weights_norm", true);
-    try kvU32v(gpa, &kv, &kv_count, "deepseek2.expert_gating_func", 2); // sigmoid
+    try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "block_count"), @intCast(n_layers));
+    try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "context_length"), 256);
+    try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "embedding_length"), @intCast(dim));
+    try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "feed_forward_length"), @intCast(ffn));
+    try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "attention.head_count"), @intCast(n_heads));
+    try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "attention.head_count_kv"), @intCast(n_heads));
+    try kvF32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "attention.layer_norm_rms_epsilon"), 1e-6);
+    try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "rope.dimension_count"), @intCast(rope_dim));
+    try kvF32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "rope.freq_base"), 10000.0);
+    try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "attention.q_lora_rank"), @intCast(q_lora));
+    try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "attention.kv_lora_rank"), @intCast(kv_lora));
+    if (is_dsa) {
+        try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "attention.key_length"), @intCast(kv_lora + rope_dim));
+        try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "attention.key_length_mla"), @intCast(key_len));
+        try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "attention.value_length_mla"), @intCast(v_len));
+        try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "attention.indexer.head_count"), 4);
+        try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "attention.indexer.key_length"), 16);
+        try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "attention.indexer.top_k"), 8);
+    } else {
+        try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "attention.key_length"), @intCast(key_len));
+        try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "attention.value_length"), @intCast(v_len));
+    }
+    try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "leading_dense_block_count"), @intCast(n_dense));
+    try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "expert_count"), @intCast(n_expert));
+    try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "expert_used_count"), @intCast(n_used));
+    try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "expert_shared_count"), @intCast(n_shared));
+    try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "expert_feed_forward_length"), @intCast(moe_ffn));
+    try kvF32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "expert_weights_scale"), 1.0);
+    try kvBool(gpa, &kv, &kv_count, kfx(&kfb, arch, "expert_weights_norm"), true);
+    try kvU32v(gpa, &kv, &kv_count, kfx(&kfb, arch, "expert_gating_func"), 2); // sigmoid
 
     // -- tokenizer: byte-fallback SPM-style vocab --
     try kvStr(gpa, &kv, &kv_count, "tokenizer.ggml.model", "llama");
@@ -470,7 +490,17 @@ pub fn writeDeepseekFixture(gpa: std.mem.Allocator, io: Io, path: []const u8, se
         try infos.append(gpa, .{ .name = L.n(na, li, "attn_q_b.weight"), .dims = .{ q_lora, n_heads * key_len, 0 }, .n_dims = 2 });
         try infos.append(gpa, .{ .name = L.n(na, li, "attn_kv_a_mqa.weight"), .dims = .{ dim, kv_lora + rope_dim, 0 }, .n_dims = 2 });
         try infos.append(gpa, .{ .name = L.n(na, li, "attn_kv_a_norm.weight"), .dims = .{ kv_lora, 0, 0 }, .n_dims = 1 });
-        try infos.append(gpa, .{ .name = L.n(na, li, "attn_kv_b.weight"), .dims = .{ kv_lora, n_heads * (nope + v_len), 0 }, .n_dims = 2 });
+        if (is_dsa) {
+            try infos.append(gpa, .{ .name = L.n(na, li, "attn_k_b.weight"), .dims = .{ nope, kv_lora, n_heads }, .n_dims = 3 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "attn_v_b.weight"), .dims = .{ kv_lora, v_len, n_heads }, .n_dims = 3 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "indexer.attn_q_b.weight"), .dims = .{ q_lora, 4 * 16, 0 }, .n_dims = 2 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "indexer.attn_k.weight"), .dims = .{ dim, 16, 0 }, .n_dims = 2 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "indexer.k_norm.weight"), .dims = .{ 16, 0, 0 }, .n_dims = 1 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "indexer.k_norm.bias"), .dims = .{ 16, 0, 0 }, .n_dims = 1 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "indexer.proj.weight"), .dims = .{ dim, 4, 0 }, .n_dims = 2 });
+        } else {
+            try infos.append(gpa, .{ .name = L.n(na, li, "attn_kv_b.weight"), .dims = .{ kv_lora, n_heads * (nope + v_len), 0 }, .n_dims = 2 });
+        }
         try infos.append(gpa, .{ .name = L.n(na, li, "attn_output.weight"), .dims = .{ n_heads * v_len, dim, 0 }, .n_dims = 2 });
         try infos.append(gpa, .{ .name = L.n(na, li, "ffn_norm.weight"), .dims = .{ dim, 0, 0 }, .n_dims = 1 });
         if (li < n_dense) {

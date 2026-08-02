@@ -577,7 +577,7 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
     if (std.mem.eql(u8, sub, "gen")) {
         const seed = try flagU64(args, "--seed", 42);
         const arch = flagStr(args, "--arch") orelse "demo";
-        if (std.mem.eql(u8, arch, "deepseek2")) {
+        if (std.mem.eql(u8, arch, "deepseek2") or std.mem.eql(u8, arch, "glm-dsa")) {
             try out.print("writing synthetic deepseek2 GGUF (MLA + MoE, random weights) -> {s}\n", .{path});
             try out.flush();
             try gguf.writeDeepseekFixture(gpa, io, path, seed);
@@ -714,7 +714,7 @@ fn cmdGgufRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8,
     @memcpy(@constCast(arch), arch_src[0..arch.len]);
     peek.deinit();
 
-    if (std.mem.eql(u8, arch, "deepseek2")) {
+    if (std.mem.eql(u8, arch, "deepseek2") or std.mem.eql(u8, arch, "glm-dsa")) {
         return runEngine(deepseek, gpa, io, out, path, args);
     }
     if (llama.archFor(arch) != null) {
@@ -794,7 +794,8 @@ fn runStore(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, dir: []const u8, ar
     var peek = gguf.parse(gpa, io, mpath) catch |e| {
         return out.print("load failed: {s}\n", .{@errorName(e)});
     };
-    const is_mla = std.mem.eql(u8, peek.getString("general.architecture") orelse "?", "deepseek2");
+    const arch_probe = peek.getString("general.architecture") orelse "?";
+    const is_mla = std.mem.eql(u8, arch_probe, "deepseek2") or std.mem.eql(u8, arch_probe, "glm-dsa");
     peek.deinit();
     if (is_mla) return runStoreWith(deepseek, gpa, io, out, &store, &src, mpath, args);
     return runStoreWith(llama, gpa, io, out, &store, &src, mpath, args);
