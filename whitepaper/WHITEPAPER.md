@@ -225,13 +225,16 @@ quantized-matmul kernels.
   attention, YaRN context extension [11], and a byte-level BPE tokenizer read
   from GGUF metadata. Validated on real DeepSeek-V2-Lite weights (Q4_K_M).
 - The **GQA** engine, covering `llama` (including Mixtral), `qwen2moe`,
-  `qwen3moe` and `glm4moe` in one forward pass. These architectures differ only
-  in optional pieces over a shared skeleton, so the engine detects them from the
-  tensors a file contains rather than from per-architecture assumptions: QKV
-  biases, per-head Q/K normalization, dense or mixture-of-experts FFN, an
-  optionally sigmoid-gated shared expert, leading dense layers, a
-  post-attention norm in place of `ffn_norm`, and trailing MTP blocks that are
-  skipped. Only the rotary-embedding style is pinned per architecture, because
+  `qwen3moe`, `glm4moe` and `gpt-oss` in one forward pass. These architectures
+  differ only in optional pieces over a shared skeleton, so the engine detects
+  them from the tensors a file contains rather than from per-architecture
+  assumptions: QKV biases, per-head Q/K normalization, dense or
+  mixture-of-experts FFN, an optionally sigmoid-gated shared expert, leading
+  dense layers, a post-attention norm in place of `ffn_norm`, trailing MTP
+  blocks that are skipped, and the gpt-oss family's additions -- alternating
+  sliding-window layers, per-head attention sinks, per-expert FFN biases with
+  the clamped `swiglu_oai` activation, YaRN-scaled NEOX rope, and a
+  select-then-softmax router. Only the rotary-embedding style is pinned per architecture, because
   an incorrect choice yields fluent but wrong output rather than an error. The
   dense llama path is validated against the tinyllamas reference models at F32,
   Q4_0 and Q8_0.
@@ -797,6 +800,7 @@ the spec governs the p2p protocol and the roadmap governs status.
 | 2026-07-28 | Batched prefill (`stepBatch`, `ggml.matmul`) and vectorized attention inner loops | Decoding unpacks every weight once per token, but a prompt is known up front, so one unpacked weight can serve several tokens. Measured 1.4x on a 145-token prefill; the kernel microbenchmark shows 2.4x in isolation, and the gap is attention, which is quadratic in prompt length and bound by the KV cache rather than by weight reads, so there is nothing to amortize. Vectorizing the attention dot and value-accumulation loops was worth a further 11% on decode. Batch capped at 8: past that, register pressure costs more than the sharing returns |
 
 | 2026-08-03 | **Distributed speculative decoding adopted as a roadmap direction, crediting DSD (Yu et al., arXiv:2511.21669) [16]**: evolve delegate-while-cold from ship-the-whole-generation into draft-local / verify-remote -- the cold node drafts a window with its MTP head plus the hot head of its store, the warm peer verifies the window in one batched forward. Adopt DSD's stabilization findings (clamped window, EMA smoothing, sticky local/delegated mode switch) and its RTT crossover as an input to the existing measured-tier-order probe. Deliberately NOT adopted: their learned window-control DNN -- the same feature vector (recent acceptance, RTT, queue depth) drives a threshold heuristic that their own ablation puts within a few percent of the learned policy | The pieces are already on the shelf: MTP drafting (2026-08-02), GEN delegation (2026-08-02), startup bandwidth probes, and per-request acceptance stats. DSD contributes the missing frame -- speculation window as a *network* decision, not an engine constant -- and evidence that the win is real at exactly the RTTs the devnet measures (10-30 ms). A deterministic controller keeps the policy debuggable and honors the code-over-model rule |
+| 2026-08-02 | **gpt-oss engine support (OpenAI gpt-oss-20b/120b), the extreme-sparsity devnet candidate**: the GQA engine gains the gpt-oss family -- alternating sliding-window(128)/full attention layers, per-head attention sinks folded into the softmax denominator, per-expert gate/up/down FFN biases, the clamped `swiglu_oai` activation (alpha 1.702, limit 7), a router that selects top-4 on raw biased logits then softmaxes only the selected four, YaRN-scaled NEOX rope with the mscale-squared logit multiplier, and the o200k Harmony chat template. Ground truth read from the real MXFP4 GGUF header and llama.cpp's openai-moe graph, not guessed; a gpt-oss fixture (sinks, biases, window 4, YaRN keys) joins the arch suite and the batched-prefill differential test. Alongside, per user request: an RPC `{"method":"model"}` reporting the served model/arch/ctx, and the boot lines now name the model being served | gpt-oss-120b is the devnet model the bandwidth math actually wants: 117B total (too big for one commodity box, so the network is load-bearing) but only 5.1B active at top-4-of-128 -- 23x sparsity vs GLM-4.5-Air's ~9x -- putting warm-store decode in the tens of tok/s where the current devnet model measures fractions. The 20b sibling shares the architecture exactly, so oracle validation runs on an 11 GB file before any 63 GB commitment |
 ---
 
 ## Appendix B: Source layout
