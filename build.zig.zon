@@ -1,6 +1,6 @@
 .{
     .name = .loom,
-    .version = "0.14.0",
+    .version = "0.15.0",
     .fingerprint = 0xc2597137d5644db8,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{
