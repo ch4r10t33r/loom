@@ -39,6 +39,10 @@ const chat_html = @embedFile("ui.html");
 pub const Ctx = struct {
     /// Opt-in alpha telemetry aggregate (numeric only; docs/ALPHA.md).
     alpha_metrics: ?*@import("alpha.zig").Metrics = null,
+    /// Node console, shared with the status thread; arrival + completion
+    /// lines per request (see rpc.zig).
+    console: ?*Io.Writer = null,
+    console_lock: ?*Io.Mutex = null,
     /// Gossiped RAG chunks; null when --rag is off. Search runs before the
     /// prompt reaches the engine.
     rag: ?*rag_store.Store = null,
@@ -418,8 +422,15 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer, dl:
         budget = reserved;
     }
 
+    consoleLine(ctx, "request  {s}: {d} prompt byte(s), max_tokens {d}{s}", .{
+        if (is_chat) @as([]const u8, "chat") else "completion", prompt_text.len, max_tokens,
+        if (stream) @as([]const u8, ", streaming") else "",
+    });
+
     // Streaming: write the SSE response to the connection and return null.
     if (stream) {
+        if (ctx.alpha_metrics) |am| am.beginGen(stats.nowNs(ctx.io));
+        defer if (ctx.alpha_metrics) |am| am.endGen();
         streamCompletions(ctx, dl, wi, is_chat, model_id, client, prompt_text, max_tokens, temp, seed, budget, reserved);
         return null;
     }
@@ -431,9 +442,12 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer, dl:
 
     // Generate under the shared engine mutex (rpc + openai serialize here).
     const gen_t0 = stats.nowNs(ctx.io);
+    if (ctx.alpha_metrics) |am| am.beginGen(gen_t0);
     ctx.engine_lock.lockUncancelable(ctx.io);
     var res = ctx.gen.generate(gpa, ctx.io, prompt_text, max_tokens, temp, seed, budget, null, parse_special) catch |e| {
         ctx.engine_lock.unlock(ctx.io);
+        if (ctx.alpha_metrics) |am| am.endGen();
+        consoleLine(ctx, "failed   {s}: {s}", .{ if (is_chat) @as([]const u8, "chat") else "completion", @errorName(e) });
         // failed generation still releases the reservation
         if (ctx.meter) |m| _ = m.settle(client, reserved, 0);
         return e;
@@ -441,10 +455,16 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer, dl:
     const gen_hit = ctx.gen.hitRate();
     ctx.engine_lock.unlock(ctx.io);
     defer res.deinit(gpa);
-    if (ctx.alpha_metrics) |am| {
+    {
         const secs = @as(f64, @floatFromInt(stats.nowNs(ctx.io) - gen_t0)) / 1e9;
         const tok_s = if (secs > 0) @as(f64, @floatFromInt(res.completion_tokens)) / secs else 0;
-        am.recordGen(tok_s, gen_hit);
+        if (ctx.alpha_metrics) |am| {
+            am.recordGen(tok_s, gen_hit);
+            am.endGen();
+        }
+        consoleLine(ctx, "served   {s}: {d} token(s) in {d:.1}s ({d:.2} tok/s, hit {d:.3})", .{
+            if (is_chat) @as([]const u8, "chat") else "completion", res.completion_tokens, secs, tok_s, gen_hit,
+        });
     }
 
     const content = try jsonEscapeAlloc(gpa, res.text);
@@ -607,6 +627,15 @@ fn promptField(parsed: ?std.json.Parsed(std.json.Value)) []const u8 {
 }
 
 /// JSON-escape a raw byte slice into an owned string (no surrounding quotes).
+fn consoleLine(ctx: *Ctx, comptime fmt: []const u8, args: anytype) void {
+    const cw = ctx.console orelse return;
+    const lk = ctx.console_lock orelse return;
+    lk.lockUncancelable(ctx.io);
+    defer lk.unlock(ctx.io);
+    cw.print(fmt ++ "\n", args) catch {};
+    cw.flush() catch {};
+}
+
 fn jsonEscapeAlloc(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(gpa);

@@ -1058,6 +1058,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     defer meter.deinit();
 
     // OpenAI-compatible HTTP surface (SPEC.md client API), off unless a port is set.
+    // Shared generation aggregates: the status line reads them, the serving
+    // surfaces write them, and the opt-in alpha reporter ships them.
+    var alpha_metrics = alpha.Metrics{ .io = io };
+
     var openai_ctx: openai.Ctx = undefined;
     if (opts.openai_port != 0) {
         openai_ctx = .{
@@ -1073,6 +1077,9 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             .synthetic = synthetic,
             .rag = if (rag) |*r| r else null,
             .rag_k = opts.rag_k,
+            .console = out,
+            .console_lock = &out_lock,
+            .alpha_metrics = &alpha_metrics,
         };
         openai_ctx.peers = &table;
         const t = try std.Thread.spawn(.{}, openaiThread, .{&openai_ctx});
@@ -1099,6 +1106,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             .serve_ui = true,
             .peers = &table,
             .synthetic = synthetic,
+            .rag = if (rag) |*r| r else null,
+            .rag_k = opts.rag_k,
+            .console = out,
+            .console_lock = &out_lock,
+            .alpha_metrics = &alpha_metrics,
         };
         const t = try std.Thread.spawn(.{}, openaiThread, .{&ui_ctx});
         t.detach();
@@ -1108,10 +1120,6 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
 
     // Periodic console status: membership and holdings move without any
     // request arriving, so an event-only log makes a churning node look idle.
-    // Shared generation aggregates: the status line reads them, the serving
-    // surfaces write them, and the opt-in alpha reporter ships them.
-    var alpha_metrics = alpha.Metrics{ .io = io };
-
     var status_ctx: status_mod.Reporter = undefined;
     if (opts.status_secs != 0) {
         status_ctx = .{
@@ -1155,7 +1163,6 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         try out.print("  metrics    reporting numeric telemetry to {s} every 60s (docs/ALPHA.md)\n", .{peer_strs.items[0]});
         try out.flush();
     }
-    if (opts.openai_port != 0) openai_ctx.alpha_metrics = &alpha_metrics;
 
     var rpc_ctx = rpc.Ctx{
         .gpa = gpa,
@@ -1168,6 +1175,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .admin_token = opts.admin_token,
         .engine_lock = &engine_lock,
         .alpha_metrics = &alpha_metrics,
+        .console = out,
+        .console_lock = &out_lock,
     };
     rpc.serve(&rpc_ctx) catch |e| {
         // Do not return: the loops above are detached and still hold pointers

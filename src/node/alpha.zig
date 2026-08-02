@@ -25,6 +25,8 @@ pub const Metrics = struct {
     tok_s_sum: f64 = 0,
     hit_sum: f64 = 0,
     last_tok_s: f64 = 0,
+    inflight: u32 = 0,
+    inflight_since_ns: i128 = 0,
 
     pub fn recordGen(self: *Metrics, tok_s: f64, hit_rate: f64) void {
         self.mu.lockUncancelable(self.io);
@@ -40,6 +42,28 @@ pub const Metrics = struct {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         return .{ .gens = self.gens, .tok_s = self.last_tok_s };
+    }
+
+    pub fn beginGen(self: *Metrics, now_ns: i128) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.inflight += 1;
+        if (self.inflight == 1) self.inflight_since_ns = now_ns;
+    }
+
+    pub fn endGen(self: *Metrics) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.inflight > 0) self.inflight -= 1;
+    }
+
+    /// Seconds the oldest in-flight generation has been running, or null when
+    /// idle. The status line uses this so a busy node never looks dead.
+    pub fn inflightSecs(self: *Metrics, now_ns: i128) ?u64 {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        if (self.inflight == 0) return null;
+        return @intCast(@divTrunc(now_ns - self.inflight_since_ns, 1_000_000_000));
     }
 
     fn snapshot(self: *Metrics) struct { gens: u64, tok_s_avg: f64, hit_avg: f64 } {
