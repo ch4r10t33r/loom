@@ -738,6 +738,23 @@ pub fn writeMoeFixture(gpa: std.mem.Allocator, io: Io, path: []const u8, seed: u
         }
     }
 
+    // NextN/MTP glue for the trailing block, so the speculative-decode path
+    // is exercisable against the fixture (the block itself was written by
+    // the loop above as an ordinary layer).
+    if (nextn == 1) {
+        const NN = struct {
+            fn n(a: std.mem.Allocator, bi: u64, comptime t: []const u8) []const u8 {
+                return std.fmt.allocPrint(a, "blk.{d}.nextn." ++ t, .{bi}) catch unreachable;
+            }
+        };
+        try infos.append(gpa, .{ .name = NN.n(na, n_layers, "enorm.weight"), .dims = .{ dim, 0, 0 }, .n_dims = 1 });
+        try infos.append(gpa, .{ .name = NN.n(na, n_layers, "hnorm.weight"), .dims = .{ dim, 0, 0 }, .n_dims = 1 });
+        try infos.append(gpa, .{ .name = NN.n(na, n_layers, "eh_proj.weight"), .dims = .{ 2 * dim, dim, 0 }, .n_dims = 2 });
+        try infos.append(gpa, .{ .name = NN.n(na, n_layers, "embed_tokens.weight"), .dims = .{ dim, vocab, 0 }, .n_dims = 2 });
+        try infos.append(gpa, .{ .name = NN.n(na, n_layers, "shared_head_norm.weight"), .dims = .{ dim, 0, 0 }, .n_dims = 1 });
+        try infos.append(gpa, .{ .name = NN.n(na, n_layers, "shared_head_head.weight"), .dims = .{ dim, vocab, 0 }, .n_dims = 2 });
+    }
+
     // header + tensor infos with aligned offsets
     var buf = std.ArrayList(u8).empty;
     defer buf.deinit(gpa);
