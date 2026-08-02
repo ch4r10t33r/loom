@@ -1070,6 +1070,10 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
 
     // Periodic console status: membership and holdings move without any
     // request arriving, so an event-only log makes a churning node look idle.
+    // Shared generation aggregates: the status line reads them, the serving
+    // surfaces write them, and the opt-in alpha reporter ships them.
+    var alpha_metrics = alpha.Metrics{ .io = io };
+
     var status_ctx: status_mod.Reporter = undefined;
     if (opts.status_secs != 0) {
         status_ctx = .{
@@ -1081,6 +1085,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             .gen = &gen,
             .committee = committee_members.len,
             .r_target = opts.r_target,
+            .alpha = &alpha_metrics,
             .gpa = gpa,
             .interval_ns = @as(u64, opts.status_secs) * std.time.ns_per_s,
             .start_ns = stats.nowNs(io),
@@ -1089,11 +1094,9 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         t.detach();
     }
 
-    // Opt-in alpha telemetry: aggregate generation stats locally, report the
-    // numeric snapshot to the bootstrap peer once a minute. Reporting without
-    // a bootstrap peer is meaningless (there is nobody to tell), so it is
-    // silently inert for an origin.
-    var alpha_metrics = alpha.Metrics{ .io = io };
+    // Opt-in alpha telemetry: report the numeric snapshot to the bootstrap
+    // peer once a minute. Reporting without a bootstrap peer is meaningless
+    // (there is nobody to tell), so it is silently inert for an origin.
     var alpha_ctx: alpha.ReporterCtx = undefined;
     if (opts.report_metrics and peer_list.items.len > 0) {
         alpha_ctx = .{
