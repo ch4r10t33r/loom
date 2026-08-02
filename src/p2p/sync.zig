@@ -101,6 +101,70 @@ fn parseDigestHex(s: []const u8) !hashmod.Digest {
 
 pub const FetchStats = struct { fetched: usize = 0, bytes: u64 = 0 };
 
+/// The order to fetch missing wanted shards from a peer: mandatory resident
+/// chunks first (indices [0, n_resident)), then the peer's hottest shards
+/// (usage is Zipfian, so the head of this list covers most token reads),
+/// then everything else in index order. Caller frees the slice.
+fn fetchOrder(
+    gpa: std.mem.Allocator,
+    n_ranges: usize,
+    n_resident: usize,
+    heat_ids: []const usize,
+) ![]usize {
+    var order = try gpa.alloc(usize, n_ranges);
+    var queued = try gpa.alloc(bool, n_ranges);
+    defer gpa.free(queued);
+    @memset(queued, false);
+    var used: usize = 0;
+    var i: usize = 0;
+    while (i < n_resident and i < n_ranges) : (i += 1) {
+        order[used] = i;
+        queued[i] = true;
+        used += 1;
+    }
+    for (heat_ids) |id| {
+        if (id >= n_ranges or queued[id]) continue;
+        order[used] = id;
+        queued[id] = true;
+        used += 1;
+    }
+    i = 0;
+    while (i < n_ranges) : (i += 1) {
+        if (queued[i]) continue;
+        order[used] = i;
+        used += 1;
+    }
+    std.debug.assert(used == n_ranges);
+    return order;
+}
+
+/// Ask a peer which shards run hottest. Best-effort: an old peer answers
+/// ERR unknown, a fresh one has no counts; both mean index order.
+fn fetchHeat(gpa: std.mem.Allocator, peer: *Peer) ![]usize {
+    try peer.send("HEAT\n", .{});
+    const line = try peer.recvLine();
+    if (!std.mem.startsWith(u8, line, "HEAT ")) return gpa.alloc(usize, 0);
+    const csv = field(line, "ids") orelse return gpa.alloc(usize, 0);
+    var ids = std.ArrayList(usize).empty;
+    errdefer ids.deinit(gpa);
+    var it = std.mem.splitScalar(u8, csv, ',');
+    while (it.next()) |tok| {
+        if (tok.len == 0) continue;
+        const id = std.fmt.parseInt(usize, tok, 10) catch continue;
+        try ids.append(gpa, id);
+        if (ids.items.len >= 4096) break;
+    }
+    return ids.toOwnedSlice(gpa);
+}
+
+test "fetchOrder: resident first, then heat, then the tail in index order" {
+    const gpa = std.testing.allocator;
+    const heat = [_]usize{ 7, 3, 99, 7 }; // 99 out of range, 7 repeated
+    const order = try fetchOrder(gpa, 10, 2, &heat);
+    defer gpa.free(order);
+    try std.testing.expectEqualSlices(usize, &[_]usize{ 0, 1, 7, 3, 2, 4, 5, 6, 8, 9 }, order);
+}
+
 /// Live sync progress. The initial sync is gigabytes over one connection;
 /// without a heartbeat the console is silent for minutes and a first-time
 /// tester has no idea whether anything is happening (it was the first thing
@@ -190,9 +254,13 @@ fn fetchFromPeerInto(
     const buf = try gpa.alloc(u8, @intCast(m.maxShardLen()));
     defer gpa.free(buf);
 
+    const heat_ids = fetchHeat(gpa, peer) catch try gpa.alloc(usize, 0);
+    defer gpa.free(heat_ids);
+    const order = try fetchOrder(gpa, n_ranges, m.n_resident, heat_ids);
+    defer gpa.free(order);
+
     const stats = out;
-    var i: usize = 0;
-    while (i < n_ranges) : (i += 1) {
+    for (order) |i| {
         if (!store.wanted.has(i) or store.holdings.has(i)) continue;
         if (!peer_holdings.has(i)) continue; // this peer can't serve it; another might
 

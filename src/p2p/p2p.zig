@@ -72,6 +72,10 @@ pub const Ctx = struct {
     /// metrics_mu; the file is capped at 256 MB and then refused.
     metrics_path: ?[]const u8 = null,
     metrics_mu: Io.Mutex = .init,
+    /// Per-shard serve counts (allocated alongside the store). GETR bumps
+    /// them; HEAT answers with the hottest ids so a syncing peer can fetch
+    /// in usefulness order instead of index order.
+    heat: ?[]std.atomic.Value(u32) = null,
     /// Our own advertised "host:port" (what we tell peers to dial us on).
     advertise: []const u8 = "",
 };
@@ -204,6 +208,36 @@ fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer) !void
         if (json.len == 0 or json.len > 8192) return wi.print("ERR bad_metrics\n", .{});
         appendMetricsLine(ctx, path, json) catch return wi.print("ERR ingest_failed\n", .{});
         try wi.print("OK\n", .{});
+    } else if (std.mem.eql(u8, line, "HEAT")) {
+        // The hottest shard ids this node has served, descending. Usage is
+        // Zipfian, so a joiner that syncs these first is useful after a
+        // fraction of the transfer. Best-effort: no counts yet means an
+        // empty list, and an old peer answers ERR unknown -- the client
+        // falls back to index order either way.
+        const h = ctx.heat orelse return wi.print("HEAT n=0 ids=\n", .{});
+        const cap = @min(h.len, 2048);
+        const Pair = struct { id: usize, n: u32 };
+        const pairs = try ctx.gpa.alloc(Pair, h.len);
+        defer ctx.gpa.free(pairs);
+        var used: usize = 0;
+        for (h, 0..) |*c, i| {
+            const n = c.load(.monotonic);
+            if (n == 0) continue;
+            pairs[used] = .{ .id = i, .n = n };
+            used += 1;
+        }
+        std.mem.sort(Pair, pairs[0..used], {}, struct {
+            fn lt(_: void, a: Pair, b: Pair) bool {
+                return a.n > b.n;
+            }
+        }.lt);
+        const k = @min(used, cap);
+        try wi.print("HEAT n={d} ids=", .{k});
+        for (pairs[0..k], 0..) |pr, j| {
+            if (j != 0) try wi.print(",", .{});
+            try wi.print("{d}", .{pr.id});
+        }
+        try wi.print("\n", .{});
     } else if (std.mem.eql(u8, line, "MANIFEST")) {
         const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
         const m = &store.manifest;
@@ -243,6 +277,7 @@ fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer) !void
         const buf = try ctx.gpa.alloc(u8, @intCast(store.manifest.rangeLen(i)));
         defer ctx.gpa.free(buf);
         const data = store.readRangeVerified(i, buf) catch return wi.print("ERR read\n", .{});
+        if (ctx.heat) |h| _ = h[i].fetchAdd(1, .monotonic);
         try wi.print("DATA {d} len={d} sha256={s}\n", .{ i, data.len, hashmod.toHex(store.manifest.digests[i]) });
         try wi.writeAll(data);
     } else if (std.mem.startsWith(u8, line, "FRAME ")) {

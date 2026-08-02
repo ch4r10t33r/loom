@@ -83,6 +83,18 @@ input cannot inject a control token; it is on only for special-marker chat
 scaffolds (chatml/llama3/gemma), where making message content injection-safe too
 requires segment encoding (follow-up).
 
+## Heat (sync ordering hint)
+
+`HEAT` asks a peer which shards it serves most. The reply is one line,
+`HEAT n=<k> ids=<csv>`, the ids of up to 2048 shards this peer has served
+via `GETR`, descending by serve count; a node with no counts replies
+`HEAT n=0 ids=`. The counts are per-process and reset on restart. A syncing
+client fetches mandatory resident chunks first, then the peer's heat list,
+then the remaining wanted shards in index order. The hint is best-effort:
+an unknown-command error or an empty list degrades to index order, and a
+lying peer can only reorder a download whose every shard is still
+digest-verified against the manifest.
+
 ## Alpha telemetry (optional)
 
 `METRICS <json>` carries one node's opt-in operational report to a peer that
