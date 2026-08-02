@@ -911,6 +911,11 @@ fn runStoreWith(
     try out.print("\n---- {d} prompt + {d} generated tokens in {d:.2}s ({d:.1} tok/s) ----\n", .{
         prompt_toks.len, produced, secs, @as(f64, @floatFromInt(prompt_toks.len + produced)) / secs,
     });
+    if (fs.pilot_pred > 0) {
+        try out.print("pilot: {d}/{d} next-layer predictions confirmed ({d:.1}%)\n", .{
+            fs.pilot_hit, fs.pilot_pred, 100.0 * @as(f64, @floatFromInt(fs.pilot_hit)) / @as(f64, @floatFromInt(fs.pilot_pred)),
+        });
+    }
     try out.print("expert tiers: local={d} peer_fetched={d} ({d:.1} MB, avg {d:.1} ms/fetch) failures={d}\n", .{
         fs.local,
         fs.fetched,

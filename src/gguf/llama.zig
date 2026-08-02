@@ -178,6 +178,9 @@ pub const Model = struct {
     /// come through Source.get() — local tier or peer fetch — instead of the
     /// (possibly sparse) memory map.
     dist: ?*expert_fetch.Source = null,
+    /// PILOT router-lookahead prefetch (see moeLayer). On by default for the
+    /// distributed path; LOOM_NO_PILOT=1 disables for A/B measurement.
+    pilot_enabled: bool = false,
     /// Set at load when every layer can be recorded into one command buffer.
     /// See gpuLayersSupported.
     gpu_layers: bool = false,
@@ -507,6 +510,7 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
 /// Attach a distributed expert source: routed-expert reads become
 /// Source.get() calls (local shard or peer fetch) instead of memory-map reads.
 pub fn attachDist(m: *Model, gpa: std.mem.Allocator, src: *expert_fetch.Source) !void {
+    m.pilot_enabled = std.c.getenv("LOOM_NO_PILOT") == null;
     const is_moe = try gpa.alloc(bool, m.cfg.n_layers);
     defer gpa.free(is_moe);
     for (m.layers, 0..) |l, i| is_moe[i] = l.is_moe;
@@ -556,6 +560,14 @@ pub const State = struct {
     bup: []f32,
     bact: []f32,
     bffn: []f32,
+
+    // PILOT lookahead (single-stream decode): the experts predicted for the
+    // next MoE layer by running its router on the current hidden state, so
+    // their fetches overlap this layer's compute. Checked (for the measured
+    // hit rate) when that layer actually routes.
+    pilot_layer: usize = std.math.maxInt(usize),
+    pilot_pred: [moe.MAX_SELECTED]usize = undefined,
+    pilot_n: usize = 0,
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config) !State {
         const kvd = cfg.kvDim();
@@ -950,11 +962,51 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize) !void {
     const acc = st.moe_acc;
     @memset(acc, 0);
     if (m.dist) |src| {
+        // PILOT scorecard: how many of the experts predicted for this layer
+        // (from the previous layer's hidden state) did the router confirm?
+        if (st.pilot_layer == li) {
+            src.stats.pilot_pred += st.pilot_n;
+            for (sel) |s| {
+                for (st.pilot_pred[0..st.pilot_n]) |p| {
+                    if (p == s.expert) {
+                        src.stats.pilot_hit += 1;
+                        break;
+                    }
+                }
+            }
+            st.pilot_layer = std.math.maxInt(usize);
+        }
+
         // warm the missing shards in parallel: per-layer miss latency
         // becomes max(fetch), not sum(fetch)
         var ids_buf: [moe.MAX_SELECTED]usize = undefined;
         for (sel, 0..) |s, k| ids_buf[k] = m.expert_shard[li * cfg.n_expert + s.expert];
         src.prefetch(ids_buf[0..sel.len]);
+
+        // PILOT lookahead (colibri's router-lookahead, Apache-2.0): run the
+        // NEXT MoE layer's router on the CURRENT hidden state and start
+        // fetching its likely experts while this layer computes. Routing is
+        // strongly correlated across adjacent layers (colibri measures 71.6%
+        // one layer ahead); a miss costs nothing but a wasted fetch that
+        // still persists to the store.
+        if (li + 1 < m.layers.len and m.pilot_enabled) {
+            const nl = m.layers[li + 1];
+            if (nl.is_moe and nl.ffn_gate_inp != null) {
+                mv(nl.ffn_gate_inp.?, st.router[0..cfg.n_expert], st.normed);
+                var psel_buf: [moe.MAX_SELECTED]moe.Selected = undefined;
+                const psel = psel_buf[0..cfg.n_used];
+                const pbias: ?[]const f32 = if (nl.exp_probs_b) |b| tensorAsF32(b) else null;
+                moe.route(cfg.route, st.router[0..cfg.n_expert], pbias, psel);
+                var pids_buf: [moe.MAX_SELECTED]usize = undefined;
+                for (psel, 0..) |s, k| {
+                    pids_buf[k] = m.expert_shard[(li + 1) * cfg.n_expert + s.expert];
+                    st.pilot_pred[k] = s.expert;
+                }
+                st.pilot_n = psel.len;
+                st.pilot_layer = li + 1;
+                src.prefetchAsync(pids_buf[0..psel.len]);
+            }
+        }
     }
     for (sel) |s| {
         if (m.dist) |src| {
