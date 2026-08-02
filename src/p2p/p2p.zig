@@ -42,6 +42,7 @@ const peers = @import("peers.zig");
 const stats = @import("../core/stats.zig");
 const bootnode = @import("bootnode.zig");
 const rag_store = @import("../rag/store.zig");
+const generator = @import("../node/generator.zig");
 const wire = @import("wire.zig");
 const sockopt = @import("../core/sockopt.zig");
 
@@ -76,6 +77,12 @@ pub const Ctx = struct {
     /// them; HEAT answers with the hottest ids so a syncing peer can fetch
     /// in usefulness order instead of index order.
     heat: ?[]std.atomic.Value(u32) = null,
+    /// Generation surface for delegate-while-cold (the GEN command). All
+    /// three are set together by the node once its engine choice is final;
+    /// until gen_ready flips true, GEN answers ERR not_ready.
+    gen: ?*generator.Generator = null,
+    engine_lock: ?*Io.Mutex = null,
+    gen_ready: ?*std.atomic.Value(bool) = null,
     /// Our own advertised "host:port" (what we tell peers to dial us on).
     advertise: []const u8 = "",
 };
@@ -162,7 +169,7 @@ fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
     while (true) {
         const raw = ri.takeDelimiterInclusive('\n') catch return;
         const line = std.mem.trimEnd(u8, raw, "\r\n");
-        try handleLine(ctx, line, ri, wi);
+        try handleLine(ctx, line, ri, wi, dl);
         try wi.flush();
         // The deadline is there to hang up on a socket that is *idle* -- a
         // slowloris holding a connection open. A peer that just took a shard
@@ -178,7 +185,7 @@ fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
     }
 }
 
-fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer) !void {
+fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer, dl: ?usize) !void {
     if (line.len == 0) return;
     if (std.mem.eql(u8, line, "PING")) {
         try wi.print("PONG\n", .{});
@@ -208,6 +215,86 @@ fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer) !void
         if (json.len == 0 or json.len > 8192) return wi.print("ERR bad_metrics\n", .{});
         appendMetricsLine(ctx, path, json) catch return wi.print("ERR ingest_failed\n", .{});
         try wi.print("OK\n", .{});
+    } else if (std.mem.startsWith(u8, line, "GEN ")) {
+        // Delegate-while-cold (SPEC.md): a cold peer forwards a generation
+        // here and relays the answer. Same trust plane as every v1 command.
+        const g = ctx.gen orelse return wi.print("ERR no_engine\n", .{});
+        const lock = ctx.engine_lock orelse return wi.print("ERR no_engine\n", .{});
+        const ready = ctx.gen_ready orelse return wi.print("ERR no_engine\n", .{});
+        if (!ready.load(.acquire)) return wi.print("ERR not_ready\n", .{});
+        const parsed = std.json.parseFromSlice(std.json.Value, ctx.gpa, line[4..], .{}) catch
+            return wi.print("ERR bad_json\n", .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return wi.print("ERR bad_json\n", .{});
+        const obj = parsed.value.object;
+        const prompt = if (obj.get("prompt")) |v| (if (v == .string) v.string else "") else "";
+        if (prompt.len == 0 or prompt.len > 65536) return wi.print("ERR bad_prompt\n", .{});
+        var max_tokens: usize = 128;
+        if (obj.get("max_tokens")) |v| {
+            if (v == .integer and v.integer > 0) max_tokens = @min(@as(usize, @intCast(v.integer)), 2048);
+        }
+        var temp: f32 = 0.7;
+        if (obj.get("temperature")) |v| {
+            if (v == .float) temp = @floatCast(v.float);
+            if (v == .integer) temp = @floatFromInt(v.integer);
+        }
+        var seed: u64 = 42;
+        if (obj.get("seed")) |v| {
+            if (v == .integer and v.integer >= 0) seed = @intCast(v.integer);
+        }
+        const parse_special = if (obj.get("parse_special")) |v| v == .bool and v.bool else false;
+        // A generation is minutes of work, not a read: switch this
+        // connection to the generation deadline for the duration.
+        sockopt.refreshServe(ctx.io, dl);
+        const t0 = stats.nowNs(ctx.io);
+        lock.lockUncancelable(ctx.io);
+        var res = g.generate(ctx.gpa, ctx.io, prompt, max_tokens, temp, seed, null, null, parse_special) catch |e| {
+            lock.unlock(ctx.io);
+            return wi.print("ERR gen_{s}\n", .{@errorName(e)});
+        };
+        const hit = g.hitRate();
+        lock.unlock(ctx.io);
+        defer res.deinit(ctx.gpa);
+        const secs = @as(f64, @floatFromInt(stats.nowNs(ctx.io) - t0)) / 1e9;
+        const tok_s = if (secs > 0) @as(f64, @floatFromInt(res.completion_tokens)) / secs else 0;
+        try wi.print("GENR ok=1 prompt_tokens={d} completion_tokens={d} tok_per_s={d:.2} hit_rate={d:.4} len={d}\n", .{
+            res.prompt_tokens, res.completion_tokens, tok_s, hit, res.text.len,
+        });
+        try wi.writeAll(res.text);
+    } else if (std.mem.startsWith(u8, line, "PACKR ")) {
+        // Batched shard stream: one request, many DATA payloads, one END.
+        // Per-shard GETR pays a round trip each; at WAN RTTs that is minutes
+        // of pure latency over a full sync. Same verification story as GETR:
+        // the receiver checks every shard against its manifest digests.
+        const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
+        var ids_buf: [256]usize = undefined;
+        var n_ids: usize = 0;
+        var it = std.mem.splitScalar(u8, std.mem.trim(u8, line[6..], " "), ',');
+        while (it.next()) |tok| {
+            if (tok.len == 0) continue;
+            if (n_ids >= ids_buf.len) return wi.print("ERR too_many\n", .{});
+            ids_buf[n_ids] = std.fmt.parseInt(usize, tok, 10) catch return wi.print("ERR bad_id\n", .{});
+            n_ids += 1;
+        }
+        for (ids_buf[0..n_ids]) |i| {
+            if (i >= store.manifest.nRanges() or !store.holdings.has(i)) {
+                try wi.print("ABSENT {d}\n", .{i});
+                continue;
+            }
+            const buf = try ctx.gpa.alloc(u8, @intCast(store.manifest.rangeLen(i)));
+            defer ctx.gpa.free(buf);
+            const data = store.readRangeVerified(i, buf) catch {
+                try wi.print("ABSENT {d}\n", .{i});
+                continue;
+            };
+            if (ctx.heat) |h| _ = h[i].fetchAdd(1, .monotonic);
+            try wi.print("DATA {d} len={d} sha256={s}\n", .{ i, data.len, hashmod.toHex(store.manifest.digests[i]) });
+            try wi.writeAll(data);
+            try wi.flush();
+            // a multi-gigabyte stream outlives the read deadline many times
+            sockopt.refreshServe(ctx.io, dl);
+        }
+        try wi.print("END\n", .{});
     } else if (std.mem.eql(u8, line, "HEAT")) {
         // The hottest shard ids this node has served, descending. Usage is
         // Zipfian, so a joiner that syncs these first is useful after a

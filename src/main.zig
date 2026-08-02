@@ -364,14 +364,14 @@ fn defaultRamGb() f64 {
 }
 
 const NODE_FLAGS = [_][]const u8{
-    "--model",          "--rpc-addr",     "--rpc-port",      "--openai-addr", "--openai-port",
-    "--p2p-addr",       "--p2p-port",     "--ram-gb",        "--pin-gb",      "--seed",
-    "--stats",          "--no-verify",    "--gguf",          "--bootstrap",   "--hold-fraction",
-    "--range-mb",       "--peers",        "--advertise",     "--network-id",  "--network",
-    "--rag",            "--rag-k",        "--r-target",      "--free-quota",  "--admin-token",
-    "--ctx",            "--ui-addr",      "--ui-port",       "--status-secs", "--threads",
-    "--mmap-weights",   "--gpu-ops",      "--no-gpu-layers", "--batch",       "--chat-format",
-    "--report-metrics", "--alpha-ingest",
+    "--model",          "--rpc-addr",     "--rpc-port",       "--openai-addr", "--openai-port",
+    "--p2p-addr",       "--p2p-port",     "--ram-gb",         "--pin-gb",      "--seed",
+    "--stats",          "--no-verify",    "--gguf",           "--bootstrap",   "--hold-fraction",
+    "--range-mb",       "--peers",        "--advertise",      "--network-id",  "--network",
+    "--rag",            "--rag-k",        "--r-target",       "--free-quota",  "--admin-token",
+    "--ctx",            "--ui-addr",      "--ui-port",        "--status-secs", "--threads",
+    "--mmap-weights",   "--gpu-ops",      "--no-gpu-layers",  "--batch",       "--chat-format",
+    "--report-metrics", "--alpha-ingest", "--delegate-below",
 };
 
 /// A flag-shaped argument this command does not know is an error, not a
@@ -471,6 +471,7 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .chat_format = flagStr(args, "--chat-format"),
         .report_metrics = hasFlag(args, "--report-metrics"),
         .alpha_ingest = flagStr(args, "--alpha-ingest"),
+        .delegate_below = std.math.clamp(try flagF64(args, "--delegate-below", 0.5), 0.0, 1.0),
     });
 }
 

@@ -29,6 +29,8 @@ const generator = @import("generator.zig");
 const rag_store = @import("../rag/store.zig");
 const sockopt = @import("../core/sockopt.zig");
 const stats = @import("../core/stats.zig");
+const weights = @import("../p2p/weights.zig");
+const sync = @import("../p2p/sync.zig");
 const chat_template = @import("../gguf/chat_template.zig");
 const meter_mod = @import("meter.zig");
 const peers_mod = @import("../p2p/peers.zig");
@@ -43,6 +45,12 @@ pub const Ctx = struct {
     /// lines per request (see rpc.zig).
     console: ?*Io.Writer = null,
     console_lock: ?*Io.Mutex = null,
+    /// Delegate-while-cold: when this node's holdings fraction is below the
+    /// threshold and a peer at >=0.9 exists, forward the generation over the
+    /// p2p GEN command and relay the answer (badged in the response). 0
+    /// disables. Local generation is always the fallback.
+    store: ?*weights.Store = null,
+    delegate_below: f64 = 0.5,
     /// Gossiped RAG chunks; null when --rag is off. Search runs before the
     /// prompt reaches the engine.
     rag: ?*rag_store.Store = null,
@@ -431,6 +439,25 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer, dl:
         if (stream) @as([]const u8, ", streaming") else "",
     });
 
+    // Delegate-while-cold: a mostly-empty store means most expert reads
+    // would stall on the network anyway; a warm peer computes the whole
+    // answer faster than we can fetch our way through it. Any failure falls
+    // through to local generation, so this can only help.
+    if (delegateTarget(ctx)) |target| {
+        defer gpa.free(target.addr);
+        const parse_special_d = is_chat and chat_template.usesSpecialMarkers(ctx.gen.chatFormat());
+        if (delegateGenerate(ctx, target.addr, prompt_text, max_tokens, temp, seed, parse_special_d)) |dres| {
+            defer gpa.free(dres.text);
+            if (ctx.meter) |m| _ = m.settle(client, reserved, @intCast(dres.prompt_tokens + dres.completion_tokens));
+            consoleLine(ctx, "served   {s}: {d} token(s) delegated to {s} ({d:.2} tok/s there)", .{
+                if (is_chat) @as([]const u8, "chat") else "completion", dres.completion_tokens, target.addr, dres.tok_per_s,
+            });
+            return try delegatedResponse(ctx, is_chat, stream, model_id, dres, wi);
+        } else |e| {
+            consoleLine(ctx, "delegate to {s} failed ({s}); generating locally", .{ target.addr, @errorName(e) });
+        }
+    }
+
     // Streaming: write the SSE response to the connection and return null.
     if (stream) {
         if (ctx.alpha_metrics) |am| am.beginGen(stats.nowNs(ctx.io));
@@ -631,6 +658,99 @@ fn promptField(parsed: ?std.json.Parsed(std.json.Value)) []const u8 {
 }
 
 /// JSON-escape a raw byte slice into an owned string (no surrounding quotes).
+const DelegateResult = struct {
+    text: []u8,
+    prompt_tokens: usize,
+    completion_tokens: usize,
+    tok_per_s: f64,
+};
+
+fn delegateTarget(ctx: *Ctx) ?struct { addr: []u8, frac: f64 } {
+    if (ctx.delegate_below <= 0) return null;
+    const st = ctx.store orelse return null;
+    const table = ctx.peers orelse return null;
+    const total = st.manifest.nRanges();
+    if (total == 0) return null;
+    const mine = @as(f64, @floatFromInt(st.holdings.count())) / @as(f64, @floatFromInt(total));
+    if (mine >= ctx.delegate_below) return null;
+    const best = (table.warmest(ctx.gpa, stats.nowNs(ctx.io), total) catch return null) orelse return null;
+    // A partial peer would just relocate the misses; require a warm one.
+    if (best.frac < 0.9) {
+        ctx.gpa.free(best.addr);
+        return null;
+    }
+    return .{ .addr = best.addr, .frac = best.frac };
+}
+
+fn delegateGenerate(
+    ctx: *Ctx,
+    addr_str: []const u8,
+    prompt: []const u8,
+    max_tokens: usize,
+    temp: f32,
+    seed: u64,
+    parse_special: bool,
+) !DelegateResult {
+    const gpa = ctx.gpa;
+    const addr = try sync.PeerAddr.parse(addr_str);
+    const peer = try sync.Peer.connect(gpa, ctx.io, addr);
+    defer peer.close(gpa);
+    const prompt_esc = try jsonEscapeAlloc(gpa, prompt);
+    defer gpa.free(prompt_esc);
+    try peer.send("GEN {{\"prompt\":\"{s}\",\"max_tokens\":{d},\"temperature\":{d:.3},\"seed\":{d},\"parse_special\":{}}}\n", .{
+        prompt_esc, max_tokens, temp, seed, parse_special,
+    });
+    // the remote generation takes minutes; stretch this connection's reaper
+    sockopt.refresh(ctx.io, peer.deadline, sockopt.GENERATE_TIMEOUT_S);
+    const line = try peer.recvLine();
+    if (!std.mem.startsWith(u8, line, "GENR ")) return error.DelegateRefused;
+    const flen = std.fmt.parseInt(usize, fieldOf(line, "len") orelse return error.BadReply, 10) catch return error.BadReply;
+    if (flen > 1 << 22) return error.BadReply;
+    const pt = std.fmt.parseInt(usize, fieldOf(line, "prompt_tokens") orelse "0", 10) catch 0;
+    const ct = std.fmt.parseInt(usize, fieldOf(line, "completion_tokens") orelse "0", 10) catch 0;
+    const tps = std.fmt.parseFloat(f64, fieldOf(line, "tok_per_s") orelse "0") catch 0;
+    const text = try gpa.alloc(u8, flen);
+    errdefer gpa.free(text);
+    try peer.r.interface.readSliceAll(text);
+    return .{ .text = text, .prompt_tokens = pt, .completion_tokens = ct, .tok_per_s = tps };
+}
+
+/// "key=value" scan over a space-separated reply line.
+fn fieldOf(line: []const u8, key: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, line, ' ');
+    while (it.next()) |tok| {
+        if (tok.len > key.len + 1 and std.mem.startsWith(u8, tok, key) and tok[key.len] == '=')
+            return tok[key.len + 1 ..];
+    }
+    return null;
+}
+
+fn delegatedResponse(ctx: *Ctx, is_chat: bool, stream: bool, model_id: []const u8, dres: DelegateResult, wi: *Io.Writer) !?Response {
+    const gpa = ctx.gpa;
+    const content = try jsonEscapeAlloc(gpa, dres.text);
+    defer gpa.free(content);
+    const model_esc = try jsonEscapeAlloc(gpa, model_id);
+    defer gpa.free(model_esc);
+    const id = id_counter.fetchAdd(1, .monotonic) + 1;
+    if (stream) {
+        // Valid SSE with the whole delegated answer as one delta.
+        try wi.print("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n", .{});
+        try wi.print("data: {{\"id\":\"chatcmpl-loom-{d}\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"{s}\",\"loom_delegated\":true,\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":\"{s}\"}},\"finish_reason\":null}}]}}\n\n", .{ id, model_esc, content });
+        try wi.print("data: {{\"id\":\"chatcmpl-loom-{d}\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{}},\"finish_reason\":\"stop\"}}]}}\n\ndata: [DONE]\n\n", .{ id, model_esc });
+        try wi.flush();
+        return null;
+    }
+    const body = if (is_chat)
+        try std.fmt.allocPrint(gpa,
+            \\{{"id":"chatcmpl-loom-{d}","object":"chat.completion","created":0,"model":"{s}","loom_delegated":true,"choices":[{{"index":0,"message":{{"role":"assistant","content":"{s}"}},"finish_reason":"stop"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+        , .{ id, model_esc, content, dres.prompt_tokens, dres.completion_tokens, dres.prompt_tokens + dres.completion_tokens })
+    else
+        try std.fmt.allocPrint(gpa,
+            \\{{"id":"cmpl-loom-{d}","object":"text_completion","created":0,"model":"{s}","loom_delegated":true,"choices":[{{"index":0,"text":"{s}","finish_reason":"stop"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+        , .{ id, model_esc, content, dres.prompt_tokens, dres.completion_tokens, dres.prompt_tokens + dres.completion_tokens });
+    return .{ .status = 200, .body = body };
+}
+
 fn consoleLine(ctx: *Ctx, comptime fmt: []const u8, args: anytype) void {
     const cw = ctx.console orelse return;
     const lk = ctx.console_lock orelse return;
