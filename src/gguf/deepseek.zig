@@ -114,7 +114,14 @@ const LayerT = struct {
     // kv path
     attn_kv_a_mqa: Tensor,
     attn_kv_a_norm: Tensor,
-    attn_kv_b: Tensor,
+    /// Fused [heads x (nope+v)] over kv_lora rows (deepseek2 conversions),
+    /// or null when the file ships the split pair below instead.
+    attn_kv_b: ?Tensor,
+    /// Split form (glm-dsa and newer deepseek conversions): k_b is stored
+    /// TRANSPOSED per head ([kv_lora rows x nope cols]), which turns the
+    /// absorb step into a plain matvec; v_b is [v rows x kv_lora cols].
+    attn_k_b: ?Tensor,
+    attn_v_b: ?Tensor,
     attn_output: Tensor,
     ffn_norm: Tensor,
     // dense layers
@@ -260,7 +267,16 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
     errdefer parsed.deinit();
 
     const arch = parsed.getString("general.architecture") orelse return error.NoArchitecture;
-    if (!std.mem.eql(u8, arch, "deepseek2")) return error.UnsupportedArchitecture;
+    const is_dsa = std.mem.eql(u8, arch, "glm-dsa");
+    if (!std.mem.eql(u8, arch, "deepseek2") and !is_dsa) return error.UnsupportedArchitecture;
+    // Config keys are prefixed by the architecture name; glm-dsa is the
+    // deepseek2 MLA family with a sparse-attention indexer bolted on.
+    var kb: [96]u8 = undefined;
+    const kf = struct {
+        fn f(buf: []u8, a: []const u8, comptime k: []const u8) []const u8 {
+            return std.fmt.bufPrint(buf, "{s}." ++ k, .{a}) catch unreachable;
+        }
+    }.f;
 
     const file = try Io.Dir.cwd().openFile(io, path, .{});
     errdefer file.close(io);
@@ -276,37 +292,46 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
     });
     errdefer mm.destroy(io);
 
-    const dim: usize = @intCast(parsed.getUint("deepseek2.embedding_length") orelse return error.BadConfig);
-    const n_heads: usize = @intCast(parsed.getUint("deepseek2.attention.head_count") orelse return error.BadConfig);
-    const rope_dim: usize = @intCast(parsed.getUint("deepseek2.rope.dimension_count") orelse return error.BadConfig);
-    const key_len: usize = @intCast(parsed.getUint("deepseek2.attention.key_length") orelse return error.BadConfig);
+    const dim: usize = @intCast(parsed.getUint(kf(&kb, arch, "embedding_length")) orelse return error.BadConfig);
+    const n_heads: usize = @intCast(parsed.getUint(kf(&kb, arch, "attention.head_count")) orelse return error.BadConfig);
+    const rope_dim: usize = @intCast(parsed.getUint(kf(&kb, arch, "rope.dimension_count")) orelse return error.BadConfig);
+    // deepseek2's key_length is the per-head MLA key; glm-dsa uses
+    // key_length for the compressed MQA lane and carries the per-head sizes
+    // under *_mla.
+    const key_len: usize = @intCast((if (is_dsa)
+        parsed.getUint(kf(&kb, arch, "attention.key_length_mla"))
+    else
+        parsed.getUint(kf(&kb, arch, "attention.key_length"))) orelse return error.BadConfig);
     if (key_len <= rope_dim) return error.BadConfig;
 
     const cfg = Config{
         .dim = dim,
-        .n_layers = @intCast(parsed.getUint("deepseek2.block_count") orelse return error.BadConfig),
-        .n_dense_layers = @intCast(parsed.getUint("deepseek2.leading_dense_block_count") orelse 0),
+        .n_layers = @intCast(parsed.getUint(kf(&kb, arch, "block_count")) orelse return error.BadConfig),
+        .n_dense_layers = @intCast(parsed.getUint(kf(&kb, arch, "leading_dense_block_count")) orelse 0),
         .n_heads = n_heads,
-        .q_lora_rank = @intCast(parsed.getUint("deepseek2.attention.q_lora_rank") orelse 0),
-        .kv_lora_rank = @intCast(parsed.getUint("deepseek2.attention.kv_lora_rank") orelse return error.BadConfig),
+        .q_lora_rank = @intCast(parsed.getUint(kf(&kb, arch, "attention.q_lora_rank")) orelse 0),
+        .kv_lora_rank = @intCast(parsed.getUint(kf(&kb, arch, "attention.kv_lora_rank")) orelse return error.BadConfig),
         .rope_dim = rope_dim,
         .nope_dim = key_len - rope_dim,
-        .v_head_dim = @intCast(parsed.getUint("deepseek2.attention.value_length") orelse return error.BadConfig),
-        .ffn = @intCast(parsed.getUint("deepseek2.feed_forward_length") orelse return error.BadConfig),
-        .moe_ffn = @intCast(parsed.getUint("deepseek2.expert_feed_forward_length") orelse 0),
-        .n_expert = @intCast(parsed.getUint("deepseek2.expert_count") orelse 0),
-        .n_used = @intCast(parsed.getUint("deepseek2.expert_used_count") orelse 0),
-        .n_shared = @intCast(parsed.getUint("deepseek2.expert_shared_count") orelse 0),
-        .gating = switch (parsed.getUint("deepseek2.expert_gating_func") orelse 1) {
+        .v_head_dim = @intCast((if (is_dsa)
+            parsed.getUint(kf(&kb, arch, "attention.value_length_mla"))
+        else
+            parsed.getUint(kf(&kb, arch, "attention.value_length"))) orelse return error.BadConfig),
+        .ffn = @intCast(parsed.getUint(kf(&kb, arch, "feed_forward_length")) orelse return error.BadConfig),
+        .moe_ffn = @intCast(parsed.getUint(kf(&kb, arch, "expert_feed_forward_length")) orelse 0),
+        .n_expert = @intCast(parsed.getUint(kf(&kb, arch, "expert_count")) orelse 0),
+        .n_used = @intCast(parsed.getUint(kf(&kb, arch, "expert_used_count")) orelse 0),
+        .n_shared = @intCast(parsed.getUint(kf(&kb, arch, "expert_shared_count")) orelse 0),
+        .gating = switch (parsed.getUint(kf(&kb, arch, "expert_gating_func")) orelse 1) {
             2 => .sigmoid,
             else => .softmax,
         },
-        .weights_norm = parsed.getBool("deepseek2.expert_weights_norm") orelse false,
-        .weights_scale = @floatCast(parsed.getFloat("deepseek2.expert_weights_scale") orelse 1.0),
+        .weights_norm = parsed.getBool(kf(&kb, arch, "expert_weights_norm")) orelse false,
+        .weights_scale = @floatCast(parsed.getFloat(kf(&kb, arch, "expert_weights_scale")) orelse 1.0),
         .vocab = 0, // from token_embd below
-        .ctx_len = @intCast(parsed.getUint("deepseek2.context_length") orelse 2048),
-        .rope_base = @floatCast(parsed.getFloat("deepseek2.rope.freq_base") orelse 10000.0),
-        .eps = @floatCast(parsed.getFloat("deepseek2.attention.layer_norm_rms_epsilon") orelse 1e-6),
+        .ctx_len = @intCast(parsed.getUint(kf(&kb, arch, "context_length")) orelse 2048),
+        .rope_base = @floatCast(parsed.getFloat(kf(&kb, arch, "rope.freq_base")) orelse 10000.0),
+        .eps = @floatCast(parsed.getFloat(kf(&kb, arch, "attention.layer_norm_rms_epsilon")) orelse 1e-6),
         .yarn_factor = 0,
         .yarn_orig_ctx = 0,
         .yarn_log_mul = 0,
@@ -322,11 +347,11 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
     // as in llama.cpp's deepseek2 graph): kq_scale = mscale^2 / sqrt(key_dim),
     // mscale = 1 + yarn_log_mul * ln(factor).
     var cfg2 = cfg;
-    const scaling_type = parsed.getString("deepseek2.rope.scaling.type") orelse "";
+    const scaling_type = parsed.getString(kf(&kb, arch, "rope.scaling.type")) orelse "";
     if (std.mem.eql(u8, scaling_type, "yarn")) {
-        cfg2.yarn_factor = @floatCast(parsed.getFloat("deepseek2.rope.scaling.factor") orelse 1.0);
-        cfg2.yarn_orig_ctx = @floatCast(parsed.getFloat("deepseek2.rope.scaling.original_context_length") orelse 4096.0);
-        cfg2.yarn_log_mul = @floatCast(parsed.getFloat("deepseek2.rope.scaling.yarn_log_multiplier") orelse 0.1);
+        cfg2.yarn_factor = @floatCast(parsed.getFloat(kf(&kb, arch, "rope.scaling.factor")) orelse 1.0);
+        cfg2.yarn_orig_ctx = @floatCast(parsed.getFloat(kf(&kb, arch, "rope.scaling.original_context_length")) orelse 4096.0);
+        cfg2.yarn_log_mul = @floatCast(parsed.getFloat(kf(&kb, arch, "rope.scaling.yarn_log_multiplier")) orelse 0.1);
     }
     const mscale: f32 = if (cfg2.yarn_factor > 1.0)
         1.0 + cfg2.yarn_log_mul * @log(cfg2.yarn_factor)
@@ -386,8 +411,19 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
         try Model.expectShape(l.attn_kv_a_mqa, cfg.dim, cfg.kv_lora_rank + cfg.rope_dim, "attn_kv_a_mqa");
         l.attn_kv_a_norm = try model.resolve(N.f(&nb, i, "attn_kv_a_norm.weight"));
         try Model.expectF32(l.attn_kv_a_norm, "attn_kv_a_norm.weight");
-        l.attn_kv_b = try model.resolve(N.f(&nb, i, "attn_kv_b.weight"));
-        try Model.expectShape(l.attn_kv_b, cfg.kv_lora_rank, cfg.n_heads * (cfg.nope_dim + cfg.v_head_dim), "attn_kv_b");
+        l.attn_kv_b = model.resolveOpt(N.f(&nb, i, "attn_kv_b.weight"));
+        l.attn_k_b = model.resolveOpt(N.f(&nb, i, "attn_k_b.weight"));
+        l.attn_v_b = model.resolveOpt(N.f(&nb, i, "attn_v_b.weight"));
+        if (l.attn_kv_b) |t| {
+            try Model.expectShape(t, cfg.kv_lora_rank, cfg.n_heads * (cfg.nope_dim + cfg.v_head_dim), "attn_kv_b");
+        } else {
+            const kb_t = l.attn_k_b orelse return error.MissingTensor;
+            const vb_t = l.attn_v_b orelse return error.MissingTensor;
+            // 3D per-head: k_b {nope, kv_lora, heads} (transposed), v_b
+            // {kv_lora, v, heads}
+            if (kb_t.ne0 != cfg.nope_dim or kb_t.ne1 != cfg.kv_lora_rank) return error.BadShape;
+            if (vb_t.ne0 != cfg.kv_lora_rank or vb_t.ne1 != cfg.v_head_dim) return error.BadShape;
+        }
         l.attn_output = try model.resolve(N.f(&nb, i, "attn_output.weight"));
         try Model.expectShape(l.attn_output, cfg.n_heads * cfg.v_head_dim, cfg.dim, "attn_output");
         l.ffn_norm = try model.resolve(N.f(&nb, i, "ffn_norm.weight"));
@@ -891,7 +927,7 @@ fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_a
     const t_tail0 = if (prof) Profile.now() else 0;
     // LOOM_NO_TAIL bisects the fused tail against the two-buffer path in one
     // binary; cross-run comparison on this machine has misled before.
-    if (allow_tail and l.is_moe and m.dist == null and std.c.getenv("LOOM_NO_TAIL") == null) {
+    if (allow_tail and l.is_moe and m.dist == null and l.attn_kv_b != null and std.c.getenv("LOOM_NO_TAIL") == null) {
         if (l.ffn_gate_exps) |gt| {
             const rbias: ?[]const f32 = if (l.exp_probs_b) |b| asF32(b) else null;
             const shexp: ?[3]backend.WeightRef = if (l.ffn_gate_shexp) |gs| .{
@@ -905,7 +941,7 @@ fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_a
                 st.x,
                 st.q_nope_all,
                 st.mla_qr,
-                .{ .ty = l.attn_kv_b.ty, .data = l.attn_kv_b.data },
+                .{ .ty = l.attn_kv_b.?.ty, .data = l.attn_kv_b.?.data },
                 .{ .ty = l.attn_output.ty, .data = l.attn_output.data },
                 asF32(l.ffn_norm),
                 cfg.eps,
@@ -938,12 +974,12 @@ fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_a
     // One call, three dispatches, one command buffer: absorption, attention,
     // and W_v -- the result is head_out, ready for the output projection. The
     // fallback below is the full host loop including its own W_v.
-    const on_device = backend.mlaAttnHeads(
+    const on_device = l.attn_kv_b != null and backend.mlaAttnHeads(
         li,
         pos,
         st.q_nope_all,
         st.mla_qr,
-        .{ .ty = l.attn_kv_b.ty, .data = l.attn_kv_b.data },
+        .{ .ty = l.attn_kv_b.?.ty, .data = l.attn_kv_b.?.data },
         st.head_out[0 .. cfg.n_heads * vd],
         cfg.n_heads,
         nope,
@@ -954,13 +990,21 @@ fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_a
         h = 0;
         while (h < cfg.n_heads) : (h += 1) {
             const q_nope = st.q[h * kd ..][0..nope];
-            const kb_base = h * (nope + vd);
-            const k_rows = l.attn_kv_b.data[kb_base * ggml.rowBytes(l.attn_kv_b.ty, kvr) ..];
             const qa = st.mla_qa[h * kvr ..][0..kvr];
-            @memset(qa, 0);
-            for (q_nope, 0..) |qr, r| {
-                backend.dequantRow(l.attn_kv_b.ty, st.row_tmp, k_rows, r, kvr);
-                backend.axpy(qa, st.row_tmp, qr);
+            if (l.attn_kv_b) |kvb| {
+                const kb_base = h * (nope + vd);
+                const k_rows = kvb.data[kb_base * ggml.rowBytes(kvb.ty, kvr) ..];
+                @memset(qa, 0);
+                for (q_nope, 0..) |qr, r| {
+                    backend.dequantRow(kvb.ty, st.row_tmp, k_rows, r, kvr);
+                    backend.axpy(qa, st.row_tmp, qr);
+                }
+            } else {
+                // Split k_b is stored transposed per head, so the absorb is
+                // one plain matvec: qa = k_b_h . q_nope.
+                const kb_t = l.attn_k_b.?;
+                const head_bytes = kb_t.ne1 * ggml.rowBytes(kb_t.ty, kb_t.ne0);
+                backend.matvec(kb_t.ty, qa, kb_t.data[h * head_bytes ..], q_nope, kvr, nope);
             }
         }
     }
@@ -968,8 +1012,12 @@ fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_a
     h = 0;
     while (h < cfg.n_heads) : (h += 1) {
         if (on_device) break; // head_out is already complete
-        const kb_base = h * (nope + vd);
-        const v_rows = l.attn_kv_b.data[(kb_base + nope) * ggml.rowBytes(l.attn_kv_b.ty, kvr) ..];
+        const v_rows = if (l.attn_kv_b) |kvb|
+            kvb.data[(h * (nope + vd) + nope) * ggml.rowBytes(kvb.ty, kvr) ..]
+        else blk: {
+            const vb_t = l.attn_v_b.?;
+            break :blk vb_t.data[h * vb_t.ne1 * ggml.rowBytes(vb_t.ty, vb_t.ne0) ..];
+        };
         const o_lat = blk: {
             // Host fallback: scores, softmax and the weighted sum, all in
             // compressed space.
@@ -991,7 +1039,7 @@ fn attnLayer(m: *const Model, l: anytype, li: usize, st: *State, pos: usize, t_a
             break :blk st.c_acc;
         };
         // W_v applied to the compressed result, once per head either way.
-        backend.matvec(l.attn_kv_b.ty, st.head_out[h * vd ..][0..vd], v_rows, o_lat, vd, kvr);
+        backend.matvec(if (l.attn_kv_b) |kvb| kvb.ty else l.attn_v_b.?.ty, st.head_out[h * vd ..][0..vd], v_rows, o_lat, vd, kvr);
     }
     if (prof) t_attn.* += Profile.now() - t_a0;
     mv(l.attn_output, st.proj_out, st.head_out);
@@ -1154,7 +1202,7 @@ pub fn buildFrameDescs(m: *const Model, gpa: std.mem.Allocator) ?[]backend.MlaLa
     if (cfg.q_lora_rank > 0) return null; // frame speaks the direct-q path only
     const descs = gpa.alloc(backend.MlaLayerDesc, cfg.n_layers) catch return null;
     for (m.layers, 0..) |l, i| {
-        if (l.attn_q == null or l.exp_probs_b != null) {
+        if (l.attn_q == null or l.exp_probs_b != null or l.attn_kv_b == null) {
             gpa.free(descs);
             return null;
         }
@@ -1163,7 +1211,7 @@ pub fn buildFrameDescs(m: *const Model, gpa: std.mem.Allocator) ?[]backend.MlaLa
             .wq = .{ .ty = l.attn_q.?.ty, .data = l.attn_q.?.data },
             .kv_a = .{ .ty = l.attn_kv_a_mqa.ty, .data = l.attn_kv_a_mqa.data },
             .kv_a_norm = asF32(l.attn_kv_a_norm),
-            .kv_b = .{ .ty = l.attn_kv_b.ty, .data = l.attn_kv_b.data },
+            .kv_b = .{ .ty = l.attn_kv_b.?.ty, .data = l.attn_kv_b.?.data },
             .attn_out = .{ .ty = l.attn_output.ty, .data = l.attn_output.data },
             .ffn_norm = asF32(l.ffn_norm),
             .is_moe = l.is_moe,
@@ -1548,12 +1596,13 @@ pub fn uploadAbsorbWeights(m: *const Model, gpa: std.mem.Allocator) void {
     const buf = gpa.alloc(f32, per_layer) catch return;
     defer gpa.free(buf);
     for (m.layers, 0..) |l, li| {
-        // Every row of the head's slice, W_k and W_v alike: the kernel strides
-        // past W_v rather than expecting them removed, so the layout on the
-        // device matches the tensor exactly.
+        // Fused layout only: the device kernel strides the [W_k; W_v] slab
+        // exactly as the fused tensor stores it. Split-kv_b files (glm-dsa)
+        // stay on the host attention path.
+        const kvb = l.attn_kv_b orelse return;
         var r: usize = 0;
         while (r < cfg.n_heads * stride) : (r += 1) {
-            backend.dequantRow(l.attn_kv_b.ty, buf[r * kvr ..][0..kvr], l.attn_kv_b.data, r, kvr);
+            backend.dequantRow(kvb.ty, buf[r * kvr ..][0..kvr], kvb.data, r, kvr);
         }
         if (!backend.mlaSetWk(li, buf)) return;
     }
@@ -1645,6 +1694,8 @@ fn buildFixture(gpa: std.mem.Allocator, seed: u64) !Fixture {
             .attn_kv_a_mqa = try f.t2(rnd, cfg.dim, cfg.kv_lora_rank + cfg.rope_dim),
             .attn_kv_a_norm = try f.norm(cfg.kv_lora_rank),
             .attn_kv_b = try f.t2(rnd, cfg.kv_lora_rank, cfg.n_heads * (cfg.nope_dim + cfg.v_head_dim)),
+            .attn_k_b = null,
+            .attn_v_b = null,
             .attn_output = try f.t2(rnd, cfg.n_heads * cfg.v_head_dim, cfg.dim),
             .ffn_norm = try f.norm(cfg.dim),
             .ffn_gate = if (moe_layer) null else try f.t2(rnd, cfg.dim, cfg.ffn),
@@ -1740,5 +1791,115 @@ test "decodeBatch agrees with sequential step, token for token" {
             ib = k;
         };
         try std.testing.expectEqual(ia, ib);
+    }
+}
+
+test "split k_b/v_b attention equals the fused kv_b path bit-exactly" {
+    // glm-dsa (and newer deepseek conversions) ship attn_k_b transposed plus
+    // attn_v_b instead of the fused attn_kv_b. Same weights, two layouts:
+    // the greedy token stream must agree (each output element is the same
+    // dot product; SIMD summation order may differ in the last bit, which
+    // argmax equality over several steps is robust to).
+    const gpa = std.testing.allocator;
+    var fx = try buildFixture(gpa, 77);
+    defer fx.deinit();
+    const m = &fx.m;
+    const cfg = m.cfg;
+    const nope = cfg.nope_dim;
+    const vd = cfg.v_head_dim;
+    const kvr = cfg.kv_lora_rank;
+
+    // Reference: a few greedy steps on the fused path.
+    const N = 6;
+    var ref: [N]u32 = undefined;
+    {
+        var st = try State.init(gpa, cfg);
+        defer st.deinit(gpa);
+        var tok: u32 = 3;
+        for (0..N) |k| {
+            try step(m, &st, tok, k);
+            tok = argmaxLogits(st.logits);
+            ref[k] = tok;
+        }
+    }
+
+    // Rebuild every layer's kv_b as the split pair: k_b transposed per head
+    // ([kvr rows x nope cols]), v_b per head ([vd rows x kvr cols]).
+    var split_bufs = std.ArrayList([]f32).empty;
+    defer {
+        for (split_bufs.items) |b| gpa.free(b);
+        split_bufs.deinit(gpa);
+    }
+    for (m.layers) |*l| {
+        const fused: []const f32 = @alignCast(std.mem.bytesAsSlice(f32, l.attn_kv_b.?.data));
+        const kb = try gpa.alloc(f32, cfg.n_heads * kvr * nope);
+        const vb = try gpa.alloc(f32, cfg.n_heads * vd * kvr);
+        try split_bufs.append(gpa, kb);
+        try split_bufs.append(gpa, vb);
+        for (0..cfg.n_heads) |h| {
+            const base = h * (nope + vd);
+            // fused row r (length kvr) holds W_k row r of head h
+            for (0..nope) |r| {
+                for (0..kvr) |c| {
+                    // transposed: k_b row c (length nope), col r
+                    kb[(h * kvr + c) * nope + r] = fused[(base + r) * kvr + c];
+                }
+            }
+            for (0..vd) |r| {
+                @memcpy(vb[(h * vd + r) * kvr ..][0..kvr], fused[(base + nope + r) * kvr ..][0..kvr]);
+            }
+        }
+        l.attn_k_b = .{ .ty = .f32, .data = std.mem.sliceAsBytes(kb), .ne0 = nope, .ne1 = kvr, .ne2 = cfg.n_heads };
+        l.attn_v_b = .{ .ty = .f32, .data = std.mem.sliceAsBytes(vb), .ne0 = kvr, .ne1 = vd, .ne2 = cfg.n_heads };
+        l.attn_kv_b = null; // force the split path
+    }
+
+    var got: [N]u32 = undefined;
+    {
+        var st = try State.init(gpa, cfg);
+        defer st.deinit(gpa);
+        var tok: u32 = 3;
+        for (0..N) |k| {
+            try step(m, &st, tok, k);
+            tok = argmaxLogits(st.logits);
+            got[k] = tok;
+        }
+    }
+    try std.testing.expectEqualSlices(u32, &ref, &got);
+}
+
+fn argmaxLogits(v: []const f32) u32 {
+    var best: usize = 0;
+    for (v, 0..) |x, i| {
+        if (x > v[best]) best = i;
+    }
+    return @intCast(best);
+}
+
+test "glm-dsa fixture loads through the deepseek engine and decodes" {
+    // The arch-prefixed keys, the *_mla per-head sizes, the split k_b/v_b
+    // pair, and indexer tensors the dense path must tolerate: the whole
+    // glm-dsa loading surface, against a generated file.
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+    const path = "test-arch-glm-dsa.gguf";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    try gguf.writeMlaFixture(gpa, io, path, 23, "glm-dsa");
+
+    var m = try load(gpa, io, path);
+    defer m.deinit();
+    try std.testing.expect(m.layers[0].attn_kv_b == null);
+    try std.testing.expect(m.layers[0].attn_k_b != null);
+    try std.testing.expect(m.layers[0].attn_v_b != null);
+
+    var st = try State.init(gpa, m.cfg);
+    defer st.deinit(gpa);
+    var tok: u32 = 3;
+    for (0..6) |k| {
+        try step(&m, &st, tok, k);
+        tok = argmaxLogits(st.logits);
+        try std.testing.expect(tok < m.cfg.vocab);
     }
 }

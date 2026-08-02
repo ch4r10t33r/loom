@@ -344,7 +344,7 @@ fn loadGgufEngine(gpa: std.mem.Allocator, io: Io, path: []const u8, gpu_ops: boo
     peek.deinit();
     const arch = arch_buf[0..n];
 
-    if (std.mem.eql(u8, arch, "deepseek2")) {
+    if (std.mem.eql(u8, arch, "deepseek2") or std.mem.eql(u8, arch, "glm-dsa")) {
         var m = try deepseek.load(gpa, io, path);
         calibrateFor(gpa, gpu_ops, m.cfg.dim, m.cfg.ffn, m.cfg.n_layers, m.cfg.ctx_len, 0, 0, 0, 0, &m.layers[0], m.output);
         return .{ .deepseek = m };

@@ -1,5 +1,11 @@
 # GLM 5.2 readiness audit (2026-08-02)
 
+
+> **Update 2026-08-02:** the `glm-dsa` engine gap below is partially closed:
+> loom now loads glm-dsa GGUFs (arch-prefixed keys, `*_mla` per-head sizes,
+> split `attn_k_b`/`attn_v_b`) and decodes with dense MLA attention, the same
+> fallback llama.cpp mainline uses. The sparse indexer itself (lightning
+> indexer, top-k 2048) is the remaining piece, tracked as colibri port three.
 Run with `loom gguf check` against live checkpoints plus the llama.cpp
 support trail. Verdict: **GO**, with one bounded engine variant. A zero-work
 bridge model is available immediately.
