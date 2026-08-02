@@ -38,9 +38,13 @@ pub const Stats = struct {
     fetch_bytes: u64 = 0,
     fetch_ns: i128 = 0,
     fetch_failures: u64 = 0, // per-peer attempt failures (retried elsewhere)
+    pilot_pred: u64 = 0, // experts predicted one layer ahead (PILOT)
+    pilot_hit: u64 = 0, // predictions the real router then confirmed
 };
 
 pub const Source = struct {
+    /// In-flight PILOT prefetch threads (bounded; see prefetchAsync).
+    async_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     gpa: std.mem.Allocator,
     io: Io,
     store: *weights.Store,
@@ -225,6 +229,32 @@ pub const Source = struct {
         for (threads_buf[0..n_missing]) |t| {
             if (t) |th| th.join();
         }
+    }
+
+    /// PILOT prefetch: fire-and-forget fetch of predicted next-layer experts
+    /// while the current layer computes. Bounded and lossy by design -- when
+    /// the pool is full the prediction is simply dropped, because a stalled
+    /// main path would cost more than a missed prefetch. Fetched shards
+    /// persist to the store, so even a mispredicted fetch warms the node.
+    pub fn prefetchAsync(self: *Source, ids: []const usize) void {
+        const CAP = 8;
+        for (ids) |id| {
+            if (self.store.holdings.has(id)) continue;
+            if (self.async_inflight.fetchAdd(1, .monotonic) >= CAP) {
+                _ = self.async_inflight.fetchSub(1, .monotonic);
+                return;
+            }
+            const t = std.Thread.spawn(.{}, asyncPrefetchOne, .{ self, id }) catch {
+                _ = self.async_inflight.fetchSub(1, .monotonic);
+                return;
+            };
+            t.detach();
+        }
+    }
+
+    fn asyncPrefetchOne(self: *Source, id: usize) void {
+        defer _ = self.async_inflight.fetchSub(1, .monotonic);
+        prefetchOne(self, id);
     }
 
     fn prefetchOne(self: *Source, id: usize) void {
