@@ -83,6 +83,32 @@ input cannot inject a control token; it is on only for special-marker chat
 scaffolds (chatml/llama3/gemma), where making message content injection-safe too
 requires segment encoding (follow-up).
 
+## Delegated generation (optional)
+
+`GEN <json>` runs one generation on the receiving node and returns it:
+`GENR ok=1 prompt_tokens=<n> completion_tokens=<n> tok_per_s=<f>
+hit_rate=<f> len=<n>` followed by exactly `len` bytes of generated text.
+The JSON object carries `prompt` (string, <=64 KiB), `max_tokens`
+(<=2048), `temperature`, `seed`, and `parse_special` (bool; the sender
+renders its own chat template and says whether the scaffold uses special
+markers). A node whose engine is not yet serving answers `ERR not_ready`;
+a node with no engine, `ERR no_engine`. Delegation shares v1's trust
+plane: the answer is unauthenticated text from a trusted-swarm peer, and
+requests are not metered. A cold node (holdings fraction under its
+`--delegate-below`, default 0.5) forwards to the warmest live peer whose
+holdings fraction is at least 0.9, and falls back to local generation on
+any failure.
+
+## Batched shard fetch
+
+`PACKR <id,id,...>` (<=256 ids) streams, per id, either
+`DATA <i> len=<l> sha256=<hex>` followed by the raw bytes, or
+`ABSENT <i>`, and finishes with `END`. Semantics per shard are identical
+to `GETR`; the batch exists because a round trip per shard puts RTT times
+the shard count on the critical path of every sync. Receivers verify
+every shard against their own manifest digests, exactly as with `GETR`,
+and degrade to per-shard `GETR` when a peer answers `ERR unknown`.
+
 ## Heat (sync ordering hint)
 
 `HEAT` asks a peer which shards it serves most. The reply is one line,

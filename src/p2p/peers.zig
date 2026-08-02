@@ -218,6 +218,38 @@ pub const Table = struct {
         return out;
     }
 
+    /// The live peer with the fullest holdings bitmap, for delegate-while-
+    /// cold: a cold node forwards generations to the warmest peer it knows.
+    /// Returns an owned addr copy plus the holdings fraction; null when no
+    /// live peer advertises a store.
+    pub fn warmest(self: *Table, gpa: std.mem.Allocator, now_ns: i128, total_shards: usize) !?struct { addr: []u8, frac: f64 } {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var best_addr: ?[]const u8 = null;
+        var best_bits: usize = 0;
+        for (self.entries.items) |*ent| {
+            if (now_ns - ent.last_seen_ns > PEER_TTL_NS) continue;
+            if (ent.holdings_hex.len == 0) continue;
+            var bits: usize = 0;
+            for (ent.holdings_hex) |c| {
+                const v = std.fmt.charToDigit(c, 16) catch continue;
+                bits += @popCount(v);
+            }
+            if (bits > best_bits) {
+                best_bits = bits;
+                best_addr = ent.addr;
+            }
+        }
+        const addr = best_addr orelse return null;
+        // Fraction against the real shard count: the bitmap's byte padding
+        // would otherwise deflate a full peer below any threshold.
+        const denom: f64 = @floatFromInt(@max(total_shards, 1));
+        return .{
+            .addr = try gpa.dupe(u8, addr),
+            .frac = @min(@as(f64, @floatFromInt(best_bits)) / denom, 1.0),
+        };
+    }
+
     pub fn count(self: *Table) usize {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);

@@ -259,10 +259,60 @@ fn fetchFromPeerInto(
     const order = try fetchOrder(gpa, n_ranges, m.n_resident, heat_ids);
     defer gpa.free(order);
 
-    const stats = out;
+    // Everything this peer can give us, in fetch order.
+    var needed = std.ArrayList(usize).empty;
+    defer needed.deinit(gpa);
     for (order) |i| {
         if (!store.wanted.has(i) or store.holdings.has(i)) continue;
         if (!peer_holdings.has(i)) continue; // this peer can't serve it; another might
+        try needed.append(gpa, i);
+    }
+
+    const stats = out;
+
+    // Batched path first: one PACKR round trip covers up to 128 shards, so a
+    // sync pays RTT per batch instead of per shard. An old peer answers ERR
+    // unknown on the first batch and the loop below degrades to GETR.
+    var use_pack = true;
+    var next: usize = 0;
+    while (use_pack and next < needed.items.len) {
+        const batch = needed.items[next..@min(next + 128, needed.items.len)];
+        var req = std.ArrayList(u8).empty;
+        defer req.deinit(gpa);
+        try req.print(gpa, "PACKR ", .{});
+        for (batch, 0..) |i, j| {
+            if (j != 0) try req.print(gpa, ",", .{});
+            try req.print(gpa, "{d}", .{i});
+        }
+        try req.print(gpa, "\n", .{});
+        try peer.send("{s}", .{req.items});
+        while (true) {
+            const rline = try peer.recvLine();
+            if (std.mem.startsWith(u8, rline, "END")) break;
+            if (std.mem.startsWith(u8, rline, "ABSENT ")) continue;
+            if (!std.mem.startsWith(u8, rline, "DATA ")) {
+                if (next == 0) {
+                    use_pack = false; // old peer: fall back to per-shard GETR
+                    break;
+                }
+                return error.RangeFetchFailed;
+            }
+            const i = try std.fmt.parseInt(usize, rline[5..std.mem.indexOfScalarPos(u8, rline, 5, ' ').?], 10);
+            const len = try std.fmt.parseInt(usize, field(rline, "len") orelse return error.BadDataLine, 10);
+            if (len > buf.len) return error.BadDataLine;
+            try peer.r.interface.readSliceAll(buf[0..len]);
+            // writeRange verifies the digest before anything touches disk
+            try store.writeRange(i, buf[0..len]);
+            stats.fetched += 1;
+            stats.bytes += len;
+            if (prog) |p| p.tick(stats.fetched, stats.bytes);
+            sockopt.refresh(io, peer.deadline, sockopt.PEER_TIMEOUT_S);
+        }
+        if (use_pack) next += batch.len;
+    }
+
+    for (needed.items[if (use_pack) needed.items.len else 0..]) |i| {
+        if (store.holdings.has(i)) continue;
 
         try peer.send("GETR {d}\n", .{i});
         const rline = try peer.recvLine();

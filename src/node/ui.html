@@ -170,6 +170,7 @@ async function send() {
   const out = addMsg('loom', '');
   const started = performance.now();
   let acc = '';
+  let delegated = false;
   // The server emits exactly one SSE frame per token, so counting frames is an
   // exact token count -- no need for the client to guess from whitespace, and
   // no need for the server to send usage on the streaming path.
@@ -241,6 +242,7 @@ async function send() {
       acc = j.choices?.[0]?.message?.content ?? '';
       out.textContent = acc;
       ntok = j.usage?.completion_tokens ?? 0;
+      if (j.loom_delegated) delegated = true;
     }
 
     history.push({ role: 'assistant', content: acc });
@@ -259,6 +261,7 @@ async function send() {
       parts.push(`${(ntok / total).toFixed(1)} tok/s`);
     }
     parts.push(`${total.toFixed(1)}s total`);
+    if (delegated) parts.push('answered by a warmer peer while your store warms');
     const s = document.createElement('div');
     s.className = 'stats';
     s.textContent = parts.join('  ·  ');

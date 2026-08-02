@@ -45,6 +45,9 @@ pub const Options = struct {
     report_metrics: bool = false,
     /// Collect METRICS lines from consenting peers into this JSONL file.
     alpha_ingest: ?[]const u8 = null,
+    /// Delegate generations to a warm peer while this node's holdings
+    /// fraction is below this value (0 disables).
+    delegate_below: f64 = 0.5,
     rpc_addr: []const u8,
     rpc_port: u16,
     openai_addr: []const u8, // OpenAI-compatible HTTP API bind addr
@@ -765,6 +768,15 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         } else |_| {}
     }
 
+    // Choose what serves inference. Default: the loom-format engine; the
+    // distributed GGUF engine replaces it further down once its resident
+    // bundle is verified. Declared before the p2p context so the GEN
+    // (delegate-while-cold) handler can hold the pointers; gen_ready gates
+    // it until the choice is final.
+    var gen = generator.Generator{ .loom = &eng };
+    var gen_ready = std.atomic.Value(bool).init(false);
+    var engine_lock: Io.Mutex = .init;
+
     var heat_counts: ?[]std.atomic.Value(u32) = null;
     if (store) |*st| {
         const h = try gpa.alloc(std.atomic.Value(u32), st.manifest.nRanges());
@@ -789,6 +801,9 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .rag = if (rag) |*r| r else null,
         .metrics_path = opts.alpha_ingest,
         .heat = heat_counts,
+        .gen = &gen,
+        .engine_lock = &engine_lock,
+        .gen_ready = &gen_ready,
     };
     const p2p_handle = try std.Thread.spawn(.{}, p2pThread, .{&p2p_ctx});
     defer p2p_handle.join();
@@ -829,16 +844,11 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
     // repair loop: generation holds mutable per-request state and mutates the
     // store (token-loop fetch), and repair mutates the store too, so all of it
     // serializes here.
-    var engine_lock: Io.Mutex = .init;
 
     // The status thread writes to the same `out` as the main thread and the
     // event logs; interleaved prints from two threads would corrupt lines.
     var out_lock: Io.Mutex = .init;
 
-    // Choose what serves inference. Default: the loom-format engine. If an
-    // expert-sharded GGUF store is attached and its resident bundle is complete,
-    // serve the distributed GGUF (deepseek2) engine with token-loop peer fetch.
-    var gen = generator.Generator{ .loom = &eng };
     var gguf_gen: generator.GgufGen = undefined;
     var gguf_src: expert_fetch.Source = undefined;
     var committee_peers = std.ArrayList(sync.PeerAddr).empty;
@@ -1097,6 +1107,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             .console = out,
             .console_lock = &out_lock,
             .alpha_metrics = &alpha_metrics,
+            .store = if (store) |*st| st else null,
+            .delegate_below = opts.delegate_below,
         };
         openai_ctx.peers = &table;
         const t = try std.Thread.spawn(.{}, openaiThread, .{&openai_ctx});
@@ -1128,6 +1140,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             .console = out,
             .console_lock = &out_lock,
             .alpha_metrics = &alpha_metrics,
+            .store = if (store) |*st| st else null,
+            .delegate_below = opts.delegate_below,
         };
         const t = try std.Thread.spawn(.{}, openaiThread, .{&ui_ctx});
         t.detach();
@@ -1180,6 +1194,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         try out.print("  metrics    reporting numeric telemetry to {s} every 60s (docs/ALPHA.md)\n", .{peer_strs.items[0]});
         try out.flush();
     }
+
+    gen_ready.store(true, .release);
 
     var rpc_ctx = rpc.Ctx{
         .gpa = gpa,
