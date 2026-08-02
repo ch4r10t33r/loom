@@ -9,9 +9,24 @@ const version = @import("build.zig.zon").version;
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const early_native_macos = target.result.os.tag == .macos and target.query.isNative();
 
-    const snappy = b.dependency("zig_snappy", .{ .target = target, .optimize = optimize });
-    const vector_index = b.dependency("vector_index", .{ .target = target, .optimize = optimize });
+    // A native macOS build otherwise inherits the BUILD machine's OS as its
+    // deployment target: a binary built on a new runner is stamped with that
+    // minos and dyld refuses to load it anywhere older ("built for macOS
+    // 26.x which is newer than running OS", hit by the first alpha tester),
+    // and @available-guarded classes (MTLResidencySet, macOS 15+) get strong
+    // classrefs instead of weak ones. Pinning the minimum keeps the runtime
+    // guards meaningful and the binary loadable back to macOS 13.
+    const eff_target = blk: {
+        if (!early_native_macos) break :blk target;
+        var q = target.query;
+        q.os_version_min = .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } };
+        break :blk b.resolveTargetQuery(q);
+    };
+
+    const snappy = b.dependency("zig_snappy", .{ .target = eff_target, .optimize = optimize });
+    const vector_index = b.dependency("vector_index", .{ .target = eff_target, .optimize = optimize });
 
     // `-Dcommit=<sha>` from CI; "unknown" for a plain local build, which is
     // itself useful information when someone reports a bug.
@@ -37,6 +52,7 @@ pub fn build(b: *std.Build) void {
     // `-Dgpu=metal` and must build natively.
     const native_macos = target.result.os.tag == .macos and target.query.isNative();
     const default_gpu: []const u8 = if (native_macos) "metal" else "none";
+
     const gpu = b.option([]const u8, "gpu", "Compute backend: metal (default on macOS), vulkan, none") orelse default_gpu;
     const build_info = b.addOptions();
     build_info.addOption([]const u8, "version", effective_version);
@@ -45,7 +61,7 @@ pub fn build(b: *std.Build) void {
 
     const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
-        .target = target,
+        .target = eff_target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "snappyz", .module = snappy.module("snappyz") },
@@ -80,7 +96,7 @@ pub fn build(b: *std.Build) void {
     // `zig build test`
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
-        .target = target,
+        .target = eff_target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "snappyz", .module = snappy.module("snappyz") },
@@ -134,6 +150,14 @@ fn addMetal(b: *std.Build, c: *std.Build.Step.Compile) void {
         .flags = &.{ "-fobjc-arc", "-fmodules" },
     });
     m.addIncludePath(b.path("src/metal"));
+    // With an explicit os_version_min the target no longer counts as native,
+    // so Zig stops resolving the SDK through xcrun on its own. Point the
+    // framework and header search at the host SDK explicitly; the pinned
+    // minos in the target still governs availability and the load command.
+    const sdk = std.mem.trim(u8, b.run(&.{ "xcrun", "--sdk", "macosx", "--show-sdk-path" }), " \n\r\t");
+    m.addSystemFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk}) });
+    m.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sdk}) });
+    m.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk}) });
     m.linkFramework("Metal", .{});
     m.linkFramework("Foundation", .{});
     m.link_libc = true;
