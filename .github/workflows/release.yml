@@ -60,18 +60,23 @@ jobs:
       - name: Build
         run: |
           set -eux
+          # A tag names the version; a manual run keeps build.zig.zon's.
+          VFLAG=""
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then VFLAG="-Dversion=${GITHUB_REF_NAME#v}"; fi
           if [ "${{ matrix.build_native }}" = "true" ]; then
             # No -Dtarget: build.zig only defaults to Metal for a native macOS
             # target, because that is the only one whose frameworks it can find.
             zig "${ZIG}" build \
               -Doptimize=ReleaseSafe \
               -Dcommit="${GITHUB_SHA}" \
+              ${VFLAG} \
               -p out
           else
             zig "${ZIG}" build \
               -Doptimize=ReleaseSafe \
               -Dtarget=${{ matrix.target }} \
               -Dcommit="${GITHUB_SHA}" \
+              ${VFLAG} \
               -p out
           fi
 

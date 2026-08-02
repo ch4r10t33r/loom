@@ -1,6 +1,8 @@
 const std = @import("std");
 
-/// Single source of truth for the release version: build.zig.zon. Baked into
+/// Default version source: build.zig.zon. A release build overrides it with
+/// `-Dversion=<v>` derived from the git tag, so cutting a release is merge +
+/// tag with no version-bump commit. Baked into
 /// the binary so a downloaded executable can report exactly what it is.
 const version = @import("build.zig.zon").version;
 
@@ -14,6 +16,7 @@ pub fn build(b: *std.Build) void {
     // `-Dcommit=<sha>` from CI; "unknown" for a plain local build, which is
     // itself useful information when someone reports a bug.
     const commit = b.option([]const u8, "commit", "Git commit the build came from") orelse "unknown";
+    const effective_version = b.option([]const u8, "version", "Release version (from the git tag in CI)") orelse version;
     // Compute backend, resolved at comptime in src/compute/backend.zig. The
     // inactive backends are not compiled, so a GPU toolchain never becomes a
     // requirement for a CPU build (issue #10).
@@ -36,7 +39,7 @@ pub fn build(b: *std.Build) void {
     const default_gpu: []const u8 = if (native_macos) "metal" else "none";
     const gpu = b.option([]const u8, "gpu", "Compute backend: metal (default on macOS), vulkan, none") orelse default_gpu;
     const build_info = b.addOptions();
-    build_info.addOption([]const u8, "version", version);
+    build_info.addOption([]const u8, "version", effective_version);
     build_info.addOption([]const u8, "commit", commit);
     build_info.addOption([]const u8, "gpu", gpu);
 
