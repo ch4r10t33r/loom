@@ -25,6 +25,16 @@ set -eu
 if ! command -v loom >/dev/null 2>&1; then
     echo "loom not found -- installing latest release..."
     curl -fsSL https://raw.githubusercontent.com/ch4r10t33r/loom/main/install.sh | sh
+else
+    # Upgrade in place when a newer release exists. Best-effort: if the
+    # GitHub API is unreachable or rate-limited, run what is installed.
+    latest=$(curl -fsSL --max-time 10 https://api.github.com/repos/ch4r10t33r/loom/releases/latest 2>/dev/null \
+        | sed -n 's/.*"tag_name": *"v\([^"]*\)".*/\1/p')
+    have=$(loom version 2>/dev/null | sed -n 's/^loom \([0-9][0-9.]*\).*/\1/p' | head -1)
+    if [ -n "$latest" ] && [ -n "$have" ] && [ "$latest" != "$have" ]; then
+        echo "upgrading loom v$have -> v$latest..."
+        curl -fsSL https://raw.githubusercontent.com/ch4r10t33r/loom/main/install.sh | sh
+    fi
 fi
 
 ADV=""

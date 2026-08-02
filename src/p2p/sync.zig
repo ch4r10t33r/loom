@@ -11,6 +11,7 @@
 const std = @import("std");
 const Io = std.Io;
 const net = std.Io.net;
+const stats_mod = @import("../core/stats.zig");
 const hashmod = @import("../core/hash.zig");
 const weights = @import("weights.zig");
 const dns = @import("dns.zig");
@@ -100,14 +101,55 @@ fn parseDigestHex(s: []const u8) !hashmod.Digest {
 
 pub const FetchStats = struct { fetched: usize = 0, bytes: u64 = 0 };
 
+/// Live sync progress. The initial sync is gigabytes over one connection;
+/// without a heartbeat the console is silent for minutes and a first-time
+/// tester has no idea whether anything is happening (it was the first thing
+/// a real alpha user hit). Prints at most every 5 s, always flushed.
+pub const Progress = struct {
+    out: *Io.Writer,
+    io: Io,
+    total: usize,
+    sources: usize = 1,
+    base_fetched: usize = 0,
+    base_bytes: u64 = 0,
+    t0: i128 = 0,
+    last_ns: i128 = 0,
+
+    pub fn init(out: *Io.Writer, io: Io, total: usize, sources: usize) Progress {
+        const now = stats_mod.nowNs(io);
+        return .{ .out = out, .io = io, .total = total, .sources = sources, .t0 = now, .last_ns = now - 5_000_000_000 };
+    }
+
+    fn tick(p: *Progress, peer_fetched: usize, peer_bytes: u64) void {
+        const now = stats_mod.nowNs(p.io);
+        if (now - p.last_ns < 5_000_000_000) return;
+        p.last_ns = now;
+        const done = p.base_fetched + peer_fetched;
+        const bytes = p.base_bytes + peer_bytes;
+        const el_s = @as(f64, @floatFromInt(now - p.t0)) / 1e9;
+        const mb = @as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0);
+        const rate = if (el_s > 0.5) mb / el_s else 0;
+        var eta_buf: [32]u8 = undefined;
+        var eta: []const u8 = "?";
+        if (done > 0 and done < p.total) {
+            const eta_s: u64 = @intFromFloat(el_s / @as(f64, @floatFromInt(done)) * @as(f64, @floatFromInt(p.total - done)));
+            eta = std.fmt.bufPrint(&eta_buf, "{d}m{d:0>2}s", .{ eta_s / 60, eta_s % 60 }) catch "?";
+        }
+        p.out.print("  sync {d}/{d} shards  {d:.0} MB  {d:.1} MB/s  ~{s} left  ({d} peer(s))\n", .{
+            done, p.total, mb, rate, eta, p.sources,
+        }) catch {};
+        p.out.flush() catch {};
+    }
+};
+
 /// Fetch the store's wanted-but-missing ranges from one peer. Guards against
 /// cross-version mixing: a peer advertising a different manifest version (e.g.
 /// across a future hardfork) is rejected wholesale. Every range is verified
 /// against its digest before it touches disk. Used by both bootstrap and the
 /// eager repair loop.
-pub fn fetchFromPeer(gpa: std.mem.Allocator, io: Io, store: *weights.Store, addr: PeerAddr) !FetchStats {
+pub fn fetchFromPeer(gpa: std.mem.Allocator, io: Io, store: *weights.Store, addr: PeerAddr, prog: ?*Progress) !FetchStats {
     var got = FetchStats{};
-    return fetchFromPeerInto(gpa, io, store, addr, &got) catch |e| {
+    return fetchFromPeerInto(gpa, io, store, addr, &got, prog) catch |e| {
         // Shards already written stay written -- `writeRange` persists each one
         // as it lands -- so losing the count on error made a mostly-successful
         // sync report "synced 0/905 ranges (0.0 MB)" while the holdings bitmap
@@ -123,6 +165,7 @@ fn fetchFromPeerInto(
     store: *weights.Store,
     addr: PeerAddr,
     out: *FetchStats,
+    prog: ?*Progress,
 ) !FetchStats {
     const m = &store.manifest;
     const n_ranges = m.nRanges();
@@ -163,6 +206,7 @@ fn fetchFromPeerInto(
         try store.writeRange(i, buf[0..len]);
         stats.fetched += 1;
         stats.bytes += len;
+        if (prog) |p| p.tick(stats.fetched, stats.bytes);
         // A shard arrived, so this connection is not idle. `PEER_TIMEOUT_S` is
         // ten seconds and a full sync is thousands of shards over one
         // connection: without this the reaper shut the socket down mid-transfer
@@ -276,9 +320,14 @@ pub fn bootstrapWithWanted(
     errdefer store.deinit();
 
     var stats = FetchStats{};
+    var prog: ?Progress = if (progress) |pw| Progress.init(pw, io, wanted, peers.len) else null;
     for (peers) |addr| {
         if (store.missingCount() == 0) break;
-        const s = fetchFromPeer(gpa, io, &store, addr) catch |e| {
+        if (prog) |*p| {
+            p.base_fetched = stats.fetched;
+            p.base_bytes = stats.bytes;
+        }
+        const s = fetchFromPeer(gpa, io, &store, addr, if (prog) |*p| p else null) catch |e| {
             // Silence here is what made the sync failure invisible: the node
             // printed "synced 0/N" and served anyway, and the only clue was
             // that inference was inexplicably slow.
