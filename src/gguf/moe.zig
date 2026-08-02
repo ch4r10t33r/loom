@@ -32,7 +32,14 @@ const backend = @import("../compute/backend.zig");
 const tensor = @import("../core/tensor.zig");
 const weights = @import("../p2p/weights.zig");
 
-pub const GatingFunc = enum(u32) { softmax = 1, sigmoid = 2 };
+pub const GatingFunc = enum(u32) {
+    softmax = 1,
+    sigmoid = 2,
+    /// gpt-oss: select top-k on the raw (biased) logits, then softmax over
+    /// only the selected k. The router bias is folded into the logits by the
+    /// caller, so route() itself needs no bias here.
+    softmax_topk = 3,
+};
 
 /// Caps on config values that index fixed-size buffers here and in the
 /// engines' `step` (security issue #29). Everything routing touches comes from
@@ -65,8 +72,18 @@ pub fn routeCfgFromMeta(
             return std.fmt.bufPrint(buf, "{s}." ++ s, .{a}) catch unreachable;
         }
     };
-    // qwen2moe is the one arch that does *not* renormalize the top-k gates.
-    const default_norm = !std.mem.eql(u8, arch, "qwen2moe");
+    // qwen2moe is the one arch that does *not* renormalize the top-k gates;
+    // gpt-oss softmaxes over the selected k instead of the full set.
+    const default_norm = !std.mem.eql(u8, arch, "qwen2moe") and !std.mem.eql(u8, arch, "gpt-oss");
+    if (std.mem.eql(u8, arch, "gpt-oss")) {
+        return .{
+            .n_expert = n_expert,
+            .n_used = n_used,
+            .gating = .softmax_topk,
+            .weights_norm = false,
+            .weights_scale = 1.0,
+        };
+    }
     return .{
         .n_expert = n_expert,
         .n_used = n_used,
@@ -98,6 +115,7 @@ pub fn route(cfg: RouteCfg, router_logits: []const f32, bias: ?[]const f32, sel:
             @memcpy(scores, router_logits);
             backend.softmax(scores);
         },
+        .softmax_topk => @memcpy(scores, router_logits),
     }
     var choice_buf: [MAX_EXPERTS]f32 = undefined;
     const choice = choice_buf[0..cfg.n_expert];
@@ -118,6 +136,12 @@ pub fn route(cfg: RouteCfg, router_logits: []const f32, bias: ?[]const f32, sel:
         }
         used[best] = true;
         s.* = .{ .expert = best, .gate = scores[best] };
+    }
+    if (cfg.gating == .softmax_topk) {
+        var sel_buf: [MAX_SELECTED]f32 = undefined;
+        for (sel, 0..) |sv, i| sel_buf[i] = sv.gate;
+        backend.softmax(sel_buf[0..sel.len]);
+        for (sel, 0..) |*sv, i| sv.gate = sel_buf[i];
     }
     if (cfg.weights_norm) {
         var sum: f32 = 0;
