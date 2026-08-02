@@ -176,6 +176,7 @@ const LayerT = struct {
     /// gpt-oss additions: per-head sink logits, sliding-window flag,
     /// router bias, per-expert FFN biases.
     attn_sinks: ?Tensor = null,
+    attn_output_b: ?Tensor = null,
     is_swa: bool = false,
     ffn_gate_inp_b: ?Tensor = null,
     ffn_gate_exps_b: ?Tensor = null,
@@ -491,6 +492,7 @@ fn loadLayerInto(model: *Model, cfg: Config, l: *LayerT, i: usize, nb: *[128]u8)
         // sliding-window pattern is llama.cpp's default period 2 with dense
         // layers second: even layers windowed, odd layers full.
         l.attn_sinks = model.resolveOpt(N2.f(nb, i, "attn_sinks.weight"));
+        l.attn_output_b = model.resolveOpt(N2.f(nb, i, "attn_output.bias"));
         l.is_swa = cfg.swa_window > 0 and (i % 2 == 0);
         l.ffn_gate_inp_b = model.resolveOpt(N2.f(nb, i, "ffn_gate_inp.bias"));
         l.ffn_gate_exps_b = model.resolveOpt(N2.f(nb, i, "ffn_gate_exps.bias"));
@@ -891,6 +893,21 @@ fn denseFFN(st: *State, gate_w: Tensor, up_w: Tensor, down_w: Tensor) void {
     mv(down_w, st.ffn_out, st.act[0..n]);
 }
 
+/// gpt-oss expert FFN: denseFFN plus the per-expert bias columns (gate/up
+/// added before the activation, down after) and swiglu_oai in place of plain
+/// SwiGLU. Bias tensors are {width, n_expert}; expert e owns column e.
+fn oaiExpertFFN(st: *State, gate_w: Tensor, up_w: Tensor, down_w: Tensor, l: LayerT, e: usize) void {
+    const n = gate_w.ne1;
+    mv(gate_w, st.gate[0..n], st.normed);
+    mv(up_w, st.up[0..n], st.normed);
+    if (l.ffn_gate_exps_b) |b| backend.add(st.gate[0..n], tensorAsF32(b)[e * n ..][0..n]);
+    if (l.ffn_up_exps_b) |b| backend.add(st.up[0..n], tensorAsF32(b)[e * n ..][0..n]);
+    swigluOai(st.act[0..n], st.gate[0..n], st.up[0..n]);
+    mv(down_w, st.ffn_out, st.act[0..n]);
+    const d = st.ffn_out.len;
+    if (l.ffn_down_exps_b) |b| backend.add(st.ffn_out, tensorAsF32(b)[e * d ..][0..d]);
+}
+
 /// One token step; logits land in `st.logits`. Errors only when a distributed
 /// expert shard has no reachable holder (fail loud, not silently degraded).
 /// Whether every layer can be recorded into one command buffer.
@@ -1073,26 +1090,31 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
         @memcpy(st.v_cache[cache_base..][0..kvd], st.v);
         _ = backend.kvAppend(li, pos, st.k, st.v);
 
-        // per-head attention over positions 0..=pos
+        // per-head attention over positions t0..=pos (t0 > 0 only on
+        // sliding-window layers, gpt-oss even layers)
         const seq = pos + 1;
-        // Offer the whole head loop to the backend first. The host cache above
-        // is still written either way: the backend keeps its own device copy,
-        // and if it ever declines mid-generation the engine's cache has to be
-        // authoritative or the fallback produces garbage.
-        if (!backend.attnHeads(li, pos, st.q, st.attn_out, cfg.n_heads, cfg.n_kv_heads, hd, scale)) {
+        const t0: usize = if (l.is_swa and cfg.swa_window > 0) seq -| cfg.swa_window else 0;
+        // Offer the whole head loop to the backend first -- but only for
+        // layers the device kernels can express: no window, no sinks.
+        const plain = t0 == 0 and l.attn_sinks == null;
+        if (!(plain and backend.attnHeads(li, pos, st.q, st.attn_out, cfg.n_heads, cfg.n_kv_heads, hd, scale))) {
             h = 0;
             while (h < cfg.n_heads) : (h += 1) {
                 const kvh = h / q_per_kv;
                 const qh = st.q[h * hd ..][0..hd];
-                var t_i: usize = 0;
+                var t_i: usize = t0;
                 while (t_i < seq) : (t_i += 1) {
                     const kt = st.k_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
                     st.scores[t_i] = backend.dotF32(qh, kt) * scale;
                 }
-                backend.softmax(st.scores[0..seq]);
+                if (l.attn_sinks) |sk| {
+                    softmaxWithSink(st.scores[t0..seq], tensorAsF32(sk)[h]);
+                } else {
+                    backend.softmax(st.scores[t0..seq]);
+                }
                 const oh = st.attn_out[h * hd ..][0..hd];
                 @memset(oh, 0);
-                t_i = 0;
+                t_i = t0;
                 while (t_i < seq) : (t_i += 1) {
                     const vt = st.v_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
                     backend.axpy(oh, vt, st.scores[t_i]);
@@ -1100,6 +1122,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             }
         }
         mv(l.attn_output, st.proj_out, st.attn_out);
+        addBias(st.proj_out, l.attn_output_b);
         backend.add(st.x, st.proj_out);
 
         // ---- FFN ----
@@ -1144,6 +1167,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
 fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool) !void {
     const cfg = m.cfg;
     mv(l.ffn_gate_inp.?, st.router[0..cfg.n_expert], st.normed);
+    addBias(st.router[0..cfg.n_expert], l.ffn_gate_inp_b);
     var sel_buf: [moe.MAX_SELECTED]moe.Selected = undefined;
     const sel = sel_buf[0..cfg.n_used];
     const bias: ?[]const f32 = if (l.exp_probs_b) |b| tensorAsF32(b) else null;
@@ -1183,6 +1207,7 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool) !v
             const nl = m.layers[li + 1];
             if (nl.is_moe and nl.ffn_gate_inp != null) {
                 mv(nl.ffn_gate_inp.?, st.router[0..cfg.n_expert], st.normed);
+                addBias(st.router[0..cfg.n_expert], nl.ffn_gate_inp_b);
                 var psel_buf: [moe.MAX_SELECTED]moe.Selected = undefined;
                 const psel = psel_buf[0..cfg.n_used];
                 const pbias: ?[]const f32 = if (nl.exp_probs_b) |b| tensorAsF32(b) else null;
@@ -1209,19 +1234,23 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool) !v
             const gl = gt.ne1 * ggml.rowBytes(gt.ty, gt.ne0);
             const ul = ut.ne1 * ggml.rowBytes(ut.ty, ut.ne0);
             const dl = dt.ne1 * ggml.rowBytes(dt.ty, dt.ne0);
-            denseFFN(
-                st,
-                .{ .ty = gt.ty, .data = blk[0..gl], .ne0 = gt.ne0, .ne1 = gt.ne1 },
-                .{ .ty = ut.ty, .data = blk[gl..][0..ul], .ne0 = ut.ne0, .ne1 = ut.ne1 },
-                .{ .ty = dt.ty, .data = blk[gl + ul ..][0..dl], .ne0 = dt.ne0, .ne1 = dt.ne1 },
-            );
+            const ge = Tensor{ .ty = gt.ty, .data = blk[0..gl], .ne0 = gt.ne0, .ne1 = gt.ne1 };
+            const ue = Tensor{ .ty = ut.ty, .data = blk[gl..][0..ul], .ne0 = ut.ne0, .ne1 = ut.ne1 };
+            const de = Tensor{ .ty = dt.ty, .data = blk[gl + ul ..][0..dl], .ne0 = dt.ne0, .ne1 = dt.ne1 };
+            if (cfg.arch.oai) {
+                oaiExpertFFN(st, ge, ue, de, l, s.expert);
+            } else {
+                denseFFN(st, ge, ue, de);
+            }
         } else {
-            denseFFN(
-                st,
-                try l.ffn_gate_exps.?.expert(s.expert),
-                try l.ffn_up_exps.?.expert(s.expert),
-                try l.ffn_down_exps.?.expert(s.expert),
-            );
+            const ge = try l.ffn_gate_exps.?.expert(s.expert);
+            const ue = try l.ffn_up_exps.?.expert(s.expert);
+            const de = try l.ffn_down_exps.?.expert(s.expert);
+            if (cfg.arch.oai) {
+                oaiExpertFFN(st, ge, ue, de, l, s.expert);
+            } else {
+                denseFFN(st, ge, ue, de);
+            }
         }
         for (acc, st.ffn_out) |*a, v| a.* += s.gate * v;
     }
@@ -1313,6 +1342,7 @@ fn mtpLayerForward(m: *const Model, st: *State, mtp_pos: usize) !void {
         }
     }
     mv(l.attn_output, st.proj_out, st.attn_out);
+    addBias(st.proj_out, l.attn_output_b);
     backend.add(st.mtp_x, st.proj_out);
 
     backend.rmsnorm(st.normed, st.mtp_x, tensorAsF32(l.ffn_norm), cfg.eps);
@@ -1443,26 +1473,35 @@ pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usi
         // whole batch is already in the cache.
         for (0..n) |k| {
             const seq = pos_base + k + 1;
+            const t0: usize = if (l.is_swa and cfg.swa_window > 0) seq -| cfg.swa_window else 0;
             const qk = st.bq[k * qd ..][0..qd];
             const ok = st.battn[k * qd ..][0..qd];
             for (0..cfg.n_heads) |h| {
                 const kvh = h / q_per_kv;
                 const qh = qk[h * hd ..][0..hd];
-                for (0..seq) |t_i| {
+                for (t0..seq) |t_i| {
                     const kt = st.k_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
                     st.scores[t_i] = backend.dotF32(qh, kt) * scale;
                 }
-                backend.softmax(st.scores[0..seq]);
+                if (l.attn_sinks) |sk| {
+                    softmaxWithSink(st.scores[t0..seq], tensorAsF32(sk)[h]);
+                } else {
+                    backend.softmax(st.scores[t0..seq]);
+                }
                 const oh = ok[h * hd ..][0..hd];
                 @memset(oh, 0);
-                for (0..seq) |t_i| {
+                for (t0..seq) |t_i| {
                     const vt = st.v_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
                     backend.axpy(oh, vt, st.scores[t_i]);
                 }
             }
         }
         mmul(l.attn_output, st.bproj[0 .. n * cfg.dim], st.battn[0 .. n * qd], n);
-        for (0..n) |k| backend.add(st.bx[k * cfg.dim ..][0..cfg.dim], st.bproj[k * cfg.dim ..][0..cfg.dim]);
+        for (0..n) |k| {
+            const row = st.bproj[k * cfg.dim ..][0..cfg.dim];
+            addBias(row, l.attn_output_b);
+            backend.add(st.bx[k * cfg.dim ..][0..cfg.dim], row);
+        }
 
         // ---- FFN ----
         for (0..n) |k| {
@@ -1594,6 +1633,7 @@ test "each supported architecture loads with the features it actually declares" 
         .{ .arch = "qwen2moe", .qkv_bias = true, .qk_norm = false, .shexp = true, .shexp_gate = true, .n_dense = 0, .rope = .neox, .head_dim = 16, .n_layers = 3 },
         .{ .arch = "qwen3moe", .qkv_bias = false, .qk_norm = true, .shexp = false, .shexp_gate = false, .n_dense = 0, .rope = .neox, .head_dim = 24, .n_layers = 3 },
         .{ .arch = "glm4moe", .qkv_bias = true, .qk_norm = true, .shexp = true, .shexp_gate = false, .n_dense = 1, .rope = .neox, .head_dim = 16, .n_layers = 3 },
+        .{ .arch = "gpt-oss", .qkv_bias = true, .qk_norm = false, .shexp = false, .shexp_gate = false, .n_dense = 0, .rope = .neox, .head_dim = 16, .n_layers = 3 },
     };
 
     for (cases) |c| {
@@ -1630,15 +1670,32 @@ test "each supported architecture loads with the features it actually declares" 
             try std.testing.expect(m.layers[0].ffn_gate != null);
             try std.testing.expect(m.layers[0].ffn_gate_inp == null);
         }
-        // glm4moe alone routes with sigmoid and a selection bias
+        // glm4moe alone routes with sigmoid and a selection bias; gpt-oss
+        // selects on raw biased logits then softmaxes the selected k
         const is_glm = std.mem.eql(u8, c.arch, "glm4moe");
+        const is_oai = std.mem.eql(u8, c.arch, "gpt-oss");
         try std.testing.expectEqual(
-            if (is_glm) moe.GatingFunc.sigmoid else moe.GatingFunc.softmax,
+            if (is_glm) moe.GatingFunc.sigmoid else if (is_oai) moe.GatingFunc.softmax_topk else moe.GatingFunc.softmax,
             m.cfg.route.gating,
         );
         try std.testing.expectEqual(is_glm, last.exp_probs_b != null);
-        // qwen2moe is the only one that does not renormalize its gates
-        try std.testing.expectEqual(!std.mem.eql(u8, c.arch, "qwen2moe"), m.cfg.route.weights_norm);
+        // qwen2moe does not renormalize its gates; gpt-oss's softmax-topk
+        // already normalizes, so weights_norm stays off there too
+        try std.testing.expectEqual(!std.mem.eql(u8, c.arch, "qwen2moe") and !is_oai, m.cfg.route.weights_norm);
+        if (is_oai) {
+            // the gpt-oss extras all resolved, and the swa pattern is
+            // even-windowed / odd-full
+            try std.testing.expectEqual(@as(usize, 4), m.cfg.swa_window);
+            try std.testing.expect(m.cfg.attn_logit_mul > 1.0);
+            try std.testing.expect(last.attn_sinks != null);
+            try std.testing.expect(last.attn_output_b != null);
+            try std.testing.expect(last.ffn_gate_inp_b != null);
+            try std.testing.expect(last.ffn_gate_exps_b != null);
+            try std.testing.expect(last.ffn_up_exps_b != null);
+            try std.testing.expect(last.ffn_down_exps_b != null);
+            try std.testing.expect(m.layers[0].is_swa);
+            try std.testing.expect(!m.layers[1].is_swa);
+        }
 
         // and it actually runs a token
         var st = try State.init(gpa, m.cfg);
@@ -1660,7 +1717,7 @@ test "batched prefill matches token-by-token prefill" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    for ([_][]const u8{ "llama", "qwen3moe", "glm4moe" }) |arch| {
+    for ([_][]const u8{ "llama", "qwen3moe", "glm4moe", "gpt-oss" }) |arch| {
         var pbuf: [96]u8 = undefined;
         const path = try std.fmt.bufPrint(&pbuf, "test-batch-{s}.gguf", .{arch});
         defer Io.Dir.cwd().deleteFile(io, path) catch {};

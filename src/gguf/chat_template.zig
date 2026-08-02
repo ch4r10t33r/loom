@@ -22,6 +22,9 @@ pub const Format = enum {
     llama3,
     gemma,
     mistral,
+    /// OpenAI Harmony (gpt-oss): `<|start|>role<|message|>...<|end|>` turns;
+    /// assistant replies carry a channel tag and end with `<|return|>`.
+    harmony,
 };
 
 pub const Message = struct {
@@ -42,6 +45,7 @@ pub fn parse(name: []const u8) ?Format {
 /// detection.
 pub fn detect(template: ?[]const u8, arch: []const u8) Format {
     if (template) |t| {
+        if (contains(t, "<|channel|>")) return .harmony;
         if (contains(t, "<|im_start|>")) return .chatml;
         if (contains(t, "<|start_header_id|>")) return .llama3;
         if (contains(t, "<start_of_turn>")) return .gemma;
@@ -49,6 +53,7 @@ pub fn detect(template: ?[]const u8, arch: []const u8) Format {
         if (contains(t, "Assistant:") or contains(t, "\u{ff5c}Assistant\u{ff5c}")) return .deepseek;
     }
     if (std.mem.eql(u8, arch, "deepseek2")) return .deepseek;
+    if (std.mem.eql(u8, arch, "gpt-oss")) return .harmony;
     // Qwen MoE and GLM-4.5 MoE both use ChatML markers. Only reached when the
     // file carries no chat_template at all — the template string above is the
     // authority when present.
@@ -68,7 +73,7 @@ fn contains(h: []const u8, needle: []const u8) bool {
 /// encoded with parse_special=false and user content cannot inject control ids.
 pub fn usesSpecialMarkers(fmt: Format) bool {
     return switch (fmt) {
-        .chatml, .llama3, .gemma => true,
+        .chatml, .llama3, .gemma, .harmony => true,
         .deepseek, .llama2, .mistral, .generic => false,
     };
 }
@@ -135,6 +140,20 @@ pub fn render(gpa: std.mem.Allocator, fmt: Format, msgs: []const Message, add_ge
             }
             try b.appendSlice(gpa, "[/INST]");
         },
+        .harmony => {
+            // Minimal Harmony: enough scaffold that gpt-oss answers on the
+            // "final" channel. Prior assistant turns are replayed as final
+            // messages; the cue leaves the channel open for the model to pick
+            // (it emits `<|channel|>analysis` or `final` itself).
+            for (msgs) |m| {
+                if (roleIs(m, "assistant")) {
+                    try b.print(gpa, "<|start|>assistant<|channel|>final<|message|>{s}<|end|>", .{m.content});
+                } else {
+                    try b.print(gpa, "<|start|>{s}<|message|>{s}<|end|>", .{ m.role, m.content });
+                }
+            }
+            if (add_generation_prompt) try b.appendSlice(gpa, "<|start|>assistant");
+        },
         .generic => {
             for (msgs) |m| try b.print(gpa, "{s}: {s}\n", .{ m.role, m.content });
             if (add_generation_prompt) try b.appendSlice(gpa, "assistant:");
@@ -150,6 +169,8 @@ test "detect from markers and arch" {
     try std.testing.expectEqual(Format.mistral, detect("...[INST]...", "llama"));
     try std.testing.expectEqual(Format.llama2, detect("...[INST]...<<SYS>>...", "llama"));
     try std.testing.expectEqual(Format.deepseek, detect(null, "deepseek2"));
+    try std.testing.expectEqual(Format.harmony, detect(null, "gpt-oss"));
+    try std.testing.expectEqual(Format.harmony, detect("...<|channel|>...", "gpt-oss"));
     // Qwen/GLM MoE default to ChatML when the file carries no template
     try std.testing.expectEqual(Format.chatml, detect(null, "qwen2moe"));
     try std.testing.expectEqual(Format.chatml, detect(null, "qwen3moe"));
@@ -159,6 +180,14 @@ test "detect from markers and arch" {
     try std.testing.expectEqual(Format.mistral, detect("{{ '[INST] ' }}", "llama"));
     // an explicit template always beats the arch fallback
     try std.testing.expectEqual(Format.llama3, detect("<|start_header_id|>", "qwen3moe"));
+}
+
+test "harmony render user turn + cue" {
+    const gpa = std.testing.allocator;
+    const msgs = [_]Message{.{ .role = "user", .content = "hi" }};
+    const out = try render(gpa, .harmony, &msgs, true);
+    defer gpa.free(out);
+    try std.testing.expectEqualStrings("<|start|>user<|message|>hi<|end|><|start|>assistant", out);
 }
 
 test "deepseek render single user turn" {
