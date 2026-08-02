@@ -121,10 +121,12 @@ function setStatus(up, label) {
 
 // Health also carries node state, so the header doubles as a liveness check
 // while a long generation is running.
+let lastHealth = null;
 async function poll() {
   try {
     const r = await fetch('/health');
     const j = await r.json();
+    lastHealth = j;
     setStatus(true, 'connected');
     if (j.model) $('model').textContent = j.model;
     // Random-weight fixtures produce gibberish by construction. Say so, or the
@@ -175,6 +177,20 @@ async function send() {
   let firstTok = 0;
   busy(true);
   inflight = new AbortController();
+
+  // Live feedback while the node grinds: on a partial store the first token
+  // waits for every missing expert the prefill needs, which can be minutes
+  // over a home link. An empty bubble for that long reads as a hang.
+  const ticker = setInterval(() => {
+    if (acc) return; // first token arrived; stop narrating
+    const el = Math.round((performance.now() - started) / 1000);
+    let line = `generating… ${el}s`;
+    if (lastHealth && typeof lastHealth.hit_rate === 'number') {
+      line += `  ·  ${(lastHealth.hit_rate * 100).toFixed(1)}% of expert reads local`;
+    }
+    out.textContent = line +
+      '\nmissing experts stream from peers on first use; cold requests take minutes and permanently warm this node';
+  }, 1000);
 
   const req = {
     model: 'loom',
@@ -252,9 +268,11 @@ async function send() {
     if (e.name === 'AbortError') {
       out.textContent = acc + '\n[stopped]';
     } else {
+      out.textContent = '[no response]';
       addMsg('error', String(e.message || e), 'err');
     }
   } finally {
+    clearInterval(ticker);
     inflight = null;
     busy(false);
   }

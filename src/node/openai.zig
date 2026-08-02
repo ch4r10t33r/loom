@@ -281,10 +281,14 @@ fn handleHealth(ctx: *Ctx) !Response {
     const n_peers: usize = if (ctx.peers) |p| p.liveCount() else 0;
     const model_esc = try jsonEscapeAlloc(ctx.gpa, ctx.model_id);
     defer ctx.gpa.free(model_esc);
+    var generating_s: i64 = -1;
+    if (ctx.alpha_metrics) |am| {
+        if (am.inflightSecs(stats.nowNs(ctx.io))) |secs| generating_s = @intCast(secs);
+    }
     const body = try std.fmt.allocPrint(
         ctx.gpa,
-        "{{\"status\":\"ok\",\"model\":\"{s}\",\"peers\":{d},\"hit_rate\":{d:.4},\"synthetic\":{}}}",
-        .{ model_esc, n_peers, ctx.gen.hitRate(), ctx.synthetic },
+        "{{\"status\":\"ok\",\"model\":\"{s}\",\"peers\":{d},\"hit_rate\":{d:.4},\"synthetic\":{},\"generating_s\":{d}}}",
+        .{ model_esc, n_peers, ctx.gen.hitRate(), ctx.synthetic, generating_s },
     );
     return .{ .status = 200, .body = body };
 }
