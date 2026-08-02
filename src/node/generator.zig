@@ -382,6 +382,11 @@ fn genGgufInner(
     var produced: usize = 0;
     var eos = false;
     if (toks.len > 0) {
+        var spec_on = false;
+        if (comptime @hasDecl(E, "stepSpec")) {
+            // MTP speculative decode: greedy only, and killable for A/B runs.
+            spec_on = temp <= 0 and m.mtp != null and std.c.getenv("LOOM_NO_MTP") == null;
+        }
         var last: u32 = @intCast(sampler.sample(scratch, st.logits, temp, rnd));
         while (produced < maxn and pos < c.ctx_len) : (produced += 1) {
             if (last == m.eosToken()) {
@@ -391,6 +396,24 @@ fn genGgufInner(
             const before = aw.writer.buffered().len;
             try m.decodeToken(&aw.writer, last);
             if (sink) |s| try s.emit(s.ctx, aw.writer.buffered()[before..]);
+            if (comptime @hasDecl(E, "stepSpec")) {
+                if (spec_on) {
+                    const r = try E.stepSpec(m, &st, last, pos);
+                    pos += r.n;
+                    if (r.n == 2) {
+                        produced += 1;
+                        if (r.tok2 == m.eosToken()) {
+                            last = r.tok2;
+                            continue;
+                        }
+                        const b2 = aw.writer.buffered().len;
+                        try m.decodeToken(&aw.writer, r.tok2);
+                        if (sink) |s| try s.emit(s.ctx, aw.writer.buffered()[b2..]);
+                    }
+                    last = r.next;
+                    continue;
+                }
+            }
             try E.step(m, &st, last, pos);
             pos += 1;
             last = @intCast(sampler.sample(scratch, st.logits, temp, rnd));

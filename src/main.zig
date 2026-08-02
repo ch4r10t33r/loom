@@ -896,11 +896,33 @@ fn runStoreWith(
     try out.flush();
 
     var produced: usize = 0;
+    var spec_on = false;
+    if (comptime @hasDecl(E, "stepSpec")) {
+        // MTP speculative decode: greedy only, and killable for A/B runs.
+        spec_on = temp <= 0 and m.mtp != null and std.c.getenv("LOOM_NO_MTP") == null;
+    }
     var last: u32 = @intCast(sampler.sample(sample_scratch, st.logits, temp, rnd));
     while (produced < max_tokens and pos < c.ctx_len) : (produced += 1) {
         if (last == m.eosToken()) break;
         try m.decodeToken(out, last);
         try out.flush();
+        if (comptime @hasDecl(E, "stepSpec")) {
+            if (spec_on) {
+                const r = try E.stepSpec(&m, &st, last, pos);
+                pos += r.n;
+                if (r.n == 2) {
+                    produced += 1;
+                    if (r.tok2 == m.eosToken()) {
+                        last = r.tok2;
+                        continue;
+                    }
+                    try m.decodeToken(out, r.tok2);
+                    try out.flush();
+                }
+                last = r.next;
+                continue;
+            }
+        }
         try E.step(&m, &st, last, pos);
         pos += 1;
         last = @intCast(sampler.sample(sample_scratch, st.logits, temp, rnd));
@@ -911,6 +933,14 @@ fn runStoreWith(
     try out.print("\n---- {d} prompt + {d} generated tokens in {d:.2}s ({d:.1} tok/s) ----\n", .{
         prompt_toks.len, produced, secs, @as(f64, @floatFromInt(prompt_toks.len + produced)) / secs,
     });
+    if (comptime @hasDecl(E, "stepSpec")) {
+        if (st.spec_fwd > 0) {
+            try out.print("mtp: {d} accepted / {d} forwards ({d:.2} tokens/forward)\n", .{
+                st.spec_acc,                                                                               st.spec_fwd,
+                @as(f64, @floatFromInt(st.spec_fwd + st.spec_acc)) / @as(f64, @floatFromInt(st.spec_fwd)),
+            });
+        }
+    }
     if (fs.pilot_pred > 0) {
         try out.print("pilot: {d}/{d} next-layer predictions confirmed ({d:.1}%)\n", .{
             fs.pilot_hit, fs.pilot_pred, 100.0 * @as(f64, @floatFromInt(fs.pilot_hit)) / @as(f64, @floatFromInt(fs.pilot_pred)),

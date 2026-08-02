@@ -73,6 +73,9 @@ pub const Config = struct {
     dim: usize,
     head_dim: usize, // may differ from dim/n_heads (qwen3 sets key_length)
     n_layers: usize, // excludes trailing MTP/NextN blocks
+    /// A NextN/MTP block was loaded; State grows one KV lane and the spec
+    /// scratch, and greedy decode may draft ahead (stepSpec).
+    has_mtp: bool = false,
     n_dense_layers: usize, // leading layers with a plain FFN
     n_heads: usize,
     n_kv_heads: usize,
@@ -181,6 +184,11 @@ pub const Model = struct {
     /// PILOT router-lookahead prefetch (see moeLayer). On by default for the
     /// distributed path; LOOM_NO_PILOT=1 disables for A/B measurement.
     pilot_enabled: bool = false,
+    /// GLM/DeepSeek-style NextN block: a full extra transformer layer plus
+    /// the glue that turns (hidden state, next-token embedding) into a draft
+    /// of the token after next. Loaded from blk.{n_layers}; null when the
+    /// file has none or any tensor is missing.
+    mtp: ?Mtp = null,
     /// Set at load when every layer can be recorded into one command buffer.
     /// See gpuLayersSupported.
     gpu_layers: bool = false,
@@ -394,117 +402,155 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
     const layers = try gpa.alloc(LayerT, cfg.n_layers);
     errdefer gpa.free(layers);
     var nb: [128]u8 = undefined;
-    const N = struct {
-        fn f(buf: []u8, li: usize, comptime s: []const u8) []const u8 {
-            return std.fmt.bufPrint(buf, "blk.{d}." ++ s, .{li}) catch unreachable;
-        }
-    };
-    const hd = cfg.head_dim;
     for (layers, 0..) |*l, i| {
-        l.attn_norm = try model.resolve(N.f(&nb, i, "attn_norm.weight"));
-        try Model.expectF32(l.attn_norm, "attn_norm");
-        try Model.expectShape(l.attn_norm, cfg.dim, 1, "attn_norm");
-        l.attn_q = try model.resolve(N.f(&nb, i, "attn_q.weight"));
-        l.attn_k = try model.resolve(N.f(&nb, i, "attn_k.weight"));
-        l.attn_v = try model.resolve(N.f(&nb, i, "attn_v.weight"));
-        l.attn_output = try model.resolve(N.f(&nb, i, "attn_output.weight"));
-        try Model.expectShape(l.attn_q, cfg.dim, cfg.qDim(), "attn_q");
-        try Model.expectShape(l.attn_k, cfg.dim, cfg.kvDim(), "attn_k");
-        try Model.expectShape(l.attn_v, cfg.dim, cfg.kvDim(), "attn_v");
-        try Model.expectShape(l.attn_output, cfg.qDim(), cfg.dim, "attn_output");
+        try loadLayerInto(&model, cfg, l, i, &nb);
+    }
+    model.layers = layers;
 
-        // qwen2moe and glm4moe carry QKV biases; llama and qwen3moe do not.
-        // Detect rather than tabulate: the file is the authority.
-        l.attn_q_bias = model.resolveOpt(N.f(&nb, i, "attn_q.bias"));
-        l.attn_k_bias = model.resolveOpt(N.f(&nb, i, "attn_k.bias"));
-        l.attn_v_bias = model.resolveOpt(N.f(&nb, i, "attn_v.bias"));
-        if (l.attn_q_bias) |b| {
-            try Model.expectF32(b, "attn_q.bias");
-            try Model.expectShape(b, cfg.qDim(), 1, "attn_q.bias");
-        }
-        if (l.attn_k_bias) |b| {
-            try Model.expectF32(b, "attn_k.bias");
-            try Model.expectShape(b, cfg.kvDim(), 1, "attn_k.bias");
-        }
-        if (l.attn_v_bias) |b| {
-            try Model.expectF32(b, "attn_v.bias");
-            try Model.expectShape(b, cfg.kvDim(), 1, "attn_v.bias");
-        }
-
-        // qwen3moe always has Q/K norms; glm4moe has them only on the 355B
-        // variant. Both are per-head RMSNorm over head_dim.
-        l.attn_q_norm = model.resolveOpt(N.f(&nb, i, "attn_q_norm.weight"));
-        l.attn_k_norm = model.resolveOpt(N.f(&nb, i, "attn_k_norm.weight"));
-        if (l.attn_q_norm) |n| {
-            try Model.expectF32(n, "attn_q_norm");
-            try Model.expectShape(n, hd, 1, "attn_q_norm");
-        }
-        if (l.attn_k_norm) |n| {
-            try Model.expectF32(n, "attn_k_norm");
-            try Model.expectShape(n, hd, 1, "attn_k_norm");
-        }
-
-        // glm4moe has no ffn_norm; its post_attention_norm sits in the same
-        // place in the graph, so accept either name.
-        l.ffn_norm = model.resolveOpt(N.f(&nb, i, "ffn_norm.weight")) orelse
-            try model.resolve(N.f(&nb, i, "post_attention_norm.weight"));
-        try Model.expectF32(l.ffn_norm, "ffn_norm");
-        try Model.expectShape(l.ffn_norm, cfg.dim, 1, "ffn_norm");
-
-        l.is_moe = cfg.n_expert > 0 and i >= cfg.n_dense_layers;
-        l.ffn_gate = null;
-        l.ffn_up = null;
-        l.ffn_down = null;
-        l.ffn_gate_inp = null;
-        l.exp_probs_b = null;
-        l.ffn_gate_exps = null;
-        l.ffn_up_exps = null;
-        l.ffn_down_exps = null;
-        l.ffn_gate_shexp = null;
-        l.ffn_up_shexp = null;
-        l.ffn_down_shexp = null;
-        l.ffn_gate_inp_shexp = null;
-
-        if (!l.is_moe) {
-            l.ffn_gate = try model.resolve(N.f(&nb, i, "ffn_gate.weight"));
-            l.ffn_up = try model.resolve(N.f(&nb, i, "ffn_up.weight"));
-            l.ffn_down = try model.resolve(N.f(&nb, i, "ffn_down.weight"));
-            try Model.expectShape(l.ffn_gate.?, cfg.dim, cfg.ffn, "ffn_gate");
-            try Model.expectShape(l.ffn_up.?, cfg.dim, cfg.ffn, "ffn_up");
-            try Model.expectShape(l.ffn_down.?, cfg.ffn, cfg.dim, "ffn_down");
-        } else {
-            l.ffn_gate_inp = try model.resolve(N.f(&nb, i, "ffn_gate_inp.weight"));
-            try Model.expectShape(l.ffn_gate_inp.?, cfg.dim, cfg.n_expert, "ffn_gate_inp");
-            l.exp_probs_b = model.resolveOpt(N.f(&nb, i, "exp_probs_b.bias"));
-            if (l.exp_probs_b) |b| {
-                try Model.expectF32(b, "exp_probs_b.bias");
-                try Model.expectShape(b, cfg.n_expert, 1, "exp_probs_b.bias");
+    // NextN/MTP: the trailing block is a full glm4moe-style layer plus the
+    // glue that turns (hidden state, next-token embedding) into a one-ahead
+    // draft. Loaded best-effort: any missing tensor leaves mtp null and the
+    // engine decodes normally.
+    if (nextn == 1) blk: {
+        var ml: LayerT = undefined;
+        loadLayerInto(&model, cfg, &ml, cfg.n_layers, &nb) catch break :blk;
+        const M = struct {
+            fn f(buf: []u8, li: usize, comptime t: []const u8) []const u8 {
+                return std.fmt.bufPrint(buf, "blk.{d}.nextn." ++ t, .{li}) catch unreachable;
             }
-            l.ffn_gate_exps = try model.resolve(N.f(&nb, i, "ffn_gate_exps.weight"));
-            l.ffn_up_exps = try model.resolve(N.f(&nb, i, "ffn_up_exps.weight"));
-            l.ffn_down_exps = try model.resolve(N.f(&nb, i, "ffn_down_exps.weight"));
-            try Model.expectExpertShape(l.ffn_gate_exps.?, cfg.dim, cfg.moe_ffn, cfg.n_expert, "ffn_gate_exps");
-            try Model.expectExpertShape(l.ffn_up_exps.?, cfg.dim, cfg.moe_ffn, cfg.n_expert, "ffn_up_exps");
-            try Model.expectExpertShape(l.ffn_down_exps.?, cfg.moe_ffn, cfg.dim, cfg.n_expert, "ffn_down_exps");
-
-            // Shared expert: qwen2moe always has one, glm4moe has one when
-            // expert_shared_count > 0, qwen3moe and Mixtral have none.
-            l.ffn_gate_shexp = model.resolveOpt(N.f(&nb, i, "ffn_gate_shexp.weight"));
-            if (l.ffn_gate_shexp) |g| {
-                l.ffn_up_shexp = try model.resolve(N.f(&nb, i, "ffn_up_shexp.weight"));
-                l.ffn_down_shexp = try model.resolve(N.f(&nb, i, "ffn_down_shexp.weight"));
-                try Model.expectShape(g, cfg.dim, cfg.shexp_ffn, "ffn_gate_shexp");
-                try Model.expectShape(l.ffn_up_shexp.?, cfg.dim, cfg.shexp_ffn, "ffn_up_shexp");
-                try Model.expectShape(l.ffn_down_shexp.?, cfg.shexp_ffn, cfg.dim, "ffn_down_shexp");
-                l.ffn_gate_inp_shexp = model.resolveOpt(N.f(&nb, i, "ffn_gate_inp_shexp.weight"));
-                if (l.ffn_gate_inp_shexp) |s| try Model.expectShape(s, cfg.dim, 1, "ffn_gate_inp_shexp");
-            }
-        }
+        };
+        const enorm = model.resolveOpt(M.f(&nb, cfg.n_layers, "enorm.weight")) orelse break :blk;
+        const hnorm = model.resolveOpt(M.f(&nb, cfg.n_layers, "hnorm.weight")) orelse break :blk;
+        const eh_proj = model.resolveOpt(M.f(&nb, cfg.n_layers, "eh_proj.weight")) orelse break :blk;
+        const embed = model.resolveOpt(M.f(&nb, cfg.n_layers, "embed_tokens.weight")) orelse break :blk;
+        const head_norm = model.resolveOpt(M.f(&nb, cfg.n_layers, "shared_head_norm.weight")) orelse break :blk;
+        const head = model.resolveOpt(M.f(&nb, cfg.n_layers, "shared_head_head.weight")) orelse break :blk;
+        Model.expectShape(eh_proj, 2 * cfg.dim, cfg.dim, "nextn.eh_proj") catch break :blk;
+        Model.expectShape(head, cfg.dim, cfg.vocab, "nextn.shared_head_head") catch break :blk;
+        model.mtp = .{
+            .layer = ml,
+            .enorm = enorm,
+            .hnorm = hnorm,
+            .eh_proj = eh_proj,
+            .embed = embed,
+            .head_norm = head_norm,
+            .head = head,
+        };
+        model.cfg.has_mtp = true;
     }
     model.layers = layers;
 
     model.tok = try Tok.init(gpa, &model.parsed);
     return model;
+}
+
+fn loadLayerInto(model: *Model, cfg: Config, l: *LayerT, i: usize, nb: *[128]u8) !void {
+    const N = struct {
+        fn f(buf: []u8, li: usize, comptime t: []const u8) []const u8 {
+            return std.fmt.bufPrint(buf, "blk.{d}." ++ t, .{li}) catch unreachable;
+        }
+    };
+    const hd = cfg.head_dim;
+
+    l.attn_norm = try model.resolve(N.f(nb, i, "attn_norm.weight"));
+    try Model.expectF32(l.attn_norm, "attn_norm");
+    try Model.expectShape(l.attn_norm, cfg.dim, 1, "attn_norm");
+    l.attn_q = try model.resolve(N.f(nb, i, "attn_q.weight"));
+    l.attn_k = try model.resolve(N.f(nb, i, "attn_k.weight"));
+    l.attn_v = try model.resolve(N.f(nb, i, "attn_v.weight"));
+    l.attn_output = try model.resolve(N.f(nb, i, "attn_output.weight"));
+    try Model.expectShape(l.attn_q, cfg.dim, cfg.qDim(), "attn_q");
+    try Model.expectShape(l.attn_k, cfg.dim, cfg.kvDim(), "attn_k");
+    try Model.expectShape(l.attn_v, cfg.dim, cfg.kvDim(), "attn_v");
+    try Model.expectShape(l.attn_output, cfg.qDim(), cfg.dim, "attn_output");
+
+    // qwen2moe and glm4moe carry QKV biases; llama and qwen3moe do not.
+    // Detect rather than tabulate: the file is the authority.
+    l.attn_q_bias = model.resolveOpt(N.f(nb, i, "attn_q.bias"));
+    l.attn_k_bias = model.resolveOpt(N.f(nb, i, "attn_k.bias"));
+    l.attn_v_bias = model.resolveOpt(N.f(nb, i, "attn_v.bias"));
+    if (l.attn_q_bias) |b| {
+        try Model.expectF32(b, "attn_q.bias");
+        try Model.expectShape(b, cfg.qDim(), 1, "attn_q.bias");
+    }
+    if (l.attn_k_bias) |b| {
+        try Model.expectF32(b, "attn_k.bias");
+        try Model.expectShape(b, cfg.kvDim(), 1, "attn_k.bias");
+    }
+    if (l.attn_v_bias) |b| {
+        try Model.expectF32(b, "attn_v.bias");
+        try Model.expectShape(b, cfg.kvDim(), 1, "attn_v.bias");
+    }
+
+    // qwen3moe always has Q/K norms; glm4moe has them only on the 355B
+    // variant. Both are per-head RMSNorm over head_dim.
+    l.attn_q_norm = model.resolveOpt(N.f(nb, i, "attn_q_norm.weight"));
+    l.attn_k_norm = model.resolveOpt(N.f(nb, i, "attn_k_norm.weight"));
+    if (l.attn_q_norm) |n| {
+        try Model.expectF32(n, "attn_q_norm");
+        try Model.expectShape(n, hd, 1, "attn_q_norm");
+    }
+    if (l.attn_k_norm) |n| {
+        try Model.expectF32(n, "attn_k_norm");
+        try Model.expectShape(n, hd, 1, "attn_k_norm");
+    }
+
+    // glm4moe has no ffn_norm; its post_attention_norm sits in the same
+    // place in the graph, so accept either name.
+    l.ffn_norm = model.resolveOpt(N.f(nb, i, "ffn_norm.weight")) orelse
+        try model.resolve(N.f(nb, i, "post_attention_norm.weight"));
+    try Model.expectF32(l.ffn_norm, "ffn_norm");
+    try Model.expectShape(l.ffn_norm, cfg.dim, 1, "ffn_norm");
+
+    l.is_moe = cfg.n_expert > 0 and i >= cfg.n_dense_layers;
+    l.ffn_gate = null;
+    l.ffn_up = null;
+    l.ffn_down = null;
+    l.ffn_gate_inp = null;
+    l.exp_probs_b = null;
+    l.ffn_gate_exps = null;
+    l.ffn_up_exps = null;
+    l.ffn_down_exps = null;
+    l.ffn_gate_shexp = null;
+    l.ffn_up_shexp = null;
+    l.ffn_down_shexp = null;
+    l.ffn_gate_inp_shexp = null;
+
+    if (!l.is_moe) {
+        l.ffn_gate = try model.resolve(N.f(nb, i, "ffn_gate.weight"));
+        l.ffn_up = try model.resolve(N.f(nb, i, "ffn_up.weight"));
+        l.ffn_down = try model.resolve(N.f(nb, i, "ffn_down.weight"));
+        try Model.expectShape(l.ffn_gate.?, cfg.dim, cfg.ffn, "ffn_gate");
+        try Model.expectShape(l.ffn_up.?, cfg.dim, cfg.ffn, "ffn_up");
+        try Model.expectShape(l.ffn_down.?, cfg.ffn, cfg.dim, "ffn_down");
+    } else {
+        l.ffn_gate_inp = try model.resolve(N.f(nb, i, "ffn_gate_inp.weight"));
+        try Model.expectShape(l.ffn_gate_inp.?, cfg.dim, cfg.n_expert, "ffn_gate_inp");
+        l.exp_probs_b = model.resolveOpt(N.f(nb, i, "exp_probs_b.bias"));
+        if (l.exp_probs_b) |b| {
+            try Model.expectF32(b, "exp_probs_b.bias");
+            try Model.expectShape(b, cfg.n_expert, 1, "exp_probs_b.bias");
+        }
+        l.ffn_gate_exps = try model.resolve(N.f(nb, i, "ffn_gate_exps.weight"));
+        l.ffn_up_exps = try model.resolve(N.f(nb, i, "ffn_up_exps.weight"));
+        l.ffn_down_exps = try model.resolve(N.f(nb, i, "ffn_down_exps.weight"));
+        try Model.expectExpertShape(l.ffn_gate_exps.?, cfg.dim, cfg.moe_ffn, cfg.n_expert, "ffn_gate_exps");
+        try Model.expectExpertShape(l.ffn_up_exps.?, cfg.dim, cfg.moe_ffn, cfg.n_expert, "ffn_up_exps");
+        try Model.expectExpertShape(l.ffn_down_exps.?, cfg.moe_ffn, cfg.dim, cfg.n_expert, "ffn_down_exps");
+
+        // Shared expert: qwen2moe always has one, glm4moe has one when
+        // expert_shared_count > 0, qwen3moe and Mixtral have none.
+        l.ffn_gate_shexp = model.resolveOpt(N.f(nb, i, "ffn_gate_shexp.weight"));
+        if (l.ffn_gate_shexp) |g| {
+            l.ffn_up_shexp = try model.resolve(N.f(nb, i, "ffn_up_shexp.weight"));
+            l.ffn_down_shexp = try model.resolve(N.f(nb, i, "ffn_down_shexp.weight"));
+            try Model.expectShape(g, cfg.dim, cfg.shexp_ffn, "ffn_gate_shexp");
+            try Model.expectShape(l.ffn_up_shexp.?, cfg.dim, cfg.shexp_ffn, "ffn_up_shexp");
+            try Model.expectShape(l.ffn_down_shexp.?, cfg.shexp_ffn, cfg.dim, "ffn_down_shexp");
+            l.ffn_gate_inp_shexp = model.resolveOpt(N.f(nb, i, "ffn_gate_inp_shexp.weight"));
+            if (l.ffn_gate_inp_shexp) |s| try Model.expectShape(s, cfg.dim, 1, "ffn_gate_inp_shexp");
+        }
+    }
 }
 
 /// Attach a distributed expert source: routed-expert reads become
@@ -525,6 +571,16 @@ pub fn attachDist(m: *Model, gpa: std.mem.Allocator, src: *expert_fetch.Source) 
     m.dist = src;
 }
 // ---- forward pass ------------------------------------------------------------
+
+pub const Mtp = struct {
+    layer: LayerT,
+    enorm: Tensor,
+    hnorm: Tensor,
+    eh_proj: Tensor,
+    embed: Tensor,
+    head_norm: Tensor,
+    head: Tensor,
+};
 
 pub const State = struct {
     cfg: Config,
@@ -569,6 +625,16 @@ pub const State = struct {
     pilot_pred: [moe.MAX_SELECTED]usize = undefined,
     pilot_n: usize = 0,
 
+    // MTP speculative decode (stepSpec). Scratch is allocated only when the
+    // model carries a NextN block; counters feed the tokens-per-forward line.
+    mtp_x: []f32 = &.{},
+    mtp_cat: []f32 = &.{},
+    bhidden: []f32 = &.{}, // residuals per verify lane (2 * dim)
+    blogits: []f32 = &.{}, // logits per verify lane (2 * vocab)
+    spec_capture: bool = false,
+    spec_fwd: u64 = 0,
+    spec_acc: u64 = 0,
+
     pub fn init(gpa: std.mem.Allocator, cfg: Config) !State {
         const kvd = cfg.kvDim();
         const ffn_max = cfg.maxFfn();
@@ -590,8 +656,12 @@ pub const State = struct {
             .router = try gpa.alloc(f32, @max(cfg.n_expert, 1)),
             .scores = try gpa.alloc(f32, cfg.ctx_len),
             .logits = try gpa.alloc(f32, cfg.vocab),
-            .k_cache = try gpa.alloc(f32, cfg.n_layers * cfg.ctx_len * kvd),
-            .v_cache = try gpa.alloc(f32, cfg.n_layers * cfg.ctx_len * kvd),
+            .k_cache = try gpa.alloc(f32, (cfg.n_layers + @intFromBool(cfg.has_mtp)) * cfg.ctx_len * kvd),
+            .v_cache = try gpa.alloc(f32, (cfg.n_layers + @intFromBool(cfg.has_mtp)) * cfg.ctx_len * kvd),
+            .mtp_x = if (cfg.has_mtp) try gpa.alloc(f32, cfg.dim) else &.{},
+            .mtp_cat = if (cfg.has_mtp) try gpa.alloc(f32, 2 * cfg.dim) else &.{},
+            .bhidden = if (cfg.has_mtp) try gpa.alloc(f32, 2 * cfg.dim) else &.{},
+            .blogits = if (cfg.has_mtp) try gpa.alloc(f32, 2 * cfg.vocab) else &.{},
             .bx = try gpa.alloc(f32, B * cfg.dim),
             .bnormed = try gpa.alloc(f32, B * cfg.dim),
             .bq = try gpa.alloc(f32, B * cfg.qDim()),
@@ -608,12 +678,13 @@ pub const State = struct {
 
     pub fn deinit(self: *State, gpa: std.mem.Allocator) void {
         inline for (.{
-            self.x,        self.normed,   self.q,      self.k,       self.v,
-            self.attn_out, self.gate,     self.up,     self.act,     self.ffn_out,
-            self.moe_acc,  self.router,   self.scores, self.logits,  self.k_cache,
-            self.v_cache,  self.proj_out, self.bx,     self.bnormed, self.bq,
-            self.bk,       self.bv,       self.battn,  self.bproj,   self.bgate,
-            self.bup,      self.bact,     self.bffn,
+            self.x,        self.normed,   self.q,       self.k,       self.v,
+            self.attn_out, self.gate,     self.up,      self.act,     self.ffn_out,
+            self.moe_acc,  self.router,   self.scores,  self.logits,  self.k_cache,
+            self.v_cache,  self.proj_out, self.bx,      self.bnormed, self.bq,
+            self.mtp_x,    self.mtp_cat,  self.bhidden, self.blogits, self.bk,
+            self.bv,       self.battn,    self.bproj,   self.bgate,   self.bup,
+            self.bact,     self.bffn,
         }) |sl| gpa.free(sl);
     }
 };
@@ -936,7 +1007,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
         }
         backend.rmsnorm(st.normed, st.x, tensorAsF32(l.ffn_norm), cfg.eps);
 
-        try moeLayer(m, st, l, li);
+        try moeLayer(m, st, l, li, true);
         backend.add(st.x, st.moe_acc);
     }
 
@@ -951,7 +1022,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
 /// Split out of `step` so the batched prefill path can reuse it per token --
 /// tokens in a batch generally select different experts, so unlike the dense
 /// projections there is nothing to share across the batch.
-fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize) !void {
+fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool) !void {
     const cfg = m.cfg;
     mv(l.ffn_gate_inp.?, st.router[0..cfg.n_expert], st.normed);
     var sel_buf: [moe.MAX_SELECTED]moe.Selected = undefined;
@@ -961,7 +1032,7 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize) !void {
 
     const acc = st.moe_acc;
     @memset(acc, 0);
-    if (m.dist) |src| {
+    if (if (dist_ok) m.dist else null) |src| {
         // PILOT scorecard: how many of the experts predicted for this layer
         // (from the previous layer's hidden state) did the router confirm?
         if (st.pilot_layer == li) {
@@ -1009,7 +1080,7 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize) !void {
         }
     }
     for (sel) |s| {
-        if (m.dist) |src| {
+        if (if (dist_ok) m.dist else null) |src| {
             // One shard carries this expert's [gate, up, down] slices
             // back to back, in that order (p2p/weights.zig).
             const blk = try src.get(m.expert_shard[li * cfg.n_expert + s.expert]);
@@ -1063,6 +1134,147 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize) !void {
 /// reads, so there is nothing to amortize. Routed experts are also still per
 /// token, because tokens in a batch generally select different experts and
 /// grouping them is a separate change.
+
+// ---- MTP speculative decode (colibri port; Apache-2.0 attribution in the
+// decision log). The NextN block drafts the token after next from the pair
+// (current residual stream, embedding of the token just chosen); the main
+// model verifies the draft in one 2-wide batched forward. Greedy only: at
+// temp 0 acceptance is an exact argmax comparison, so MTP-on output is
+// token-identical to MTP-off by construction. Host path only: the extra KV
+// lane lives past the backend's device cache, and the block is 1/47th of
+// the model.
+
+/// Run the NextN transformer layer at `mtp_pos` on `st.mtp_x`, writing the
+/// extra KV lane. Attention is host-side over that lane.
+fn mtpLayerForward(m: *const Model, st: *State, mtp_pos: usize) !void {
+    const cfg = m.cfg;
+    const mtp = m.mtp.?;
+    const l = mtp.layer;
+    const hd = cfg.head_dim;
+    const kvd = cfg.kvDim();
+    const q_per_kv = cfg.n_heads / cfg.n_kv_heads;
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const lane = cfg.n_layers; // the extra KV lane
+
+    backend.rmsnorm(st.normed, st.mtp_x, tensorAsF32(l.attn_norm), cfg.eps);
+    mv(l.attn_q, st.q, st.normed);
+    mv(l.attn_k, st.k, st.normed);
+    mv(l.attn_v, st.v, st.normed);
+    addBias(st.q, l.attn_q_bias);
+    addBias(st.k, l.attn_k_bias);
+    addBias(st.v, l.attn_v_bias);
+    headNorm(st.q, l.attn_q_norm, cfg.n_heads, hd, cfg.eps);
+    headNorm(st.k, l.attn_k_norm, cfg.n_kv_heads, hd, cfg.eps);
+    var h: usize = 0;
+    while (h < cfg.n_heads) : (h += 1) ropeApply(cfg.arch.rope, st.q[h * hd ..][0..hd], cfg.rope_dim, mtp_pos, cfg.rope_base);
+    h = 0;
+    while (h < cfg.n_kv_heads) : (h += 1) ropeApply(cfg.arch.rope, st.k[h * hd ..][0..hd], cfg.rope_dim, mtp_pos, cfg.rope_base);
+
+    const cache_base = (lane * cfg.ctx_len + mtp_pos) * kvd;
+    @memcpy(st.k_cache[cache_base..][0..kvd], st.k);
+    @memcpy(st.v_cache[cache_base..][0..kvd], st.v);
+
+    const seq = mtp_pos + 1;
+    h = 0;
+    while (h < cfg.n_heads) : (h += 1) {
+        const kvh = h / q_per_kv;
+        const qh = st.q[h * hd ..][0..hd];
+        var t_i: usize = 0;
+        while (t_i < seq) : (t_i += 1) {
+            const kt = st.k_cache[(lane * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
+            st.scores[t_i] = backend.dotF32(qh, kt) * scale;
+        }
+        backend.softmax(st.scores[0..seq]);
+        const oh = st.attn_out[h * hd ..][0..hd];
+        @memset(oh, 0);
+        t_i = 0;
+        while (t_i < seq) : (t_i += 1) {
+            const vt = st.v_cache[(lane * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
+            backend.axpy(oh, vt, st.scores[t_i]);
+        }
+    }
+    mv(l.attn_output, st.proj_out, st.attn_out);
+    backend.add(st.mtp_x, st.proj_out);
+
+    backend.rmsnorm(st.normed, st.mtp_x, tensorAsF32(l.ffn_norm), cfg.eps);
+    try moeLayer(m, st, l, cfg.n_layers, false);
+    backend.add(st.mtp_x, st.moe_acc);
+}
+
+/// The NextN glue: mtp_x = eh_proj([enorm(embed(tok)); hnorm(h)]), then the
+/// layer forward at `mtp_pos`. `h` is the main model's residual stream that
+/// chose `tok` (read-only here).
+fn mtpGlue(m: *const Model, st: *State, h: []const f32, tok: u32, mtp_pos: usize) !void {
+    const cfg = m.cfg;
+    const mtp = m.mtp.?;
+    if (tok >= cfg.vocab) return error.TokenOutOfRange;
+    backend.dequantRow(mtp.embed.ty, st.mtp_cat[0..cfg.dim], mtp.embed.data, tok, cfg.dim);
+    rmsnormInPlace(st.mtp_cat[0..cfg.dim], tensorAsF32(mtp.enorm), cfg.eps);
+    @memcpy(st.mtp_cat[cfg.dim..][0..cfg.dim], h);
+    rmsnormInPlace(st.mtp_cat[cfg.dim..][0..cfg.dim], tensorAsF32(mtp.hnorm), cfg.eps);
+    mv(mtp.eh_proj, st.mtp_x, st.mtp_cat);
+    try mtpLayerForward(m, st, mtp_pos);
+}
+
+fn rmsnormInPlace(v: []f32, w: []const f32, eps: f32) void {
+    var tmp_buf: [16384]f32 = undefined;
+    const tmp = tmp_buf[0..v.len];
+    backend.rmsnorm(tmp, v, w, eps);
+    @memcpy(v, tmp);
+}
+
+fn argmaxSlice(v: []const f32) u32 {
+    var best: usize = 0;
+    for (v, 0..) |x, i| {
+        if (x > v[best]) best = i;
+    }
+    return @intCast(best);
+}
+
+pub const SpecOut = struct {
+    n: u8, // tokens advanced: 1 (draft rejected) or 2 (accepted)
+    tok2: u32, // the accepted draft, when n == 2
+    next: u32, // greedy choice after the last advanced position
+};
+
+/// One greedy speculative iteration. `cur` is the token chosen for `pos`
+/// (not yet forwarded); st.x must hold the residual stream that chose it.
+/// On return st.x/st.logits describe the last advanced position, the KV is
+/// current through it, and `next` is the greedy continuation.
+pub fn stepSpec(m: *const Model, st: *State, cur: u32, pos: usize) !SpecOut {
+    const cfg = m.cfg;
+    if (pos + 1 >= cfg.ctx_len) { // no room to verify a draft: plain step
+        try step(m, st, cur, pos);
+        return .{ .n = 1, .tok2 = 0, .next = argmaxSlice(st.logits) };
+    }
+
+    // Draft the token after `cur` (MTP position pos-1: aligned with the
+    // residual stream that produced cur).
+    try mtpGlue(m, st, st.x, cur, pos -| 1);
+    backend.rmsnorm(st.normed, st.mtp_x, tensorAsF32(m.mtp.?.head_norm), cfg.eps);
+    mv(m.mtp.?.head, st.logits, st.normed);
+    const draft = argmaxSlice(st.logits);
+
+    st.spec_capture = true;
+    defer st.spec_capture = false;
+    try stepBatch(m, st, &.{ cur, draft }, pos);
+    st.spec_fwd += 1;
+
+    const main1 = argmaxSlice(st.blogits[0..cfg.vocab]);
+    if (main1 == draft) {
+        st.spec_acc += 1;
+        // Backfill the MTP lane for position pos (its inputs are lane 0's
+        // residual and the accepted draft), keeping the lane contiguous.
+        try mtpGlue(m, st, st.bhidden[0..cfg.dim], draft, pos);
+        @memcpy(st.x, st.bhidden[cfg.dim..][0..cfg.dim]);
+        @memcpy(st.logits, st.blogits[cfg.vocab..][0..cfg.vocab]);
+        return .{ .n = 2, .tok2 = draft, .next = argmaxSlice(st.logits) };
+    }
+    @memcpy(st.x, st.bhidden[0..cfg.dim]);
+    @memcpy(st.logits, st.blogits[0..cfg.vocab]);
+    return .{ .n = 1, .tok2 = 0, .next = main1 };
+}
+
 pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usize) !void {
     const n = tokens.len;
     std.debug.assert(n > 0 and n <= backend.MAX_BATCH);
@@ -1150,8 +1362,21 @@ pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usi
         // time through the existing single-token path.
         for (0..n) |k| {
             @memcpy(st.normed, st.bnormed[k * cfg.dim ..][0..cfg.dim]);
-            try moeLayer(m, st, l, li);
+            try moeLayer(m, st, l, li, true);
             backend.add(st.bx[k * cfg.dim ..][0..cfg.dim], st.moe_acc);
+        }
+    }
+
+    // Speculative verify wants the residual and logits of EVERY position,
+    // not just the last: acceptance compares the model's choice after lane k
+    // with the draft in lane k+1, and the surviving lane's hidden state
+    // seeds the next draft.
+    if (st.spec_capture) {
+        for (0..n) |k| {
+            const lane = st.bx[k * cfg.dim ..][0..cfg.dim];
+            @memcpy(st.bhidden[k * cfg.dim ..][0..cfg.dim], lane);
+            backend.rmsnorm(st.normed, lane, tensorAsF32(m.output_norm), cfg.eps);
+            mv(m.output, st.blogits[k * cfg.vocab ..][0..cfg.vocab], st.normed);
         }
     }
 
@@ -1233,7 +1458,6 @@ test "each supported architecture loads with the features it actually declares" 
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const gguf_mod = @import("gguf.zig");
 
     const Case = struct {
         arch: []const u8,
@@ -1257,7 +1481,7 @@ test "each supported architecture loads with the features it actually declares" 
         var pbuf: [128]u8 = undefined;
         const path = try std.fmt.bufPrint(&pbuf, "test-arch-{s}.gguf", .{c.arch});
         defer Io.Dir.cwd().deleteFile(io, path) catch {};
-        try gguf_mod.writeMoeFixture(gpa, io, path, 7, c.arch);
+        try gguf.writeMoeFixture(gpa, io, path, 7, c.arch);
 
         var m = try load(gpa, io, path);
         defer m.deinit();
@@ -1316,13 +1540,12 @@ test "batched prefill matches token-by-token prefill" {
     var threaded: std.Io.Threaded = .init(gpa, .{});
     defer threaded.deinit();
     const io = threaded.io();
-    const gguf_mod = @import("gguf.zig");
 
     for ([_][]const u8{ "llama", "qwen3moe", "glm4moe" }) |arch| {
         var pbuf: [96]u8 = undefined;
         const path = try std.fmt.bufPrint(&pbuf, "test-batch-{s}.gguf", .{arch});
         defer Io.Dir.cwd().deleteFile(io, path) catch {};
-        try gguf_mod.writeMoeFixture(gpa, io, path, 11, arch);
+        try gguf.writeMoeFixture(gpa, io, path, 11, arch);
 
         var m = try load(gpa, io, path);
         defer m.deinit();
@@ -1357,4 +1580,69 @@ test "batched prefill matches token-by-token prefill" {
             try std.testing.expectApproxEqAbs(want, got, @max(@abs(want), @abs(got)) * 1e-3 + 1e-3);
         }
     }
+}
+
+test "MTP speculative decode is token-identical to plain greedy decode" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const path = "test-mtp-glm4moe.gguf";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    try gguf.writeMoeFixture(gpa, io, path, 11, "glm4moe");
+
+    var m = try load(gpa, io, path);
+    defer m.deinit();
+    try std.testing.expect(m.mtp != null);
+    try std.testing.expect(m.cfg.has_mtp);
+
+    const N = 24;
+    const first: u32 = 5;
+
+    // Reference: plain greedy decode.
+    var ref: [N]u32 = undefined;
+    {
+        var st = try State.init(gpa, m.cfg);
+        defer st.deinit(gpa);
+        var tok: u32 = first;
+        var pos: usize = 0;
+        for (0..N) |k| {
+            try step(&m, &st, tok, pos);
+            pos += 1;
+            tok = argmaxSlice(st.logits);
+            ref[k] = tok;
+        }
+    }
+
+    // Speculative: same greedy stream through stepSpec. The invariant is
+    // exact equality -- acceptance is an argmax comparison of the same
+    // arithmetic, so a divergence is a bug, not a tuning issue.
+    var got: [N]u32 = undefined;
+    {
+        var st = try State.init(gpa, m.cfg);
+        defer st.deinit(gpa);
+        // one plain step primes st.x/st.logits for the first draft
+        try step(&m, &st, first, 0);
+        var pos: usize = 1;
+        var cur = argmaxSlice(st.logits);
+        got[0] = cur;
+        var n_out: usize = 1;
+        while (n_out < N) {
+            const r = try stepSpec(&m, &st, cur, pos);
+            pos += r.n;
+            if (r.n == 2 and n_out < N) {
+                got[n_out] = r.tok2;
+                n_out += 1;
+            }
+            if (n_out < N) {
+                got[n_out] = r.next;
+                n_out += 1;
+            }
+            cur = r.next;
+        }
+        // the drafter must have been exercised, whatever its acceptance
+        try std.testing.expect(st.spec_fwd > 0);
+    }
+    try std.testing.expectEqualSlices(u32, &ref, &got);
 }
