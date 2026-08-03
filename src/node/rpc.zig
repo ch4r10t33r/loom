@@ -2,6 +2,7 @@
 //!
 //! Request  (one JSON object per line):
 //!   {"prompt": "hello", "max_tokens": 32, "temp": 0.0, "seed": 42}
+//!   {"method": "model"}  ->  {"ok":true,"model":...,"arch":...,"ctx":N}
 //! Response (one JSON object per line):
 //!   {"ok": true, "generated": N, "text": "...", "tokens": [...],
 //!    "tok_per_s": X, "hit_rate": Y}
