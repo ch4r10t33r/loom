@@ -593,6 +593,27 @@ Milestones with exit criteria; full tracking in
    version, with the existing version guard enforcing isolation during transition.
 5. **v2 trust layer.** Exit: untrusted-peer serving with pollution-resistant
    propagation and sampled compute verification.
+6. **Distributed speculative decoding** (inspired by DSD [16]). Today a cold
+   node below the holdings threshold delegates the *whole* generation to a
+   warm peer and relays the answer. DSD's edge-cloud split suggests the
+   middle rung: the cold node drafts tokens locally with what it already
+   holds (the MTP head and the hot head of the store) and ships only the
+   draft window to the warm peer, which verifies the whole window in one
+   batched forward -- per-request traffic becomes tokens, not experts, and
+   the warm peer's cost per accepted token drops by the acceptance rate.
+   DSD's measured crossover (distributed drafting wins below ~50-60 ms RTT,
+   local wins above) maps directly onto loom's measured-tier-order
+   principle: the same startup probe that orders fetch tiers decides
+   draft-locally-vs-delegate-wholesale. Their stabilization findings carry
+   over too -- clamp the speculation window, smooth it, and make the
+   local/delegated mode switch sticky so it cannot flap. Their learned
+   window controller (a DNN predicting window size) is noted and
+   deliberately not adopted: at loom's scale the same signals (recent
+   acceptance rate, RTT, queue depth) feed a threshold heuristic that DSD's
+   own ablation places within a few percent of the learned policy. Exit:
+   draft-remote-verify measured on the devnet against delegate-wholesale on
+   the same prompts, with the mode decision driven by probed RTT and
+   measured acceptance.
 
 ---
 
@@ -629,6 +650,7 @@ problem, bound by network and kernels, and the roadmap treats it as such.
 13. Google. *Snappy compression.* https://github.com/google/snappy (Zig binding: https://github.com/blockblaz/zig-snappy)
 14. Krohn, Freedman, Mazieres. *On-the-fly Verification of Rateless Erasure Codes for Efficient Content Distribution.* IEEE S&P 2004 (homomorphic hashing).
 15. Di Giacinto, E. et al. *LocalAI: The free, open-source OpenAI alternative.* https://localai.io (federated and worker modes: https://localai.io/features/distribute/)
+16. Yu, F., Li, L., McDanel, B., Zhang, S.Q. *DSD: A Distributed Speculative Decoding Solution for Edge-Cloud Agile Large Model Serving.* 2025. https://arxiv.org/abs/2511.21669 (adaptive window control, edge-draft/cloud-verify split, RTT crossover).
 
 ---
 
@@ -774,6 +796,7 @@ the spec governs the p2p protocol and the roadmap governs status.
 | 2026-07-29 | Steady-state decode on DeepSeek-V2-Lite Q4_K_M is 128 ms/token (7.8 tok/s) on a 17 GB M5 with the 9.7 GB store device-resident: expert FFN 58.9 ms (46%), expert get 26.3 (21%), attention 17.0 (13%), submissions 6.9 (5%) | Against ~2.5 tok/s at the start of the same session, from two changes that were both about reaching the weights rather than about arithmetic: making the mapping device-resident, and adding the Q5_0/Q8_0 kernels without which every MoE layer declined to the host. The expert FFN moves ~1.1 GB per token in 58.9 ms, about 19 GB/s against a ~110 GB/s streaming ceiling: the gap is random 6 MB reads with dequantization, not the kernel, and it is where any further work belongs. No comparison against llama.cpp is claimed: the harness used earlier timed from first stream delta to last, which collapses when a server buffers its output, and it once reported 1236 tok/s. Those figures are withdrawn |
 | 2026-07-28 | Batched prefill (`stepBatch`, `ggml.matmul`) and vectorized attention inner loops | Decoding unpacks every weight once per token, but a prompt is known up front, so one unpacked weight can serve several tokens. Measured 1.4x on a 145-token prefill; the kernel microbenchmark shows 2.4x in isolation, and the gap is attention, which is quadratic in prompt length and bound by the KV cache rather than by weight reads, so there is nothing to amortize. Vectorizing the attention dot and value-accumulation loops was worth a further 11% on decode. Batch capped at 8: past that, register pressure costs more than the sharing returns |
 
+| 2026-08-03 | **Distributed speculative decoding adopted as a roadmap direction, crediting DSD (Yu et al., arXiv:2511.21669) [16]**: evolve delegate-while-cold from ship-the-whole-generation into draft-local / verify-remote -- the cold node drafts a window with its MTP head plus the hot head of its store, the warm peer verifies the window in one batched forward. Adopt DSD's stabilization findings (clamped window, EMA smoothing, sticky local/delegated mode switch) and its RTT crossover as an input to the existing measured-tier-order probe. Deliberately NOT adopted: their learned window-control DNN -- the same feature vector (recent acceptance, RTT, queue depth) drives a threshold heuristic that their own ablation puts within a few percent of the learned policy | The pieces are already on the shelf: MTP drafting (2026-08-02), GEN delegation (2026-08-02), startup bandwidth probes, and per-request acceptance stats. DSD contributes the missing frame -- speculation window as a *network* decision, not an engine constant -- and evidence that the win is real at exactly the RTTs the devnet measures (10-30 ms). A deterministic controller keeps the policy debuggable and honors the code-over-model rule |
 ---
 
 ## Appendix B: Source layout
