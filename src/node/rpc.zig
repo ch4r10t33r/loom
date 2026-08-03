@@ -2,6 +2,7 @@
 //!
 //! Request  (one JSON object per line):
 //!   {"prompt": "hello", "max_tokens": 32, "temp": 0.0, "seed": 42}
+//!   {"method": "model"}  ->  {"ok":true,"model":...,"arch":...,"ctx":N}
 //! Response (one JSON object per line):
 //!   {"ok": true, "generated": N, "text": "...", "tokens": [...],
 //!    "tok_per_s": X, "hit_rate": Y}
@@ -156,6 +157,17 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
     // v1 accepts the proof unverified (trusted swarm); a payment rail replaces
     // exactly this check.
     if (obj.get("method")) |mv| {
+        // {"method":"model"} -> what this node is serving. No metering: it is
+        // the cheapest possible request and clients use it to label sessions.
+        if (mv == .string and std.mem.eql(u8, mv.string, "model")) {
+            try wi.print("{{\"ok\":true,\"model\":", .{});
+            try writeJsonBytes(wi, ctx.gen.modelName());
+            try wi.print(",\"arch\":", .{});
+            try writeJsonBytes(wi, ctx.gen.modelArch());
+            try wi.print(",\"ctx\":{d}}}\n", .{ctx.gen.modelCtx()});
+            try wi.flush();
+            return;
+        }
         if (mv == .string and std.mem.eql(u8, mv.string, "credit")) {
             const m = ctx.meter orelse return wi.print("{{\"ok\":false,\"error\":\"no_meter\"}}\n", .{});
             // audit #6 P0-1: credit is admin-gated. No token configured -> the

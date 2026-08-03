@@ -176,6 +176,32 @@ pub const Generator = union(enum) {
         };
     }
 
+    /// The served model's human name (GGUF `general.name`), for the boot line
+    /// and the RPC `model` method. The loom byte engine has no checkpoint
+    /// metadata, so it names itself.
+    pub fn modelName(self: Generator) []const u8 {
+        return switch (self) {
+            .loom => "loom byte engine",
+            .gguf => |g| g.m.generalName() orelse "unknown",
+        };
+    }
+
+    /// The served model's architecture id (GGUF `general.architecture`).
+    pub fn modelArch(self: Generator) []const u8 {
+        return switch (self) {
+            .loom => "loom",
+            .gguf => |g| g.m.archName(),
+        };
+    }
+
+    /// Context window actually in effect (post `--ctx` clamp).
+    pub fn modelCtx(self: Generator) usize {
+        return switch (self) {
+            .loom => 0,
+            .gguf => |g| g.m.ctxLen(),
+        };
+    }
+
     /// The chat template to render `messages[]` with. The loom byte engine has
     /// no template (generic); the GGUF engine's is detected at load.
     pub fn chatFormat(self: Generator) chat_template.Format {

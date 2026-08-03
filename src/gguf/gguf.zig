@@ -600,13 +600,14 @@ pub fn writeMoeFixture(gpa: std.mem.Allocator, io: Io, path: []const u8, seed: u
     const is_qwen2 = std.mem.eql(u8, arch, "qwen2moe");
     const is_qwen3 = std.mem.eql(u8, arch, "qwen3moe");
     const is_glm = std.mem.eql(u8, arch, "glm4moe");
-    if (!is_llama and !is_qwen2 and !is_qwen3 and !is_glm) return error.UnsupportedArchitecture;
+    const is_oai = std.mem.eql(u8, arch, "gpt-oss");
+    if (!is_llama and !is_qwen2 and !is_qwen3 and !is_glm and !is_oai) return error.UnsupportedArchitecture;
 
-    const qkv_bias = is_qwen2 or is_glm;
+    const qkv_bias = is_qwen2 or is_glm or is_oai;
     const qk_norm = is_qwen3 or is_glm;
     const shexp = is_qwen2 or is_glm;
     const shexp_gate = is_qwen2; // qwen2moe alone gates its shared expert
-    const post_norm = is_glm; // glm4moe names the pre-FFN norm differently
+    const post_norm = is_glm or is_oai; // both name the pre-FFN norm differently
     const sigmoid = is_glm;
     const n_dense: u64 = if (is_glm) 1 else 0;
     const nextn: u64 = if (is_glm) 1 else 0;
@@ -656,6 +657,14 @@ pub fn writeMoeFixture(gpa: std.mem.Allocator, io: Io, path: []const u8, seed: u
     try kvU32v(gpa, &kv, &kv_count, K.f(&kb, arch, "expert_used_count"), @intCast(n_used));
     try kvU32v(gpa, &kv, &kv_count, K.f(&kb, arch, "expert_feed_forward_length"), @intCast(moe_ffn));
     if (is_qwen3) try kvU32v(gpa, &kv, &kv_count, K.f(&kb, arch, "attention.key_length"), @intCast(head_dim));
+    if (is_oai) {
+        // Small window so a short decode already crosses it, plus real
+        // gpt-oss YaRN keys so the scaled-rope path runs in the suite.
+        try kvU32v(gpa, &kv, &kv_count, K.f(&kb, arch, "attention.sliding_window"), 4);
+        try kvStr(gpa, &kv, &kv_count, K.f(&kb, arch, "rope.scaling.type"), "yarn");
+        try kvF32v(gpa, &kv, &kv_count, K.f(&kb, arch, "rope.scaling.factor"), 32.0);
+        try kvF32v(gpa, &kv, &kv_count, K.f(&kb, arch, "rope.scaling.original_context_length"), 4096.0);
+    }
     if (shexp) {
         try kvU32v(gpa, &kv, &kv_count, K.f(&kb, arch, "expert_shared_count"), @intCast(n_shared));
         try kvU32v(gpa, &kv, &kv_count, K.f(&kb, arch, "expert_shared_feed_forward_length"), @intCast(shexp_ffn));
@@ -744,6 +753,10 @@ pub fn writeMoeFixture(gpa: std.mem.Allocator, io: Io, path: []const u8, seed: u
             try infos.append(gpa, .{ .name = L.n(na, li, "attn_q_norm.weight"), .dims = .{ head_dim, 0, 0 }, .n_dims = 1 });
             try infos.append(gpa, .{ .name = L.n(na, li, "attn_k_norm.weight"), .dims = .{ head_dim, 0, 0 }, .n_dims = 1 });
         }
+        if (is_oai) {
+            try infos.append(gpa, .{ .name = L.n(na, li, "attn_sinks.weight"), .dims = .{ n_heads, 0, 0 }, .n_dims = 1 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "attn_output.bias"), .dims = .{ dim, 0, 0 }, .n_dims = 1 });
+        }
         if (post_norm) {
             try infos.append(gpa, .{ .name = L.n(na, li, "post_attention_norm.weight"), .dims = .{ dim, 0, 0 }, .n_dims = 1 });
         } else {
@@ -760,6 +773,12 @@ pub fn writeMoeFixture(gpa: std.mem.Allocator, io: Io, path: []const u8, seed: u
         try infos.append(gpa, .{ .name = L.n(na, li, "ffn_gate_exps.weight"), .dims = .{ dim, moe_ffn, n_expert }, .n_dims = 3 });
         try infos.append(gpa, .{ .name = L.n(na, li, "ffn_up_exps.weight"), .dims = .{ dim, moe_ffn, n_expert }, .n_dims = 3 });
         try infos.append(gpa, .{ .name = L.n(na, li, "ffn_down_exps.weight"), .dims = .{ moe_ffn, dim, n_expert }, .n_dims = 3 });
+        if (is_oai) {
+            try infos.append(gpa, .{ .name = L.n(na, li, "ffn_gate_inp.bias"), .dims = .{ n_expert, 0, 0 }, .n_dims = 1 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "ffn_gate_exps.bias"), .dims = .{ moe_ffn, n_expert, 0 }, .n_dims = 2 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "ffn_up_exps.bias"), .dims = .{ moe_ffn, n_expert, 0 }, .n_dims = 2 });
+            try infos.append(gpa, .{ .name = L.n(na, li, "ffn_down_exps.bias"), .dims = .{ dim, n_expert, 0 }, .n_dims = 2 });
+        }
         if (shexp) {
             try infos.append(gpa, .{ .name = L.n(na, li, "ffn_gate_shexp.weight"), .dims = .{ dim, shexp_ffn, 0 }, .n_dims = 2 });
             try infos.append(gpa, .{ .name = L.n(na, li, "ffn_up_shexp.weight"), .dims = .{ dim, shexp_ffn, 0 }, .n_dims = 2 });

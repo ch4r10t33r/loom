@@ -93,7 +93,16 @@ pub const Bpe = struct {
             .specials = specials,
             .bos = @intCast(parsed.getUint("tokenizer.ggml.bos_token_id") orelse 0),
             .eos = @intCast(parsed.getUint("tokenizer.ggml.eos_token_id") orelse 0),
-            .add_bos = parsed.getBool("tokenizer.ggml.add_bos_token") orelse true,
+            // Default matches llama.cpp: for BPE vocabs add_bos is OFF unless
+            // the file says otherwise or the pre-tokenizer family turns it on
+            // (llama3 does; deepseek and gpt-4o/o200k do not). The previous
+            // blanket `true` happened to match the deepseek GGUFs this engine
+            // grew up on, which DO ship an explicit add_bos_token=true.
+            .add_bos = parsed.getBool("tokenizer.ggml.add_bos_token") orelse blk: {
+                const pre = parsed.getString("tokenizer.ggml.pre") orelse "";
+                break :blk std.mem.eql(u8, pre, "llama-bpe") or std.mem.eql(u8, pre, "llama3") or
+                    std.mem.eql(u8, pre, "llama-v3");
+            },
         };
     }
 

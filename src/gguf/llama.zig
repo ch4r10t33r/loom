@@ -50,6 +50,9 @@ pub const Tok = @import("tok.zig").Tok;
 pub const Arch = struct {
     name: []const u8, // also the metadata key prefix
     rope: RopeStyle,
+    /// gpt-oss: swiglu_oai expert activation, per-expert FFN biases,
+    /// attention sinks, alternating sliding-window layers, YaRN rope.
+    oai: bool = false,
 };
 
 pub const RopeStyle = enum { norm, neox };
@@ -59,6 +62,7 @@ pub const arches = [_]Arch{
     .{ .name = "qwen2moe", .rope = .neox },
     .{ .name = "qwen3moe", .rope = .neox },
     .{ .name = "glm4moe", .rope = .neox },
+    .{ .name = "gpt-oss", .rope = .neox, .oai = true },
 };
 
 pub fn archFor(name: []const u8) ?Arch {
@@ -76,6 +80,15 @@ pub const Config = struct {
     /// A NextN/MTP block was loaded; State grows one KV lane and the spec
     /// scratch, and greedy decode may draft ahead (stepSpec).
     has_mtp: bool = false,
+    /// Sliding-window size for the layers that use one (gpt-oss: even layers,
+    /// window 128); 0 = no windowed layers.
+    swa_window: usize = 0,
+    /// YaRN rope scaling (gpt-oss: factor 32 over a 4096 original context).
+    yarn_factor: f32 = 0,
+    yarn_orig_ctx: f32 = 0,
+    /// Multiplier on the attention logits: mscale^2 under YaRN (the rope
+    /// magnitude scale applied to q and k, folded into the score instead).
+    attn_logit_mul: f32 = 1.0,
     n_dense_layers: usize, // leading layers with a plain FFN
     n_heads: usize,
     n_kv_heads: usize,
@@ -160,6 +173,15 @@ const LayerT = struct {
     /// shared expert output unweighted.
     ffn_gate_inp_shexp: ?Tensor,
     is_moe: bool,
+    /// gpt-oss additions: per-head sink logits, sliding-window flag,
+    /// router bias, per-expert FFN biases.
+    attn_sinks: ?Tensor = null,
+    attn_output_b: ?Tensor = null,
+    is_swa: bool = false,
+    ffn_gate_inp_b: ?Tensor = null,
+    ffn_gate_exps_b: ?Tensor = null,
+    ffn_up_exps_b: ?Tensor = null,
+    ffn_down_exps_b: ?Tensor = null,
 };
 
 pub const Model = struct {
@@ -366,6 +388,7 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
         .ctx_len = @intCast(parsed.getUint(K.f(&kb, arch_name, "context_length")) orelse 2048),
         .rope_dim = @intCast(parsed.getUint(K.f(&kb, arch_name, "rope.dimension_count")) orelse head_dim),
         .rope_base = @floatCast(parsed.getFloat(K.f(&kb, arch_name, "rope.freq_base")) orelse 10000.0),
+        .swa_window = @intCast(parsed.getUint(K.f(&kb, arch_name, "attention.sliding_window")) orelse 0),
         .eps = @floatCast(parsed.getFloat(K.f(&kb, arch_name, "attention.layer_norm_rms_epsilon")) orelse 1e-5),
     };
     // llama.cpp's fallback when a MoE file omits the per-expert FFN size
@@ -376,6 +399,20 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
         cfg.shexp_ffn = if (std.mem.eql(u8, arch_name, "qwen2moe")) cfg.ffn else cfg.n_shared * cfg.moe_ffn;
     }
     try validateConfig(cfg);
+
+    // YaRN: statically rescaled rope frequencies plus a magnitude scale on
+    // q and k, folded into the attention logits as mscale^2 (the deepseek
+    // engine's trick; ggml applies mscale to the rotated components).
+    if (parsed.getString(K.f(&kb, arch_name, "rope.scaling.type"))) |sc| {
+        if (std.mem.eql(u8, sc, "yarn")) {
+            cfg.yarn_factor = @floatCast(parsed.getFloat(K.f(&kb, arch_name, "rope.scaling.factor")) orelse 1.0);
+            cfg.yarn_orig_ctx = @floatCast(parsed.getFloat(K.f(&kb, arch_name, "rope.scaling.original_context_length")) orelse 4096.0);
+            if (cfg.yarn_factor > 1.0) {
+                const mscale = 1.0 + 0.1 * @log(cfg.yarn_factor);
+                cfg.attn_logit_mul = mscale * mscale;
+            }
+        }
+    }
 
     var model = Model{
         .gpa = gpa,
@@ -445,6 +482,23 @@ pub fn load(gpa: std.mem.Allocator, io: Io, path: []const u8) !Model {
 }
 
 fn loadLayerInto(model: *Model, cfg: Config, l: *LayerT, i: usize, nb: *[128]u8) !void {
+    const N2 = struct {
+        fn f(buf: []u8, li: usize, comptime t: []const u8) []const u8 {
+            return std.fmt.bufPrint(buf, "blk.{d}." ++ t, .{li}) catch unreachable;
+        }
+    };
+    defer {
+        // gpt-oss extras; resolveOpt leaves them null everywhere else. The
+        // sliding-window pattern is llama.cpp's default period 2 with dense
+        // layers second: even layers windowed, odd layers full.
+        l.attn_sinks = model.resolveOpt(N2.f(nb, i, "attn_sinks.weight"));
+        l.attn_output_b = model.resolveOpt(N2.f(nb, i, "attn_output.bias"));
+        l.is_swa = cfg.swa_window > 0 and (i % 2 == 0);
+        l.ffn_gate_inp_b = model.resolveOpt(N2.f(nb, i, "ffn_gate_inp.bias"));
+        l.ffn_gate_exps_b = model.resolveOpt(N2.f(nb, i, "ffn_gate_exps.bias"));
+        l.ffn_up_exps_b = model.resolveOpt(N2.f(nb, i, "ffn_up_exps.bias"));
+        l.ffn_down_exps_b = model.resolveOpt(N2.f(nb, i, "ffn_down_exps.bias"));
+    }
     const N = struct {
         fn f(buf: []u8, li: usize, comptime t: []const u8) []const u8 {
             return std.fmt.bufPrint(buf, "blk.{d}." ++ t, .{li}) catch unreachable;
@@ -736,6 +790,73 @@ fn ropeNeox(vec: []f32, rope_dim: usize, pos: usize, base: f32) void {
     }
 }
 
+/// NEOX-pair rope with YaRN frequency correction (gpt-oss: factor 32 over a
+/// 4096 original context; betas 32/1 as ggml hardcodes for these keys). The
+/// magnitude scale (mscale) is folded into the attention logits instead of
+/// the vectors -- see Config.attn_logit_mul.
+fn ropeNeoxYarn(vec: []f32, rope_dim: usize, pos: usize, base: f32, factor: f32, orig_ctx: f32) void {
+    const half = rope_dim / 2;
+    const d: f32 = @floatFromInt(rope_dim);
+    const two_pi = 2.0 * std.math.pi;
+    const corr = struct {
+        fn dim(nd: f32, orig: f32, beta: f32, b: f32) f32 {
+            return nd * @log(orig / (beta * two_pi)) / (2.0 * @log(b));
+        }
+    };
+    const low = @max(0.0, @floor(corr.dim(d, orig_ctx, 32.0, base)));
+    const high = @min(d - 1.0, @ceil(corr.dim(d, orig_ctx, 1.0, base)));
+    var i: usize = 0;
+    while (i < half) : (i += 1) {
+        const exponent = @as(f32, @floatFromInt(2 * i)) / d;
+        const freq = std.math.pow(f32, base, -exponent);
+        const theta_extrap = @as(f32, @floatFromInt(pos)) * freq;
+        const theta_interp = theta_extrap / factor;
+        const y = (@as(f32, @floatFromInt(i)) - low) / @max(0.001, high - low);
+        const ramp_mix = 1.0 - std.math.clamp(y, 0.0, 1.0); // 1 = extrapolate
+        const theta = theta_interp * (1.0 - ramp_mix) + theta_extrap * ramp_mix;
+        const c = @cos(theta);
+        const sn = @sin(theta);
+        const a = vec[i];
+        const b2 = vec[i + half];
+        vec[i] = a * c - b2 * sn;
+        vec[i + half] = a * sn + b2 * c;
+    }
+}
+
+inline fn ropeApplyC(cfg: Config, vec: []f32, pos: usize) void {
+    if (cfg.yarn_factor > 1.0) {
+        // yarn arches in this engine are neox-paired (gpt-oss)
+        return ropeNeoxYarn(vec, cfg.rope_dim, pos, cfg.rope_base, cfg.yarn_factor, cfg.yarn_orig_ctx);
+    }
+    ropeApply(cfg.arch.rope, vec, cfg.rope_dim, pos, cfg.rope_base);
+}
+
+/// Softmax with a per-head sink logit (gpt-oss): the sink joins the
+/// denominator and its probability mass is discarded, so heads can attend
+/// to nothing.
+fn softmaxWithSink(scores: []f32, sink: f32) void {
+    var m = sink;
+    for (scores) |v| m = @max(m, v);
+    var denom: f32 = @exp(sink - m);
+    for (scores) |*v| {
+        v.* = @exp(v.* - m);
+        denom += v.*;
+    }
+    for (scores) |*v| v.* /= denom;
+}
+
+/// gpt-oss's clamped SwiGLU (ggml swiglu_oai, alpha 1.702, limit 7):
+/// out = min(g,7) * sigmoid(1.702 * min(g,7)) * (clamp(u,-7,7) + 1).
+fn swigluOai(out: []f32, gate: []const f32, up: []const f32) void {
+    const alpha: f32 = 1.702;
+    const limit: f32 = 7.0;
+    for (out, gate, up) |*o, g, u| {
+        const x = @min(g, limit);
+        const y = std.math.clamp(u, -limit, limit);
+        o.* = (x / (1.0 + @exp(-alpha * x))) * (y + 1.0);
+    }
+}
+
 inline fn ropeApply(style: RopeStyle, vec: []f32, rope_dim: usize, pos: usize, base: f32) void {
     switch (style) {
         .norm => ropeNorm(vec, rope_dim, pos, base),
@@ -770,6 +891,21 @@ fn denseFFN(st: *State, gate_w: Tensor, up_w: Tensor, down_w: Tensor) void {
     mv(up_w, st.up[0..n], st.normed);
     backend.swiglu(st.act[0..n], st.gate[0..n], st.up[0..n]);
     mv(down_w, st.ffn_out, st.act[0..n]);
+}
+
+/// gpt-oss expert FFN: denseFFN plus the per-expert bias columns (gate/up
+/// added before the activation, down after) and swiglu_oai in place of plain
+/// SwiGLU. Bias tensors are {width, n_expert}; expert e owns column e.
+fn oaiExpertFFN(st: *State, gate_w: Tensor, up_w: Tensor, down_w: Tensor, l: LayerT, e: usize) void {
+    const n = gate_w.ne1;
+    mv(gate_w, st.gate[0..n], st.normed);
+    mv(up_w, st.up[0..n], st.normed);
+    if (l.ffn_gate_exps_b) |b| backend.add(st.gate[0..n], tensorAsF32(b)[e * n ..][0..n]);
+    if (l.ffn_up_exps_b) |b| backend.add(st.up[0..n], tensorAsF32(b)[e * n ..][0..n]);
+    swigluOai(st.act[0..n], st.gate[0..n], st.up[0..n]);
+    mv(down_w, st.ffn_out, st.act[0..n]);
+    const d = st.ffn_out.len;
+    if (l.ffn_down_exps_b) |b| backend.add(st.ffn_out, tensorAsF32(b)[e * d ..][0..d]);
 }
 
 /// One token step; logits land in `st.logits`. Errors only when a distributed
@@ -867,7 +1003,7 @@ pub var last_layer_cpu_ns: i128 = 0;
 fn stepRecorded(m: *const Model, st: *State, pos: usize) bool {
     const cfg = m.cfg;
     const hd = cfg.head_dim;
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const scale = cfg.attn_logit_mul / @sqrt(@as(f32, @floatFromInt(hd)));
     if (!backend.beginFrame()) return false;
     if (!backend.frameLoadX(st.x)) {
         backend.endFrame();
@@ -913,7 +1049,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     const hd = cfg.head_dim;
     const kvd = cfg.kvDim();
     const q_per_kv = cfg.n_heads / cfg.n_kv_heads;
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const scale = cfg.attn_logit_mul / @sqrt(@as(f32, @floatFromInt(hd)));
 
     // A token id indexes token_embd rows directly. Ids come from the
     // tokenizer, whose ceiling is an independent metadata array, so bound it
@@ -944,9 +1080,9 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
         headNorm(st.k, l.attn_k_norm, cfg.n_kv_heads, hd, cfg.eps);
 
         var h: usize = 0;
-        while (h < cfg.n_heads) : (h += 1) ropeApply(cfg.arch.rope, st.q[h * hd ..][0..hd], cfg.rope_dim, pos, cfg.rope_base);
+        while (h < cfg.n_heads) : (h += 1) ropeApplyC(cfg, st.q[h * hd ..][0..hd], pos);
         h = 0;
-        while (h < cfg.n_kv_heads) : (h += 1) ropeApply(cfg.arch.rope, st.k[h * hd ..][0..hd], cfg.rope_dim, pos, cfg.rope_base);
+        while (h < cfg.n_kv_heads) : (h += 1) ropeApplyC(cfg, st.k[h * hd ..][0..hd], pos);
 
         // append to cache
         const cache_base = (li * cfg.ctx_len + pos) * kvd;
@@ -954,26 +1090,31 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
         @memcpy(st.v_cache[cache_base..][0..kvd], st.v);
         _ = backend.kvAppend(li, pos, st.k, st.v);
 
-        // per-head attention over positions 0..=pos
+        // per-head attention over positions t0..=pos (t0 > 0 only on
+        // sliding-window layers, gpt-oss even layers)
         const seq = pos + 1;
-        // Offer the whole head loop to the backend first. The host cache above
-        // is still written either way: the backend keeps its own device copy,
-        // and if it ever declines mid-generation the engine's cache has to be
-        // authoritative or the fallback produces garbage.
-        if (!backend.attnHeads(li, pos, st.q, st.attn_out, cfg.n_heads, cfg.n_kv_heads, hd, scale)) {
+        const t0: usize = if (l.is_swa and cfg.swa_window > 0) seq -| cfg.swa_window else 0;
+        // Offer the whole head loop to the backend first -- but only for
+        // layers the device kernels can express: no window, no sinks.
+        const plain = t0 == 0 and l.attn_sinks == null;
+        if (!(plain and backend.attnHeads(li, pos, st.q, st.attn_out, cfg.n_heads, cfg.n_kv_heads, hd, scale))) {
             h = 0;
             while (h < cfg.n_heads) : (h += 1) {
                 const kvh = h / q_per_kv;
                 const qh = st.q[h * hd ..][0..hd];
-                var t_i: usize = 0;
+                var t_i: usize = t0;
                 while (t_i < seq) : (t_i += 1) {
                     const kt = st.k_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
                     st.scores[t_i] = backend.dotF32(qh, kt) * scale;
                 }
-                backend.softmax(st.scores[0..seq]);
+                if (l.attn_sinks) |sk| {
+                    softmaxWithSink(st.scores[t0..seq], tensorAsF32(sk)[h]);
+                } else {
+                    backend.softmax(st.scores[t0..seq]);
+                }
                 const oh = st.attn_out[h * hd ..][0..hd];
                 @memset(oh, 0);
-                t_i = 0;
+                t_i = t0;
                 while (t_i < seq) : (t_i += 1) {
                     const vt = st.v_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
                     backend.axpy(oh, vt, st.scores[t_i]);
@@ -981,6 +1122,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
             }
         }
         mv(l.attn_output, st.proj_out, st.attn_out);
+        addBias(st.proj_out, l.attn_output_b);
         backend.add(st.x, st.proj_out);
 
         // ---- FFN ----
@@ -1025,6 +1167,7 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
 fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool) !void {
     const cfg = m.cfg;
     mv(l.ffn_gate_inp.?, st.router[0..cfg.n_expert], st.normed);
+    addBias(st.router[0..cfg.n_expert], l.ffn_gate_inp_b);
     var sel_buf: [moe.MAX_SELECTED]moe.Selected = undefined;
     const sel = sel_buf[0..cfg.n_used];
     const bias: ?[]const f32 = if (l.exp_probs_b) |b| tensorAsF32(b) else null;
@@ -1064,6 +1207,7 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool) !v
             const nl = m.layers[li + 1];
             if (nl.is_moe and nl.ffn_gate_inp != null) {
                 mv(nl.ffn_gate_inp.?, st.router[0..cfg.n_expert], st.normed);
+                addBias(st.router[0..cfg.n_expert], nl.ffn_gate_inp_b);
                 var psel_buf: [moe.MAX_SELECTED]moe.Selected = undefined;
                 const psel = psel_buf[0..cfg.n_used];
                 const pbias: ?[]const f32 = if (nl.exp_probs_b) |b| tensorAsF32(b) else null;
@@ -1090,19 +1234,23 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool) !v
             const gl = gt.ne1 * ggml.rowBytes(gt.ty, gt.ne0);
             const ul = ut.ne1 * ggml.rowBytes(ut.ty, ut.ne0);
             const dl = dt.ne1 * ggml.rowBytes(dt.ty, dt.ne0);
-            denseFFN(
-                st,
-                .{ .ty = gt.ty, .data = blk[0..gl], .ne0 = gt.ne0, .ne1 = gt.ne1 },
-                .{ .ty = ut.ty, .data = blk[gl..][0..ul], .ne0 = ut.ne0, .ne1 = ut.ne1 },
-                .{ .ty = dt.ty, .data = blk[gl + ul ..][0..dl], .ne0 = dt.ne0, .ne1 = dt.ne1 },
-            );
+            const ge = Tensor{ .ty = gt.ty, .data = blk[0..gl], .ne0 = gt.ne0, .ne1 = gt.ne1 };
+            const ue = Tensor{ .ty = ut.ty, .data = blk[gl..][0..ul], .ne0 = ut.ne0, .ne1 = ut.ne1 };
+            const de = Tensor{ .ty = dt.ty, .data = blk[gl + ul ..][0..dl], .ne0 = dt.ne0, .ne1 = dt.ne1 };
+            if (cfg.arch.oai) {
+                oaiExpertFFN(st, ge, ue, de, l, s.expert);
+            } else {
+                denseFFN(st, ge, ue, de);
+            }
         } else {
-            denseFFN(
-                st,
-                try l.ffn_gate_exps.?.expert(s.expert),
-                try l.ffn_up_exps.?.expert(s.expert),
-                try l.ffn_down_exps.?.expert(s.expert),
-            );
+            const ge = try l.ffn_gate_exps.?.expert(s.expert);
+            const ue = try l.ffn_up_exps.?.expert(s.expert);
+            const de = try l.ffn_down_exps.?.expert(s.expert);
+            if (cfg.arch.oai) {
+                oaiExpertFFN(st, ge, ue, de, l, s.expert);
+            } else {
+                denseFFN(st, ge, ue, de);
+            }
         }
         for (acc, st.ffn_out) |*a, v| a.* += s.gate * v;
     }
@@ -1153,7 +1301,7 @@ fn mtpLayerForward(m: *const Model, st: *State, mtp_pos: usize) !void {
     const hd = cfg.head_dim;
     const kvd = cfg.kvDim();
     const q_per_kv = cfg.n_heads / cfg.n_kv_heads;
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const scale = cfg.attn_logit_mul / @sqrt(@as(f32, @floatFromInt(hd)));
     const lane = cfg.n_layers; // the extra KV lane
 
     backend.rmsnorm(st.normed, st.mtp_x, tensorAsF32(l.attn_norm), cfg.eps);
@@ -1166,9 +1314,9 @@ fn mtpLayerForward(m: *const Model, st: *State, mtp_pos: usize) !void {
     headNorm(st.q, l.attn_q_norm, cfg.n_heads, hd, cfg.eps);
     headNorm(st.k, l.attn_k_norm, cfg.n_kv_heads, hd, cfg.eps);
     var h: usize = 0;
-    while (h < cfg.n_heads) : (h += 1) ropeApply(cfg.arch.rope, st.q[h * hd ..][0..hd], cfg.rope_dim, mtp_pos, cfg.rope_base);
+    while (h < cfg.n_heads) : (h += 1) ropeApplyC(cfg, st.q[h * hd ..][0..hd], mtp_pos);
     h = 0;
-    while (h < cfg.n_kv_heads) : (h += 1) ropeApply(cfg.arch.rope, st.k[h * hd ..][0..hd], cfg.rope_dim, mtp_pos, cfg.rope_base);
+    while (h < cfg.n_kv_heads) : (h += 1) ropeApplyC(cfg, st.k[h * hd ..][0..hd], mtp_pos);
 
     const cache_base = (lane * cfg.ctx_len + mtp_pos) * kvd;
     @memcpy(st.k_cache[cache_base..][0..kvd], st.k);
@@ -1194,6 +1342,7 @@ fn mtpLayerForward(m: *const Model, st: *State, mtp_pos: usize) !void {
         }
     }
     mv(l.attn_output, st.proj_out, st.attn_out);
+    addBias(st.proj_out, l.attn_output_b);
     backend.add(st.mtp_x, st.proj_out);
 
     backend.rmsnorm(st.normed, st.mtp_x, tensorAsF32(l.ffn_norm), cfg.eps);
@@ -1285,7 +1434,7 @@ pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usi
     const kvd = cfg.kvDim();
     const qd = cfg.qDim();
     const q_per_kv = cfg.n_heads / cfg.n_kv_heads;
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(hd)));
+    const scale = cfg.attn_logit_mul / @sqrt(@as(f32, @floatFromInt(hd)));
 
     for (tokens, 0..) |tok, k| {
         if (tok >= cfg.vocab) return error.TokenOutOfRange;
@@ -1312,8 +1461,8 @@ pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usi
             headNorm(qk, l.attn_q_norm, cfg.n_heads, hd, cfg.eps);
             headNorm(kk, l.attn_k_norm, cfg.n_kv_heads, hd, cfg.eps);
             const pos = pos_base + k;
-            for (0..cfg.n_heads) |h| ropeApply(cfg.arch.rope, qk[h * hd ..][0..hd], cfg.rope_dim, pos, cfg.rope_base);
-            for (0..cfg.n_kv_heads) |h| ropeApply(cfg.arch.rope, kk[h * hd ..][0..hd], cfg.rope_dim, pos, cfg.rope_base);
+            for (0..cfg.n_heads) |h| ropeApplyC(cfg, qk[h * hd ..][0..hd], pos);
+            for (0..cfg.n_kv_heads) |h| ropeApplyC(cfg, kk[h * hd ..][0..hd], pos);
             const base = (li * cfg.ctx_len + pos) * kvd;
             @memcpy(st.k_cache[base..][0..kvd], kk);
             @memcpy(st.v_cache[base..][0..kvd], vk);
@@ -1324,26 +1473,35 @@ pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usi
         // whole batch is already in the cache.
         for (0..n) |k| {
             const seq = pos_base + k + 1;
+            const t0: usize = if (l.is_swa and cfg.swa_window > 0) seq -| cfg.swa_window else 0;
             const qk = st.bq[k * qd ..][0..qd];
             const ok = st.battn[k * qd ..][0..qd];
             for (0..cfg.n_heads) |h| {
                 const kvh = h / q_per_kv;
                 const qh = qk[h * hd ..][0..hd];
-                for (0..seq) |t_i| {
+                for (t0..seq) |t_i| {
                     const kt = st.k_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
                     st.scores[t_i] = backend.dotF32(qh, kt) * scale;
                 }
-                backend.softmax(st.scores[0..seq]);
+                if (l.attn_sinks) |sk| {
+                    softmaxWithSink(st.scores[t0..seq], tensorAsF32(sk)[h]);
+                } else {
+                    backend.softmax(st.scores[t0..seq]);
+                }
                 const oh = ok[h * hd ..][0..hd];
                 @memset(oh, 0);
-                for (0..seq) |t_i| {
+                for (t0..seq) |t_i| {
                     const vt = st.v_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
                     backend.axpy(oh, vt, st.scores[t_i]);
                 }
             }
         }
         mmul(l.attn_output, st.bproj[0 .. n * cfg.dim], st.battn[0 .. n * qd], n);
-        for (0..n) |k| backend.add(st.bx[k * cfg.dim ..][0..cfg.dim], st.bproj[k * cfg.dim ..][0..cfg.dim]);
+        for (0..n) |k| {
+            const row = st.bproj[k * cfg.dim ..][0..cfg.dim];
+            addBias(row, l.attn_output_b);
+            backend.add(st.bx[k * cfg.dim ..][0..cfg.dim], row);
+        }
 
         // ---- FFN ----
         for (0..n) |k| {
@@ -1475,6 +1633,7 @@ test "each supported architecture loads with the features it actually declares" 
         .{ .arch = "qwen2moe", .qkv_bias = true, .qk_norm = false, .shexp = true, .shexp_gate = true, .n_dense = 0, .rope = .neox, .head_dim = 16, .n_layers = 3 },
         .{ .arch = "qwen3moe", .qkv_bias = false, .qk_norm = true, .shexp = false, .shexp_gate = false, .n_dense = 0, .rope = .neox, .head_dim = 24, .n_layers = 3 },
         .{ .arch = "glm4moe", .qkv_bias = true, .qk_norm = true, .shexp = true, .shexp_gate = false, .n_dense = 1, .rope = .neox, .head_dim = 16, .n_layers = 3 },
+        .{ .arch = "gpt-oss", .qkv_bias = true, .qk_norm = false, .shexp = false, .shexp_gate = false, .n_dense = 0, .rope = .neox, .head_dim = 16, .n_layers = 3 },
     };
 
     for (cases) |c| {
@@ -1511,15 +1670,32 @@ test "each supported architecture loads with the features it actually declares" 
             try std.testing.expect(m.layers[0].ffn_gate != null);
             try std.testing.expect(m.layers[0].ffn_gate_inp == null);
         }
-        // glm4moe alone routes with sigmoid and a selection bias
+        // glm4moe alone routes with sigmoid and a selection bias; gpt-oss
+        // selects on raw biased logits then softmaxes the selected k
         const is_glm = std.mem.eql(u8, c.arch, "glm4moe");
+        const is_oai = std.mem.eql(u8, c.arch, "gpt-oss");
         try std.testing.expectEqual(
-            if (is_glm) moe.GatingFunc.sigmoid else moe.GatingFunc.softmax,
+            if (is_glm) moe.GatingFunc.sigmoid else if (is_oai) moe.GatingFunc.softmax_topk else moe.GatingFunc.softmax,
             m.cfg.route.gating,
         );
         try std.testing.expectEqual(is_glm, last.exp_probs_b != null);
-        // qwen2moe is the only one that does not renormalize its gates
-        try std.testing.expectEqual(!std.mem.eql(u8, c.arch, "qwen2moe"), m.cfg.route.weights_norm);
+        // qwen2moe does not renormalize its gates; gpt-oss's softmax-topk
+        // already normalizes, so weights_norm stays off there too
+        try std.testing.expectEqual(!std.mem.eql(u8, c.arch, "qwen2moe") and !is_oai, m.cfg.route.weights_norm);
+        if (is_oai) {
+            // the gpt-oss extras all resolved, and the swa pattern is
+            // even-windowed / odd-full
+            try std.testing.expectEqual(@as(usize, 4), m.cfg.swa_window);
+            try std.testing.expect(m.cfg.attn_logit_mul > 1.0);
+            try std.testing.expect(last.attn_sinks != null);
+            try std.testing.expect(last.attn_output_b != null);
+            try std.testing.expect(last.ffn_gate_inp_b != null);
+            try std.testing.expect(last.ffn_gate_exps_b != null);
+            try std.testing.expect(last.ffn_up_exps_b != null);
+            try std.testing.expect(last.ffn_down_exps_b != null);
+            try std.testing.expect(m.layers[0].is_swa);
+            try std.testing.expect(!m.layers[1].is_swa);
+        }
 
         // and it actually runs a token
         var st = try State.init(gpa, m.cfg);
@@ -1541,7 +1717,7 @@ test "batched prefill matches token-by-token prefill" {
     defer threaded.deinit();
     const io = threaded.io();
 
-    for ([_][]const u8{ "llama", "qwen3moe", "glm4moe" }) |arch| {
+    for ([_][]const u8{ "llama", "qwen3moe", "glm4moe", "gpt-oss" }) |arch| {
         var pbuf: [96]u8 = undefined;
         const path = try std.fmt.bufPrint(&pbuf, "test-batch-{s}.gguf", .{arch});
         defer Io.Dir.cwd().deleteFile(io, path) catch {};
