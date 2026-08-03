@@ -636,6 +636,10 @@ pub const Mtp = struct {
     head: Tensor,
 };
 
+/// Widest verify window the per-lane capture buffers accommodate: DSD draft
+/// windows are capped at 8 (openai.zig draft_buf), plus the bonus lane.
+pub const VERIFY_LANES = 9;
+
 pub const State = struct {
     cfg: Config,
     /// Draft-local mode (DSD, whitepaper roadmap 6): routed experts are read
@@ -689,7 +693,9 @@ pub const State = struct {
     // model carries a NextN block; counters feed the tokens-per-forward line.
     mtp_x: []f32 = &.{},
     mtp_cat: []f32 = &.{},
-    bhidden: []f32 = &.{}, // residuals per verify lane (2 * dim)
+    /// Residuals / logits per verify lane. MTP uses two lanes; DSD batch
+    /// verification uses up to VERIFY_LANES (the draft-window cap).
+    bhidden: []f32 = &.{},
     blogits: []f32 = &.{}, // logits per verify lane (2 * vocab)
     spec_capture: bool = false,
     spec_fwd: u64 = 0,
@@ -720,8 +726,8 @@ pub const State = struct {
             .v_cache = try gpa.alloc(f32, (cfg.n_layers + @intFromBool(cfg.has_mtp)) * cfg.ctx_len * kvd),
             .mtp_x = if (cfg.has_mtp) try gpa.alloc(f32, cfg.dim) else &.{},
             .mtp_cat = if (cfg.has_mtp) try gpa.alloc(f32, 2 * cfg.dim) else &.{},
-            .bhidden = if (cfg.has_mtp) try gpa.alloc(f32, 2 * cfg.dim) else &.{},
-            .blogits = if (cfg.has_mtp) try gpa.alloc(f32, 2 * cfg.vocab) else &.{},
+            .bhidden = try gpa.alloc(f32, VERIFY_LANES * cfg.dim),
+            .blogits = try gpa.alloc(f32, VERIFY_LANES * cfg.vocab),
             .bx = try gpa.alloc(f32, B * cfg.dim),
             .bnormed = try gpa.alloc(f32, B * cfg.dim),
             .bq = try gpa.alloc(f32, B * cfg.qDim()),

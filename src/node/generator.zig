@@ -534,10 +534,45 @@ fn verifyDraftInner(
     const scratch = try gpa.alloc(f32, c.vocab);
     defer gpa.free(scratch);
 
+    // The first draft token is judged by the logits the prefill already
+    // produced -- rejecting it costs no forward work at all.
+    const t0: u32 = @intCast(sampler.sample(scratch, sess.st.logits, 0, undefined));
+    if (t0 != draft[0]) return .{ .accepted = 0, .correction = t0 };
+
+    // Batched verification (the DSD speed lever): feed the whole window in
+    // ONE forward with per-lane logits capture, so the verifier reads each
+    // weight once per window instead of once per token -- on a
+    // disk-streaming host that is nearly a gamma-fold cut in the dominant
+    // cost. Lane i's logits are the model's choice after draft[0..i], i.e.
+    // the judgment on draft[i+1] (and lane k-1 holds the bonus token).
+    // Rejected lanes leave junk KV rows behind; the next call's
+    // longest-common-prefix re-feed overwrites those positions.
+    const batched = comptime @hasField(E.State, "spec_capture");
+    if (batched and draft.len > 1) {
+        sess.st.spec_capture = true;
+        defer sess.st.spec_capture = false;
+        try E.stepBatch(m, &sess.st, draft, pos);
+        try sess.toks.append(gpa, draft[0]);
+        var accepted: usize = 1;
+        while (accepted < draft.len) {
+            const row = sess.st.blogits[(accepted - 1) * c.vocab ..][0..c.vocab];
+            const target: u32 = @intCast(sampler.sample(scratch, row, 0, undefined));
+            if (target != draft[accepted]) return .{ .accepted = accepted, .correction = target };
+            try sess.toks.append(gpa, draft[accepted]);
+            accepted += 1;
+        }
+        const bonus_row = sess.st.blogits[(draft.len - 1) * c.vocab ..][0..c.vocab];
+        const bonus: u32 = @intCast(sampler.sample(scratch, bonus_row, 0, undefined));
+        return .{ .accepted = accepted, .correction = bonus };
+    }
+
+    // Sequential fallback (deepseek engine, or a one-token window).
     var accepted: usize = 0;
     while (accepted < draft.len) {
-        const target: u32 = @intCast(sampler.sample(scratch, sess.st.logits, 0, undefined));
-        if (target != draft[accepted]) return .{ .accepted = accepted, .correction = target };
+        if (accepted > 0) {
+            const target: u32 = @intCast(sampler.sample(scratch, sess.st.logits, 0, undefined));
+            if (target != draft[accepted]) return .{ .accepted = accepted, .correction = target };
+        }
         try E.step(m, &sess.st, draft[accepted], pos);
         try sess.toks.append(gpa, draft[accepted]);
         pos += 1;
