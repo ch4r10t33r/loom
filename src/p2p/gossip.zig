@@ -183,22 +183,24 @@ fn bytesToHexAlloc(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
 /// Unreachable peers are retried next round (eager-churn policy: never
 /// forgotten).
 pub fn loop(ctx: *Ctx) void {
+    std.debug.print("gossip: loop started\n", .{});
     while (true) {
-        Io.sleep(ctx.io, .{ .nanoseconds = INTERVAL_NS }, .awake) catch return;
+        Io.sleep(ctx.io, .{ .nanoseconds = INTERVAL_NS }, .awake) catch |e| {
+            std.debug.print("gossip: sleep failed: {t}; loop exiting\n", .{e});
+            return;
+        };
         const addrs = ctx.table.snapshotAddrs(ctx.gpa) catch continue;
+        if (addrs.len == 0) std.debug.print("gossip: empty snapshot (table has {d} entries)\n", .{ctx.table.count()});
         defer {
             for (addrs) |a| ctx.gpa.free(a);
             ctx.gpa.free(addrs);
         }
         for (addrs) |a| {
             exchange(ctx, a) catch |e| {
-                // One line, not silence: exchange failures were previously
-                // swallowed whole, which made every gossip pathology look
-                // identical (an empty peer count with no cause attached) --
-                // the #210 diagnosis needed exactly this print.
                 std.debug.print("gossip: exchange with {s} failed: {t}\n", .{ a, e });
                 continue;
             };
+            std.debug.print("gossip: exchange with {s} ok\n", .{a});
         }
     }
 }

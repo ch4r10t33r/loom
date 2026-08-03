@@ -51,11 +51,11 @@ const Pool = struct {
     const QUEUE_CAP = 128;
     const NO_ID = std.math.maxInt(usize);
 
-    mutex: std.Thread.Mutex = .{},
+    mutex: Io.Mutex = .init,
     /// wakes workers when work arrives or stop flips
-    work_cond: std.Thread.Condition = .{},
+    work_cond: Io.Condition = .init,
     /// wakes waiters when a job leaves the pending set
-    done_cond: std.Thread.Condition = .{},
+    done_cond: Io.Condition = .init,
     queue: [QUEUE_CAP]usize = undefined,
     head: usize = 0,
     len: usize = 0,
@@ -76,14 +76,14 @@ const Pool = struct {
 
     /// Enqueue unless duplicate or full. Returns whether the id is now
     /// pending (true also for duplicates -- the caller's wait still works).
-    fn submit(p: *Pool, id: usize) bool {
-        p.mutex.lock();
-        defer p.mutex.unlock();
+    fn submit(p: *Pool, io: Io, id: usize) bool {
+        p.mutex.lockUncancelable(io);
+        defer p.mutex.unlock(io);
         if (p.pendingLocked(id)) return true;
         if (p.len == QUEUE_CAP) return false;
         p.queue[(p.head + p.len) % QUEUE_CAP] = id;
         p.len += 1;
-        p.work_cond.signal();
+        p.work_cond.signal(io);
         return true;
     }
 };
@@ -151,10 +151,10 @@ pub const Source = struct {
 
     pub fn deinit(self: *Source) void {
         {
-            self.pool.mutex.lock();
+            self.pool.mutex.lockUncancelable(self.io);
             self.pool.stop = true;
-            self.pool.mutex.unlock();
-            self.pool.work_cond.broadcast();
+            self.pool.mutex.unlock(self.io);
+            self.pool.work_cond.broadcast(self.io);
         }
         for (self.pool.threads) |t| if (t) |th| th.join();
         self.gpa.free(self.scratch);
@@ -164,8 +164,8 @@ pub const Source = struct {
     /// Spawn the fetch workers on first use, so a Source that never prefetches
     /// (unit tests, local-only runs) never owns a thread.
     fn ensurePool(self: *Source) void {
-        self.pool.mutex.lock();
-        defer self.pool.mutex.unlock();
+        self.pool.mutex.lockUncancelable(self.io);
+        defer self.pool.mutex.unlock(self.io);
         if (self.pool.started) return;
         self.pool.started = true;
         for (&self.pool.threads, 0..) |*t, i| {
@@ -177,27 +177,28 @@ pub const Source = struct {
         const buf = self.gpa.alloc(u8, @intCast(self.store.manifest.maxShardLen())) catch return;
         defer self.gpa.free(buf);
         const p = &self.pool;
+        const io = self.io;
         while (true) {
-            p.mutex.lock();
-            while (p.len == 0 and !p.stop) p.work_cond.wait(&p.mutex);
+            p.mutex.lockUncancelable(io);
+            while (p.len == 0 and !p.stop) p.work_cond.waitUncancelable(io, &p.mutex);
             if (p.stop) {
-                p.mutex.unlock();
+                p.mutex.unlock(io);
                 return;
             }
             const id = p.queue[p.head];
             p.head = (p.head + 1) % Pool.QUEUE_CAP;
             p.len -= 1;
             p.active[slot] = id;
-            p.mutex.unlock();
+            p.mutex.unlock(io);
 
             if (!self.store.holdings.has(id)) {
                 _ = self.fetchShard(id, buf) catch {};
             }
 
-            p.mutex.lock();
+            p.mutex.lockUncancelable(io);
             p.active[slot] = Pool.NO_ID;
-            p.mutex.unlock();
-            p.done_cond.broadcast();
+            p.mutex.unlock(io);
+            p.done_cond.broadcast(io);
         }
     }
 
@@ -206,12 +207,12 @@ pub const Source = struct {
     /// wait too -- the caller's get() retries (or errors) exactly as before.
     fn waitPool(self: *Source, ids: []const usize) void {
         const p = &self.pool;
-        p.mutex.lock();
-        defer p.mutex.unlock();
+        p.mutex.lockUncancelable(self.io);
+        defer p.mutex.unlock(self.io);
         outer: while (true) {
             for (ids) |id| {
                 if (p.pendingLocked(id)) {
-                    p.done_cond.wait(&p.mutex);
+                    p.done_cond.waitUncancelable(self.io, &p.mutex);
                     continue :outer;
                 }
             }
@@ -376,7 +377,7 @@ pub const Source = struct {
         // overflow inline, which is backpressure rather than lost work.
         self.ensurePool();
         for (missing_buf[0..n_missing]) |id| {
-            if (!self.pool.submit(id)) _ = self.fetchShard(id, self.scratch) catch {};
+            if (!self.pool.submit(self.io, id)) _ = self.fetchShard(id, self.scratch) catch {};
         }
         self.waitPool(missing_buf[0..n_missing]);
     }
@@ -392,7 +393,7 @@ pub const Source = struct {
             if (self.store.holdings.has(id)) continue;
             // lossy by design: a full queue drops the prediction rather than
             // stalling the main path (same policy the thread cap enforced)
-            _ = self.pool.submit(id);
+            _ = self.pool.submit(self.io, id);
         }
     }
 
@@ -555,4 +556,64 @@ test "get: a shard larger than a cache slot bypasses the cache instead of overfl
     const before = src.stats.ram;
     _ = try src.get(1);
     try std.testing.expect(src.stats.ram > before);
+}
+
+test "fetch pool: prefetch of unfetchable shards completes, dedups, and shuts down clean" {
+    // No peers are configured, so every pooled fetch fails -- the point is
+    // the machinery: waiters must not deadlock on failed jobs, duplicate
+    // submissions must collapse, and deinit must join the workers.
+    const gpa = std.testing.allocator;
+    var thr: std.Io.Threaded = .init(gpa, .{});
+    defer thr.deinit();
+    const io = thr.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&dir_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+
+    const n_shards = 6;
+    const shard_len: u64 = 512;
+    var blob = try gpa.alloc(u8, @intCast(n_shards * shard_len));
+    defer gpa.free(blob);
+    for (blob, 0..) |*b, k| b.* = @truncate(k *% 13);
+
+    var digests = try gpa.alloc(hashmod.Digest, n_shards);
+    var extents = try gpa.alloc(weights.Extent, n_shards);
+    var starts = try gpa.alloc(u32, n_shards + 1);
+    for (0..n_shards) |i| {
+        digests[i] = hashmod.hashBlock(blob[i * @as(usize, @intCast(shard_len)) ..][0..@intCast(shard_len)]);
+        extents[i] = .{ .offset = @as(u64, @intCast(i)) * shard_len, .len = shard_len };
+        starts[i] = @intCast(i);
+    }
+    starts[n_shards] = n_shards;
+    const total = n_shards * shard_len;
+    const version = try weights.computeVersion(gpa, .expert, total, 1, digests, extents, starts);
+    const manifest = weights.Manifest{
+        .mode = .expert,
+        .version = version,
+        .file_size = total,
+        .range_size = 0,
+        .n_resident = 1,
+        .digests = digests,
+        .extents = extents,
+        .extent_start = starts,
+    };
+    var wanted = try weights.Holdings.initEmpty(gpa, n_shards);
+    for (0..n_shards) |i| wanted.set(i);
+    var store = try weights.createFromManifest(gpa, io, dir, manifest, wanted);
+    defer store.deinit();
+    // hold only shard 0; the rest are misses with nowhere to fetch from
+    try store.writeRange(0, blob[0..@intCast(shard_len)]);
+
+    var src = try Source.init(gpa, io, &store, &.{});
+    defer src.deinit();
+
+    const ids = [_]usize{ 1, 2, 3, 4, 5 };
+    src.prefetch(&ids); // must return despite every fetch failing
+    src.prefetch(&ids); // second round: same ids again, still no deadlock
+    src.prefetchAsync(&ids); // lossy path exercises submit-without-wait
+    src.prefetch(&.{ 1, 1, 1, 2 }); // duplicates collapse
+
+    try std.testing.expect(!store.holdings.has(1));
+    try std.testing.expect(store.holdings.has(0));
 }
