@@ -363,6 +363,12 @@ pub fn poolOverhead(gpa: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
 /// time a re-touched slot -- alongside major/minor fault deltas from
 /// getrusage, which are the page-in counters perf would give us.
 fn expertFfnFile(gpa: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
+    // posix mmap/getrusage; the pass measures page-cache behavior that has no
+    // direct Windows equivalent, and the engine's Windows story is mmap-free
+    // reads anyway. Compile-time gate so the release matrix keeps building.
+    if (@import("builtin").os.tag == .windows) {
+        return out.print("--ffn-file is not supported on windows\n", .{});
+    }
     const dim = 2048;
     const moe_ffn = 1408;
     const N = 192;
