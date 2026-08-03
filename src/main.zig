@@ -364,14 +364,14 @@ fn defaultRamGb() f64 {
 }
 
 const NODE_FLAGS = [_][]const u8{
-    "--model",          "--rpc-addr",     "--rpc-port",       "--openai-addr", "--openai-port",
-    "--p2p-addr",       "--p2p-port",     "--ram-gb",         "--pin-gb",      "--seed",
-    "--stats",          "--no-verify",    "--gguf",           "--bootstrap",   "--hold-fraction",
-    "--range-mb",       "--peers",        "--advertise",      "--network-id",  "--network",
-    "--rag",            "--rag-k",        "--r-target",       "--free-quota",  "--admin-token",
-    "--ctx",            "--ui-addr",      "--ui-port",        "--status-secs", "--threads",
-    "--mmap-weights",   "--gpu-ops",      "--no-gpu-layers",  "--batch",       "--chat-format",
-    "--report-metrics", "--alpha-ingest", "--delegate-below",
+    "--model",          "--rpc-addr",     "--rpc-port",       "--openai-addr",    "--openai-port",
+    "--p2p-addr",       "--p2p-port",     "--ram-gb",         "--pin-gb",         "--seed",
+    "--stats",          "--no-verify",    "--gguf",           "--bootstrap",      "--hold-fraction",
+    "--range-mb",       "--peers",        "--advertise",      "--network-id",     "--network",
+    "--rag",            "--rag-k",        "--r-target",       "--free-quota",     "--admin-token",
+    "--ctx",            "--ui-addr",      "--ui-port",        "--status-secs",    "--threads",
+    "--mmap-weights",   "--gpu-ops",      "--no-gpu-layers",  "--batch",          "--chat-format",
+    "--report-metrics", "--alpha-ingest", "--delegate-below", "--bootstrap-http",
 };
 
 /// A flag-shaped argument this command does not know is an error, not a
@@ -448,6 +448,7 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .cache_root = cache_root,
         .gguf_path = gguf_path,
         .bootstrap = bootstrap,
+        .bootstrap_http = flagStr(args, "--bootstrap-http"),
         .peers = flagStr(args, "--peers"),
         .advertise = flagStr(args, "--advertise"),
         .network_id = if (flagStr(args, "--network-id")) |v| (std.fmt.parseInt(u64, v, 10) catch null) else null,

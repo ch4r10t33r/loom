@@ -98,6 +98,9 @@ pub const Options = struct {
     bootstrap: ?[]const u8, // "host:port" — sync weight ranges from this peer
     peers: ?[]const u8, // extra weight peers, comma-separated "host:port"
     hold_fraction: f32, // fraction of ranges to hold when bootstrapping
+    /// Static-mirror URL of the exact model file for the HTTP-range bootstrap
+    /// tier (http_bootstrap.zig); null = p2p-only sync.
+    bootstrap_http: ?[]const u8 = null,
     range_bytes: u64, // range size when building a fresh manifest
     advertise: ?[]const u8, // our dialable "host:port" (default 127.0.0.1:<p2p_port>)
     r_target: u16, // committee redundancy target when acting as bootnode
@@ -656,7 +659,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             try srcs.appendSlice(gpa, peer_list.items);
 
             // hand manifest+wanted to the store; keep members for heartbeats
-            const res = sync.bootstrapWithWanted(gpa, io, srcs.items, store_dir, ji.manifest, ji.wanted, out) catch |e| {
+            const res = sync.bootstrapWithWanted(gpa, io, srcs.items, store_dir, ji.manifest, ji.wanted, out, opts.bootstrap_http) catch |e| {
                 for (ji.members) |m| gpa.free(m);
                 gpa.free(ji.members);
                 if (reopenLocalStore(gpa, io, store_dir, out)) |st| {
@@ -677,7 +680,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             try out.print("bootstrapping weight ranges from {d} peer(s) (hold-fraction {d:.2})...\n", .{ peer_list.items.len, opts.hold_fraction });
             try out.flush();
             try out.flush();
-            const res = sync.bootstrap(gpa, io, peer_list.items, store_dir, opts.hold_fraction, opts.seed, out) catch |e| {
+            const res = sync.bootstrap(gpa, io, peer_list.items, store_dir, opts.hold_fraction, opts.seed, out, opts.bootstrap_http) catch |e| {
                 if (reopenLocalStore(gpa, io, store_dir, out)) |st| {
                     store = st;
                 } else {

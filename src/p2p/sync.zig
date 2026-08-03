@@ -14,6 +14,7 @@ const net = std.Io.net;
 const stats_mod = @import("../core/stats.zig");
 const hashmod = @import("../core/hash.zig");
 const weights = @import("weights.zig");
+const http_bootstrap = @import("http_bootstrap.zig");
 const dns = @import("dns.zig");
 const sockopt = @import("../core/sockopt.zig");
 
@@ -414,6 +415,7 @@ pub fn bootstrapWithWanted(
     manifest: weights.Manifest,
     wanted_bits: weights.Holdings,
     progress: ?*Io.Writer,
+    http_url: ?[]const u8,
 ) !Result {
     const wanted = wanted_bits.count();
     // Resume if this directory already holds a store for the same manifest.
@@ -438,6 +440,28 @@ pub fn bootstrapWithWanted(
     errdefer store.deinit();
 
     var stats = FetchStats{};
+    // HTTP-range mirror tier first (http_bootstrap.zig): bulk bytes come off
+    // a static mirror's CDN instead of the origin's uplink; whatever fails
+    // or is missing falls through to the peer loop below unchanged.
+    if (http_url) |u| {
+        if (store.missingCount() > 0) {
+            const r = http_bootstrap.fetchMissing(gpa, io, &store, u, progress) catch |e| blk: {
+                if (progress) |pw| {
+                    pw.print("  http sync failed ({t}); falling back to peers\n", .{e}) catch {};
+                    pw.flush() catch {};
+                }
+                break :blk http_bootstrap.Result{};
+            };
+            stats.fetched += r.fetched;
+            stats.bytes += r.bytes;
+            if (progress) |pw| {
+                pw.print("  http sync done: {d} shard(s), {d:.1} MB ({d} left for peers)\n", .{
+                    r.fetched, @as(f64, @floatFromInt(r.bytes)) / (1024.0 * 1024.0), store.missingCount(),
+                }) catch {};
+                pw.flush() catch {};
+            }
+        }
+    }
     var prog: ?Progress = if (progress) |pw| Progress.init(pw, io, wanted, peers.len) else null;
     for (peers) |addr| {
         if (store.missingCount() == 0) break;
@@ -481,6 +505,7 @@ pub fn bootstrap(
     fraction: f32,
     seed: u64,
     progress: ?*Io.Writer,
+    http_url: ?[]const u8,
 ) !Result {
     // adopt a manifest from the first peer that answers
     var manifest: ?weights.Manifest = null;
@@ -500,5 +525,5 @@ pub fn bootstrap(
 
     manifest_owned = false;
     wanted_owned = false;
-    return bootstrapWithWanted(gpa, io, peers, store_dir, m, wanted_bits, progress);
+    return bootstrapWithWanted(gpa, io, peers, store_dir, m, wanted_bits, progress, http_url);
 }
