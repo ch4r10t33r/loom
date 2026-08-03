@@ -825,6 +825,13 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         .network_id = network_id,
         .rag = if (rag) |*r| r else null,
     };
+    // Re-seed the statically configured peers with a fresh timestamp: the
+    // original seed at boot predates the (possibly minutes-long) store open,
+    // and snapshotAddrs filters by PEER_TTL -- without this the first gossip
+    // tick can find an already-expired table and the node orphans itself.
+    for (peer_strs.items) |ps| {
+        _ = table.merge(ps, zero_version, "", peers.NO_COMMITTEE, 0, stats.nowNs(io), .first_hand) catch {};
+    }
     {
         const t = try std.Thread.spawn(.{}, gossip.loop, .{&gossip_ctx});
         t.detach();
