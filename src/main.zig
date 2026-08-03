@@ -371,7 +371,7 @@ const NODE_FLAGS = [_][]const u8{
     "--rag",            "--rag-k",        "--r-target",       "--free-quota",     "--admin-token",
     "--ctx",            "--ui-addr",      "--ui-port",        "--status-secs",    "--threads",
     "--mmap-weights",   "--gpu-ops",      "--no-gpu-layers",  "--batch",          "--chat-format",
-    "--report-metrics", "--alpha-ingest", "--delegate-below", "--bootstrap-http",
+    "--report-metrics", "--alpha-ingest", "--delegate-below", "--bootstrap-http", "--bootstrap-http-split-gb",
 };
 
 /// A flag-shaped argument this command does not know is an error, not a
@@ -449,6 +449,7 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .gguf_path = gguf_path,
         .bootstrap = bootstrap,
         .bootstrap_http = flagStr(args, "--bootstrap-http"),
+        .bootstrap_http_part_bytes = @intFromFloat((try flagF64(args, "--bootstrap-http-split-gb", 0)) * GB),
         .peers = flagStr(args, "--peers"),
         .advertise = flagStr(args, "--advertise"),
         .network_id = if (flagStr(args, "--network-id")) |v| (std.fmt.parseInt(u64, v, 10) catch null) else null,

@@ -416,6 +416,7 @@ pub fn bootstrapWithWanted(
     wanted_bits: weights.Holdings,
     progress: ?*Io.Writer,
     http_url: ?[]const u8,
+    http_part_bytes: u64,
 ) !Result {
     const wanted = wanted_bits.count();
     // Resume if this directory already holds a store for the same manifest.
@@ -445,7 +446,7 @@ pub fn bootstrapWithWanted(
     // or is missing falls through to the peer loop below unchanged.
     if (http_url) |u| {
         if (store.missingCount() > 0) {
-            const r = http_bootstrap.fetchMissing(gpa, io, &store, u, progress) catch |e| blk: {
+            const r = http_bootstrap.fetchMissing(gpa, io, &store, u, http_part_bytes, progress) catch |e| blk: {
                 if (progress) |pw| {
                     pw.print("  http sync failed ({t}); falling back to peers\n", .{e}) catch {};
                     pw.flush() catch {};
@@ -506,6 +507,7 @@ pub fn bootstrap(
     seed: u64,
     progress: ?*Io.Writer,
     http_url: ?[]const u8,
+    http_part_bytes: u64,
 ) !Result {
     // adopt a manifest from the first peer that answers
     var manifest: ?weights.Manifest = null;
@@ -525,5 +527,5 @@ pub fn bootstrap(
 
     manifest_owned = false;
     wanted_owned = false;
-    return bootstrapWithWanted(gpa, io, peers, store_dir, m, wanted_bits, progress, http_url);
+    return bootstrapWithWanted(gpa, io, peers, store_dir, m, wanted_bits, progress, http_url, http_part_bytes);
 }

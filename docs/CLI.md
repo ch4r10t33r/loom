@@ -57,7 +57,7 @@ loom node [--model SPEC] [--rpc-addr A] [--rpc-port P]
           [--seed S] [--stats FILE] [--no-verify]
           [--gguf FILE | --bootstrap HOST:PORT]
           [--peers H:P,...] [--hold-fraction F] [--range-mb M]
-          [--bootstrap-http URL]
+          [--bootstrap-http URL] [--bootstrap-http-split-gb G]
           [--advertise HOST:PORT] [--network-id N] [--rag] [--rag-k N] [--r-target N]
           [--free-quota TOKENS] [--admin-token TOK]
 ```
@@ -121,6 +121,7 @@ other makes you a joiner.
 | `--bootstrap HOST:PORT` | off | Join an existing swarm: adopt that peer's manifest (root-verified), get a committee and shard assignment from the bootnode, then fetch the assigned shards, each digest-verified. Also seeds the gossip table. |
 | `--peers H:P,...` | none | Extra known peers, comma-separated. Seeds the gossip table and gives bootstrap and repair more sources to try. |
 | `--bootstrap-http URL` | unset | Static mirror of the exact model file for the initial sync: shards are pulled as parallel HTTP `Range` requests (6 streams) from the URL instead of the p2p mesh, digest-verified per shard exactly as a peer fetch is, with the p2p pass fetching whatever the mirror could not serve. Any plain file host works — Hugging Face, R2/S3, an nginx serving one file — because the manifest maps shards to byte offsets of the original GGUF. The mirror must host the byte-identical file (a hardfork's new version fails digests loudly and falls back to peers). Plain `http://` is accepted for LAN mirrors; integrity does not depend on the transport. |
+| `--bootstrap-http-split-gb G` | `0` | The mirror hosts the model as fixed-size byte parts `<url>.part-00000`, `.part-00001`, ... of exactly `G` GiB each (except the last), concatenating to the byte-identical file. For hosts that cap single-file size (Hugging Face: 50 GB). `0` = single file at `URL`. |
 | `--hold-fraction F` | `1.0` | Fraction of expert shards this node holds, `0.0`–`1.0`. A real cap, enforced continuously: a shard fetched from a peer at token time is persisted and marked held, and once the count exceeds the cap the least-recently-used expert is evicted — its holdings bit cleared and its blocks hole-punched back to the filesystem. Resident (non-expert) shards are mandatory and never evicted. Set it below 1.0 and the node's store stays that size no matter how long it serves; leave it at 1.0 (the default) and the node keeps everything, which is what an origin wants. The trade-off: a cap well below the model's hot set makes the node re-fetch evicted experts, so the miss rate rises sharply, and on a slow link so does token latency. |
 | `--range-mb M` | `4.0` | Shard size when *building* a fresh manifest, for non-MoE files that use fixed-size ranges. Ignored when joining (you adopt the peer's layout) and for expert-aligned sharding (where the shard is one expert). |
 | `--r-target N` | `2` | Redundancy target when acting as bootnode: how many committee members should hold each shard before the committee counts as saturated. Higher means more copies and more resilience, at more storage. |
