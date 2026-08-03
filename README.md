@@ -30,9 +30,14 @@ curl -fsSL https://raw.githubusercontent.com/ch4r10t33r/loom/main/install.sh | s
 ```
 
 Join the devnet. This installs loom if it is missing, then starts a node
-that downloads its share of the model's GGUF shards from peers to local
-disk (about a fifth of the ~73 GB GLM-4.5-Air checkpoint by default) and
-serves an OpenAI API on `:8772`:
+that downloads its share of the model's GGUF shards to local disk (about a
+fifth of the ~73 GB GLM-4.5-Air checkpoint by default) and serves an OpenAI
+API on `:8772`. The initial sync pulls from the [official Hugging Face
+mirror](https://huggingface.co/ch4r10t33r/loom-devnet-glm-4.5-air) over
+parallel HTTP range requests — every shard digest-verified against the
+network's Merkle manifest, so the mirror donates bandwidth but cannot alter
+what your node runs — with the p2p mesh serving whatever the mirror cannot
+(set `LOOM_HTTP_MIRROR=""` to sync from peers only):
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ch4r10t33r/loom/main/scripts/join-devnet.sh | sh
