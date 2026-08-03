@@ -27,6 +27,12 @@ pub const Metrics = struct {
     last_tok_s: f64 = 0,
     inflight: u32 = 0,
     inflight_since_ns: i128 = 0,
+    // DSD draft-verify (whitepaper roadmap 6)
+    draft_rounds: u64 = 0,
+    draft_drafted: u64 = 0,
+    draft_accepted: u64 = 0,
+    draft_last_gamma: u64 = 0,
+    draft_bails: u64 = 0,
 
     pub fn recordGen(self: *Metrics, tok_s: f64, hit_rate: f64) void {
         self.mu.lockUncancelable(self.io);
@@ -35,6 +41,16 @@ pub const Metrics = struct {
         self.tok_s_sum += tok_s;
         self.hit_sum += hit_rate;
         self.last_tok_s = tok_s;
+    }
+
+    pub fn recordDraft(self: *Metrics, rounds: usize, drafted: usize, accepted: usize, gamma: usize, bailed: bool) void {
+        self.mu.lockUncancelable(self.io);
+        defer self.mu.unlock(self.io);
+        self.draft_rounds += rounds;
+        self.draft_drafted += drafted;
+        self.draft_accepted += accepted;
+        self.draft_last_gamma = gamma;
+        if (bailed) self.draft_bails += 1;
     }
 
     /// For the status line: how many generations, and the latest speed.
@@ -66,7 +82,16 @@ pub const Metrics = struct {
         return @intCast(@divTrunc(now_ns - self.inflight_since_ns, 1_000_000_000));
     }
 
-    fn snapshot(self: *Metrics) struct { gens: u64, tok_s_avg: f64, hit_avg: f64 } {
+    fn snapshot(self: *Metrics) struct {
+        gens: u64,
+        tok_s_avg: f64,
+        hit_avg: f64,
+        draft_rounds: u64,
+        draft_drafted: u64,
+        draft_accepted: u64,
+        draft_gamma: u64,
+        draft_bails: u64,
+    } {
         self.mu.lockUncancelable(self.io);
         defer self.mu.unlock(self.io);
         const n: f64 = @floatFromInt(@max(self.gens, 1));
@@ -74,6 +99,11 @@ pub const Metrics = struct {
             .gens = self.gens,
             .tok_s_avg = self.tok_s_sum / n,
             .hit_avg = self.hit_sum / n,
+            .draft_rounds = self.draft_rounds,
+            .draft_drafted = self.draft_drafted,
+            .draft_accepted = self.draft_accepted,
+            .draft_gamma = self.draft_last_gamma,
+            .draft_bails = self.draft_bails,
         };
     }
 };
@@ -107,7 +137,8 @@ fn buildReport(ctx: *ReporterCtx, buf: []u8) ![]const u8 {
     const n_peers = ctx.table.count();
     return std.fmt.bufPrint(buf, "{{\"id\":\"{x:0>16}\",\"v\":\"{s}\",\"os\":\"{s}\",\"arch\":\"{s}\"," ++
         "\"up_s\":{d},\"net\":{d},\"hold_target\":{d:.3},\"held\":{d},\"total\":{d}," ++
-        "\"peers\":{d},\"gens\":{d},\"tok_s_avg\":{d:.3},\"hit_avg\":{d:.4}}}", .{
+        "\"peers\":{d},\"gens\":{d},\"tok_s_avg\":{d:.3},\"hit_avg\":{d:.4}," ++
+        "\"draft_rounds\":{d},\"draft_drafted\":{d},\"draft_accepted\":{d},\"draft_gamma\":{d},\"draft_bails\":{d}}}", .{
         ctx.boot_id,
         ctx.version,
         @tagName(builtin.os.tag),
@@ -121,6 +152,11 @@ fn buildReport(ctx: *ReporterCtx, buf: []u8) ![]const u8 {
         snap.gens,
         snap.tok_s_avg,
         snap.hit_avg,
+        snap.draft_rounds,
+        snap.draft_drafted,
+        snap.draft_accepted,
+        snap.draft_gamma,
+        snap.draft_bails,
     });
 }
 

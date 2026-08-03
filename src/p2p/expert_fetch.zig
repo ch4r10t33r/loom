@@ -204,6 +204,44 @@ pub const Source = struct {
         return self.scratch[0..n];
     }
 
+    /// Local tiers only -- RAM cache or held shards; never the network. The
+    /// draft-local path uses this: the caller skips a missing expert entirely,
+    /// so a cold node can draft candidate tokens without paying a single peer
+    /// round trip. Same verify-before-use rules as get(); a shard that fails
+    /// its digest reads as absent rather than fetched.
+    pub fn getLocal(self: *Source, id: usize) ?[]const u8 {
+        const want: usize = @intCast(self.store.manifest.rangeLen(id));
+        if (self.cache) |*c| {
+            if (want <= c.block_bytes) {
+                const seq = self.store.holdingsSeq();
+                if (seq != self.cache_seq) {
+                    c.clear();
+                    self.cache_seq = seq;
+                } else if (c.find(id)) |blk| {
+                    self.stats.ram += 1;
+                    self.store.touch(id);
+                    return blk[0..want];
+                }
+                if (!self.store.holdings.has(id)) return null;
+                const slot = c.reserve(id) catch return null;
+                if (self.store.readRangeVerified(id, slot[1][0..want])) |data| {
+                    self.stats.local += 1;
+                    self.store.touch(id);
+                    return data;
+                } else |_| {
+                    c.abort(id);
+                    return null;
+                }
+            }
+        }
+        if (!self.store.holdings.has(id)) return null;
+        if (self.store.readRangeVerified(id, self.scratch)) |data| {
+            self.stats.local += 1;
+            self.store.touch(id);
+            return data;
+        } else |_| return null;
+    }
+
     /// Parallel warm-up for one MoE layer's selected experts: fetch every
     /// missing shard concurrently (one thread + connection each) so the
     /// per-layer miss latency is max(fetch), not sum(fetch). After this,

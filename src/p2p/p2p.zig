@@ -215,6 +215,39 @@ fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer, dl: ?
         if (json.len == 0 or json.len > 8192) return wi.print("ERR bad_metrics\n", .{});
         appendMetricsLine(ctx, path, json) catch return wi.print("ERR ingest_failed\n", .{});
         try wi.print("OK\n", .{});
+    } else if (std.mem.startsWith(u8, line, "DRAFT ")) {
+        // DSD verification (SPEC.md): greedy-check a drafted window against
+        // the exact model. Same trust plane and gating as GEN.
+        const g = ctx.gen orelse return wi.print("ERR no_engine\n", .{});
+        const lock = ctx.engine_lock orelse return wi.print("ERR no_engine\n", .{});
+        const ready = ctx.gen_ready orelse return wi.print("ERR no_engine\n", .{});
+        if (!ready.load(.acquire)) return wi.print("ERR not_ready\n", .{});
+        const gg = switch (g.*) {
+            .gguf => |p| p,
+            else => return wi.print("ERR no_engine\n", .{}),
+        };
+        const parsed = std.json.parseFromSlice(std.json.Value, ctx.gpa, line[6..], .{}) catch
+            return wi.print("ERR bad_json\n", .{});
+        defer parsed.deinit();
+        if (parsed.value != .object) return wi.print("ERR bad_json\n", .{});
+        const obj = parsed.value.object;
+        const ctx_toks = jsonTokenArray(ctx.gpa, obj.get("ctx"), 32768) catch
+            return wi.print("ERR bad_draft\n", .{});
+        defer ctx.gpa.free(ctx_toks);
+        const draft_toks = jsonTokenArray(ctx.gpa, obj.get("draft"), 8) catch
+            return wi.print("ERR bad_draft\n", .{});
+        defer ctx.gpa.free(draft_toks);
+        if (ctx_toks.len == 0 or draft_toks.len == 0) return wi.print("ERR bad_draft\n", .{});
+        // a verify window is seconds of work, but a cold-cache re-prefill of a
+        // long context is not: use the generation deadline
+        sockopt.refreshServe(ctx.io, dl);
+        lock.lockUncancelable(ctx.io);
+        const v = generator.verifyDraft(gg, ctx.gpa, ctx_toks, draft_toks) catch |e| {
+            lock.unlock(ctx.io);
+            return wi.print("ERR draft_{s}\n", .{@errorName(e)});
+        };
+        lock.unlock(ctx.io);
+        try wi.print("DRAFTR ok=1 accepted={d} correction={d}\n", .{ v.accepted, v.correction });
     } else if (std.mem.startsWith(u8, line, "GEN ")) {
         // Delegate-while-cold (SPEC.md): a cold peer forwards a generation
         // here and relays the answer. Same trust plane as every v1 command.
@@ -655,4 +688,21 @@ fn fieldOf(line: []const u8, key: []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Parse a JSON array of token ids with a length cap; any non-integer,
+/// negative, or oversized input is an error (the caller answers ERR).
+fn jsonTokenArray(gpa: std.mem.Allocator, v: ?std.json.Value, max: usize) ![]u32 {
+    const arr = switch (v orelse return error.Bad) {
+        .array => |a| a,
+        else => return error.Bad,
+    };
+    if (arr.items.len > max) return error.Bad;
+    const out = try gpa.alloc(u32, arr.items.len);
+    errdefer gpa.free(out);
+    for (arr.items, 0..) |it, i| {
+        if (it != .integer or it.integer < 0 or it.integer > std.math.maxInt(u32)) return error.Bad;
+        out[i] = @intCast(it.integer);
+    }
+    return out;
 }

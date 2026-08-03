@@ -446,6 +446,24 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer, dl:
     if (delegateTarget(ctx)) |target| {
         defer gpa.free(target.addr);
         const parse_special_d = is_chat and chat_template.usesSpecialMarkers(ctx.gen.chatFormat());
+        // DSD draft-local (whitepaper roadmap 6): greedy requests first try
+        // drafting with the partial local store and having the warm peer
+        // verify windows -- traffic becomes tokens instead of experts, and
+        // every emitted token is exactly what the peer would have produced.
+        // A collapsed acceptance rate bails to wholesale GEN below; any error
+        // does the same. LOOM_NO_DRAFT=1 disables for A/B.
+        if (temp <= 0 and std.c.getenv("LOOM_NO_DRAFT") == null) {
+            if (draftDelegate(ctx, target.addr, prompt_text, max_tokens, parse_special_d)) |maybe| {
+                if (maybe) |dres| {
+                    defer gpa.free(dres.text);
+                    if (ctx.meter) |m| _ = m.settle(client, reserved, @intCast(dres.prompt_tokens + dres.completion_tokens));
+                    return try delegatedResponse(ctx, is_chat, stream, model_id, dres, wi);
+                }
+                // null = controller bailed early; fall through to GEN
+            } else |e| {
+                consoleLine(ctx, "draft-verify with {s} failed ({s}); trying wholesale delegation", .{ target.addr, @errorName(e) });
+            }
+        }
         if (delegateGenerate(ctx, target.addr, prompt_text, max_tokens, temp, seed, parse_special_d)) |dres| {
             defer gpa.free(dres.text);
             if (ctx.meter) |m| _ = m.settle(client, reserved, @intCast(dres.prompt_tokens + dres.completion_tokens));
@@ -713,6 +731,87 @@ fn delegateGenerate(
     errdefer gpa.free(text);
     try peer.r.interface.readSliceAll(text);
     return .{ .text = text, .prompt_tokens = pt, .completion_tokens = ct, .tok_per_s = tps };
+}
+
+const DraftPeer = struct {
+    ctx: *Ctx,
+    peer: *sync.Peer,
+
+    fn verify(opaque_self: *anyopaque, tokens: []const u32, draft: []const u32) anyerror!generator.DraftVerify {
+        const self: *DraftPeer = @ptrCast(@alignCast(opaque_self));
+        const gpa = self.ctx.gpa;
+        var aw = std.Io.Writer.Allocating.init(gpa);
+        defer aw.deinit();
+        try aw.writer.print("DRAFT {{\"ctx\":[", .{});
+        for (tokens, 0..) |t, i| {
+            if (i != 0) try aw.writer.print(",", .{});
+            try aw.writer.print("{d}", .{t});
+        }
+        try aw.writer.print("],\"draft\":[", .{});
+        for (draft, 0..) |t, i| {
+            if (i != 0) try aw.writer.print(",", .{});
+            try aw.writer.print("{d}", .{t});
+        }
+        try aw.writer.print("]}}\n", .{});
+        try self.peer.send("{s}", .{aw.writer.buffered()});
+        sockopt.refresh(self.ctx.io, self.peer.deadline, sockopt.GENERATE_TIMEOUT_S);
+        const line = try self.peer.recvLine();
+        if (!std.mem.startsWith(u8, line, "DRAFTR ")) return error.DraftRefused;
+        const acc = std.fmt.parseInt(usize, fieldOf(line, "accepted") orelse return error.BadReply, 10) catch return error.BadReply;
+        const corr = std.fmt.parseInt(u32, fieldOf(line, "correction") orelse return error.BadReply, 10) catch return error.BadReply;
+        return .{ .accepted = acc, .correction = corr };
+    }
+};
+
+/// Draft locally, verify remotely. Returns null when the acceptance
+/// controller bailed (caller falls back to wholesale GEN); the few verified
+/// tokens of a bailed attempt are discarded -- the bail fires within two
+/// windows, so the waste is bounded and the GEN answer stays token-exact.
+fn draftDelegate(
+    ctx: *Ctx,
+    addr_str: []const u8,
+    prompt: []const u8,
+    max_tokens: usize,
+    parse_special: bool,
+) !?DelegateResult {
+    const gg = switch (ctx.gen.*) {
+        .gguf => |p| p,
+        else => return error.DraftUnsupported,
+    };
+    const gpa = ctx.gpa;
+    const addr = try sync.PeerAddr.parse(addr_str);
+    const peer = try sync.Peer.connect(gpa, ctx.io, addr);
+    defer peer.close(gpa);
+    var dp = DraftPeer{ .ctx = ctx, .peer = peer };
+
+    const t0 = stats.nowNs(ctx.io);
+    ctx.engine_lock.lockUncancelable(ctx.io);
+    const out = generator.generateDrafted(gg, gpa, prompt, max_tokens, parse_special, .{
+        .ctx = @ptrCast(&dp),
+        .call = DraftPeer.verify,
+    }) catch |e| {
+        ctx.engine_lock.unlock(ctx.io);
+        return e;
+    };
+    ctx.engine_lock.unlock(ctx.io);
+    const secs = @as(f64, @floatFromInt(stats.nowNs(ctx.io) - t0)) / 1e9;
+
+    if (ctx.alpha_metrics) |am| am.recordDraft(out.rounds, out.drafted, out.accepted, out.final_gamma, out.bailed);
+    if (out.bailed) {
+        gpa.free(out.res.text);
+        consoleLine(ctx, "draft-verify bailed after {d} round(s) (acceptance collapsed); wholesale delegation", .{out.rounds});
+        return null;
+    }
+    const tok_s = if (secs > 0) @as(f64, @floatFromInt(out.res.completion_tokens)) / secs else 0;
+    consoleLine(ctx, "served   draft-verify: {d} token(s), {d}/{d} drafts accepted over {d} round(s), gamma {d} ({d:.2} tok/s)", .{
+        out.res.completion_tokens, out.accepted, out.drafted, out.rounds, out.final_gamma, tok_s,
+    });
+    return .{
+        .text = @constCast(out.res.text),
+        .prompt_tokens = out.res.prompt_tokens,
+        .completion_tokens = out.res.completion_tokens,
+        .tok_per_s = tok_s,
+    };
 }
 
 /// "key=value" scan over a space-separated reply line.
