@@ -221,6 +221,23 @@ test "sigmoid gating with selection bias picks by biased score, gates from raw" 
     try std.testing.expectApproxEqAbs(backend.sigmoid(3.0), sel[1].gate, 1e-6);
 }
 
+test "softmax-topk selects on raw logits, softmaxes only the selected" {
+    // gpt-oss: top-k on the raw (bias-included) logits, then softmax over
+    // just those k -- NOT a softmax over all experts first. The two orders
+    // give different gates whenever an unselected expert carries mass.
+    const cfg = RouteCfg{ .n_expert = 4, .n_used = 2, .gating = .softmax_topk, .weights_norm = false, .weights_scale = 1.0 };
+    const logits = [_]f32{ 0.5, 3.0, 1.0, 2.0 };
+    var sel: [2]Selected = undefined;
+    route(cfg, &logits, null, &sel);
+    try std.testing.expectEqual(@as(usize, 1), sel[0].expert);
+    try std.testing.expectEqual(@as(usize, 3), sel[1].expert);
+    // softmax over {3.0, 2.0} alone
+    const d = @exp(@as(f32, 3.0)) + @exp(@as(f32, 2.0));
+    try std.testing.expectApproxEqAbs(@exp(@as(f32, 3.0)) / d, sel[0].gate, 1e-6);
+    try std.testing.expectApproxEqAbs(@exp(@as(f32, 2.0)) / d, sel[1].gate, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), sel[0].gate + sel[1].gate, 1e-6);
+}
+
 test "renormalization makes the top-k gates sum to one" {
     // Mixtral and Qwen3 renormalize; Qwen2-MoE does not. The difference is a
     // silent quality change, so pin both directions.
