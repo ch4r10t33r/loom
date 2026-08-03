@@ -17,6 +17,9 @@
 #   LOOM_HTTP_MIRROR URL of a static mirror of the devnet model file;
 #                   initial sync pulls shard ranges from it in parallel
 #                   (digest-verified) instead of loading the bootnode
+#   LOOM_HTTP_SPLIT_GB  set when the mirror hosts fixed-size parts
+#                   (<url>.part-00000, ...) of this many GB each, e.g. a
+#                   Hugging Face mirror where single files cap at 50 GB
 #   LOOM_ADVERTISE  host:port peers can dial you on        (default unset:
 #                   fine behind NAT; set it if you are publicly reachable
 #                   so you can serve shards to others)
@@ -71,6 +74,7 @@ ADV=""
 
 MIRROR=""
 [ -n "${LOOM_HTTP_MIRROR:-}" ] && MIRROR="--bootstrap-http ${LOOM_HTTP_MIRROR}"
+[ -n "${LOOM_HTTP_MIRROR:-}" ] && [ -n "${LOOM_HTTP_SPLIT_GB:-}" ] && MIRROR="$MIRROR --bootstrap-http-split-gb ${LOOM_HTTP_SPLIT_GB}"
 
 METRICS="--report-metrics"
 if [ "${LOOM_NO_METRICS:-}" = "1" ]; then
