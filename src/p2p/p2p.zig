@@ -633,7 +633,7 @@ fn sendAnnounceBatch(ctx: *Ctx, wi: *Io.Writer) !void {
     {
         var self_snap: ?[]u8 = null;
         defer if (self_snap) |sp| gpa.free(sp);
-        var self_ann = wire.Announce{ .committee_id = ctx.committee_id, .addr = ctx.advertise };
+        var self_ann = wire.Announce{ .network_id = ctx.network_id, .committee_id = ctx.committee_id, .addr = ctx.advertise };
         if (ctx.store) |st| {
             self_ann.manifest_version = st.manifest.version;
             self_ann.holdings_seq = @intCast(st.holdings.count());
@@ -655,7 +655,11 @@ fn sendAnnounceBatch(ctx: *Ctx, wi: *Io.Writer) !void {
             }
             const bitmap = hexToBytesAlloc(gpa, e.holdings_hex) catch continue;
             defer gpa.free(bitmap);
+            // Table entries share our network_id by construction: both merge
+            // surfaces refuse a record from another network before it can
+            // enter the table.
             const ann = wire.Announce{
+                .network_id = ctx.network_id,
                 .committee_id = e.committee_id,
                 .manifest_version = ver,
                 .addr = e.addr,
@@ -705,4 +709,56 @@ fn jsonTokenArray(gpa: std.mem.Allocator, v: ?std.json.Value, max: usize) ![]u32
         out[i] = @intCast(it.integer);
     }
     return out;
+}
+
+test "announce batch entries carry the responder's network_id" {
+    // The regression this pins (observed live on devnet): proto v2 gave
+    // Announce a network_id and gossip.exchange a merge-side filter, but
+    // sendAnnounceBatch left the field at its zero default on every entry it
+    // returned. On any network with a nonzero id the dialer discarded the
+    // entire response, so a dial-out-only (NAT'd) node could never refresh a
+    // peer's liveness: its announces arrived (the bootnode showed "peers 1")
+    // while its own table decayed past PEER_TTL_NS and stayed at "peers 0",
+    // leaving warmest()/holdersOf() empty-handed for good.
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var table = peers.Table.init(gpa, io, "1.2.3.4:8771");
+    defer table.deinit();
+    _ = try table.merge("5.6.7.8:8771", "0" ** 64, "ff", peers.NO_COMMITTEE, 1, stats.nowNs(io), .first_hand);
+
+    var ctx = Ctx{
+        .gpa = gpa,
+        .io = io,
+        .entries = &.{},
+        .unique_bytes = 0,
+        .addr = "127.0.0.1",
+        .port = 0,
+        .table = &table,
+        .network_id = 1337,
+        .advertise = "1.2.3.4:8771",
+    };
+
+    var buf: [1 << 16]u8 = undefined;
+    var w: Io.Writer = .fixed(&buf);
+    try sendAnnounceBatch(&ctx, &w);
+
+    var r: Io.Reader = .fixed(w.buffered());
+    const raw = try wire.readFrameAlloc(gpa, &r);
+    defer gpa.free(raw);
+    const dec = try wire.decodeFrame(gpa, raw);
+    defer gpa.free(dec.body);
+    try std.testing.expect(dec.ty == .announce_batch);
+
+    // every entry must survive the dialer's `network_id != ours` filter
+    var survivors: usize = 0;
+    var it = try wire.AnnounceBatch.iterate(dec.body);
+    while (try it.next()) |entry_body| {
+        const e = try wire.Announce.parseBody(entry_body);
+        try std.testing.expectEqual(@as(u64, 1337), e.network_id);
+        survivors += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), survivors); // self + the table entry
 }
