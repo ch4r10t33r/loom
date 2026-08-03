@@ -452,7 +452,6 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer, dl:
         // every emitted token is exactly what the peer would have produced.
         // A collapsed acceptance rate bails to wholesale GEN below; any error
         // does the same. LOOM_NO_DRAFT=1 disables for A/B.
-        std.debug.print("DBG delegate: temp={d} no_draft_env={} gen_tag={s}\n", .{ temp, std.c.getenv("LOOM_NO_DRAFT") != null, @tagName(ctx.gen.*) });
         if (temp <= 0 and std.c.getenv("LOOM_NO_DRAFT") == null) {
             if (draftDelegate(ctx, target.addr, prompt_text, max_tokens, parse_special_d)) |maybe| {
                 if (maybe) |dres| {
@@ -736,11 +735,40 @@ fn delegateGenerate(
 
 const DraftPeer = struct {
     ctx: *Ctx,
-    peer: *sync.Peer,
+    addr: sync.PeerAddr,
+    peer: ?*sync.Peer = null,
+
+    /// Lazy connect + reconnect: the local drafting between rounds can outlast
+    /// the responder's read deadline, so the server reaping our idle
+    /// connection is normal operation, not an error. Each verify round
+    /// tolerates exactly one reconnect.
+    fn ensure(self: *DraftPeer) !*sync.Peer {
+        if (self.peer) |p| return p;
+        const p = try sync.Peer.connect(self.ctx.gpa, self.ctx.io, self.addr);
+        sockopt.refresh(self.ctx.io, p.deadline, sockopt.GENERATE_TIMEOUT_S);
+        self.peer = p;
+        return p;
+    }
+
+    fn drop(self: *DraftPeer) void {
+        if (self.peer) |p| p.close(self.ctx.gpa);
+        self.peer = null;
+    }
 
     fn verify(opaque_self: *anyopaque, tokens: []const u32, draft: []const u32) anyerror!generator.DraftVerify {
         const self: *DraftPeer = @ptrCast(@alignCast(opaque_self));
+        return self.verifyOnce(tokens, draft) catch {
+            // stale connection (server reaped it while we drafted): one fresh
+            // connection, one retry, then the error is real
+            self.drop();
+            return self.verifyOnce(tokens, draft);
+        };
+    }
+
+    fn verifyOnce(self: *DraftPeer, tokens: []const u32, draft: []const u32) anyerror!generator.DraftVerify {
         const gpa = self.ctx.gpa;
+        const peer = try self.ensure();
+        errdefer self.drop();
         var aw = std.Io.Writer.Allocating.init(gpa);
         defer aw.deinit();
         try aw.writer.print("DRAFT {{\"ctx\":[", .{});
@@ -754,9 +782,9 @@ const DraftPeer = struct {
             try aw.writer.print("{d}", .{t});
         }
         try aw.writer.print("]}}\n", .{});
-        try self.peer.send("{s}", .{aw.writer.buffered()});
-        sockopt.refresh(self.ctx.io, self.peer.deadline, sockopt.GENERATE_TIMEOUT_S);
-        const line = try self.peer.recvLine();
+        try peer.send("{s}", .{aw.writer.buffered()});
+        sockopt.refresh(self.ctx.io, peer.deadline, sockopt.GENERATE_TIMEOUT_S);
+        const line = try peer.recvLine();
         if (!std.mem.startsWith(u8, line, "DRAFTR ")) return error.DraftRefused;
         const acc = std.fmt.parseInt(usize, fieldOf(line, "accepted") orelse return error.BadReply, 10) catch return error.BadReply;
         const corr = std.fmt.parseInt(u32, fieldOf(line, "correction") orelse return error.BadReply, 10) catch return error.BadReply;
@@ -775,17 +803,14 @@ fn draftDelegate(
     max_tokens: usize,
     parse_special: bool,
 ) !?DelegateResult {
-    std.debug.print("DBG draftDelegate: entered\n", .{});
     const gg = switch (ctx.gen.*) {
         .gguf => |p| p,
         else => return error.DraftUnsupported,
     };
     const gpa = ctx.gpa;
     const addr = try sync.PeerAddr.parse(addr_str);
-    std.debug.print("DBG draftDelegate: peer parsed, connecting\n", .{});
-    const peer = try sync.Peer.connect(gpa, ctx.io, addr);
-    defer peer.close(gpa);
-    var dp = DraftPeer{ .ctx = ctx, .peer = peer };
+    var dp = DraftPeer{ .ctx = ctx, .addr = addr };
+    defer dp.drop();
 
     const t0 = stats.nowNs(ctx.io);
     ctx.engine_lock.lockUncancelable(ctx.io);
@@ -794,11 +819,9 @@ fn draftDelegate(
         .call = DraftPeer.verify,
     }) catch |e| {
         ctx.engine_lock.unlock(ctx.io);
-        std.debug.print("DBG draftDelegate: generateDrafted error {t}\n", .{e});
         return e;
     };
     ctx.engine_lock.unlock(ctx.io);
-    std.debug.print("DBG draftDelegate: done rounds={d} acc={d}/{d} bailed={}\n", .{ out.rounds, out.accepted, out.drafted, out.bailed });
     const secs = @as(f64, @floatFromInt(stats.nowNs(ctx.io) - t0)) / 1e9;
 
     if (ctx.alpha_metrics) |am| am.recordDraft(out.rounds, out.drafted, out.accepted, out.final_gamma, out.bailed);
