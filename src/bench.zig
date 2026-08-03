@@ -111,6 +111,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
     if (hasFlag(args, "--pool")) return poolOverhead(gpa, io, out);
     if (hasFlag(args, "--ffn")) return expertFfn(gpa, io, out);
     if (hasFlag(args, "--ffn-engine")) return expertFfnEngine(gpa, io, out);
+    if (hasFlag(args, "--ffn-file")) return expertFfnFile(gpa, io, out);
 
     var results = std.ArrayList(Result).empty;
     defer results.deinit(gpa);
@@ -350,6 +351,154 @@ pub fn poolOverhead(gpa: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
 /// 2048x2048 cannot tell those apart. This reproduces the exact call sequence
 /// -- gate and up over `dim`, SwiGLU, down over `moe_ffn` -- with gate/up in
 /// Q4_K and down in Q5_1, the mixture `Q4_K_M` actually produces.
+/// The file-backed pass (issue #171, round two): the anonymous-slab bench
+/// measured slab size, random access and concurrent writes at ~zero cost on
+/// both page-size regimes, which leaves the one thing it did not reproduce --
+/// the engine reads experts through a file-backed mmap under a RAM budget.
+/// This writes the expert slab to a file, maps it, and runs the same kernels
+/// three ways: warm (pages cached by the write), after an eviction pass (an
+/// anonymous ballast of most of physical RAM is touched and freed, pushing
+/// the file pages out), and again immediately after (re-warmed). Cold cost
+/// is reported as the MEAN over the schedule -- best-of-N would only ever
+/// time a re-touched slot -- alongside major/minor fault deltas from
+/// getrusage, which are the page-in counters perf would give us.
+fn expertFfnFile(gpa: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
+    const dim = 2048;
+    const moe_ffn = 1408;
+    const N = 192;
+
+    const gate_bytes = ggml.tensorBytes(.q4_k, dim, moe_ffn);
+    const up_bytes = gate_bytes;
+    const down_bytes = ggml.tensorBytes(.q5_1, moe_ffn, dim);
+    const set_bytes = gate_bytes + up_bytes + down_bytes;
+
+    var slab_gb: f64 = 4.0;
+    if (std.c.getenv("LOOM_BENCH_GB")) |v| {
+        slab_gb = std.fmt.parseFloat(f64, std.mem.span(v)) catch 4.0;
+    }
+    const slots: usize = @intFromFloat(@max(8.0, slab_gb * 1024.0 * 1024.0 * 1024.0 / @as(f64, @floatFromInt(set_bytes))));
+    const total = set_bytes * slots;
+
+    // Write the slab to a file in expert-sized chunks.
+    var prng = std.Random.DefaultPrng.init(0xF11E);
+    const rnd = prng.random();
+    const path = "bench-ffn-file.bin";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    {
+        const chunk = try gpa.alloc(u8, set_bytes);
+        defer gpa.free(chunk);
+        const f = try Io.Dir.cwd().createFile(io, path, .{ .truncate = true });
+        defer f.close(io);
+        var fw_buf: [1 << 16]u8 = undefined;
+        var fw = f.writer(io, &fw_buf);
+        for (0..slots) |_| {
+            rnd.bytes(chunk);
+            for (0..chunk.len / 2) |i| chunk[i * 2 + 1] &= 0xFB;
+            try fw.interface.writeAll(chunk);
+        }
+        try fw.interface.flush();
+    }
+
+    const f = try Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
+    const slab = try std.posix.mmap(null, total, .{ .READ = true }, .{ .TYPE = .PRIVATE }, f.handle, 0);
+    defer std.posix.munmap(slab);
+
+    const x = try gpa.alloc(f32, dim);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rnd.float(f32) - 0.5;
+    const g = try gpa.alloc(f32, moe_ffn);
+    defer gpa.free(g);
+    const u = try gpa.alloc(f32, moe_ffn);
+    defer gpa.free(u);
+    const a = try gpa.alloc(f32, moe_ffn);
+    defer gpa.free(a);
+    const o = try gpa.alloc(f32, dim);
+    defer gpa.free(o);
+
+    const One = struct {
+        fn run(sl: []const u8, sb: usize, slot: usize, gb: usize, ub: usize, xx: []const f32, gg: []f32, uu: []f32, aa: []f32, oo: []f32) void {
+            const set = sl[slot * sb ..][0..sb];
+            backend.matvec(.q4_k, gg, set[0..gb], xx, moe_ffn, dim);
+            backend.matvec(.q4_k, uu, set[gb..][0..ub], xx, moe_ffn, dim);
+            backend.swiglu(aa, gg, uu);
+            backend.matvec(.q5_1, oo, set[gb + ub ..], aa, dim, moe_ffn);
+        }
+    };
+
+    const rnd_sched = try gpa.alloc(usize, N);
+    defer gpa.free(rnd_sched);
+    for (rnd_sched) |*sv| sv.* = rnd.intRangeLessThan(usize, 0, slots);
+
+    const Pass = struct {
+        mean_ns: f64,
+        best_ns: i128,
+        majf: isize,
+        minf: isize,
+        fn run(ioo: Io, sl: []const u8, sb: usize, sched: []const usize, gb: usize, ub: usize, xx: []const f32, gg: []f32, uu: []f32, aa: []f32, oo: []f32) @This() {
+            const r0 = std.posix.getrusage(std.posix.rusage.SELF);
+            var sum: i128 = 0;
+            var best: i128 = std.math.maxInt(i64);
+            for (sched) |slot| {
+                const t0 = nowNs(ioo);
+                One.run(sl, sb, slot, gb, ub, xx, gg, uu, aa, oo);
+                const dt = nowNs(ioo) - t0;
+                sum += dt;
+                if (dt < best) best = dt;
+            }
+            const r1 = std.posix.getrusage(std.posix.rusage.SELF);
+            return .{
+                .mean_ns = @as(f64, @floatFromInt(sum)) / @as(f64, @floatFromInt(sched.len)),
+                .best_ns = best,
+                .majf = @intCast(r1.majflt - r0.majflt),
+                .minf = @intCast(r1.minflt - r0.minflt),
+            };
+        }
+    };
+
+    const threads_n = generator.threads();
+    backend.parallelBegin(threads_n);
+    const warm = Pass.run(io, slab, set_bytes, rnd_sched, gate_bytes, up_bytes, x, g, u, a, o);
+    backend.parallelEnd();
+
+    // Evict: touch an anonymous ballast of most of physical RAM, then free it.
+    // Crude but portable; the fault counters below say whether it worked.
+    {
+        const ram: u64 = if (std.c.getenv("LOOM_BENCH_RAM_GB")) |v|
+            @intFromFloat((std.fmt.parseFloat(f64, std.mem.span(v)) catch 8.0) * 1024.0 * 1024.0 * 1024.0)
+        else
+            8 * 1024 * 1024 * 1024;
+        const ballast_len: usize = @intCast(ram * 3 / 4);
+        const ballast = std.posix.mmap(null, ballast_len, .{ .READ = true, .WRITE = true }, .{ .TYPE = .PRIVATE, .ANONYMOUS = true }, -1, 0) catch null;
+        if (ballast) |b| {
+            var i: usize = 0;
+            while (i < b.len) : (i += 4096) b[i] = 1;
+            std.posix.munmap(b);
+        }
+    }
+
+    backend.parallelBegin(threads_n);
+    const cold = Pass.run(io, slab, set_bytes, rnd_sched, gate_bytes, up_bytes, x, g, u, a, o);
+    const rewarm = Pass.run(io, slab, set_bytes, rnd_sched, gate_bytes, up_bytes, x, g, u, a, o);
+    backend.parallelEnd();
+
+    const fb: f64 = @floatFromInt(set_bytes);
+    try out.print("\nexpert ffn, file-backed (issue #171 round two): {d} experts, {d:.2} GB file, {d} threads\n", .{
+        slots, @as(f64, @floatFromInt(total)) / (1 << 30), threads_n,
+    });
+    const P = struct {
+        fn line(oo: *Io.Writer, name: []const u8, p: anytype, bytes: f64) !void {
+            try oo.print("  {s}  mean {d:6.1} GB/s   best {d:6.1} GB/s   majflt {d:6}  minflt {d:8}\n", .{
+                name, bytes / p.mean_ns, bytes / @as(f64, @floatFromInt(p.best_ns)), p.majf, p.minf,
+            });
+        }
+    };
+    try P.line(out, "warm mapping   ", warm, fb);
+    try P.line(out, "after eviction ", cold, fb);
+    try P.line(out, "re-warmed      ", rewarm, fb);
+    try out.flush();
+}
+
 /// The engine-shaped variant (issue #171): the same kernels and shapes as
 /// --ffn, but spread across a multi-gigabyte slab with router-like *random*
 /// slot selection, plus a pass with concurrent writer threads standing in for
