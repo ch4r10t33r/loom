@@ -42,9 +42,54 @@ pub const Stats = struct {
     pilot_hit: u64 = 0, // predictions the real router then confirmed
 };
 
+/// Persistent bounded fetch workers (issue #170): jobs are shard ids, the
+/// queue applies backpressure, concurrent requests for one shard collapse
+/// into one fetch, and the per-layer path never touches Thread.spawn. The
+/// workers park on a condition variable, so an idle pool costs nothing.
+const Pool = struct {
+    const WORKERS = 6;
+    const QUEUE_CAP = 128;
+    const NO_ID = std.math.maxInt(usize);
+
+    mutex: std.Thread.Mutex = .{},
+    /// wakes workers when work arrives or stop flips
+    work_cond: std.Thread.Condition = .{},
+    /// wakes waiters when a job leaves the pending set
+    done_cond: std.Thread.Condition = .{},
+    queue: [QUEUE_CAP]usize = undefined,
+    head: usize = 0,
+    len: usize = 0,
+    active: [WORKERS]usize = @splat(NO_ID),
+    stop: bool = false,
+    started: bool = false,
+    threads: [WORKERS]?std.Thread = @splat(null),
+
+    /// Under mutex: is `id` queued or being fetched right now?
+    fn pendingLocked(p: *Pool, id: usize) bool {
+        var i: usize = 0;
+        while (i < p.len) : (i += 1) {
+            if (p.queue[(p.head + i) % QUEUE_CAP] == id) return true;
+        }
+        for (p.active) |a| if (a == id) return true;
+        return false;
+    }
+
+    /// Enqueue unless duplicate or full. Returns whether the id is now
+    /// pending (true also for duplicates -- the caller's wait still works).
+    fn submit(p: *Pool, id: usize) bool {
+        p.mutex.lock();
+        defer p.mutex.unlock();
+        if (p.pendingLocked(id)) return true;
+        if (p.len == QUEUE_CAP) return false;
+        p.queue[(p.head + p.len) % QUEUE_CAP] = id;
+        p.len += 1;
+        p.work_cond.signal();
+        return true;
+    }
+};
+
 pub const Source = struct {
-    /// In-flight PILOT prefetch threads (bounded; see prefetchAsync).
-    async_inflight: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    pool: Pool = .{},
     gpa: std.mem.Allocator,
     io: Io,
     store: *weights.Store,
@@ -105,8 +150,73 @@ pub const Source = struct {
     }
 
     pub fn deinit(self: *Source) void {
+        {
+            self.pool.mutex.lock();
+            self.pool.stop = true;
+            self.pool.mutex.unlock();
+            self.pool.work_cond.broadcast();
+        }
+        for (self.pool.threads) |t| if (t) |th| th.join();
         self.gpa.free(self.scratch);
         if (self.cache) |*c| c.deinit(self.gpa);
+    }
+
+    /// Spawn the fetch workers on first use, so a Source that never prefetches
+    /// (unit tests, local-only runs) never owns a thread.
+    fn ensurePool(self: *Source) void {
+        self.pool.mutex.lock();
+        defer self.pool.mutex.unlock();
+        if (self.pool.started) return;
+        self.pool.started = true;
+        for (&self.pool.threads, 0..) |*t, i| {
+            t.* = std.Thread.spawn(.{}, poolWorker, .{ self, i }) catch null;
+        }
+    }
+
+    fn poolWorker(self: *Source, slot: usize) void {
+        const buf = self.gpa.alloc(u8, @intCast(self.store.manifest.maxShardLen())) catch return;
+        defer self.gpa.free(buf);
+        const p = &self.pool;
+        while (true) {
+            p.mutex.lock();
+            while (p.len == 0 and !p.stop) p.work_cond.wait(&p.mutex);
+            if (p.stop) {
+                p.mutex.unlock();
+                return;
+            }
+            const id = p.queue[p.head];
+            p.head = (p.head + 1) % Pool.QUEUE_CAP;
+            p.len -= 1;
+            p.active[slot] = id;
+            p.mutex.unlock();
+
+            if (!self.store.holdings.has(id)) {
+                _ = self.fetchShard(id, buf) catch {};
+            }
+
+            p.mutex.lock();
+            p.active[slot] = Pool.NO_ID;
+            p.mutex.unlock();
+            p.done_cond.broadcast();
+        }
+    }
+
+    /// Block until none of `ids` is pending in the pool. "Pending" means
+    /// queued or actively fetching; a job that failed its fetch completes the
+    /// wait too -- the caller's get() retries (or errors) exactly as before.
+    fn waitPool(self: *Source, ids: []const usize) void {
+        const p = &self.pool;
+        p.mutex.lock();
+        defer p.mutex.unlock();
+        outer: while (true) {
+            for (ids) |id| {
+                if (p.pendingLocked(id)) {
+                    p.done_cond.wait(&p.mutex);
+                    continue :outer;
+                }
+            }
+            return;
+        }
     }
 
     /// Whether pointers returned by `get` stay valid across later `get` calls.
@@ -260,13 +370,15 @@ pub const Source = struct {
             _ = self.fetchShard(missing_buf[0], self.scratch) catch {};
             return;
         }
-        var threads_buf: [64]?std.Thread = [_]?std.Thread{null} ** 64;
-        for (missing_buf[0..n_missing], 0..) |id, i| {
-            threads_buf[i] = std.Thread.spawn(.{}, prefetchOne, .{ self, id }) catch null;
+        // Submit to the persistent pool and wait; per-layer miss latency stays
+        // max(fetch) up to the worker bound, without a single Thread.spawn on
+        // the token path (issue #170). A full queue degrades to fetching the
+        // overflow inline, which is backpressure rather than lost work.
+        self.ensurePool();
+        for (missing_buf[0..n_missing]) |id| {
+            if (!self.pool.submit(id)) _ = self.fetchShard(id, self.scratch) catch {};
         }
-        for (threads_buf[0..n_missing]) |t| {
-            if (t) |th| th.join();
-        }
+        self.waitPool(missing_buf[0..n_missing]);
     }
 
     /// PILOT prefetch: fire-and-forget fetch of predicted next-layer experts
@@ -275,30 +387,13 @@ pub const Source = struct {
     /// main path would cost more than a missed prefetch. Fetched shards
     /// persist to the store, so even a mispredicted fetch warms the node.
     pub fn prefetchAsync(self: *Source, ids: []const usize) void {
-        const CAP = 8;
+        self.ensurePool();
         for (ids) |id| {
             if (self.store.holdings.has(id)) continue;
-            if (self.async_inflight.fetchAdd(1, .monotonic) >= CAP) {
-                _ = self.async_inflight.fetchSub(1, .monotonic);
-                return;
-            }
-            const t = std.Thread.spawn(.{}, asyncPrefetchOne, .{ self, id }) catch {
-                _ = self.async_inflight.fetchSub(1, .monotonic);
-                return;
-            };
-            t.detach();
+            // lossy by design: a full queue drops the prediction rather than
+            // stalling the main path (same policy the thread cap enforced)
+            _ = self.pool.submit(id);
         }
-    }
-
-    fn asyncPrefetchOne(self: *Source, id: usize) void {
-        defer _ = self.async_inflight.fetchSub(1, .monotonic);
-        prefetchOne(self, id);
-    }
-
-    fn prefetchOne(self: *Source, id: usize) void {
-        const buf = self.gpa.alloc(u8, @intCast(self.store.manifest.rangeLen(id))) catch return;
-        defer self.gpa.free(buf);
-        _ = self.fetchShard(id, buf) catch {};
     }
 
     /// Fetch shard `id` from the first peer (starting round-robin) that holds
