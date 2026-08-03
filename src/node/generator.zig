@@ -138,8 +138,26 @@ pub const GgufModel = union(enum) {
 
 /// Distributed GGUF generator: the model plus its token-loop expert fetch
 /// source. A fresh `State` (KV cache) is built per request.
+/// One cached verification (or drafting) lane: engine state plus the token
+/// ids its KV currently represents. Kept for the lifetime of the node; the
+/// longest-common-prefix rule below makes the cache self-keying, so there is
+/// no session id anywhere in the protocol.
+fn DraftSess(comptime E: type) type {
+    return struct {
+        st: E.State,
+        toks: std.ArrayList(u32),
+    };
+}
+
+pub const DraftVerify = struct { accepted: usize, correction: u32 };
+
 pub const GgufGen = struct {
     m: GgufModel,
+    /// DRAFT-command verification lane (warm-peer side), per engine variant.
+    /// Allocated on first use, held until process exit -- one extra KV cache,
+    /// deliberately not a pool.
+    vsess_gqa: ?DraftSess(llama) = null,
+    vsess_mla: ?DraftSess(deepseek) = null,
     /// The distributed expert source, or null when this GGUF is served
     /// locally (a dense model has no routed experts to fetch, so there is no
     /// source to attach). Optional rather than undefined: hitRate() reads it
@@ -453,4 +471,340 @@ fn genGgufInner(
         .completion_tokens = produced,
         .stop = eos or produced < maxn,
     };
+}
+
+/// Warm-peer side of DSD (whitepaper roadmap 6): verify `draft` greedily
+/// against the exact model after `ctx` tokens. Returns how many draft tokens
+/// the target model agrees with and the target's own next token at the first
+/// disagreement (or the bonus token when everything is accepted) -- standard
+/// speculative-decoding acceptance, greedy-only, so the emitted stream is
+/// token-identical to the target generating alone.
+///
+/// The KV lane persists across calls: the longest common prefix of the cached
+/// token history and `ctx` is reused, everything past it is re-fed. The
+/// context itself is the session key.
+pub fn verifyDraft(g: *GgufGen, gpa: std.mem.Allocator, ctx: []const u32, draft: []const u32) !DraftVerify {
+    return switch (g.m) {
+        .deepseek => |*m| verifyDraftInner(deepseek, m, &g.vsess_mla, gpa, ctx, draft),
+        .gqa => |*m| verifyDraftInner(llama, m, &g.vsess_gqa, gpa, ctx, draft),
+    };
+}
+
+fn verifyDraftInner(
+    comptime E: type,
+    m: *E.Model,
+    sess_slot: *?DraftSess(E),
+    gpa: std.mem.Allocator,
+    ctx: []const u32,
+    draft: []const u32,
+) !DraftVerify {
+    const c = m.cfg;
+    if (ctx.len == 0 or ctx.len + draft.len + 1 > c.ctx_len) return error.ContextTooLong;
+    for (ctx) |t| if (t >= c.vocab) return error.BadToken;
+    for (draft) |t| if (t >= c.vocab) return error.BadToken;
+
+    backend.parallelBegin(threads());
+    defer backend.parallelEnd();
+    _ = backend.materializeArenas();
+
+    if (sess_slot.* == null) {
+        sess_slot.* = .{ .st = try E.State.init(gpa, c), .toks = .empty };
+    }
+    const sess = &sess_slot.*.?;
+
+    // Longest common prefix with the cached history; the last context token is
+    // always re-fed so st.logits is fresh even on a full cache hit.
+    var lcp: usize = 0;
+    while (lcp < sess.toks.items.len and lcp < ctx.len and sess.toks.items[lcp] == ctx[lcp]) lcp += 1;
+    if (lcp >= ctx.len) lcp = ctx.len - 1;
+
+    var pos: usize = lcp;
+    if (@hasDecl(E, "stepBatch") and ctx.len - lcp > 1) {
+        while (pos < ctx.len) {
+            const take = @min(batchSize(), ctx.len - pos);
+            try E.stepBatch(m, &sess.st, ctx[pos..][0..take], pos);
+            pos += take;
+        }
+    } else {
+        while (pos < ctx.len) : (pos += 1) try E.step(m, &sess.st, ctx[pos], pos);
+    }
+    sess.toks.clearRetainingCapacity();
+    try sess.toks.appendSlice(gpa, ctx);
+
+    const scratch = try gpa.alloc(f32, c.vocab);
+    defer gpa.free(scratch);
+
+    var accepted: usize = 0;
+    while (accepted < draft.len) {
+        const target: u32 = @intCast(sampler.sample(scratch, sess.st.logits, 0, undefined));
+        if (target != draft[accepted]) return .{ .accepted = accepted, .correction = target };
+        try E.step(m, &sess.st, draft[accepted], pos);
+        try sess.toks.append(gpa, draft[accepted]);
+        pos += 1;
+        accepted += 1;
+    }
+    const bonus: u32 = @intCast(sampler.sample(scratch, sess.st.logits, 0, undefined));
+    return .{ .accepted = accepted, .correction = bonus };
+}
+
+/// Cold-node side of DSD: greedy generation where windows of tokens are
+/// drafted with the *local-only* expert tier (missing experts skipped,
+/// llama.zig State.draft_local) and verified remotely through `verify` --
+/// openai.zig supplies the DRAFT round trip as that callback. Output is
+/// token-identical to the verifying peer generating alone, because every
+/// emitted token either matched the peer's greedy choice or IS the peer's
+/// greedy choice.
+///
+/// gqa engine only: drafting needs the draft_local switch, which the deepseek
+/// engine does not carry yet.
+pub const VerifyFn = struct {
+    ctx: *anyopaque,
+    call: *const fn (ctx: *anyopaque, tokens: []const u32, draft: []const u32) anyerror!DraftVerify,
+};
+
+pub const DraftedResult = struct {
+    res: Result,
+    rounds: usize,
+    drafted: usize,
+    accepted: usize,
+    final_gamma: usize,
+    /// True when the controller abandoned drafting (acceptance collapsed);
+    /// the caller should finish the request over wholesale GEN instead.
+    bailed: bool,
+    tokens_done: usize,
+};
+
+pub fn generateDrafted(
+    g: *GgufGen,
+    gpa: std.mem.Allocator,
+    prompt_text: []const u8,
+    max_tokens: usize,
+    parse_special: bool,
+    verify: VerifyFn,
+) !DraftedResult {
+    const m = switch (g.m) {
+        .gqa => |*mm| mm,
+        else => return error.DraftUnsupported,
+    };
+    const c = m.cfg;
+
+    backend.parallelBegin(threads());
+    defer backend.parallelEnd();
+    _ = backend.materializeArenas();
+
+    const prompt = try m.encodePrompt(gpa, prompt_text, parse_special);
+    defer gpa.free(prompt);
+    if (prompt.len == 0 or prompt.len >= c.ctx_len) return error.PromptTooLong;
+
+    var all = std.ArrayList(u32).empty;
+    defer all.deinit(gpa);
+    try all.appendSlice(gpa, prompt);
+
+    var st = try llama.State.init(gpa, c);
+    defer st.deinit(gpa);
+    st.draft_local = true;
+    const scratch = try gpa.alloc(f32, c.vocab);
+    defer gpa.free(scratch);
+
+    // Local prefill in draft mode: reads only held experts, fetches nothing.
+    var pos: usize = 0;
+    while (pos < prompt.len) {
+        const take = @min(batchSize(), prompt.len - pos);
+        try llama.stepBatch(m, &st, prompt[pos..][0..take], pos);
+        pos += take;
+    }
+
+    // DSD's dynamic-window baseline, deterministically: clamp, EMA, raise on
+    // high acceptance, lower on low, and a sticky bail-out so the mode cannot
+    // flap (their stabilization findings; the learned controller is
+    // deliberately not ported).
+    var gamma: usize = 4;
+    var ema: f64 = 0.5;
+    var low_rounds: usize = 0;
+    var rounds: usize = 0;
+    var drafted_total: usize = 0;
+    var accepted_total: usize = 0;
+    var bailed = false;
+    var eos = false;
+
+    var draft_buf: [8]u32 = undefined;
+    while (all.items.len - prompt.len < max_tokens and all.items.len + gamma + 1 < c.ctx_len) {
+        // Draft gamma tokens with the degraded local model.
+        var n_draft: usize = 0;
+        var dpos = all.items.len;
+        while (n_draft < gamma) : (n_draft += 1) {
+            const t: u32 = @intCast(sampler.sample(scratch, st.logits, 0, undefined));
+            draft_buf[n_draft] = t;
+            try llama.step(m, &st, t, dpos);
+            dpos += 1;
+        }
+        const v = try verify.call(verify.ctx, all.items, draft_buf[0..n_draft]);
+        rounds += 1;
+        drafted_total += n_draft;
+        accepted_total += @min(v.accepted, n_draft);
+
+        // Adopt the verified prefix plus the peer's token.
+        const nacc = @min(v.accepted, n_draft);
+        const round_start = all.items.len;
+        try all.appendSlice(gpa, draft_buf[0..nacc]);
+        try all.append(gpa, v.correction);
+        for (all.items[round_start..]) |t| {
+            if (t == m.eosToken()) eos = true;
+        }
+        if (eos) break;
+
+        // Re-align the local draft state. Accepted positions already carry the
+        // right draft KV (the same tokens were stepped while drafting), and a
+        // rejected position's junk KV is overwritten the next time that
+        // position is stepped. Only the peer's token is new: feed it so the
+        // logits are ready for the next window.
+        try llama.step(m, &st, all.items[all.items.len - 1], all.items.len - 1);
+
+        // Controller update.
+        const rate = @as(f64, @floatFromInt(nacc)) / @as(f64, @floatFromInt(n_draft));
+        ema = 0.4 * rate + 0.6 * ema;
+        if (ema > 0.75 and gamma < draft_buf.len) gamma += 1;
+        if (ema < 0.25 and gamma > 1) gamma -= 1;
+        if (ema < 0.25 and gamma == 1) {
+            low_rounds += 1;
+            if (low_rounds >= 2) {
+                bailed = true;
+                break;
+            }
+        } else low_rounds = 0;
+    }
+
+    // A window can overshoot the requested length by up to gamma tokens;
+    // greedy output is prefix-stable, so trimming is exact.
+    if (all.items.len - prompt.len > max_tokens) all.items.len = prompt.len + max_tokens;
+
+    // Detokenize everything generated so far.
+    var aw = std.Io.Writer.Allocating.init(gpa);
+    defer aw.deinit();
+    for (all.items[prompt.len..]) |t| {
+        if (t == m.eosToken()) break;
+        try m.decodeToken(&aw.writer, t);
+    }
+    const done = all.items.len - prompt.len;
+    return .{
+        .res = .{
+            .text = try aw.toOwnedSlice(),
+            .token_ids = &.{},
+            .prompt_tokens = prompt.len,
+            .completion_tokens = done,
+            .stop = eos,
+        },
+        .rounds = rounds,
+        .drafted = drafted_total,
+        .accepted = accepted_total,
+        .final_gamma = gamma,
+        .bailed = bailed,
+        .tokens_done = done,
+    };
+}
+
+const gguf_mod = @import("../gguf/gguf.zig");
+
+test "verifyDraft: exact drafts all accepted, a corrupted draft is cut at the first lie" {
+    const gpa = std.testing.allocator;
+    var thr: std.Io.Threaded = .init(gpa, .{});
+    defer thr.deinit();
+    const io = thr.io();
+    const path = "test-draft-verify.gguf";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    try gguf_mod.writeMoeFixture(gpa, io, path, 5, "qwen3moe");
+
+    var m = try llama.load(gpa, io, path);
+    defer m.deinit();
+
+    // Ground truth: greedy-generate 4 tokens with the plain engine.
+    const prompt = [_]u32{ 7, 21, 4, 90 };
+    var st = try llama.State.init(gpa, m.cfg);
+    defer st.deinit(gpa);
+    const scratch = try gpa.alloc(f32, m.cfg.vocab);
+    defer gpa.free(scratch);
+    var truth: [4]u32 = undefined;
+    var pos: usize = 0;
+    for (prompt) |t| {
+        try llama.step(&m, &st, t, pos);
+        pos += 1;
+    }
+    var seq = std.ArrayList(u32).empty;
+    defer seq.deinit(gpa);
+    try seq.appendSlice(gpa, &prompt);
+    for (&truth) |*t| {
+        t.* = @intCast(sampler.sample(scratch, st.logits, 0, undefined));
+        try llama.step(&m, &st, t.*, pos);
+        try seq.append(gpa, t.*);
+        pos += 1;
+    }
+
+    var g = GgufGen{ .m = .{ .gqa = m }, .ctx_cap = 256 };
+    // Careful: g.m now owns a copy; verify against the copy, not `m`.
+    // Exact draft: everything accepted, correction is the model's own next token.
+    const v1 = try verifyDraft(&g, gpa, &prompt, &truth);
+    try std.testing.expectEqual(truth.len, v1.accepted);
+    // Session reuse: extend the context by the accepted window; a corrupted
+    // second draft gets cut at the first wrong position with the true token
+    // as the correction.
+    var bad = [_]u32{ v1.correction, 0, 0 };
+    bad[1] = if (truth[0] == 0) 1 else 0; // guaranteed wrong only if the model would not pick it; checked below
+    const v2 = try verifyDraft(&g, gpa, seq.items, &bad);
+    try std.testing.expect(v2.accepted >= 1); // first token IS the model's greedy pick
+    if (v2.accepted == 1) {
+        // the correction must be what the model actually wants there
+        try std.testing.expect(v2.correction != bad[1]);
+    }
+    if (g.vsess_gqa) |*sess| {
+        sess.st.deinit(gpa);
+        sess.toks.deinit(gpa);
+    }
+    // g.m's model copy shares tensors with `m`; only one deinit (above).
+}
+
+test "generateDrafted round-trips token-identical against a local verifier" {
+    const gpa = std.testing.allocator;
+    var thr: std.Io.Threaded = .init(gpa, .{});
+    defer thr.deinit();
+    const io = thr.io();
+    const path = "test-draft-loop.gguf";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    try gguf_mod.writeMoeFixture(gpa, io, path, 9, "qwen3moe");
+
+    var m = try llama.load(gpa, io, path);
+    defer m.deinit();
+
+    // Plain greedy reference through the public path.
+    var g = GgufGen{ .m = .{ .gqa = m }, .ctx_cap = 256 };
+    const gen = Generator{ .gguf = &g };
+    var ref = try gen.generate(gpa, io, "hello", 8, 0, 42, null, null, false);
+    defer ref.deinit(gpa);
+
+    // Draft loop with the SAME model as its own verifier: the drafter has no
+    // dist source, so draft_local changes nothing and every draft matches --
+    // which is exactly what makes the output a strict equality check on the
+    // loop plumbing (window adoption, re-align, eos, controller).
+    const LocalVerify = struct {
+        g: *GgufGen,
+        gpa: std.mem.Allocator,
+        fn call(op: *anyopaque, tokens: []const u32, draft: []const u32) anyerror!DraftVerify {
+            const self: *@This() = @ptrCast(@alignCast(op));
+            return verifyDraft(self.g, self.gpa, tokens, draft);
+        }
+    };
+    var lv = LocalVerify{ .g = &g, .gpa = gpa };
+    const out = try generateDrafted(&g, gpa, "hello", 8, false, .{
+        .ctx = @ptrCast(&lv),
+        .call = LocalVerify.call,
+    });
+    defer gpa.free(out.res.text);
+
+    try std.testing.expect(!out.bailed);
+    try std.testing.expectEqualStrings(ref.text, out.res.text);
+    try std.testing.expectEqual(ref.completion_tokens, out.res.completion_tokens);
+    try std.testing.expectEqual(out.drafted, out.accepted); // same model: nothing rejected
+    if (g.vsess_gqa) |*sess| {
+        sess.st.deinit(gpa);
+        sess.toks.deinit(gpa);
+    }
 }

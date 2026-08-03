@@ -65,6 +65,8 @@ address or hostname:
 | `hold_target`, `held`, `total` | your configured hold fraction and actual shard holdings |
 | `peers` | size of your peer table |
 | `gens`, `tok_s_avg`, `hit_avg` | generations served, average tokens/sec, average expert-cache hit rate |
+| `draft_rounds`, `draft_drafted`, `draft_accepted` | DSD draft-verify: verification round trips, tokens drafted locally, drafts the verifying peer accepted |
+| `draft_gamma`, `draft_bails` | DSD: last speculation-window size, and how many requests fell back to wholesale delegation |
 
 The wire message is `METRICS <json>` to the bootstrap peer; a node that was
 not started with `--alpha-ingest` refuses it, so reports only ever land on

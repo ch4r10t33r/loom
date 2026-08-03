@@ -99,6 +99,28 @@ requests are not metered. A cold node (holdings fraction under its
 holdings fraction is at least 0.9, and falls back to local generation on
 any failure.
 
+## Draft verification (optional, DSD)
+
+`DRAFT <json>` verifies a window of speculatively drafted tokens against the
+receiving node's exact model (greedy). The JSON object carries `ctx` (array of
+token ids, the full context so far: prompt plus every token already emitted;
+<=32768 ids) and `draft` (array of token ids, <=8). Reply:
+`DRAFTR ok=1 accepted=<n> correction=<id>` — the target model agrees with the
+first `accepted` draft tokens, and `correction` is its own greedy token at the
+first disagreement (or the bonus token after the window when everything was
+accepted). The emitted stream `ctx ++ draft[0..accepted] ++ correction` is
+therefore token-identical to the receiving node generating alone.
+
+The verification KV cache persists between requests and is keyed by nothing:
+the receiver reuses the longest common prefix of the previous request's token
+history and `ctx`, re-feeding only the delta, so consecutive windows of one
+generation cost one incremental forward each. There is no session id; the
+context is the session. A node whose engine is not serving answers
+`ERR not_ready`; no engine, `ERR no_engine`; ids out of vocab range or
+over-long arrays, `ERR bad_draft`. Same trust plane as `GEN`: token ids from a
+trusted-swarm peer, unmetered. Greedy only — a sampled (temperature > 0)
+generation must use `GEN`.
+
 ## Batched shard fetch
 
 `PACKR <id,id,...>` (<=256 ids) streams, per id, either

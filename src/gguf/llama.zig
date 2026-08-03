@@ -638,6 +638,12 @@ pub const Mtp = struct {
 
 pub const State = struct {
     cfg: Config,
+    /// Draft-local mode (DSD, whitepaper roadmap 6): routed experts are read
+    /// from local tiers only; a missing expert is skipped and the surviving
+    /// gates are rescaled. The output is an approximation whose quality rises
+    /// with the hold fraction -- acceptable only because a warm peer verifies
+    /// every drafted token against the exact model.
+    draft_local: bool = false,
     // activations
     x: []f32,
     normed: []f32,
@@ -1175,7 +1181,7 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool) !v
 
     const acc = st.moe_acc;
     @memset(acc, 0);
-    if (if (dist_ok) m.dist else null) |src| {
+    if (if (dist_ok and !st.draft_local) m.dist else null) |src| {
         // PILOT scorecard: how many of the experts predicted for this layer
         // (from the previous layer's hidden state) did the router confirm?
         if (st.pilot_layer == li) {
@@ -1223,11 +1229,19 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool) !v
             }
         }
     }
+    // Draft-local bookkeeping: how much gate mass was actually applied vs
+    // selected, so the accumulator can be rescaled to full-model magnitude.
+    var gate_all: f32 = 0;
+    var gate_used: f32 = 0;
     for (sel) |s| {
+        gate_all += s.gate;
         if (if (dist_ok) m.dist else null) |src| {
             // One shard carries this expert's [gate, up, down] slices
             // back to back, in that order (p2p/weights.zig).
-            const blk = try src.get(m.expert_shard[li * cfg.n_expert + s.expert]);
+            const blk = if (st.draft_local)
+                (src.getLocal(m.expert_shard[li * cfg.n_expert + s.expert]) orelse continue)
+            else
+                try src.get(m.expert_shard[li * cfg.n_expert + s.expert]);
             const gt = l.ffn_gate_exps.?;
             const ut = l.ffn_up_exps.?;
             const dt = l.ffn_down_exps.?;
@@ -1252,7 +1266,15 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool) !v
                 denseFFN(st, ge, ue, de);
             }
         }
+        gate_used += s.gate;
         for (acc, st.ffn_out) |*a, v| a.* += s.gate * v;
+    }
+    // Rescale a partial draft-mode mixture back to full gate mass. With no
+    // held expert at all the layer contributes nothing and the residual
+    // carries the token -- degraded, but the verifier catches the damage.
+    if (st.draft_local and gate_used > 0 and gate_used < gate_all) {
+        const boost = gate_all / gate_used;
+        for (acc) |*a| a.* *= boost;
     }
     if (l.ffn_gate_shexp) |gs| {
         denseFFN(st, gs, l.ffn_up_shexp.?, l.ffn_down_shexp.?);
