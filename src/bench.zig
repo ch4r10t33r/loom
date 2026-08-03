@@ -110,6 +110,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
     }
     if (hasFlag(args, "--pool")) return poolOverhead(gpa, io, out);
     if (hasFlag(args, "--ffn")) return expertFfn(gpa, io, out);
+    if (hasFlag(args, "--ffn-engine")) return expertFfnEngine(gpa, io, out);
 
     var results = std.ArrayList(Result).empty;
     defer results.deinit(gpa);
@@ -349,6 +350,135 @@ pub fn poolOverhead(gpa: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
 /// 2048x2048 cannot tell those apart. This reproduces the exact call sequence
 /// -- gate and up over `dim`, SwiGLU, down over `moe_ffn` -- with gate/up in
 /// Q4_K and down in Q5_1, the mixture `Q4_K_M` actually produces.
+/// The engine-shaped variant (issue #171): the same kernels and shapes as
+/// --ffn, but spread across a multi-gigabyte slab with router-like *random*
+/// slot selection, plus a pass with concurrent writer threads standing in for
+/// the fetch pool. --ffn measures the kernel in a 330 MB sequential ring;
+/// this measures it the way the engine actually runs it. The delta between
+/// the passes attributes the in-engine bandwidth loss:
+///   big+sequential vs small ring  -> slab size alone (page walks, residency)
+///   big+random    vs big+sequential -> access pattern (TLB locality)
+///   big+random+writers vs big+random -> concurrent fetch traffic
+fn expertFfnEngine(gpa: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
+    const dim = 2048;
+    const moe_ffn = 1408;
+    const N = 192;
+
+    const gate_bytes = ggml.tensorBytes(.q4_k, dim, moe_ffn);
+    const up_bytes = gate_bytes;
+    const down_bytes = ggml.tensorBytes(.q5_1, moe_ffn, dim);
+    const set_bytes = gate_bytes + up_bytes + down_bytes;
+
+    // As many distinct experts as ~4 GB holds -- the engine's LRU scale,
+    // hundreds of thousands of pages, far past every TLB on this class of
+    // machine. LOOM_BENCH_GB overrides.
+    var slab_gb: f64 = 4.0;
+    if (std.c.getenv("LOOM_BENCH_GB")) |v| {
+        slab_gb = std.fmt.parseFloat(f64, std.mem.span(v)) catch 4.0;
+    }
+    const slots: usize = @intFromFloat(@max(8.0, slab_gb * 1024.0 * 1024.0 * 1024.0 / @as(f64, @floatFromInt(set_bytes))));
+
+    var prng = std.Random.DefaultPrng.init(0xE7E7);
+    const rnd = prng.random();
+    const slab = try gpa.alloc(u8, set_bytes * slots);
+    defer gpa.free(slab);
+    rnd.bytes(slab);
+    for (0..slab.len / 2) |i| slab[i * 2 + 1] &= 0xFB;
+
+    const x = try gpa.alloc(f32, dim);
+    defer gpa.free(x);
+    for (x) |*v| v.* = rnd.float(f32) - 0.5;
+    const g = try gpa.alloc(f32, moe_ffn);
+    defer gpa.free(g);
+    const u = try gpa.alloc(f32, moe_ffn);
+    defer gpa.free(u);
+    const a = try gpa.alloc(f32, moe_ffn);
+    defer gpa.free(a);
+    const o = try gpa.alloc(f32, dim);
+    defer gpa.free(o);
+
+    const One = struct {
+        fn run(sl: []const u8, sb: usize, slot: usize, gb: usize, ub: usize, xx: []const f32, gg: []f32, uu: []f32, aa: []f32, oo: []f32) void {
+            const set = sl[slot * sb ..][0..sb];
+            backend.matvec(.q4_k, gg, set[0..gb], xx, moe_ffn, dim);
+            backend.matvec(.q4_k, uu, set[gb..][0..ub], xx, moe_ffn, dim);
+            backend.swiglu(aa, gg, uu);
+            backend.matvec(.q5_1, oo, set[gb + ub ..], aa, dim, moe_ffn);
+        }
+    };
+
+    // Best-of-N over a slot schedule; the schedule is what varies per pass.
+    const Measure = struct {
+        fn f(ioo: Io, sl: []const u8, sb: usize, sched: []const usize, gb: usize, ub: usize, xx: []const f32, gg: []f32, uu: []f32, aa: []f32, oo: []f32) i128 {
+            var best: i128 = std.math.maxInt(i64);
+            for (sched) |slot| {
+                const t0 = nowNs(ioo);
+                One.run(sl, sb, slot, gb, ub, xx, gg, uu, aa, oo);
+                const dt = nowNs(ioo) - t0;
+                if (dt < best) best = dt;
+            }
+            return best;
+        }
+    };
+
+    const seq_sched = try gpa.alloc(usize, N);
+    defer gpa.free(seq_sched);
+    for (seq_sched, 0..) |*sv, i| sv.* = i % slots;
+    const rnd_sched = try gpa.alloc(usize, N);
+    defer gpa.free(rnd_sched);
+    for (rnd_sched) |*sv| sv.* = rnd.intRangeLessThan(usize, 0, slots);
+
+    const threads_n = generator.threads();
+    backend.parallelBegin(threads_n);
+    // warm: touch every page once so first-touch faults are not in the timing
+    for (0..slots) |i| One.run(slab, set_bytes, i, gate_bytes, up_bytes, x, g, u, a, o);
+    const b_seq = Measure.f(io, slab, set_bytes, seq_sched, gate_bytes, up_bytes, x, g, u, a, o);
+    const b_rnd = Measure.f(io, slab, set_bytes, rnd_sched, gate_bytes, up_bytes, x, g, u, a, o);
+    backend.parallelEnd();
+
+    // Concurrent-writer pass: two threads memcpy expert-sized blocks into
+    // random slots throughout, the fetch pool's memory traffic in miniature.
+    var stop = std.atomic.Value(bool).init(false);
+    const Writer = struct {
+        fn run(sl: []u8, sb: usize, nslots: usize, seed: u64, st: *std.atomic.Value(bool)) void {
+            var p = std.Random.DefaultPrng.init(seed);
+            const r = p.random();
+            var buf: [64 * 1024]u8 = undefined;
+            r.bytes(&buf);
+            while (!st.load(.monotonic)) {
+                const slot = r.intRangeLessThan(usize, 0, nslots);
+                var off: usize = 0;
+                while (off + buf.len <= sb) : (off += buf.len) {
+                    @memcpy(sl[slot * sb + off ..][0..buf.len], &buf);
+                    if (st.load(.monotonic)) return;
+                }
+            }
+        }
+    };
+    const w1 = try std.Thread.spawn(.{}, Writer.run, .{ slab, set_bytes, slots, 1, &stop });
+    const w2 = try std.Thread.spawn(.{}, Writer.run, .{ slab, set_bytes, slots, 2, &stop });
+    backend.parallelBegin(threads_n);
+    const b_rw = Measure.f(io, slab, set_bytes, rnd_sched, gate_bytes, up_bytes, x, g, u, a, o);
+    backend.parallelEnd();
+    stop.store(true, .monotonic);
+    w1.join();
+    w2.join();
+
+    const fb: f64 = @floatFromInt(set_bytes);
+    const gbs = struct {
+        fn f(bytes: f64, ns: i128) f64 {
+            return bytes / @as(f64, @floatFromInt(ns));
+        }
+    }.f;
+    try out.print("\nexpert ffn, engine-shaped (issue #171): {d} distinct experts, {d:.2} GB slab, {d} threads\n", .{
+        slots, @as(f64, @floatFromInt(set_bytes * slots)) / (1 << 30), threads_n,
+    });
+    try out.print("  sequential slots          {d:6.1} GB/s   (compare --ffn's 330 MB ring)\n", .{gbs(fb, b_seq)});
+    try out.print("  random slots              {d:6.1} GB/s   (router-like access)\n", .{gbs(fb, b_rnd)});
+    try out.print("  random + fetch writers    {d:6.1} GB/s   (concurrent pool traffic)\n", .{gbs(fb, b_rw)});
+    try out.flush();
+}
+
 fn expertFfn(gpa: std.mem.Allocator, io: Io, out: *Io.Writer) !void {
     const dim = 2048;
     const moe_ffn = 1408;

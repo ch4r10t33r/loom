@@ -452,6 +452,7 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer, dl:
         // every emitted token is exactly what the peer would have produced.
         // A collapsed acceptance rate bails to wholesale GEN below; any error
         // does the same. LOOM_NO_DRAFT=1 disables for A/B.
+        std.debug.print("DBG delegate: temp={d} no_draft_env={} gen_tag={s}\n", .{ temp, std.c.getenv("LOOM_NO_DRAFT") != null, @tagName(ctx.gen.*) });
         if (temp <= 0 and std.c.getenv("LOOM_NO_DRAFT") == null) {
             if (draftDelegate(ctx, target.addr, prompt_text, max_tokens, parse_special_d)) |maybe| {
                 if (maybe) |dres| {
@@ -774,12 +775,14 @@ fn draftDelegate(
     max_tokens: usize,
     parse_special: bool,
 ) !?DelegateResult {
+    std.debug.print("DBG draftDelegate: entered\n", .{});
     const gg = switch (ctx.gen.*) {
         .gguf => |p| p,
         else => return error.DraftUnsupported,
     };
     const gpa = ctx.gpa;
     const addr = try sync.PeerAddr.parse(addr_str);
+    std.debug.print("DBG draftDelegate: peer parsed, connecting\n", .{});
     const peer = try sync.Peer.connect(gpa, ctx.io, addr);
     defer peer.close(gpa);
     var dp = DraftPeer{ .ctx = ctx, .peer = peer };
@@ -791,9 +794,11 @@ fn draftDelegate(
         .call = DraftPeer.verify,
     }) catch |e| {
         ctx.engine_lock.unlock(ctx.io);
+        std.debug.print("DBG draftDelegate: generateDrafted error {t}\n", .{e});
         return e;
     };
     ctx.engine_lock.unlock(ctx.io);
+    std.debug.print("DBG draftDelegate: done rounds={d} acc={d}/{d} bailed={}\n", .{ out.rounds, out.accepted, out.drafted, out.bailed });
     const secs = @as(f64, @floatFromInt(stats.nowNs(ctx.io) - t0)) / 1e9;
 
     if (ctx.alpha_metrics) |am| am.recordDraft(out.rounds, out.drafted, out.accepted, out.final_gamma, out.bailed);
