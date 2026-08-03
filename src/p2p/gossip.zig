@@ -191,7 +191,14 @@ pub fn loop(ctx: *Ctx) void {
             ctx.gpa.free(addrs);
         }
         for (addrs) |a| {
-            exchange(ctx, a) catch continue;
+            exchange(ctx, a) catch |e| {
+                // One line, not silence: exchange failures were previously
+                // swallowed whole, which made every gossip pathology look
+                // identical (an empty peer count with no cause attached) --
+                // the #210 diagnosis needed exactly this print.
+                std.debug.print("gossip: exchange with {s} failed: {t}\n", .{ a, e });
+                continue;
+            };
         }
     }
 }
