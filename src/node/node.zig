@@ -975,8 +975,8 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                         synthetic = std.mem.startsWith(u8, gname, "loom ") and std.mem.endsWith(u8, gname, "fixture");
                         try printCompute(out, gguf_layers_gpu);
                         try out.print("  serving    distributed GGUF ({s}): model \"{s}\" ctx={d} chat={s}\n", .{
-                            arch_name,                          gguf_gen.m.generalName() orelse "unknown",
-                            gguf_gen.m.ctxLen(),                @tagName(gguf_gen.chat_format),
+                            arch_name,           gguf_gen.m.generalName() orelse "unknown",
+                            gguf_gen.m.ctxLen(), @tagName(gguf_gen.chat_format),
                         });
                     } else |e| {
                         try out.print("  gguf serve disabled: attach failed ({s})\n", .{@errorName(e)});
