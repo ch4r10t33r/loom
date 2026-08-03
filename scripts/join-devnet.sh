@@ -16,10 +16,13 @@
 #   LOOM_API_PORT   OpenAI-compatible API port             (default 8772)
 #   LOOM_HTTP_MIRROR URL of a static mirror of the devnet model file;
 #                   initial sync pulls shard ranges from it in parallel
-#                   (digest-verified) instead of loading the bootnode
+#                   (digest-verified) instead of loading the bootnode.
+#                   Defaults to the official Hugging Face mirror; set to
+#                   the empty string to sync from peers only
 #   LOOM_HTTP_SPLIT_GB  set when the mirror hosts fixed-size parts
-#                   (<url>.part-00000, ...) of this many GB each, e.g. a
-#                   Hugging Face mirror where single files cap at 50 GB
+#                   (<url>.part-00000, ...) of this many GiB each, e.g. a
+#                   Hugging Face mirror where single files cap at 50 GB;
+#                   defaults to 20 to match the official mirror
 #   LOOM_ADVERTISE  host:port peers can dial you on        (default unset:
 #                   fine behind NAT; set it if you are publicly reachable
 #                   so you can serve shards to others)
@@ -72,9 +75,14 @@ fi
 ADV=""
 [ -n "${LOOM_ADVERTISE:-}" ] && ADV="--advertise ${LOOM_ADVERTISE}"
 
+# Official devnet mirror: the merged GLM-4.5-Air GGUF as 20 GiB parts on
+# Hugging Face. Every shard is digest-verified against the p2p manifest, so
+# the mirror only ever donates bandwidth -- it cannot alter what a node runs.
+DEFAULT_MIRROR="https://huggingface.co/ch4r10t33r/loom-devnet-glm-4.5-air/resolve/main/merged.gguf"
+MIRROR_URL="${LOOM_HTTP_MIRROR-$DEFAULT_MIRROR}"
+SPLIT_GB="${LOOM_HTTP_SPLIT_GB:-20}"
 MIRROR=""
-[ -n "${LOOM_HTTP_MIRROR:-}" ] && MIRROR="--bootstrap-http ${LOOM_HTTP_MIRROR}"
-[ -n "${LOOM_HTTP_MIRROR:-}" ] && [ -n "${LOOM_HTTP_SPLIT_GB:-}" ] && MIRROR="$MIRROR --bootstrap-http-split-gb ${LOOM_HTTP_SPLIT_GB}"
+[ -n "$MIRROR_URL" ] && MIRROR="--bootstrap-http $MIRROR_URL --bootstrap-http-split-gb $SPLIT_GB"
 
 METRICS="--report-metrics"
 if [ "${LOOM_NO_METRICS:-}" = "1" ]; then
