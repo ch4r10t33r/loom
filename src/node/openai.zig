@@ -62,6 +62,11 @@ pub const Ctx = struct {
     /// Admin token (same value the RPC credit op uses). When set, RAG ingest
     /// requires it as the bearer; see handleRagIngest (security issue #140).
     admin_token: []const u8 = "",
+    /// Value for Access-Control-Allow-Origin, or "" for no CORS header at all
+    /// (the default). A metered API that accepts bearer tokens must not
+    /// advertise itself to every web origin (security issue #143); the
+    /// built-in chat UI is same-origin, so it needs nothing here.
+    cors_origin: []const u8 = "",
     port: u16,
     seed: u64,
     /// Advertised model id: echoed in `/v1/models` and each response `model`
@@ -156,7 +161,7 @@ fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
 
     const req = parseRequest(ctx.gpa, ri) catch {
         // static body: the allocated variant leaked on every malformed request
-        try writeHttp(wi, 400, "{\"error\":{\"message\":\"malformed_request\",\"type\":\"invalid_request_error\"}}", .json);
+        try writeHttp(wi, 400, "{\"error\":{\"message\":\"malformed_request\",\"type\":\"invalid_request_error\"}}", .json, ctx.cors_origin);
         return;
     };
     defer req.deinit(ctx.gpa);
@@ -165,7 +170,7 @@ fn handleConn(ctx: *Ctx, stream: net.Stream) !void {
     // null; otherwise we get a buffered Response to write here.
     if (try route(ctx, req, wi, dl)) |resp| {
         defer if (resp.owned) ctx.gpa.free(resp.body);
-        try writeHttp(wi, resp.status, resp.body, resp.content_type);
+        try writeHttp(wi, resp.status, resp.body, resp.content_type, ctx.cors_origin);
     }
 }
 
@@ -186,6 +191,11 @@ const Request = struct {
     }
 };
 
+/// Header-count and total-header-byte caps for the hand-rolled parser
+/// (security issue #143).
+const MAX_HEADERS = 64;
+const MAX_HEADER_BYTES = 16 * 1024;
+
 fn parseRequest(gpa: std.mem.Allocator, ri: *Io.Reader) !Request {
     // request line: "METHOD PATH HTTP/1.1"
     const line0 = trimCrlf(try ri.takeDelimiterInclusive('\n'));
@@ -201,10 +211,23 @@ fn parseRequest(gpa: std.mem.Allocator, ri: *Io.Reader) !Request {
     var bearer: []u8 = try gpa.dupe(u8, "");
     errdefer gpa.free(bearer);
 
-    // headers until a blank line
+    // headers until a blank line, bounded in count and total bytes (security
+    // issue #143): an unbounded loop lets a client burn CPU and allocations
+    // dribbling header lines inside the serve timeout.
+    var n_headers: usize = 0;
+    var header_bytes: usize = 0;
     while (true) {
         const h = trimCrlf(try ri.takeDelimiterInclusive('\n'));
         if (h.len == 0) break;
+        n_headers += 1;
+        header_bytes += h.len;
+        if (n_headers > MAX_HEADERS or header_bytes > MAX_HEADER_BYTES) return error.HeadersTooLarge;
+        if (asciiHeaderIs(h, "transfer-encoding")) {
+            // Only Content-Length framing is implemented; accepting a request
+            // that also declares chunked encoding is how request smuggling
+            // starts (issue #143).
+            return error.UnsupportedTransferEncoding;
+        }
         if (asciiHeaderIs(h, "content-length")) {
             content_length = std.fmt.parseInt(usize, std.mem.trim(u8, headerValue(h), " "), 10) catch 0;
         } else if (asciiHeaderIs(h, "authorization")) {
@@ -406,41 +429,97 @@ fn handleCompletions(ctx: *Ctx, req: Request, is_chat: bool, wi: *Io.Writer, dl:
     // checking and charging separately let N concurrent requests each see the
     // full balance.
 
-    // Parse the body once for model / stream / params / prompt.
-    var model_id: []const u8 = ctx.model_id;
+    // Parse and VALIDATE the body (security issue #160). Malformed input used
+    // to fail open -- bad JSON, a non-object body, a missing prompt or
+    // wrong-typed parameter all became an empty prompt and an HTTP 200, so
+    // no caller could trust success. Every invalid form is now a 400.
+    //
+    // The response's model identity is always this node's loaded model: the
+    // request field is only allowed to *match* it. Echoing an arbitrary
+    // client string let a request be labeled as a model that never ran it.
     var stream = false;
     var max_tokens: usize = 128;
     var temp: f32 = 0.0;
     var seed: u64 = ctx.seed;
     var parsed: ?std.json.Parsed(std.json.Value) = std.json.parseFromSlice(std.json.Value, gpa, req.body, .{}) catch null;
     defer if (parsed) |*p| p.deinit();
-    if (parsed) |p| if (p.value == .object) {
-        const o = p.value.object;
-        if (o.get("model")) |v| if (v == .string) {
-            model_id = v.string;
-        };
-        if (o.get("stream")) |v| if (v == .bool) {
-            stream = v.bool;
-        };
-        if (o.get("max_tokens")) |v| if (v == .integer and v.integer > 0) {
-            max_tokens = @intCast(v.integer);
-        };
-        if (o.get("temperature")) |v| switch (v) {
-            .float => temp = @floatCast(v.float),
-            .integer => temp = @floatFromInt(v.integer),
-            else => {},
-        };
-        if (o.get("seed")) |v| if (v == .integer and v.integer >= 0) {
-            seed = @intCast(v.integer);
-        };
+    const p = parsed orelse {
+        const b = try errorJson(gpa, "request body is not valid JSON", "invalid_request_error", "bad_request");
+        return .{ .status = 400, .body = b };
     };
+    if (p.value != .object) {
+        const b = try errorJson(gpa, "request body must be a JSON object", "invalid_request_error", "bad_request");
+        return .{ .status = 400, .body = b };
+    }
+    {
+        const o = p.value.object;
+        if (o.get("model")) |v| {
+            if (v != .string) {
+                const b = try errorJson(gpa, "model must be a string", "invalid_request_error", "bad_request");
+                return .{ .status = 400, .body = b };
+            }
+            if (!std.mem.eql(u8, v.string, ctx.model_id)) {
+                const b = try errorJson(gpa, "requested model is not the model this node serves", "invalid_request_error", "model_not_found");
+                return .{ .status = 404, .body = b };
+            }
+        }
+        if (o.get("stream")) |v| {
+            if (v != .bool) {
+                const b = try errorJson(gpa, "stream must be a boolean", "invalid_request_error", "bad_request");
+                return .{ .status = 400, .body = b };
+            }
+            stream = v.bool;
+        }
+        if (o.get("max_tokens")) |v| {
+            if (v != .integer or v.integer <= 0 or v.integer > MAX_RESERVE) {
+                const b = try errorJson(gpa, "max_tokens must be a positive integer within the server limit", "invalid_request_error", "bad_request");
+                return .{ .status = 400, .body = b };
+            }
+            max_tokens = @intCast(v.integer);
+        }
+        if (o.get("temperature")) |v| {
+            switch (v) {
+                .float => temp = @floatCast(v.float),
+                .integer => temp = @floatFromInt(v.integer),
+                else => {
+                    const b = try errorJson(gpa, "temperature must be a number", "invalid_request_error", "bad_request");
+                    return .{ .status = 400, .body = b };
+                },
+            }
+            if (!std.math.isFinite(temp) or temp < 0 or temp > 2) {
+                const b = try errorJson(gpa, "temperature must be between 0 and 2", "invalid_request_error", "bad_request");
+                return .{ .status = 400, .body = b };
+            }
+        }
+        if (o.get("seed")) |v| {
+            if (v != .integer or v.integer < 0) {
+                const b = try errorJson(gpa, "seed must be a non-negative integer", "invalid_request_error", "bad_request");
+                return .{ .status = 400, .body = b };
+            }
+            seed = @intCast(v.integer);
+        }
+    }
+    // Always the served model, never the requested string.
+    const model_id: []const u8 = ctx.model_id;
 
     // Assemble the prompt: chat messages -> role-labeled text, or the raw
     // `prompt` field for the completions endpoint. Shared by both paths.
-    const base_prompt = if (is_chat)
-        try assembleChatPrompt(ctx, gpa, parsed)
-    else
-        try gpa.dupe(u8, promptField(parsed));
+    const base_prompt = if (is_chat) blk: {
+        const t = try assembleChatPrompt(ctx, gpa, parsed);
+        if (t.len == 0) {
+            gpa.free(t);
+            const b = try errorJson(gpa, "messages must be a non-empty array of {role, content} objects", "invalid_request_error", "bad_request");
+            return .{ .status = 400, .body = b };
+        }
+        break :blk t;
+    } else blk: {
+        const raw = promptField(parsed);
+        if (raw.len == 0) {
+            const b = try errorJson(gpa, "prompt must be a non-empty string", "invalid_request_error", "bad_request");
+            return .{ .status = 400, .body = b };
+        }
+        break :blk try gpa.dupe(u8, raw);
+    };
     defer gpa.free(base_prompt);
 
     // Retrieval: the closest gossiped chunks are prepended as context. The
@@ -635,7 +714,9 @@ fn streamCompletions(
     const model_esc = jsonEscapeAlloc(gpa, model_id) catch return;
     defer gpa.free(model_esc);
 
-    wi.print("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n", .{}) catch return;
+    wi.print("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\n", .{}) catch return;
+    if (ctx.cors_origin.len > 0) wi.print("Access-Control-Allow-Origin: {s}\r\n", .{ctx.cors_origin}) catch return;
+    wi.print("Connection: close\r\n\r\n", .{}) catch return;
     if (is_chat) {
         wi.print("data: {{\"id\":\"chatcmpl-loom-{d}\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\"}},\"finish_reason\":null}}]}}\n\n", .{ id, model_esc }) catch return;
     }
@@ -964,10 +1045,12 @@ fn errorJson(gpa: std.mem.Allocator, msg: []const u8, ty: []const u8, code: []co
     , .{ msg, ty, code });
 }
 
-fn writeHttp(wi: *Io.Writer, status: u16, body: []const u8, ct: ContentType) !void {
+fn writeHttp(wi: *Io.Writer, status: u16, body: []const u8, ct: ContentType, cors_origin: []const u8) !void {
     const reason = switch (status) {
         200 => "OK",
         400 => "Bad Request",
+        413 => "Content Too Large",
+        431 => "Request Header Fields Too Large",
         401 => "Unauthorized",
         402 => "Payment Required",
         404 => "Not Found",
@@ -978,7 +1061,10 @@ fn writeHttp(wi: *Io.Writer, status: u16, body: []const u8, ct: ContentType) !vo
     try wi.print("HTTP/1.1 {d} {s}\r\n", .{ status, reason });
     try wi.print("Content-Type: {s}\r\n", .{ct.mime()});
     try wi.print("Content-Length: {d}\r\n", .{body.len});
-    try wi.print("Access-Control-Allow-Origin: *\r\n", .{});
+    // No CORS header unless the operator opted in (security issue #143):
+    // `*` on a bearer-metered API invites drive-by browser abuse, and the
+    // built-in chat UI is same-origin.
+    if (cors_origin.len > 0) try wi.print("Access-Control-Allow-Origin: {s}\r\n", .{cors_origin});
     try wi.print("Connection: close\r\n\r\n", .{});
     try wi.print("{s}", .{body});
     try wi.flush();

@@ -429,6 +429,26 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
     if (gguf_path != null and bootstrap != null) {
         return out.print("node: --gguf and --bootstrap are mutually exclusive\n", .{});
     }
+    // Admin secret: prefer a file so the token never reaches argv, where
+    // shell history, `ps`, and container inspection all record it (security
+    // issue #162). --admin-token still works and is documented as the
+    // convenience path for local use.
+    const admin_token = blk: {
+        if (flagStr(args, "--admin-token-file")) |p| {
+            const tok = readSecretFile(gpa, io, p) catch |e| {
+                try out.print("cannot read --admin-token-file {s}: {t}\n", .{ p, e });
+                return;
+            };
+            if (flagStr(args, "--admin-token") != null) {
+                try out.print("--admin-token and --admin-token-file are mutually exclusive\n", .{});
+                return;
+            }
+            break :blk tok;
+        }
+        break :blk flagStr(args, "--admin-token") orelse "";
+    };
+    defer if (flagStr(args, "--admin-token-file") != null) gpa.free(admin_token);
+
     const hold_fraction = try flagF64(args, "--hold-fraction", 1.0);
     const range_mb = try flagF64(args, "--range-mb", 4.0);
 
@@ -461,7 +481,8 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         // 50 identities' worth by default: enough for a small swarm of real
         // users, bounded against a rotation attack (security issue #141)
         .free_pool = try flagU64(args, "--free-pool", 50 * 100_000),
-        .admin_token = flagStr(args, "--admin-token") orelse "",
+        .admin_token = admin_token,
+        .cors_origin = flagStr(args, "--cors-origin") orelse "",
         .hold_fraction = @floatCast(std.math.clamp(hold_fraction, 0.0, 1.0)),
         .range_bytes = @intFromFloat(range_mb * @as(f64, MB)),
         .ctx_cap = try flagUsize(args, "--ctx", 4096),
@@ -1131,4 +1152,28 @@ test "default RAM budget scales with the machine and stays in bounds" {
         // Unknown memory must not produce an aggressive budget.
         try std.testing.expectEqual(@as(f64, 2.0), got);
     }
+}
+
+/// Read a secret from a file, trimming a single trailing newline. Refuses a
+/// group/world-readable file on POSIX (security issue #162): a token that
+/// anyone on the box can read is not a secret, and failing loudly at startup
+/// is better than a false sense of protection.
+fn readSecretFile(gpa: std.mem.Allocator, io: Io, path: []const u8) ![]const u8 {
+    const f = try Io.Dir.cwd().openFile(io, path, .{});
+    defer f.close(io);
+    if (@import("builtin").os.tag != .windows) {
+        const st = try f.stat(io);
+        if (st.permissions.toMode() & 0o077 != 0) return error.SecretFileTooPermissive;
+    }
+    const size = try f.length(io);
+    if (size > 4096) return error.SecretFileTooLarge;
+    const buf = try gpa.alloc(u8, @intCast(size));
+    errdefer gpa.free(buf);
+    _ = try f.readPositionalAll(io, buf, 0);
+    const trimmed = std.mem.trim(u8, buf, " \t\r\n");
+    if (trimmed.len == 0) return error.SecretFileEmpty;
+    if (trimmed.len == buf.len) return buf;
+    const out = try gpa.dupe(u8, trimmed);
+    gpa.free(buf);
+    return out;
 }

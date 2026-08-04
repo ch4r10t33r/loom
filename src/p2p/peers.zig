@@ -32,6 +32,12 @@ pub const PeerInfo = struct {
     committee_id: u32, // NO_COMMITTEE when unknown / not in one
     holdings_seq: u64, // monotonic per-peer; a lower seq never overwrites bits
     last_seen_ns: i128,
+    /// Whether we have ever *dialed this address successfully*. Hearsay --
+    /// an address relayed inside another peer's batch -- is enough to try
+    /// dialing, but not enough to send token-loop fetches to (security issue
+    /// #144): an attacker who announces full bitmaps for addresses that do
+    /// not answer would otherwise redirect every fetch into a timeout.
+    dialed: bool = false,
 };
 
 /// Bound on distinct peers retained (audit #7 P1 unbounded table): beyond this
@@ -100,7 +106,10 @@ pub const Table = struct {
                 // of three or more, because the survivors keep echoing the
                 // dead node's entry to each other forever — measured, the
                 // origin stayed "live" indefinitely after being killed.
-                if (evidence == .first_hand) e.last_seen_ns = now_ns;
+                if (evidence == .first_hand) {
+                    e.last_seen_ns = now_ns;
+                    e.dialed = true;
+                }
                 // a strictly-lower seq must not clobber fresher holdings/version
                 // (audit #7 P1); seq 0 (text GOSSIP) never regresses a known seq
                 if (holdings_seq < e.holdings_seq) return false;
@@ -123,6 +132,7 @@ pub const Table = struct {
             .committee_id = committee_id,
             .holdings_seq = holdings_seq,
             .last_seen_ns = now_ns,
+            .dialed = evidence == .first_hand,
         };
         @memcpy(&info.version_hex, version_hex);
         try self.entries.append(self.gpa, info);
@@ -180,6 +190,8 @@ pub const Table = struct {
             // address to time out, and would hide from the repair loop that
             // the shard now has no holder at all.
             if (now - e.last_seen_ns > PEER_TTL_NS) continue;
+            // Hearsay holdings never steer the hot path (issue #144).
+            if (!e.dialed) continue;
             if (byte_i * 2 + 1 >= e.holdings_hex.len) continue;
             const b = std.fmt.parseInt(u8, e.holdings_hex[byte_i * 2 ..][0..2], 16) catch continue;
             if (b & bit != 0) try out.append(gpa, try gpa.dupe(u8, e.addr));
@@ -442,4 +454,40 @@ test "hearsay about a peer does not keep it alive" {
     // direct contact revives it
     _ = try t.merge("127.0.0.1:9101", &v, "ff", NO_COMMITTEE, 3, now, .first_hand);
     try std.testing.expectEqual(@as(usize, 1), t.liveCount());
+}
+
+test "hearsay holdings never steer the hot path (security issue #144)" {
+    // An attacker can put any address into another peer's AnnounceBatch with
+    // a full bitmap. Trusting that for fetch selection sends every miss to a
+    // black hole; requiring a successful dial first makes the claim cost the
+    // attacker a reachable, answering node.
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    var t = Table.init(gpa, threaded.io(), "127.0.0.1:9000");
+    defer t.deinit();
+
+    const now = stats_mod.nowNs(t.io);
+    const v = [_]u8{'0'} ** 64;
+    // relayed claim only: known address, but never answered us
+    _ = try t.merge("10.0.0.9:1", &v, "ff", NO_COMMITTEE, 1, now, .hearsay);
+    {
+        const h = try t.holdersOf(gpa, 3);
+        defer {
+            for (h) |a| gpa.free(a);
+            gpa.free(h);
+        }
+        try std.testing.expectEqual(@as(usize, 0), h.len);
+    }
+    // it stays in the table (we may still dial it) and becomes a holder only
+    // once a first-hand exchange proves it answers
+    _ = try t.merge("10.0.0.9:1", &v, "ff", NO_COMMITTEE, 2, now, .first_hand);
+    {
+        const h = try t.holdersOf(gpa, 3);
+        defer {
+            for (h) |a| gpa.free(a);
+            gpa.free(h);
+        }
+        try std.testing.expectEqual(@as(usize, 1), h.len);
+    }
 }

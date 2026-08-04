@@ -283,19 +283,35 @@ pub fn load(gpa: std.mem.Allocator, io: Io, dir_path: []const u8) !Loaded {
     if (header.format_version != FORMAT_VERSION) return error.BadVersion;
     try header.config.validate();
 
+    // The index count is attacker-controlled (security issue #164): require
+    // it to equal what the config implies AND the manifest to be exactly the
+    // right length, with checked arithmetic, before allocating anything.
     const n = header.n_experts_index;
+    if (n != header.config.totalRoutedExperts()) return error.ExpertIndexCountMismatch;
+    const idx_bytes = std.math.mul(usize, n, @sizeOf(ExpertEntry)) catch return error.ManifestTooLarge;
+    const want_manifest = std.math.add(usize, @sizeOf(Header), idx_bytes) catch return error.ManifestTooLarge;
+    if (mbytes.len != want_manifest) return error.ManifestSizeMismatch;
     const entries = try gpa.alloc(ExpertEntry, n);
     errdefer gpa.free(entries);
-    const entry_bytes = mbytes[@sizeOf(Header)..][0 .. n * @sizeOf(ExpertEntry)];
+    const entry_bytes = mbytes[@sizeOf(Header)..][0..idx_bytes];
     @memcpy(std.mem.sliceAsBytes(entries), entry_bytes);
 
-    // dense blob -> resident RAM
+    // dense blob -> resident RAM. The declared length, the config-derived
+    // element count and the file on disk must all agree before allocating
+    // (security issue #164): carving relied on slice bounds to catch a short
+    // blob, i.e. on a trap rather than a check.
     const expect_dense = denseElemCount(header.config);
-    if (header.dense_len != expect_dense * @sizeOf(f32)) return error.DenseSizeMismatch;
-    const dense = try gpa.alloc(f32, expect_dense);
-    errdefer gpa.free(dense);
+    const expect_dense_bytes = std.math.mul(usize, expect_dense, @sizeOf(f32)) catch return error.DenseSizeMismatch;
+    if (header.dense_len != expect_dense_bytes) return error.DenseSizeMismatch;
     const dpath = try joinPath(&pbuf, dir_path, "dense.blob");
     const df = try Io.Dir.cwd().openFile(io, dpath, .{});
+    const dsize = (try df.stat(io)).size;
+    if (dsize != expect_dense_bytes) {
+        df.close(io);
+        return error.DenseSizeMismatch;
+    }
+    const dense = try gpa.alloc(f32, expect_dense);
+    errdefer gpa.free(dense);
     _ = try df.readPositionalAll(io, std.mem.sliceAsBytes(dense), 0);
     df.close(io);
 
@@ -305,6 +321,21 @@ pub fn load(gpa: std.mem.Allocator, io: Io, dir_path: []const u8) !Loaded {
 
     const epath = try joinPath(&pbuf, dir_path, "experts.blob");
     const experts_file = try Io.Dir.cwd().openFile(io, epath, .{});
+    errdefer experts_file.close(io);
+
+    // Every entry must name exactly one expert-sized extent inside the blob
+    // (security issue #164). The expert cache indexes `entries[id]` and trusts
+    // offset+len on the inference path; validating here is what makes that
+    // trust sound, and it is one pass over the index at load.
+    {
+        const esize = (try experts_file.stat(io)).size;
+        const want_len = header.config.expertBytes();
+        for (entries) |e| {
+            if (e.len != want_len) return error.ExpertEntryLengthMismatch;
+            const end = std.math.add(u64, e.offset, e.len) catch return error.ExpertEntryOutOfRange;
+            if (end > esize) return error.ExpertEntryOutOfRange;
+        }
+    }
 
     return .{
         .gpa = gpa,

@@ -111,6 +111,9 @@ pub const Options = struct {
     /// Node-wide budget for free grants (security issue #141): identity
     /// rotation mints at most this much free compute in total.
     free_pool: u64,
+    /// Access-Control-Allow-Origin value for the OpenAI surface; empty sends
+    /// no CORS header (security issue #143).
+    cors_origin: []const u8 = "",
     admin_token: []const u8, // gates the credit op (empty = credit disabled)
     ctx_cap: usize, // context-length cap when serving a distributed GGUF engine
     chat_format: ?[]const u8, // --chat-format override (null = auto-detect)
@@ -1128,6 +1131,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             .store = if (store) |*st| st else null,
             .delegate_below = opts.delegate_below,
             .admin_token = opts.admin_token,
+            .cors_origin = opts.cors_origin,
         };
         openai_ctx.peers = &table;
         const t = try std.Thread.spawn(.{}, openaiThread, .{&openai_ctx});

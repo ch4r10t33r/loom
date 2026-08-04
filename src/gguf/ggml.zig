@@ -420,16 +420,18 @@ fn quantizeXN(xs: []const f32, n: usize, cols: usize) void {
         for (0..nb) |b| {
             const src = x[b * QK_0 ..][0..QK_0];
             var amax: f32 = 0;
-            for (src) |v| amax = @max(amax, @abs(v));
+            for (src) |v| if (std.math.isFinite(v)) {
+                amax = @max(amax, @abs(v));
+            };
             const d = amax / 127.0;
-            const inv: f32 = if (d != 0) 1.0 / d else 0;
+            const inv: f32 = if (d != 0 and std.math.isFinite(d)) 1.0 / d else 0;
             var sum: i32 = 0;
             for (src, 0..) |v, i| {
-                const q: i8 = @intFromFloat(@round(v * inv));
+                const q = toI8Saturating(v * inv);
                 qxn_buf[b][k].q[i] = q;
                 sum += q;
             }
-            qxn_buf[b][k].d = d;
+            qxn_buf[b][k].d = if (std.math.isFinite(d)) d else 0;
             qxn_buf[b][k].sum = sum;
         }
     }
@@ -770,6 +772,20 @@ const XBlock = struct {
 const MAX_QX_BLOCKS = 1024; // 32k activation elements
 threadlocal var qx_buf: [MAX_QX_BLOCKS]XBlock = undefined;
 
+/// Round-to-int that cannot trap on a poisoned model (security issue #165).
+/// A NaN or Inf scale decoded from an attacker-supplied tensor propagates into
+/// activations, and `@intFromFloat` on a non-finite value is a checked trap in
+/// ReleaseSafe and undefined behavior in ReleaseFast. Non-finite maps to 0
+/// (the block's own scale is separately zeroed) and finite values saturate
+/// into i8 instead of relying on the conversion's range check.
+inline fn toI8Saturating(v: f32) i8 {
+    if (!std.math.isFinite(v)) return 0;
+    const r = @round(v);
+    if (r >= 127.0) return 127;
+    if (r <= -127.0) return -127;
+    return @intFromFloat(r);
+}
+
 /// Quantize `x` into `qx_buf`, returning the populated slice. Symmetric
 /// round-to-nearest against the block's absolute maximum, matching Q8_0.
 fn quantizeX(x: []const f32) []const XBlock {
@@ -778,16 +794,18 @@ fn quantizeX(x: []const f32) []const XBlock {
     for (0..nb) |b| {
         const src = x[b * QK_0 ..][0..QK_0];
         var amax: f32 = 0;
-        for (src) |v| amax = @max(amax, @abs(v));
+        for (src) |v| if (std.math.isFinite(v)) {
+            amax = @max(amax, @abs(v));
+        };
         const d = amax / 127.0;
-        const inv: f32 = if (d != 0) 1.0 / d else 0;
+        const inv: f32 = if (d != 0 and std.math.isFinite(d)) 1.0 / d else 0;
         var sum: i32 = 0;
         for (src, 0..) |v, i| {
-            const q: i8 = @intFromFloat(@round(v * inv));
+            const q = toI8Saturating(v * inv);
             qx_buf[b].q[i] = q;
             sum += q;
         }
-        qx_buf[b].d = d;
+        qx_buf[b].d = if (std.math.isFinite(d)) d else 0;
         qx_buf[b].sum = sum;
     }
     return qx_buf[0..nb];
@@ -1884,4 +1902,28 @@ test "matmul is bit-identical to repeated matvec" {
             try std.testing.expectEqualSlices(f32, want, got);
         }
     }
+}
+
+test "non-finite activations cannot trap the quantizers (security issue #165)" {
+    // A poisoned tensor decodes to NaN/Inf scales, which flow into
+    // activations; @intFromFloat on those is a checked trap in ReleaseSafe
+    // and UB otherwise. The quantizers must survive and stay in range.
+    var x: [QK_0 * 2]f32 = undefined;
+    for (&x, 0..) |*v, i| v.* = @floatFromInt(i % 7);
+    x[0] = std.math.nan(f32);
+    x[1] = std.math.inf(f32);
+    x[2] = -std.math.inf(f32);
+
+    const blocks = quantizeX(x[0..]);
+    try std.testing.expectEqual(@as(usize, 2), blocks.len);
+    for (blocks) |b| {
+        try std.testing.expect(std.math.isFinite(b.d));
+        for (b.q) |q| try std.testing.expect(q >= -127 and q <= 127);
+    }
+
+    // an all-non-finite block degrades to zeros rather than trapping
+    var y: [QK_0]f32 = @splat(std.math.nan(f32));
+    const zb = quantizeX(y[0..]);
+    try std.testing.expectEqual(@as(f32, 0), zb[0].d);
+    for (zb[0].q) |q| try std.testing.expectEqual(@as(i8, 0), q);
 }
