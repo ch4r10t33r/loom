@@ -125,7 +125,14 @@ fn delegate(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
     var attempt: usize = 0;
     while (attempt < n_backends) : (attempt += 1) {
         const backend = ctx.opts.full_nodes[(start + attempt) % n_backends];
-        const resp = forwardTo(ctx, backend, fixed) catch continue;
+        var sent = false;
+        const resp = forwardTo(ctx, backend, fixed, &sent) catch {
+            // at-most-once across backends (security issue #159): a failure
+            // after the request went out is ambiguous -- the backend may have
+            // generated and charged -- so it must not be replayed elsewhere
+            if (sent) return error.AmbiguousBackendFailure;
+            continue;
+        };
         defer gpa.free(resp);
         trackSpend(ctx, resp);
         try wi.print("{s}\n", .{resp});
@@ -135,7 +142,7 @@ fn delegate(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
     return error.NoFullNodeReachable;
 }
 
-fn forwardTo(ctx: *Ctx, backend: sync.PeerAddr, request: []const u8) ![]u8 {
+fn forwardTo(ctx: *Ctx, backend: sync.PeerAddr, request: []const u8, sent: *bool) ![]u8 {
     const io = ctx.io;
     const ip = try dns.resolve(io, backend.host, backend.port);
     const stream = try ip.connect(io, .{ .mode = .stream });
@@ -147,6 +154,7 @@ fn forwardTo(ctx: *Ctx, backend: sync.PeerAddr, request: []const u8) ![]u8 {
     var r = stream.reader(io, &rbuf);
     var w = stream.writer(io, &wbuf);
 
+    sent.* = true; // commit point: bytes may reach the backend from here on
     try w.interface.print("{s}\n", .{request});
     try w.interface.flush();
     const line = std.mem.trimEnd(u8, try r.interface.takeDelimiterInclusive('\n'), "\r\n");

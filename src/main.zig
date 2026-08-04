@@ -458,6 +458,9 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
         .rag_k = try flagUsize(args, "--rag-k", 3),
         .r_target = @intCast(try flagU64(args, "--r-target", 2)),
         .free_quota = try flagU64(args, "--free-quota", 100_000),
+        // 50 identities' worth by default: enough for a small swarm of real
+        // users, bounded against a rotation attack (security issue #141)
+        .free_pool = try flagU64(args, "--free-pool", 50 * 100_000),
         .admin_token = flagStr(args, "--admin-token") orelse "",
         .hold_fraction = @floatCast(std.math.clamp(hold_fraction, 0.0, 1.0)),
         .range_bytes = @intFromFloat(range_mb * @as(f64, MB)),

@@ -59,7 +59,7 @@ loom node [--model SPEC] [--rpc-addr A] [--rpc-port P]
           [--peers H:P,...] [--hold-fraction F] [--range-mb M]
           [--bootstrap-http URL] [--bootstrap-http-split-gb G]
           [--advertise HOST:PORT] [--network-id N] [--rag] [--rag-k N] [--r-target N]
-          [--free-quota TOKENS] [--admin-token TOK]
+          [--free-quota TOKENS] [--free-pool TOKENS] [--admin-token TOK]
 ```
 
 ### Which engine actually serves
@@ -131,7 +131,8 @@ other makes you a joiner.
 | Flag | Default | What it does |
 |---|---|---|
 | `--free-quota TOKENS` | `100000` | Free token allowance per client id before requests are refused with `payment_required` / HTTP 402. A token is one prompt token processed or one token generated. |
-| `--admin-token TOK` | empty (**credit disabled**) | Gates the `credit` operation that tops up a client's balance. With no token set the operation is disabled entirely; there is no default to guess. This is the seam a real payment rail replaces. |
+| `--free-pool TOKENS` | `5000000` (50 quotas) | Node-wide budget for *free* grants. Client ids are self-asserted, so a per-client quota alone lets an attacker mint unlimited free compute by rotating ids (security issue #141); every new account's free allowance is drawn from this pool instead, and once it is empty new identities get nothing while purchased credits keep working. Client ids longer than 256 bytes are rejected outright (#142). |
+| `--admin-token TOK` | empty (**credit disabled**) | Gates the `credit` operation that tops up a client's balance. With no token set the operation is disabled entirely; there is no default to guess. This is the seam a real payment rail replaces. It also gates RAG ingest: with a token set, `POST /v1/rag/chunks` requires it as the bearer; with no token, ingest is refused unless the OpenAI listener is bound to loopback, because accepted chunks gossip network-wide into other clients' prompts (security issue #140). |
 
 ---
 

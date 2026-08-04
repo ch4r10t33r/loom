@@ -692,6 +692,15 @@ pub const Store = struct {
     seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     /// Guards `saveSidecars` only (see there). Never held across network I/O.
     sidecar_mutex: Io.Mutex = .init,
+    /// Guards `verified`+`verified_seq` and `last_use`+`use_clock` (security
+    /// issue #158): parallel fetch workers, up to 256 serve handlers, and the
+    /// repair loop all mutate them, and unsynchronized they were racing lazy
+    /// allocation, generation resets and LRU stamps -- undefined behavior in
+    /// Zig, and concretely: leaked duplicate allocations, lost clock ticks,
+    /// and a verification bitmap that could survive a generation it should
+    /// not. The digest hash itself runs outside the lock; only the metadata
+    /// transitions serialize.
+    meta_mutex: Io.Mutex = .init,
     /// Serializes cap enforcement. Shard *writes* need no lock -- they touch
     /// disjoint extents and flip one bit -- but choosing a victim reads the
     /// whole bitmap and then clears a bit, and two fetchers doing that at once
@@ -811,6 +820,8 @@ pub const Store = struct {
     /// True if shard `i` has already been verified this session. Also handles
     /// the generation reset, so callers need not.
     fn markVerifiedOnce(self: *Store, i: usize) bool {
+        self.meta_mutex.lockUncancelable(self.io);
+        defer self.meta_mutex.unlock(self.io);
         const seq = self.holdingsSeq();
         if (self.verified) |*v| {
             if (seq != self.verified_seq) {
@@ -826,17 +837,28 @@ pub const Store = struct {
     }
 
     fn setVerified(self: *Store, i: usize) void {
+        self.meta_mutex.lockUncancelable(self.io);
+        defer self.meta_mutex.unlock(self.io);
         if (self.verified) |*v| v.set(i);
     }
 
     fn ensureVerified(self: *Store, i: usize) bool {
-        var v = &(self.verified orelse return false);
-        const seq = self.holdingsSeq();
-        if (seq != self.verified_seq) {
-            v.clearAll();
-            self.verified_seq = seq;
+        // Check-and-reset under the lock; hash outside it (multi-MB SHA-256
+        // must not serialize 256 concurrent serves); publish under the lock
+        // again, discarding the result if the generation moved while hashing.
+        self.meta_mutex.lockUncancelable(self.io);
+        var seq_at_start: u64 = undefined;
+        {
+            defer self.meta_mutex.unlock(self.io);
+            var v = &(self.verified orelse return false);
+            const seq = self.holdingsSeq();
+            if (seq != self.verified_seq) {
+                v.clearAll();
+                self.verified_seq = seq;
+            }
+            if (v.has(i)) return true;
+            seq_at_start = self.verified_seq;
         }
-        if (v.has(i)) return true;
 
         const map = self.map orelse return false;
         var h = hashmod.blockHasher();
@@ -853,8 +875,18 @@ pub const Store = struct {
             _ = self.seq.fetchAdd(1, .monotonic);
             return false;
         }
-        v.set(i);
-        return true;
+
+        self.meta_mutex.lockUncancelable(self.io);
+        defer self.meta_mutex.unlock(self.io);
+        if (self.verified) |*v| {
+            if (self.verified_seq == seq_at_start) {
+                v.set(i);
+                return true;
+            }
+        }
+        // The generation moved mid-hash: the bytes we verified may no longer
+        // be the bytes on disk. Fail the read; the caller falls back to fetch.
+        return false;
     }
 
     pub fn holdingsSeq(self: *Store) u64 {
@@ -963,6 +995,8 @@ pub const Store = struct {
     /// Note that shard `i` was used, so eviction can prefer colder ones.
     pub fn touch(self: *Store, i: usize) void {
         if (self.cap_experts == null) return;
+        self.meta_mutex.lockUncancelable(self.io);
+        defer self.meta_mutex.unlock(self.io);
         const lu = self.last_use orelse blk: {
             const b = self.gpa.alloc(u32, self.manifest.nRanges()) catch return;
             @memset(b, 0);
@@ -999,6 +1033,8 @@ pub const Store = struct {
         self.holdings.clear(i);
         _ = self.seq.fetchAdd(1, .monotonic);
         for (self.manifest.shardExtents(i)) |e| punchHole(self.file.handle, e.offset, e.len);
+        self.meta_mutex.lockUncancelable(self.io);
+        defer self.meta_mutex.unlock(self.io);
         if (self.last_use) |lu| {
             if (i < lu.len) lu[i] = 0;
         }
@@ -1015,7 +1051,12 @@ pub const Store = struct {
         }
     }
 
-    fn coldestHeld(self: *const Store) ?usize {
+    fn coldestHeld(self: *Store) ?usize {
+        // The whole scan runs under the metadata lock (issue #158) so a
+        // concurrent touch cannot tear the stamps mid-comparison; it is an
+        // O(n) integer pass, and enforceCap already serializes eviction.
+        self.meta_mutex.lockUncancelable(self.io);
+        defer self.meta_mutex.unlock(self.io);
         var best: ?usize = null;
         var best_use: u32 = std.math.maxInt(u32);
         var i: usize = self.manifest.n_resident;
@@ -1055,11 +1096,22 @@ fn subPath(buf: []u8, dir: []const u8, name: []const u8) ![]const u8 {
 }
 
 fn writeFileIn(io: Io, dir: []const u8, name: []const u8, bytes: []const u8) !void {
+    // Temp + fsync + atomic rename (security issue #157): truncate-and-write
+    // in place left a crash window where a sidecar exists but is empty or
+    // short, and recovery treated that as "no reusable store" -- destroying
+    // every downloaded range. After a rename the file is either the old
+    // complete version or the new complete version, never a torn one.
     var pbuf: [4096]u8 = undefined;
+    var tbuf: [4096]u8 = undefined;
     const p = try subPath(&pbuf, dir, name);
-    const f = try Io.Dir.cwd().createFile(io, p, .{ .truncate = true });
-    defer f.close(io);
-    try f.writeStreamingAll(io, bytes);
+    const tmp = try std.fmt.bufPrint(&tbuf, "{s}/{s}.tmp", .{ dir, name });
+    {
+        const f = try Io.Dir.cwd().createFile(io, tmp, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, bytes);
+        f.sync(io) catch {};
+    }
+    try Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), p, io);
 }
 
 fn readFileIn(gpa: std.mem.Allocator, io: Io, dir: []const u8, name: []const u8) ![]u8 {

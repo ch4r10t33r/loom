@@ -59,6 +59,9 @@ pub const Ctx = struct {
     io: Io,
     gen: *generator.Generator,
     addr: []const u8,
+    /// Admin token (same value the RPC credit op uses). When set, RAG ingest
+    /// requires it as the bearer; see handleRagIngest (security issue #140).
+    admin_token: []const u8 = "",
     port: u16,
     seed: u64,
     /// Advertised model id: echoed in `/v1/models` and each response `model`
@@ -307,6 +310,19 @@ fn handleHealth(ctx: *Ctx) !Response {
 fn handleRagIngest(ctx: *Ctx, req: Request) !?Response {
     const gpa = ctx.gpa;
     const st = ctx.rag orelse return .{ .status = 503, .body = try gpa.dupe(u8, "{\"error\":\"rag disabled\"}") };
+    // Ingest is write access to every peer's prompts -- accepted chunks
+    // gossip network-wide and get prepended to other clients' generations
+    // (security issue #140). Gate: with an admin token configured, the
+    // bearer must match it; with none, ingest is allowed only when the
+    // listener is bound to loopback, so a public bind cannot be poisoned by
+    // anonymous traffic.
+    if (ctx.admin_token.len > 0) {
+        if (!constEqlTok(ctx.admin_token, req.bearer)) {
+            return .{ .status = 401, .body = try gpa.dupe(u8, "{\"error\":\"rag ingest requires the admin token as bearer\"}") };
+        }
+    } else if (!isLoopback(ctx.addr)) {
+        return .{ .status = 403, .body = try gpa.dupe(u8, "{\"error\":\"rag ingest on a non-loopback bind requires --admin-token\"}") };
+    }
     var parsed = std.json.parseFromSlice(std.json.Value, gpa, req.body, .{}) catch
         return .{ .status = 400, .body = try gpa.dupe(u8, "{\"error\":\"bad json\"}") };
     defer parsed.deinit();
@@ -323,6 +339,19 @@ fn handleRagIngest(ctx: *Ctx, req: Request) !?Response {
     }
     const body = try std.fmt.allocPrint(gpa, "{{\"added\":{d},\"received\":{d},\"total\":{d}}}", .{ added, seen, st.count() });
     return .{ .status = 200, .body = body };
+}
+
+fn isLoopback(addr: []const u8) bool {
+    return std.mem.eql(u8, addr, "127.0.0.1") or std.mem.eql(u8, addr, "::1") or
+        std.mem.eql(u8, addr, "localhost");
+}
+
+/// Constant-time-ish token equality (mirrors rpc.zig's admin check).
+fn constEqlTok(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= x ^ y;
+    return diff == 0;
 }
 
 fn handleModels(ctx: *Ctx) !Response {

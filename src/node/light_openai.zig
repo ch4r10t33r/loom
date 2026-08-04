@@ -149,14 +149,23 @@ fn delegate(ctx: *Ctx, req: Request) !Response {
     var attempt: usize = 0;
     while (attempt < n) : (attempt += 1) {
         const backend = ctx.opts.backends[(start + attempt) % n];
-        const resp = forwardTo(ctx, backend, req) catch continue;
+        var sent = false;
+        const resp = forwardTo(ctx, backend, req, &sent) catch {
+            // At-most-once (security issue #159): once request bytes are on
+            // the wire the backend may have completed and charged the
+            // generation even though our read failed, so replaying it against
+            // the next backend double-computes and double-bills. Only
+            // pre-send failures are provably safe to retry.
+            if (sent) return error.AmbiguousBackendFailure;
+            continue;
+        };
         trackSpend(ctx, resp.body);
         return resp;
     }
     return error.NoBackendReachable;
 }
 
-fn forwardTo(ctx: *Ctx, backend: sync.PeerAddr, req: Request) !Response {
+fn forwardTo(ctx: *Ctx, backend: sync.PeerAddr, req: Request, sent: *bool) !Response {
     const io = ctx.io;
     const gpa = ctx.gpa;
     const ip = try dns.resolve(io, backend.host, backend.port);
@@ -179,6 +188,7 @@ fn forwardTo(ctx: *Ctx, backend: sync.PeerAddr, req: Request) !Response {
     try wi.print("Content-Length: {d}\r\n", .{req.body.len});
     try wi.print("Connection: close\r\n\r\n", .{});
     if (req.body.len > 0) try wi.print("{s}", .{req.body});
+    sent.* = true; // commit point: bytes may reach the backend from here on
     try wi.flush();
 
     // Response: status code + Content-Length body.

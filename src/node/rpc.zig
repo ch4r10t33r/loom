@@ -152,6 +152,13 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
         .string => |s| s,
         else => "anon",
     };
+    // reject at the boundary with a clear error (security issue #142); the
+    // meter enforces the same bound defensively
+    if (client.len > meter_mod.MAX_CLIENT_ID_LEN) {
+        try wi.print("{{\"ok\":false,\"error\":\"client_id_too_long\"}}\n", .{});
+        try wi.flush();
+        return;
+    }
 
     // settlement seam: {"method":"credit","client":X,"amount":N,"proof":...}
     // v1 accepts the proof unverified (trusted swarm); a payment rail replaces
