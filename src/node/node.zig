@@ -108,6 +108,9 @@ pub const Options = struct {
     advertise: ?[]const u8, // our dialable "host:port" (default 127.0.0.1:<p2p_port>)
     r_target: u16, // committee redundancy target when acting as bootnode
     free_quota: u64, // per-client free token allowance (metering)
+    /// Node-wide budget for free grants (security issue #141): identity
+    /// rotation mints at most this much free compute in total.
+    free_pool: u64,
     admin_token: []const u8, // gates the credit op (empty = credit disabled)
     ctx_cap: usize, // context-length cap when serving a distributed GGUF engine
     chat_format: ?[]const u8, // --chat-format override (null = auto-detect)
@@ -1100,7 +1103,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
         }
     }
 
-    var meter = meter_mod.Meter.init(gpa, io, opts.free_quota);
+    var meter = meter_mod.Meter.init(gpa, io, opts.free_quota, opts.free_pool);
     defer meter.deinit();
 
     // OpenAI-compatible HTTP surface (SPEC.md client API), off unless a port is set.
@@ -1124,6 +1127,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
             .alpha_metrics = &alpha_metrics,
             .store = if (store) |*st| st else null,
             .delegate_below = opts.delegate_below,
+            .admin_token = opts.admin_token,
         };
         openai_ctx.peers = &table;
         const t = try std.Thread.spawn(.{}, openaiThread, .{&openai_ctx});

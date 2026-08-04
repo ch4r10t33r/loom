@@ -427,7 +427,23 @@ pub fn bootstrapWithWanted(
     // all of it away and began again. The manifest version is the identity
     // check -- a store for a different model must not be adopted.
     var store = reopen: {
-        var existing = weights.openDir(gpa, io, store_dir) catch break :reopen null;
+        // Only a genuinely absent store may fall through to
+        // createFromManifest, because that path TRUNCATES model.gguf
+        // (security issue #157): collapsing every openDir error into
+        // "create fresh" turned any transient or torn-metadata failure into
+        // the loss of every range already downloaded. Anything other than
+        // file-not-found fails loudly instead; the operator can remove the
+        // directory to reset explicitly.
+        var existing = weights.openDir(gpa, io, store_dir) catch |e| switch (e) {
+            error.FileNotFound => break :reopen null,
+            else => {
+                if (progress) |pw| {
+                    pw.print("  refusing to recreate {s}: metadata unreadable ({t}); remove the directory to reset\n", .{ store_dir, e }) catch {};
+                    pw.flush() catch {};
+                }
+                return e;
+            },
+        };
         if (!hashmod.eql(existing.manifest.version, manifest.version)) {
             existing.deinit();
             break :reopen null;
@@ -439,6 +455,11 @@ pub fn bootstrapWithWanted(
         break :reopen existing;
     } orelse try weights.createFromManifest(gpa, io, store_dir, manifest, wanted_bits);
     errdefer store.deinit();
+
+    // Persist manifest/wanted/holdings BEFORE the first fetch (issue #157):
+    // a process kill mid-sync previously left gigabytes of verified ranges
+    // with no resumable metadata, and the restart discarded them.
+    try store.saveSidecars();
 
     var stats = FetchStats{};
     // HTTP-range mirror tier first (http_bootstrap.zig): bulk bytes come off
@@ -455,6 +476,7 @@ pub fn bootstrapWithWanted(
             };
             stats.fetched += r.fetched;
             stats.bytes += r.bytes;
+            store.saveSidecars() catch {}; // checkpoint: the tier's work is resumable
             if (progress) |pw| {
                 pw.print("  http sync done: {d} shard(s), {d:.1} MB ({d} left for peers)\n", .{
                     r.fetched, @as(f64, @floatFromInt(r.bytes)) / (1024.0 * 1024.0), store.missingCount(),
@@ -482,6 +504,7 @@ pub fn bootstrapWithWanted(
         };
         stats.fetched += s.fetched;
         stats.bytes += s.bytes;
+        store.saveSidecars() catch {}; // checkpoint after each peer's contribution
         if (progress) |pw| {
             try pw.print("  synced {d}/{d} ranges ({d:.1} MB) after {s}:{d}\n", .{
                 stats.fetched, wanted, @as(f64, @floatFromInt(stats.bytes)) / (1024.0 * 1024.0), addr.host, addr.port,
@@ -528,4 +551,67 @@ pub fn bootstrap(
     manifest_owned = false;
     wanted_owned = false;
     return bootstrapWithWanted(gpa, io, peers, store_dir, m, wanted_bits, progress, http_url, http_part_bytes);
+}
+
+const gguf_fixture_mod = @import("../gguf/gguf.zig");
+
+test "corrupt store metadata refuses recreation instead of truncating (issue #157)" {
+    const gpa = std.testing.allocator;
+    var thr: std.Io.Threaded = .init(gpa, .{});
+    defer thr.deinit();
+    const io = thr.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const model_path = try std.fmt.bufPrint(&pbuf, ".zig-cache/tmp/{s}/m.gguf", .{tmp.sub_path});
+    try gguf_fixture_mod.writeMoeFixture(gpa, io, model_path, 3, "llama");
+
+    var manifest = try weights.buildExpertManifest(gpa, io, model_path);
+    var manifest_owned = true;
+    defer if (manifest_owned) manifest.deinit(gpa);
+    const wanted = try weights.Holdings.initWanted(gpa, manifest.nRanges(), manifest.n_resident, 1.0, 1);
+    var sdir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const store_dir = try std.fmt.bufPrint(&sdir_buf, ".zig-cache/tmp/{s}/store", .{tmp.sub_path});
+
+    // Build a store with real sidecars, then note the model file's size.
+    {
+        var store = try weights.createFromManifest(gpa, io, store_dir, manifest, wanted);
+        manifest_owned = false; // store took ownership
+        try store.saveSidecars();
+        store.deinit();
+    }
+    var mp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const model_file = try std.fmt.bufPrint(&mp_buf, "{s}/model.gguf", .{store_dir});
+    const size_before = blk: {
+        const f = try Io.Dir.cwd().openFile(io, model_file, .{});
+        defer f.close(io);
+        break :blk try f.length(io);
+    };
+
+    // Corrupt the manifest sidecar: recovery must fail loudly, NOT fall
+    // through to createFromManifest (which truncates model.gguf).
+    var cp_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sidecar = try std.fmt.bufPrint(&cp_buf, "{s}/ranges.manifest", .{store_dir});
+    {
+        const f = try Io.Dir.cwd().createFile(io, sidecar, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, "garbage");
+    }
+
+    var manifest2 = try weights.buildExpertManifest(gpa, io, model_path);
+    // ownership never transfers: the call below must fail before any store
+    // is created from this manifest
+    defer manifest2.deinit(gpa);
+    var wanted2 = try weights.Holdings.initWanted(gpa, manifest2.nRanges(), manifest2.n_resident, 1.0, 1);
+    defer wanted2.deinit(gpa);
+    const res = bootstrapWithWanted(gpa, io, &.{}, store_dir, manifest2, wanted2, null, null, 0);
+    try std.testing.expect(if (res) |_| false else |_| true);
+
+    const size_after = blk: {
+        const f = try Io.Dir.cwd().openFile(io, model_file, .{});
+        defer f.close(io);
+        break :blk try f.length(io);
+    };
+    try std.testing.expectEqual(size_before, size_after);
 }
