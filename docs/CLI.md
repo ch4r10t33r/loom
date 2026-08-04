@@ -59,7 +59,8 @@ loom node [--model SPEC] [--rpc-addr A] [--rpc-port P]
           [--peers H:P,...] [--hold-fraction F] [--range-mb M]
           [--bootstrap-http URL] [--bootstrap-http-split-gb G]
           [--advertise HOST:PORT] [--network-id N] [--rag] [--rag-k N] [--r-target N]
-          [--free-quota TOKENS] [--free-pool TOKENS] [--admin-token TOK]
+          [--free-quota TOKENS] [--free-pool TOKENS]
+          [--admin-token TOK | --admin-token-file PATH] [--cors-origin ORIGIN]
 ```
 
 ### Which engine actually serves
@@ -133,6 +134,8 @@ other makes you a joiner.
 | `--free-quota TOKENS` | `100000` | Free token allowance per client id before requests are refused with `payment_required` / HTTP 402. A token is one prompt token processed or one token generated. |
 | `--free-pool TOKENS` | `5000000` (50 quotas) | Node-wide budget for *free* grants. Client ids are self-asserted, so a per-client quota alone lets an attacker mint unlimited free compute by rotating ids (security issue #141); every new account's free allowance is drawn from this pool instead, and once it is empty new identities get nothing while purchased credits keep working. Client ids longer than 256 bytes are rejected outright (#142). |
 | `--admin-token TOK` | empty (**credit disabled**) | Gates the `credit` operation that tops up a client's balance. With no token set the operation is disabled entirely; there is no default to guess. This is the seam a real payment rail replaces. It also gates RAG ingest: with a token set, `POST /v1/rag/chunks` requires it as the bearer; with no token, ingest is refused unless the OpenAI listener is bound to loopback, because accepted chunks gossip network-wide into other clients' prompts (security issue #140). |
+| `--admin-token-file PATH` | unset | Read the admin token from a file instead of argv, so it never appears in shell history, `ps`, or container inspection (security issue #162). The file must not be group- or world-readable; a single trailing newline is trimmed. Mutually exclusive with `--admin-token`. |
+| `--cors-origin ORIGIN` | unset (**no CORS header**) | Value for `Access-Control-Allow-Origin` on OpenAI responses. The default sends no header at all: a bearer-metered API should not advertise itself to every web origin (security issue #143), and the built-in chat UI is same-origin. Set an explicit origin when a separate web front-end needs access. |
 
 ---
 

@@ -409,6 +409,12 @@ fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer, dl: ?
         try handleFrame(ctx, raw, wi);
     } else if (std.mem.startsWith(u8, line, "JOIN ")) {
         const reg = ctx.boot orelse return wi.print("ERR no_bootnode\n", .{});
+        // Rate-limit placement changes (security issue #144): JOIN is
+        // unauthenticated by design in v1, and each call creates or grows a
+        // committee, so an unthrottled dialer can inflate placement state
+        // with unique addresses. A token bucket bounds the damage to a slow
+        // drip without blocking a real swarm's joins (they are rare).
+        if (!joinBucket.allow(stats.nowNs(ctx.io))) return wi.print("ERR join_rate_limited\n", .{});
         const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
         const addr = fieldOf(line, "addr") orelse return wi.print("ERR bad_join\n", .{});
         const frac_s = fieldOf(line, "fraction") orelse return wi.print("ERR bad_join\n", .{});
@@ -693,6 +699,36 @@ fn fieldOf(line: []const u8, key: []const u8) ?[]const u8 {
     }
     return null;
 }
+
+/// Token bucket for unauthenticated JOINs (security issue #144). Process-wide
+/// rather than per-connection, because the attack is many short connections.
+const JoinBucket = struct {
+    const CAPACITY: i64 = 32; // burst: a fleet restarting at once
+    const REFILL_NS: i64 = std.time.ns_per_s; // one token per second
+
+    /// Milli-tokens x 1000 held as an atomic, plus the last refill stamp.
+    /// A benign race only mis-refills by a tick, which a rate limiter can
+    /// absorb; the point is the bound, not exactness.
+    tokens: std.atomic.Value(i64) = std.atomic.Value(i64).init(CAPACITY),
+    last_ns: std.atomic.Value(i64) = std.atomic.Value(i64).init(0),
+
+    fn allow(self: *JoinBucket, now_i128: i128) bool {
+        const now: i64 = @truncate(now_i128);
+        const last = self.last_ns.load(.monotonic);
+        if (last == 0) {
+            self.last_ns.store(now, .monotonic);
+        } else if (now > last) {
+            const gained = @divTrunc(now - last, REFILL_NS);
+            if (gained > 0) {
+                self.last_ns.store(now, .monotonic);
+                const cur = self.tokens.load(.monotonic);
+                self.tokens.store(@min(CAPACITY, cur + gained), .monotonic);
+            }
+        }
+        return self.tokens.fetchSub(1, .monotonic) > 0;
+    }
+};
+var joinBucket: JoinBucket = .{};
 
 /// Parse a JSON array of token ids with a length cap; any non-integer,
 /// negative, or oversized input is an error (the caller answers ERR).

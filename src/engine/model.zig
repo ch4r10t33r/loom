@@ -72,12 +72,37 @@ pub const ModelConfig = extern struct {
         return self.n_moe_layers * self.n_experts;
     }
 
+    /// Ceilings on attacker-controlled dimensions (security issue #164). A
+    /// manifest is just a file: without them, a checkpoint can name a model
+    /// whose layout arithmetic overflows or whose allocation is absurd, and
+    /// the first symptom is a trap or an OOM at load.
+    pub const MAX_DIM = 1 << 20; // any single dimension
+    pub const MAX_LAYERS = 1 << 12;
+    pub const MAX_EXPERTS = 1 << 20; // per layer
+    pub const MAX_TOTAL_EXPERTS = 1 << 24; // layers x experts
+
     pub fn validate(self: ModelConfig) !void {
         if (self.hidden % QK != 0) return error.HiddenNotBlockAligned;
         if (self.moe_ffn % QK != 0) return error.MoeFfnNotBlockAligned;
         if (self.dense_ffn % QK != 0) return error.DenseFfnNotBlockAligned;
         if (self.n_routed > self.n_experts) return error.RoutedExceedsExperts;
         if (self.headDim() == 0 or self.n_heads == 0) return error.BadAttention;
+
+        // Bounded dimensions first, so every product below is safe to form.
+        if (self.hidden == 0 or self.hidden > MAX_DIM) return error.DimOutOfRange;
+        if (self.moe_ffn > MAX_DIM or self.dense_ffn > MAX_DIM) return error.DimOutOfRange;
+        if (self.vocab_size == 0 or self.vocab_size > MAX_DIM) return error.DimOutOfRange;
+        if (self.n_heads > MAX_DIM or self.headDim() > MAX_DIM) return error.DimOutOfRange;
+        if (self.nope_dim > MAX_DIM or self.rope_dim > MAX_DIM or self.v_head_dim > MAX_DIM) return error.DimOutOfRange;
+        if (self.n_dense_layers > MAX_LAYERS or self.n_moe_layers > MAX_LAYERS) return error.LayersOutOfRange;
+        if (self.n_experts > MAX_EXPERTS) return error.ExpertsOutOfRange;
+
+        // Checked products: a silent wrap here becomes an undersized
+        // allocation indexed with the unwrapped value.
+        const total = std.math.mul(usize, self.n_moe_layers, self.n_experts) catch return error.ExpertsOutOfRange;
+        if (total > MAX_TOTAL_EXPERTS) return error.ExpertsOutOfRange;
+        _ = std.math.mul(usize, self.hidden, self.moe_ffn) catch return error.DimOutOfRange;
+        _ = std.math.mul(usize, self.hidden, self.vocab_size) catch return error.DimOutOfRange;
     }
 };
 
@@ -137,4 +162,22 @@ test "config sizing is self-consistent" {
     // expert bytes must be a multiple of a block (20 bytes) and > 0
     try std.testing.expect(c.expertBytes() > 0);
     try std.testing.expect(c.expertBytes() % (QK / 2 + 4) == 0);
+}
+
+test "config validation rejects out-of-range dimensions and overflowing products (issue #164)" {
+    var cfg = tinyShape();
+    try cfg.validate();
+
+    // a dimension large enough that layout products would wrap
+    var big = cfg;
+    big.hidden = ModelConfig.MAX_DIM + QK;
+    try std.testing.expectError(error.DimOutOfRange, big.validate());
+
+    var many = cfg;
+    many.n_moe_layers = ModelConfig.MAX_LAYERS + 1;
+    try std.testing.expectError(error.LayersOutOfRange, many.validate());
+
+    var experts = cfg;
+    experts.n_experts = ModelConfig.MAX_EXPERTS + 1;
+    try std.testing.expectError(error.ExpertsOutOfRange, experts.validate());
 }
