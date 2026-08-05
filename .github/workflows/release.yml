@@ -28,6 +28,14 @@ jobs:
           # across two runners anyway so each native binary gets smoke-tested
           # on the OS it claims to support, rather than only being linked.
           - { target: x86_64-linux-musl,  runner: ubuntu-latest, asset: x86_64-linux,  anyzig: x86_64-linux,   sha: f9d5a09fbd7c019eecef1a397613ce5baec22872a1c3eb5ab4b1132e917c3d71, native: true }
+          # A second x86_64 artifact tuned for x86-64-v3 (AVX2/FMA/BMI, i.e.
+          # Haswell 2013+ and every current server CPU). The baseline build
+          # above targets generic x86_64 (SSE2) so it never SIGILLs on old or
+          # heterogeneous swarm hardware; this one is what install.sh hands a
+          # host that reports avx2, and it is measurably faster because the
+          # matvec kernels get 256-bit vectors instead of 128-bit. Kept as an
+          # *addition*, not a replacement, so the safe default still exists.
+          - { target: x86_64-linux-musl,  cpu: x86_64_v3, runner: ubuntu-latest, asset: x86_64-v3-linux, anyzig: x86_64-linux, sha: f9d5a09fbd7c019eecef1a397613ce5baec22872a1c3eb5ab4b1132e917c3d71, native: false }
           - { target: aarch64-linux-musl, runner: ubuntu-latest, asset: aarch64-linux, anyzig: x86_64-linux,   sha: f9d5a09fbd7c019eecef1a397613ce5baec22872a1c3eb5ab4b1132e917c3d71, native: false }
           # Built natively so it can link Metal: cross-compiling to macOS
           # cannot find the frameworks (Zig resolves the SDK through xcrun for
@@ -63,6 +71,10 @@ jobs:
           # A tag names the version; a manual run keeps build.zig.zon's.
           VFLAG=""
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then VFLAG="-Dversion=${GITHUB_REF_NAME#v}"; fi
+          # Optional micro-architecture tuning (e.g. x86_64_v3 for the AVX2
+          # artifact); empty for the baseline and native builds.
+          CPUFLAG=""
+          if [ -n "${{ matrix.cpu }}" ]; then CPUFLAG="-Dcpu=${{ matrix.cpu }}"; fi
           if [ "${{ matrix.build_native }}" = "true" ]; then
             # No -Dtarget: build.zig only defaults to Metal for a native macOS
             # target, because that is the only one whose frameworks it can find.
@@ -75,6 +87,7 @@ jobs:
             zig "${ZIG}" build \
               -Doptimize=ReleaseSafe \
               -Dtarget=${{ matrix.target }} \
+              ${CPUFLAG} \
               -Dcommit="${GITHUB_SHA}" \
               ${VFLAG} \
               -p out
@@ -200,6 +213,7 @@ jobs:
           | macOS, Apple silicon | \`loom-${V}-aarch64-macos.tar.gz\` |
           | macOS, Intel | \`loom-${V}-x86_64-macos.tar.gz\` |
           | Linux, x86-64 | \`loom-${V}-x86_64-linux.tar.gz\` |
+          | Linux, x86-64-v3 (AVX2) | \`loom-${V}-x86_64-v3-linux.tar.gz\` |
           | Linux, arm64 | \`loom-${V}-aarch64-linux.tar.gz\` |
           | Windows, x86-64 | \`loom-${V}-x86_64-windows.zip\` |
 

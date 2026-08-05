@@ -164,7 +164,17 @@ else
     release_json=$(api_get "${API}/releases/tags/${VERSION}" 2>/dev/null) || no_access
 fi
 
-asset="${BIN}-${VERSION}-${platform}.tar.gz"
+asset_stem="${BIN}-${VERSION}-${platform}"
+asset_stem_fallback=""
+# On x86_64 Linux, prefer the AVX2-tuned (x86-64-v3) build when the host
+# advertises avx2 -- its matvec kernels use 256-bit vectors. Fall back to the
+# baseline (SSE2) build otherwise, and on releases cut before the v3 artifact
+# existed (resolved below, once asset_url_of is defined).
+if [ "$os" = linux ] && [ "$arch" = x86_64 ] && grep -qw avx2 /proc/cpuinfo 2>/dev/null; then
+    asset_stem_fallback="$asset_stem"
+    asset_stem="${BIN}-${VERSION}-${arch}-v3-${os}"
+fi
+asset="${asset_stem}.tar.gz"
 step "Installing ${BIN} ${VERSION} ${D}(${asset})${Z}"
 
 # Resolve an asset's API download URL from the release JSON, without jq.
@@ -212,6 +222,14 @@ Available builds are listed at https://github.com/${REPO}/releases/tag/${VERSION
     fi
 }
 
+# A release cut before the v3 artifact existed only has the baseline build;
+# fall back to it rather than failing.
+if [ -n "$asset_stem_fallback" ] && [ -z "$(asset_url_of "$asset")" ]; then
+    asset_stem="$asset_stem_fallback"
+    asset="${asset_stem}.tar.gz"
+    step "AVX2 build absent from this release; using baseline ${D}(${asset})${Z}"
+fi
+
 step "Downloading"
 fetch_asset "$asset" "${tmp}/${asset}" || die "download failed"
 fetch_asset "SHA256SUMS" "${tmp}/SHA256SUMS" || die "could not download SHA256SUMS (refusing to install unverified)"
@@ -230,7 +248,7 @@ say "    ${D}sha256 ${got}${Z}"
 
 step "Extracting"
 tar -xzf "${tmp}/${asset}" -C "$tmp"
-src="${tmp}/${BIN}-${VERSION}-${platform}/${BIN}"
+src="${tmp}/${asset_stem}/${BIN}"
 [ -f "$src" ] || die "archive did not contain ${BIN}"
 chmod +x "$src"
 
