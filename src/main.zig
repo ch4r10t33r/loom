@@ -676,6 +676,10 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
         return cmdGgufRun(gpa, io, out, path, args);
     }
 
+    if (std.mem.eql(u8, sub, "batchbench")) {
+        return cmdBatchBench(gpa, io, out, path, args);
+    }
+
     if (std.mem.eql(u8, sub, "shard")) {
         var m = weights.buildExpertManifest(gpa, io, path) catch |e| switch (e) {
             error.NoExpertTensors => return out.print("no 3D expert tensors found — not a MoE GGUF (fixed-size ranges apply instead)\n", .{}),
@@ -995,6 +999,71 @@ fn runStoreWith(
 }
 
 /// Generic generation loop over either engine module (same load/State/step shape).
+/// Continuous-batching throughput probe: advance `--batch` independent
+/// sequences one token per forward and report aggregate tok/s, so the batch
+/// scaling of the GQA engine can be measured on a real model. Greedy, from
+/// distinct seed tokens; steady-state decode only (no prompt), which is the
+/// regime the batching helps. GQA-family models only (decodeBatch is the llama
+/// engine); a deepseek/MLA file reports the load error.
+fn cmdBatchBench(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8, args: [][]const u8) !void {
+    const batch = try flagUsize(args, "--batch", 4);
+    const max_tokens = try flagUsize(args, "--max-tokens", 32);
+    generator.kernel_threads = try flagUsize(args, "--threads", 0);
+    const ctx_cap = try flagUsize(args, "--ctx", 4096);
+    if (batch < 1 or batch > backend.MAX_BATCH) return out.print("batch must be 1..{d}\n", .{backend.MAX_BATCH});
+
+    var m = llama.load(gpa, io, path) catch |e| {
+        return out.print("load failed: {s} (batchbench is GQA-family only)\n", .{@errorName(e)});
+    };
+    defer m.deinit();
+    m.cfg.ctx_len = @min(m.cfg.ctx_len, ctx_cap);
+    const c = m.cfg;
+
+    backend.parallelBegin(generator.threads());
+    defer backend.parallelEnd();
+    _ = backend.materializeArenas();
+
+    var st = try llama.State.init(gpa, c);
+    defer st.deinit(gpa);
+    const seqs = try gpa.alloc(llama.Seq, batch);
+    defer gpa.free(seqs);
+    for (seqs) |*s| s.* = try llama.Seq.init(gpa, c);
+    defer for (seqs) |*s| s.deinit(gpa);
+    const toks = try gpa.alloc(u32, batch);
+    defer gpa.free(toks);
+    const logits = try gpa.alloc(f32, batch * c.vocab);
+    defer gpa.free(logits);
+
+    for (toks, 0..) |*t, k| t.* = @intCast(1 + (k * 7) % 100); // distinct seeds
+
+    // One warm step: page-in and settle, not counted.
+    llama.decodeBatch(&m, &st, seqs, toks, logits) catch |e| {
+        return out.print("decode failed: {s}\n", .{@errorName(e)});
+    };
+    for (0..batch) |k| toks[k] = argmaxRow(logits[k * c.vocab ..][0..c.vocab]);
+
+    const t0 = stats.nowNs(io);
+    var i: usize = 0;
+    while (i < max_tokens) : (i += 1) {
+        try llama.decodeBatch(&m, &st, seqs, toks, logits);
+        for (0..batch) |k| toks[k] = argmaxRow(logits[k * c.vocab ..][0..c.vocab]);
+    }
+    const secs = @as(f64, @floatFromInt(stats.nowNs(io) - t0)) / 1e9;
+    const total: f64 = @floatFromInt(batch * max_tokens);
+    try out.print("batch={d} threads={d}: {d} tok in {d:.2}s -> {d:.1} tok/s aggregate, {d:.2} tok/s/seq\n", .{
+        batch, generator.threads(), batch * max_tokens, secs, total / secs, @as(f64, @floatFromInt(max_tokens)) / secs,
+    });
+    try out.flush();
+}
+
+fn argmaxRow(v: []const f32) u32 {
+    var best: usize = 0;
+    for (v, 0..) |x, i| if (x > v[best]) {
+        best = i;
+    };
+    return @intCast(best);
+}
+
 fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8, args: [][]const u8) !void {
     const prompt = flagStr(args, "--prompt") orelse "Once upon a time";
     const max_tokens = try flagUsize(args, "--max-tokens", 128);
