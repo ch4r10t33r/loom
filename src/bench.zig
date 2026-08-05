@@ -130,7 +130,7 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
     const dst = try gpa.alloc(f32, ROWS);
     defer gpa.free(dst);
 
-    const types = [_]ggml.Type{ .f32, .f16, .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .iq4_xs };
+    const types = [_]ggml.Type{ .f32, .f16, .q4_0, .q8_0, .q4_k, .q5_k, .q6_k, .mxfp4, .iq4_xs };
     var q4k_1thread: f64 = 0;
     var q4k_nthread: f64 = 0;
 

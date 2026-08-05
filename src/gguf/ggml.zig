@@ -16,7 +16,9 @@
 //! format (quant.zig, f32 scales): here we implement GGML's layouts exactly.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const iq = @import("iq.zig");
+const iq_tables = @import("iq_tables.zig");
 
 pub const Type = enum(u32) {
     f32 = 0,
@@ -676,6 +678,7 @@ fn dispatch(t: Type, out: []f32, data: []const u8, x: []const f32, rows: usize, 
         .q4_k => matvecQ4KInt(out, data, x, rows, cols),
         .q6_k => matvecQ6KInt(out, data, x, rows, cols),
         .q5_k => matvecQ5KInt(out, data, x, rows, cols),
+        .mxfp4 => matvecMxfp4Int(out, data, x, rows, cols),
         else => matvecCodebook(t, out, data, x, rows, cols),
     }
 }
@@ -864,12 +867,73 @@ fn matvecQ4KInt(out: []f32, data: []const u8, x: []const f32, rows: usize, cols:
     }
 }
 
+/// 16-lane 4-bit codebook gather. On aarch64 this is a single `tbl`
+/// instruction (what makes llama.cpp's MXFP4 fast); elsewhere a scalar
+/// fallback. The MXFP4 value table is 16 i8 entries, so one tbl covers a
+/// full nibble half.
+inline fn fp4Gather16(nibbles: @Vector(16, u8)) @Vector(16, i8) {
+    if (builtin.cpu.arch == .aarch64) {
+        const table: @Vector(16, i8) = iq_tables.kvalues_fp4;
+        return asm ("tbl %[o].16b, {%[t].16b}, %[i].16b"
+            : [o] "=w" (-> @Vector(16, i8)),
+            : [t] "w" (table),
+              [i] "w" (nibbles),
+        );
+    }
+    const arr: [16]i8 = iq_tables.kvalues_fp4;
+    var out: @Vector(16, i8) = undefined;
+    inline for (0..16) |k| out[k] = arr[nibbles[k]];
+    return out;
+}
+
+/// MXFP4 (gpt-oss, and the MXFP4 quants of DeepSeek-V4 / Ling) against int8
+/// activations.
+///
+/// The E2M1 value table is stored doubled and *integer* -- {0,1,2,3,4,6,8,12}
+/// and negatives (`iq_tables.kvalues_fp4`, i8) -- with the compensating 1/2
+/// folded into the per-block E8M0 scale. So a weight nibble is a lookup into a
+/// 16-entry i8 codebook, exactly the shape the int8 path wants: gather the
+/// weights with `tbl`, quantize the activation once, do one int8 dot per
+/// 32-value block, scale by `d * dx`. No zero-point, so no min/sum term.
+///
+/// This replaces the generic dequant-to-f32 `matvecCodebook` for MXFP4, the
+/// single kernel gpt-oss decode spends all its time in. The 32 nibbles map
+/// low-nibbles-first then high nibbles, matching how the activation is
+/// quantized in natural order.
+fn matvecMxfp4Int(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
+    const qx = quantizeX(x);
+    const blocks_per_row = cols / QK_0; // QK_0 == 32 == MXFP4 block width
+    const rb = blocks_per_row * iq.MXFP4_BLOCK;
+    const lo_mask: @Vector(QK_0 / 2, u8) = @splat(0x0F);
+    const sh4: @Vector(QK_0 / 2, u3) = @splat(4);
+    for (0..rows) |r| {
+        const row = data[r * rb ..][0..rb];
+        var acc: f32 = 0;
+        for (0..blocks_per_row) |b| {
+            const block = row[b * iq.MXFP4_BLOCK ..][0..iq.MXFP4_BLOCK];
+            const d = iq.e8m0ToF32Half(block[0]);
+            const qs: @Vector(QK_0 / 2, u8) = block[1..][0 .. QK_0 / 2].*;
+            const wlo = fp4Gather16(qs & lo_mask); // 16 i8, vals[0..15]
+            const whi = fp4Gather16(qs >> sh4); //    16 i8, vals[16..31]
+            const xb = &qx[b];
+            const xlo: @Vector(QK_0 / 2, i8) = xb.q[0 .. QK_0 / 2].*;
+            const xhi: @Vector(QK_0 / 2, i8) = xb.q[QK_0 / 2 ..][0 .. QK_0 / 2].*;
+            // widen i8 -> i32 before multiply-reduce: the SDOT idiom.
+            const plo: @Vector(QK_0 / 2, i32) = @as(@Vector(QK_0 / 2, i32), wlo) * @as(@Vector(QK_0 / 2, i32), xlo);
+            const phi: @Vector(QK_0 / 2, i32) = @as(@Vector(QK_0 / 2, i32), whi) * @as(@Vector(QK_0 / 2, i32), xhi);
+            const dot = @reduce(.Add, plo + phi);
+            acc += d * xb.d * @as(f32, @floatFromInt(dot));
+        }
+        out[r] = acc;
+    }
+}
+
 /// True for the kernels that quantize the activation vector to int8, and are
 /// therefore approximate rather than exact against the dequantize-then-dot
 /// reference.
 pub fn usesInt8Activations(t: Type) bool {
     return switch (t) {
-        .q4_k, .q5_k, .q6_k, .q4_0, .q8_0, .q4_1, .q5_1 => true,
+        .q4_k, .q5_k, .q6_k, .q4_0, .q8_0, .q4_1, .q5_1, .mxfp4 => true,
         else => false,
     };
 }

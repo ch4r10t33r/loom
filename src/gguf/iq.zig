@@ -44,7 +44,7 @@ inline fn f16FromBytes(b: []const u8) f32 {
 /// E8M0 shared exponent, halved. MXFP4's E2M1 value table is stored doubled
 /// (see `kvalues_fp4`), so the scale carries the compensating 1/2.
 /// Mirrors ggml_e8m0_to_fp32_half in ggml-impl.h.
-inline fn e8m0ToF32Half(x: u8) f32 {
+pub inline fn e8m0ToF32Half(x: u8) f32 {
     // x < 2 lands in the denormal range, where shifting the exponent field
     // would underflow; llama.cpp uses precomputed patterns for those two.
     const bits: u32 = if (x < 2)
