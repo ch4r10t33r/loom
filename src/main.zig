@@ -32,6 +32,7 @@ pub const rpc = @import("node/rpc.zig");
 pub const p2p = @import("p2p/p2p.zig");
 pub const gguf = @import("gguf/gguf.zig");
 pub const weights = @import("p2p/weights.zig");
+pub const merge = @import("gguf/merge.zig");
 pub const sync = @import("p2p/sync.zig");
 pub const peers = @import("p2p/peers.zig");
 pub const gossip = @import("p2p/gossip.zig");
@@ -136,6 +137,7 @@ fn usage(out: *Io.Writer) !void {
         \\  loom gguf check <file | https://...>
         \\  loom gguf info <file> [--range-mb M]
         \\  loom gguf shard <file>
+        \\  loom gguf merge <first-shard.gguf> <out.gguf>
         \\  loom gguf run <file.gguf | store-dir> [--prompt STR] [--max-tokens N] [--temp T]
         \\                [--seed S] [--ctx N] [--threads N] [--batch N] [--committee H:P,...] [--peers H:P,...]
         \\  loom gen <dir> [--glm] [--seed N]
@@ -664,6 +666,12 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
         return;
     }
 
+    if (std.mem.eql(u8, sub, "merge")) {
+        const dest = if (args.len > 0) args[0] else null;
+        if (dest == null) return out.print("usage: loom gguf merge <first-shard.gguf> <out.gguf>\n", .{});
+        return merge.run(gpa, io, out, path, dest.?);
+    }
+
     if (std.mem.eql(u8, sub, "run")) {
         return cmdGgufRun(gpa, io, out, path, args);
     }
@@ -710,7 +718,7 @@ fn cmdGguf(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8) 
         return;
     }
 
-    try out.print("gguf: unknown subcommand {s} (want gen|check|info|shard|run)\n", .{sub});
+    try out.print("gguf: unknown subcommand {s} (want gen|check|info|shard|merge|run)\n", .{sub});
 }
 
 fn cmdGgufRun(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, path: []const u8, args: [][]const u8) !void {

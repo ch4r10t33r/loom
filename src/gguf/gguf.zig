@@ -62,6 +62,12 @@ pub const MetaValue = union(enum) {
 pub const MetaKV = struct {
     key: []const u8, // owned by Parsed.arena
     value: MetaValue,
+    /// Byte span of this whole key/value pair in the source file. Kept so a
+    /// tool can copy a KV verbatim instead of re-serializing it: `readValue`
+    /// deliberately skips array element types it has no use for, and a
+    /// round-trip through the parsed form would drop them (gguf merge).
+    span_start: u64 = 0,
+    span_end: u64 = 0,
 };
 
 pub const Parsed = struct {
@@ -206,6 +212,42 @@ fn readValueDepth(c: *Cursor, arena: std.mem.Allocator, vtype: u32, depth: u32) 
 
 /// Parse the GGUF header/metadata/tensor table from the start of a file. Only
 /// the header region is read into memory, never the tensor data.
+/// Split-GGUF metadata (`gguf-split` output). `count <= 1` means a plain
+/// single-file model; every large published quant of a frontier model is
+/// split, and the first shard is usually metadata-only.
+pub const Split = struct {
+    no: u16,
+    count: u16,
+    tensors_count: u64,
+};
+
+pub fn splitInfo(p: *const Parsed) ?Split {
+    const count = p.getUint("split.count") orelse return null;
+    if (count <= 1) return null;
+    return .{
+        .no = @intCast(p.getUint("split.no") orelse 0),
+        .count = @intCast(count),
+        .tensors_count = p.getUint("split.tensors.count") orelse 0,
+    };
+}
+
+/// Rewrite `-00001-of-00003.gguf` in `path` to shard `no` (0-based), into
+/// `buf`. The convention is llama.cpp's `gguf-split`, which every published
+/// split model follows.
+pub fn shardPath(buf: []u8, path: []const u8, no: u16, count: u16) ![]const u8 {
+    const marker = "-of-";
+    const at = std.mem.lastIndexOf(u8, path, marker) orelse return error.NotSplitName;
+    // "-00001" ends where "-of-" begins; find the dash starting it
+    if (at < 6) return error.NotSplitName;
+    const num_start = at - 5;
+    if (path[num_start - 1] != '-') return error.NotSplitName;
+    const tail_start = at + marker.len + 5; // past "-of-00003"
+    if (tail_start > path.len) return error.NotSplitName;
+    return std.fmt.bufPrint(buf, "{s}{d:0>5}-of-{d:0>5}{s}", .{
+        path[0..num_start], no + 1, count, path[tail_start..],
+    }) catch error.PathTooLong;
+}
+
 pub fn parse(gpa: std.mem.Allocator, io: Io, path: []const u8) !Parsed {
     const f = try Io.Dir.cwd().openFile(io, path, .{});
     defer f.close(io);
@@ -231,9 +273,12 @@ pub fn parse(gpa: std.mem.Allocator, io: Io, path: []const u8) !Parsed {
 
     const metadata = try a.alloc(MetaKV, @intCast(kv_count));
     for (metadata) |*kv| {
+        const start = c.pos;
         kv.key = try a.dupe(u8, try c.str());
         const vtype = try c.u32le();
         kv.value = try readValue(&c, a, vtype);
+        kv.span_start = start;
+        kv.span_end = c.pos;
     }
 
     const tensors = try a.alloc(TensorInfo, @intCast(tensor_count));
