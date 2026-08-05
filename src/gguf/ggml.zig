@@ -28,6 +28,8 @@ pub const Type = enum(u32) {
     q5_0 = 6,
     q5_1 = 7,
     q8_0 = 8,
+    q2_k = 10,
+    q3_k = 11,
     q4_k = 12,
     q5_k = 13,
     q6_k = 14,
@@ -52,6 +54,8 @@ pub const Type = enum(u32) {
             .q5_0,
             .q5_1,
             .q8_0,
+            .q2_k,
+            .q3_k,
             .q4_k,
             .q5_k,
             .q6_k,
@@ -88,6 +92,8 @@ const Q5_1_BLOCK: usize = 2 + 2 + 4 + QK_0 / 2; // + f16 min = 24
 const Q8_0_BLOCK: usize = 2 + QK_0; // f16 scale + 32 int8 = 34
 
 pub const QK_K: usize = 256; // super-block width for K-quants
+const Q2_K_BLOCK: usize = QK_K / 16 + QK_K / 4 + 2 + 2; // scales, qs, d, dmin = 84
+const Q3_K_BLOCK: usize = QK_K / 8 + QK_K / 4 + 12 + 2; // hmask, qs, scales, d = 110
 const Q4_K_BLOCK: usize = 2 + 2 + 12 + QK_K / 2; // d, dmin, 6-bit scales, nibbles = 144
 const Q5_K_BLOCK: usize = 2 + 2 + 12 + QK_K / 8 + QK_K / 2; // + high bits = 176
 const Q6_K_BLOCK: usize = QK_K / 2 + QK_K / 4 + QK_K / 16 + 2; // ql, qh, scales, d = 210
@@ -103,6 +109,8 @@ pub fn rowBytes(t: Type, n: usize) usize {
         .q5_0 => (n / QK_0) * Q5_0_BLOCK,
         .q5_1 => (n / QK_0) * Q5_1_BLOCK,
         .q8_0 => (n / QK_0) * Q8_0_BLOCK,
+        .q2_k => (n / QK_K) * Q2_K_BLOCK,
+        .q3_k => (n / QK_K) * Q3_K_BLOCK,
         .q4_k => (n / QK_K) * Q4_K_BLOCK,
         .q5_k => (n / QK_K) * Q5_K_BLOCK,
         .q6_k => (n / QK_K) * Q6_K_BLOCK,
@@ -121,7 +129,7 @@ pub fn blockElems(t: Type) usize {
     return switch (t) {
         .f32, .f16 => 1,
         .q4_0, .q4_1, .q5_0, .q5_1, .q8_0 => QK_0,
-        .q4_k, .q5_k, .q6_k => QK_K,
+        .q2_k, .q3_k, .q4_k, .q5_k, .q6_k => QK_K,
         // codebook types: iq4_nl and mxfp4 are 32-wide, the rest are 256-wide
         .iq4_nl, .mxfp4 => iq.QK_NL,
         .iq2_xxs, .iq2_xs, .iq3_xxs, .iq1_s, .iq3_s, .iq2_s, .iq4_xs, .iq1_m => iq.QK_K,
@@ -152,6 +160,8 @@ pub fn blockBytes(t: Type) usize {
         .q5_0 => Q5_0_BLOCK,
         .q5_1 => Q5_1_BLOCK,
         .q8_0 => Q8_0_BLOCK,
+        .q2_k => Q2_K_BLOCK,
+        .q3_k => Q3_K_BLOCK,
         .q4_k => Q4_K_BLOCK,
         .q5_k => Q5_K_BLOCK,
         .q6_k => Q6_K_BLOCK,
@@ -675,6 +685,8 @@ fn dispatch(t: Type, out: []f32, data: []const u8, x: []const f32, rows: usize, 
         .q5_0 => matvecQ50(out, data, x, rows, cols),
         .q5_1 => matvecQ41Int(.q5_1, out, data, x, rows, cols),
         .q8_0 => matvecQ80Int(out, data, x, rows, cols),
+        .q2_k => matvecQ2K(out, data, x, rows, cols),
+        .q3_k => matvecQ3K(out, data, x, rows, cols),
         .q4_k => matvecQ4KInt(out, data, x, rows, cols),
         .q6_k => matvecQ6KInt(out, data, x, rows, cols),
         .q5_k => matvecQ5KInt(out, data, x, rows, cols),
@@ -933,9 +945,143 @@ fn matvecMxfp4Int(out: []f32, data: []const u8, x: []const f32, rows: usize, col
 /// reference.
 pub fn usesInt8Activations(t: Type) bool {
     return switch (t) {
-        .q4_k, .q5_k, .q6_k, .q4_0, .q8_0, .q4_1, .q5_1, .mxfp4 => true,
+        .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .q4_0, .q8_0, .q4_1, .q5_1, .mxfp4 => true,
         else => false,
     };
+}
+
+/// Q2_K against int8 activations.
+///
+/// Sixteen 16-wide sub-blocks per super-block. Each carries a 4-bit unsigned
+/// scale and a 4-bit unsigned min packed in `scales[s]`; the value is
+/// `d*scale*q2 - dmin*min` with q2 a 2-bit unsigned. Over a sub-block that
+/// separates into `dx*(d*scale*dot(q2,xq) - dmin*min*sum(xq))`. A 32-wide qx
+/// block spans two sub-blocks (lanes 0..15 and 16..31), each with its own
+/// scale/min, so dot and sum both split at lane 16 — folding them is wrong.
+fn matvecQ2K(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
+    const qx = quantizeX(x);
+    const blocks_per_row = cols / QK_K;
+    const rb = blocks_per_row * Q2_K_BLOCK;
+    const m3: @Vector(16, u8) = @splat(3);
+    for (0..rows) |r| {
+        const row = data[r * rb ..][0..rb];
+        var acc: f32 = 0;
+        for (0..blocks_per_row) |b| {
+            const block = row[b * Q2_K_BLOCK ..][0..Q2_K_BLOCK];
+            const scales = block[0 .. QK_K / 16];
+            const qs = block[QK_K / 16 ..][0 .. QK_K / 4];
+            const d = f16FromBytes(block[QK_K / 16 + QK_K / 4 ..][0..2]);
+            const dmin = f16FromBytes(block[QK_K / 16 + QK_K / 4 + 2 ..][0..2]);
+            // Eight 32-wide qx blocks per super-block; qx block k covers
+            // sub-blocks 2k (low half) and 2k+1 (high half).
+            for (0..8) |k| {
+                const nb = (k / 4) * 32; // qs byte offset for this 128-run
+                const sh: u3 = @intCast((k % 4) * 2); // 2-bit lane shift
+                const shv: @Vector(16, u3) = @splat(sh);
+                const lo_raw: @Vector(16, u8) = qs[nb..][0..16].*;
+                const hi_raw: @Vector(16, u8) = qs[nb + 16 ..][0..16].*;
+                const w_lo: @Vector(16, i16) = @as(@Vector(16, u8), (lo_raw >> shv) & m3);
+                const w_hi: @Vector(16, i16) = @as(@Vector(16, u8), (hi_raw >> shv) & m3);
+                const xb = &qx[b * 8 + k];
+                const X: @Vector(QK_0, i16) = @as(@Vector(QK_0, i8), xb.q);
+                const lo_x: @Vector(16, i16) = std.simd.extract(X, 0, 16);
+                const hi_x: @Vector(16, i16) = std.simd.extract(X, 16, 16);
+                const dot_lo = @reduce(.Add, @as(@Vector(16, i32), w_lo * lo_x));
+                const dot_hi = @reduce(.Add, @as(@Vector(16, i32), w_hi * hi_x));
+                const sum_lo = @reduce(.Add, @as(@Vector(16, i32), lo_x));
+                const sum_hi = @reduce(.Add, @as(@Vector(16, i32), hi_x));
+                const s_lo = scales[2 * k];
+                const s_hi = scales[2 * k + 1];
+                const scale_lo: f32 = @floatFromInt(s_lo & 0xF);
+                const min_lo: f32 = @floatFromInt(s_lo >> 4);
+                const scale_hi: f32 = @floatFromInt(s_hi & 0xF);
+                const min_hi: f32 = @floatFromInt(s_hi >> 4);
+                acc += xb.d * (d * scale_lo * @as(f32, @floatFromInt(dot_lo)) -
+                    dmin * min_lo * @as(f32, @floatFromInt(sum_lo)));
+                acc += xb.d * (d * scale_hi * @as(f32, @floatFromInt(dot_hi)) -
+                    dmin * min_hi * @as(f32, @floatFromInt(sum_hi)));
+            }
+        }
+        out[r] = acc;
+    }
+}
+
+/// Unpack the 12 packed bytes of a Q3_K super-block into 16 unsigned 6-bit
+/// scales (0..63). Mirrors llama.cpp's aux shuffle exactly.
+inline fn q3kScales(packed_scales: []const u8) [16]u8 {
+    var aux: [4]u32 = undefined;
+    aux[0] = std.mem.readInt(u32, packed_scales[0..4], .little);
+    aux[1] = std.mem.readInt(u32, packed_scales[4..8], .little);
+    aux[2] = std.mem.readInt(u32, packed_scales[8..12], .little);
+    const kmask1: u32 = 0x03030303;
+    const kmask2: u32 = 0x0f0f0f0f;
+    const tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+    aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+    aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+    aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+    var out: [16]u8 = undefined;
+    inline for (0..4) |i| {
+        const bytes = std.mem.toBytes(aux[i]);
+        inline for (0..4) |j| out[i * 4 + j] = bytes[j];
+    }
+    return out;
+}
+
+/// Q3_K against int8 activations.
+///
+/// Sixteen 16-wide sub-blocks per super-block. Scale is a signed 6-bit value
+/// (`unpacked-32`); the weight is a 2-bit quant from `qs` plus a sign/level bit
+/// from `hmask`: `w = q2 - (hmask&m ? 0 : 4)`, so `w` runs -4..3 and folds the
+/// high bit into a single i8 dot — no separate min term. A 32-wide qx block
+/// spans two sub-blocks sharing one hmask bit `m = 1<<k`.
+fn matvecQ3K(out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
+    const qx = quantizeX(x);
+    const blocks_per_row = cols / QK_K;
+    const rb = blocks_per_row * Q3_K_BLOCK;
+    const m3: @Vector(16, u8) = @splat(3);
+    const four: @Vector(16, i16) = @splat(4);
+    for (0..rows) |r| {
+        const row = data[r * rb ..][0..rb];
+        var acc: f32 = 0;
+        for (0..blocks_per_row) |b| {
+            const block = row[b * Q3_K_BLOCK ..][0..Q3_K_BLOCK];
+            const hmask = block[0 .. QK_K / 8];
+            const qs = block[QK_K / 8 ..][0 .. QK_K / 4];
+            const sc = q3kScales(block[QK_K / 8 + QK_K / 4 ..][0..12]);
+            const d = f16FromBytes(block[QK_K / 8 + QK_K / 4 + 12 ..][0..2]);
+            for (0..8) |k| {
+                const nb = (k / 4) * 32; // qs byte offset for this 128-run
+                const sh: u3 = @intCast((k % 4) * 2);
+                const shv: @Vector(16, u3) = @splat(sh);
+                const mbit: u8 = @as(u8, 1) << @intCast(k); // hmask bit for this pair
+                const mv: @Vector(16, u8) = @splat(mbit);
+                const zero16: @Vector(16, u8) = @splat(0);
+                const lo_raw: @Vector(16, u8) = qs[nb..][0..16].*;
+                const hi_raw: @Vector(16, u8) = qs[nb + 16 ..][0..16].*;
+                const hm_lo: @Vector(16, u8) = hmask[0..16].*;
+                const hm_hi: @Vector(16, u8) = hmask[16..32].*;
+                // subtract 4 where the high bit is CLEAR
+                const off_lo: @Vector(16, i16) = @select(i16, (hm_lo & mv) != zero16, @as(@Vector(16, i16), @splat(0)), four);
+                const off_hi: @Vector(16, i16) = @select(i16, (hm_hi & mv) != zero16, @as(@Vector(16, i16), @splat(0)), four);
+                const q2_lo: @Vector(16, i16) = @as(@Vector(16, u8), (lo_raw >> shv) & m3);
+                const q2_hi: @Vector(16, i16) = @as(@Vector(16, u8), (hi_raw >> shv) & m3);
+                const w_lo = q2_lo - off_lo;
+                const w_hi = q2_hi - off_hi;
+                const xb = &qx[b * 8 + k];
+                const X: @Vector(QK_0, i16) = @as(@Vector(QK_0, i8), xb.q);
+                const lo_x: @Vector(16, i16) = std.simd.extract(X, 0, 16);
+                const hi_x: @Vector(16, i16) = std.simd.extract(X, 16, 16);
+                const dot_lo = @reduce(.Add, @as(@Vector(16, i32), w_lo * lo_x));
+                const dot_hi = @reduce(.Add, @as(@Vector(16, i32), w_hi * hi_x));
+                const scale_lo: f32 = @floatFromInt(@as(i32, sc[2 * k]) - 32);
+                const scale_hi: f32 = @floatFromInt(@as(i32, sc[2 * k + 1]) - 32);
+                acc += xb.d * d * (scale_lo * @as(f32, @floatFromInt(dot_lo)) +
+                    scale_hi * @as(f32, @floatFromInt(dot_hi)));
+            }
+        }
+        out[r] = acc;
+    }
 }
 
 /// Q6_K against int8 activations.
@@ -1156,6 +1302,8 @@ fn matvecQ80Int(out: []f32, data: []const u8, x: []const f32, rows: usize, cols:
 fn matvecK(t: Type, out: []f32, data: []const u8, x: []const f32, rows: usize, cols: usize) void {
     std.debug.assert(cols % QK_K == 0);
     const bs: usize = switch (t) {
+        .q2_k => Q2_K_BLOCK,
+        .q3_k => Q3_K_BLOCK,
         .q4_k => Q4_K_BLOCK,
         .q5_k => Q5_K_BLOCK,
         .q6_k => Q6_K_BLOCK,
@@ -1172,6 +1320,8 @@ fn matvecK(t: Type, out: []f32, data: []const u8, x: []const f32, rows: usize, c
         while (b < blocks_per_row) : (b += 1) {
             const block = row[b * bs ..][0..bs];
             switch (t) {
+                .q2_k => dequantBlockQ2K(block, &vals),
+                .q3_k => dequantBlockQ3K(block, &vals),
                 .q4_k => dequantBlockQ4K(block, &vals),
                 .q5_k => dequantBlockQ5K(block, &vals),
                 .q6_k => dequantBlockQ6K(block, &vals),
@@ -1322,6 +1472,74 @@ fn dequantBlockQ6K(block: []const u8, vals: *[QK_K]f32) void {
         qlo += 64;
         qho += 32;
         sco += 8;
+    }
+}
+
+/// Q2_K reference dequant (exact mirror of llama.cpp dequantize_row_q2_K).
+/// Used for embeddings lookup and as the golden reference in tests; the hot
+/// path is matvecQ2K.
+fn dequantBlockQ2K(block: []const u8, vals: *[QK_K]f32) void {
+    const scales = block[0 .. QK_K / 16];
+    const qs = block[QK_K / 16 ..][0 .. QK_K / 4];
+    const d = f16FromBytes(block[QK_K / 16 + QK_K / 4 ..][0..2]);
+    const dmin = f16FromBytes(block[QK_K / 16 + QK_K / 4 + 2 ..][0..2]);
+    var y: usize = 0;
+    var qbase: usize = 0;
+    var is: usize = 0;
+    var n: usize = 0;
+    while (n < QK_K) : (n += 128) {
+        var j: usize = 0;
+        while (j < 4) : (j += 1) {
+            const shift: u3 = @intCast(j * 2);
+            var half: usize = 0;
+            while (half < 2) : (half += 1) {
+                const sc = scales[is];
+                is += 1;
+                const dl = d * @as(f32, @floatFromInt(sc & 0xF));
+                const ml = dmin * @as(f32, @floatFromInt(sc >> 4));
+                var l: usize = 0;
+                while (l < 16) : (l += 1) {
+                    const q2: i32 = @intCast((qs[qbase + half * 16 + l] >> shift) & 3);
+                    vals[y] = dl * @as(f32, @floatFromInt(q2)) - ml;
+                    y += 1;
+                }
+            }
+        }
+        qbase += 32;
+    }
+}
+
+/// Q3_K reference dequant (exact mirror of llama.cpp dequantize_row_q3_K).
+fn dequantBlockQ3K(block: []const u8, vals: *[QK_K]f32) void {
+    const hmask = block[0 .. QK_K / 8];
+    const qs = block[QK_K / 8 ..][0 .. QK_K / 4];
+    const scales = q3kScales(block[QK_K / 8 + QK_K / 4 ..][0..12]);
+    const d_all = f16FromBytes(block[QK_K / 8 + QK_K / 4 + 12 ..][0..2]);
+    var y: usize = 0;
+    var qbase: usize = 0;
+    var is: usize = 0;
+    var n: usize = 0;
+    while (n < QK_K) : (n += 128) {
+        var j: usize = 0;
+        while (j < 4) : (j += 1) {
+            const shift: u3 = @intCast(j * 2);
+            // hmask bit for this sub-block pair: exponent (n/128)*4 + j, 0..7.
+            const m: u8 = @as(u8, 1) << @intCast((n / 128) * 4 + j);
+            var half: usize = 0;
+            while (half < 2) : (half += 1) {
+                const dl = d_all * @as(f32, @floatFromInt(@as(i32, scales[is]) - 32));
+                is += 1;
+                var l: usize = 0;
+                while (l < 16) : (l += 1) {
+                    const idx = half * 16 + l;
+                    const q2: i32 = @intCast((qs[qbase + idx] >> shift) & 3);
+                    const off: i32 = if ((hmask[idx] & m) != 0) 0 else 4;
+                    vals[y] = dl * @as(f32, @floatFromInt(q2 - off));
+                    y += 1;
+                }
+            }
+        }
+        qbase += 32;
     }
 }
 
@@ -1532,10 +1750,12 @@ pub fn dequantRow(t: Type, out: []f32, data: []const u8, r: usize, cols: usize) 
                 o.* = @floatCast(@as(f16, @bitCast(bits)));
             }
         },
-        .q4_k, .q5_k, .q6_k => {
+        .q2_k, .q3_k, .q4_k, .q5_k, .q6_k => {
             const rb = rowBytes(t, cols);
             const row = data[r * rb ..][0..rb];
             const bs: usize = switch (t) {
+                .q2_k => Q2_K_BLOCK,
+                .q3_k => Q3_K_BLOCK,
                 .q4_k => Q4_K_BLOCK,
                 .q5_k => Q5_K_BLOCK,
                 else => Q6_K_BLOCK,
@@ -1545,6 +1765,8 @@ pub fn dequantRow(t: Type, out: []f32, data: []const u8, r: usize, cols: usize) 
             while (b * QK_K < cols) : (b += 1) {
                 const block = row[b * bs ..][0..bs];
                 switch (t) {
+                    .q2_k => dequantBlockQ2K(block, &vals),
+                    .q3_k => dequantBlockQ3K(block, &vals),
                     .q4_k => dequantBlockQ4K(block, &vals),
                     .q5_k => dequantBlockQ5K(block, &vals),
                     else => dequantBlockQ6K(block, &vals),
@@ -1818,7 +2040,7 @@ test "matvec agrees with dequantRow for every supported type" {
     defer gpa.free(x);
     for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 4.0;
 
-    const types = [_]Type{ .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q4_k, .q5_k, .q6_k, .f32, .f16 };
+    const types = [_]Type{ .q4_0, .q4_1, .q5_0, .q5_1, .q8_0, .q2_k, .q3_k, .q4_k, .q5_k, .q6_k, .f32, .f16 };
     for (types) |t| {
         const bytes = tensorBytes(t, cols, rows);
         const data = try gpa.alloc(u8, bytes);
