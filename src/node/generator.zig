@@ -263,6 +263,19 @@ pub const Generator = union(enum) {
 /// the extra cores return, and efficiency cores contribute little. Override
 /// with `--threads` when the shape of the machine is different.
 pub fn defaultThreads() usize {
+    // Apple Silicon is heterogeneous: performance cores are ~3x an efficiency
+    // core, and the matvec barrier is synchronous, so a job split across all
+    // cores waits on the E-core chunk. Spreading a decode over P+E cores is
+    // therefore SLOWER than P-cores alone -- measured on a 4P+6E machine,
+    // greedy TinyLlama Q4_K_M: 8 threads 33 tok/s vs 4 threads (P-count) 36.
+    // Default to the performance-core count where the OS reports it.
+    if (@import("builtin").os.tag == .macos) {
+        var p: c_int = 0;
+        var len: usize = @sizeOf(c_int);
+        if (std.c.sysctlbyname("hw.perflevel0.physicalcpu", &p, &len, null, 0) == 0 and p >= 1) {
+            return @intCast(p);
+        }
+    }
     const n = std.Thread.getCpuCount() catch 1;
     return if (n <= 3) 1 else n - 2;
 }
