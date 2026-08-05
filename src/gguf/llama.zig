@@ -680,6 +680,13 @@ pub const State = struct {
     bup: []f32,
     bact: []f32,
     bffn: []f32,
+    // Batched router logits (MAX_BATCH * n_expert) and a gather buffer
+    // (MAX_BATCH * dim) for continuous-batching batch-union MoE: the union of
+    // experts across the batch is computed once per expert against the lanes
+    // that selected it, so each expert's weights are unpacked once for the
+    // whole batch instead of once per lane.
+    brouter: []f32,
+    bgather: []f32,
 
     // PILOT lookahead (single-stream decode): the experts predicted for the
     // next MoE layer by running its router on the current hidden state, so
@@ -739,6 +746,8 @@ pub const State = struct {
             .bup = try gpa.alloc(f32, B * ffn_max),
             .bact = try gpa.alloc(f32, B * ffn_max),
             .bffn = try gpa.alloc(f32, B * cfg.dim),
+            .brouter = try gpa.alloc(f32, B * @max(cfg.n_expert, 1)),
+            .bgather = try gpa.alloc(f32, B * cfg.dim),
         };
     }
 
@@ -750,8 +759,33 @@ pub const State = struct {
             self.v_cache,  self.proj_out, self.bx,      self.bnormed, self.bq,
             self.mtp_x,    self.mtp_cat,  self.bhidden, self.blogits, self.bk,
             self.bv,       self.battn,    self.bproj,   self.bgate,   self.bup,
-            self.bact,     self.bffn,
+            self.bact,     self.bffn,     self.brouter, self.bgather,
         }) |sl| gpa.free(sl);
+    }
+};
+
+/// One concurrent sequence for continuous-batching decode: its own KV cache
+/// and position, and nothing else. The batched compute scratch (bx/bq/... in
+/// `State`) is shared across all sequences in a batch, because the only part
+/// of the forward that depends on a sequence's own history is attention over
+/// its KV. Sizing matches `State`'s single-sequence KV cache exactly.
+pub const Seq = struct {
+    k_cache: []f32,
+    v_cache: []f32,
+    pos: usize = 0,
+
+    pub fn init(gpa: std.mem.Allocator, cfg: Config) !Seq {
+        const kvd = cfg.kvDim();
+        const lanes = cfg.n_layers + @intFromBool(cfg.has_mtp);
+        return .{
+            .k_cache = try gpa.alloc(f32, lanes * cfg.ctx_len * kvd),
+            .v_cache = try gpa.alloc(f32, lanes * cfg.ctx_len * kvd),
+        };
+    }
+
+    pub fn deinit(self: *Seq, gpa: std.mem.Allocator) void {
+        gpa.free(self.k_cache);
+        gpa.free(self.v_cache);
     }
 };
 
@@ -1572,6 +1606,229 @@ pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usi
     mv(m.output, st.logits, st.normed);
 }
 
+/// Batch-union MoE for continuous-batching decode. Routes all `n` lanes from
+/// `bnormed`, then walks the union of experts across the batch: each expert's
+/// weights are unpacked ONCE and its FFN runs as a mini-matmul over exactly the
+/// lanes that selected it (the unpack, not the dot, is the expensive half, so
+/// this is where batching a MoE pays off). Gated results are added into
+/// `bx[k]`. The shared expert is a plain dense FFN batched across all lanes.
+fn moeBatchUnion(m: *const Model, st: *State, l: LayerT, li: usize, n: usize, dist_ok: bool) !void {
+    const cfg = m.cfg;
+    const dim = cfg.dim;
+    const ne = cfg.n_expert;
+
+    mmul(l.ffn_gate_inp.?, st.brouter[0 .. n * ne], st.bnormed[0 .. n * dim], n);
+    var sel: [backend.MAX_BATCH][moe.MAX_SELECTED]moe.Selected = undefined;
+    const bias: ?[]const f32 = if (l.exp_probs_b) |b| tensorAsF32(b) else null;
+    for (0..n) |k| {
+        const logits = st.brouter[k * ne ..][0..ne];
+        addBias(logits, l.ffn_gate_inp_b);
+        moe.route(cfg.route, logits, bias, sel[k][0..cfg.n_used]);
+    }
+
+    const src = if (dist_ok) m.dist else null;
+    for (0..ne) |e| {
+        // Gather the lanes that selected expert e, with their gate weights.
+        var lanes: [backend.MAX_BATCH]usize = undefined;
+        var gates: [backend.MAX_BATCH]f32 = undefined;
+        var mrows: usize = 0;
+        for (0..n) |k| {
+            for (sel[k][0..cfg.n_used]) |s| if (s.expert == e) {
+                lanes[mrows] = k;
+                gates[mrows] = s.gate;
+                mrows += 1;
+                break;
+            };
+        }
+        if (mrows == 0) continue;
+
+        // Resolve this expert's [gate, up, down] once for the whole batch.
+        var ge: Tensor = undefined;
+        var ue: Tensor = undefined;
+        var de: Tensor = undefined;
+        if (src) |sp| {
+            const blk = try sp.get(m.expert_shard[li * ne + e]);
+            const gt = l.ffn_gate_exps.?;
+            const ut = l.ffn_up_exps.?;
+            const dt = l.ffn_down_exps.?;
+            const gl = gt.ne1 * ggml.rowBytes(gt.ty, gt.ne0);
+            const ul = ut.ne1 * ggml.rowBytes(ut.ty, ut.ne0);
+            const dl = dt.ne1 * ggml.rowBytes(dt.ty, dt.ne0);
+            ge = .{ .ty = gt.ty, .data = blk[0..gl], .ne0 = gt.ne0, .ne1 = gt.ne1 };
+            ue = .{ .ty = ut.ty, .data = blk[gl..][0..ul], .ne0 = ut.ne0, .ne1 = ut.ne1 };
+            de = .{ .ty = dt.ty, .data = blk[gl + ul ..][0..dl], .ne0 = dt.ne0, .ne1 = dt.ne1 };
+        } else {
+            ge = try l.ffn_gate_exps.?.expert(e);
+            ue = try l.ffn_up_exps.?.expert(e);
+            de = try l.ffn_down_exps.?.expert(e);
+        }
+        const f = ge.ne1;
+
+        for (0..mrows) |j| @memcpy(st.bgather[j * dim ..][0..dim], st.bnormed[lanes[j] * dim ..][0..dim]);
+        mmul(ge, st.bgate[0 .. mrows * f], st.bgather[0 .. mrows * dim], mrows);
+        mmul(ue, st.bup[0 .. mrows * f], st.bgather[0 .. mrows * dim], mrows);
+        for (0..mrows) |j| {
+            const gbuf = st.bgate[j * f ..][0..f];
+            const ubuf = st.bup[j * f ..][0..f];
+            if (cfg.arch.oai) {
+                if (l.ffn_gate_exps_b) |b| backend.add(gbuf, tensorAsF32(b)[e * f ..][0..f]);
+                if (l.ffn_up_exps_b) |b| backend.add(ubuf, tensorAsF32(b)[e * f ..][0..f]);
+                swigluOai(st.bact[j * f ..][0..f], gbuf, ubuf);
+            } else {
+                backend.swiglu(st.bact[j * f ..][0..f], gbuf, ubuf);
+            }
+        }
+        mmul(de, st.bffn[0 .. mrows * dim], st.bact[0 .. mrows * f], mrows);
+        for (0..mrows) |j| {
+            const outp = st.bffn[j * dim ..][0..dim];
+            if (cfg.arch.oai) {
+                if (l.ffn_down_exps_b) |b| backend.add(outp, tensorAsF32(b)[e * dim ..][0..dim]);
+            }
+            const g = gates[j];
+            for (st.bx[lanes[j] * dim ..][0..dim], outp) |*a, v| a.* += g * v;
+        }
+    }
+
+    // Shared expert: a dense FFN, batched across every lane.
+    if (l.ffn_gate_shexp) |gs| {
+        const sf = gs.ne1;
+        mmul(gs, st.bgate[0 .. n * sf], st.bnormed[0 .. n * dim], n);
+        mmul(l.ffn_up_shexp.?, st.bup[0 .. n * sf], st.bnormed[0 .. n * dim], n);
+        for (0..n) |k| backend.swiglu(st.bact[k * sf ..][0..sf], st.bgate[k * sf ..][0..sf], st.bup[k * sf ..][0..sf]);
+        mmul(l.ffn_down_shexp.?, st.bffn[0 .. n * dim], st.bact[0 .. n * sf], n);
+        for (0..n) |k| {
+            const outp = st.bffn[k * dim ..][0..dim];
+            if (l.ffn_gate_inp_shexp) |sg| {
+                var logit: [1]f32 = undefined;
+                mv(sg, &logit, st.bnormed[k * dim ..][0..dim]);
+                const gg = backend.sigmoid(logit[0]);
+                for (st.bx[k * dim ..][0..dim], outp) |*a, v| a.* += gg * v;
+            } else {
+                backend.add(st.bx[k * dim ..][0..dim], outp);
+            }
+        }
+    }
+}
+
+/// Continuous-batching decode: advance `n` independent sequences by one token
+/// each in a single forward pass. Every weight matmul (QKV, output projection,
+/// dense FFN, and the per-token MoE) is batched across the sequences, so each
+/// weight is read from memory once and dotted `n` times -- the throughput lever
+/// for a memory-/dispatch-bound decode. Attention, the only history-dependent
+/// part, runs per sequence against that sequence's own KV cache and position.
+///
+/// This is `stepBatch` with its one shared sequence replaced by `n` independent
+/// ones: identical matmul batching, but each lane keeps its own KV and position
+/// rather than occupying consecutive positions of a single causal sequence.
+/// Per-sequence logits for the just-decoded token land in `out` (n * vocab),
+/// and each sequence's `pos` is advanced. Verified token-identical to `n`
+/// separate `step` streams.
+pub fn decodeBatch(m: *const Model, st: *State, seqs: []Seq, tokens: []const u32, out: []f32) !void {
+    const n = tokens.len;
+    std.debug.assert(n > 0 and n <= backend.MAX_BATCH and seqs.len == n);
+    const cfg = m.cfg;
+    std.debug.assert(out.len == n * cfg.vocab);
+    const hd = cfg.head_dim;
+    const kvd = cfg.kvDim();
+    const qd = cfg.qDim();
+    const q_per_kv = cfg.n_heads / cfg.n_kv_heads;
+    const scale = cfg.attn_logit_mul / @sqrt(@as(f32, @floatFromInt(hd)));
+
+    for (tokens, 0..) |tok, k| {
+        if (tok >= cfg.vocab) return error.TokenOutOfRange;
+        if (seqs[k].pos >= cfg.ctx_len) return error.ContextExhausted;
+        backend.dequantRow(m.token_embd.ty, st.bx[k * cfg.dim ..][0..cfg.dim], m.token_embd.data, tok, cfg.dim);
+    }
+
+    for (m.layers, 0..) |l, li| {
+        // ---- attention ----
+        for (0..n) |k| {
+            backend.rmsnorm(st.bnormed[k * cfg.dim ..][0..cfg.dim], st.bx[k * cfg.dim ..][0..cfg.dim], tensorAsF32(l.attn_norm), cfg.eps);
+        }
+        mmul(l.attn_q, st.bq[0 .. n * qd], st.bnormed[0 .. n * cfg.dim], n);
+        mmul(l.attn_k, st.bk[0 .. n * kvd], st.bnormed[0 .. n * cfg.dim], n);
+        mmul(l.attn_v, st.bv[0 .. n * kvd], st.bnormed[0 .. n * cfg.dim], n);
+
+        for (0..n) |k| {
+            const qk = st.bq[k * qd ..][0..qd];
+            const kk = st.bk[k * kvd ..][0..kvd];
+            const vk = st.bv[k * kvd ..][0..kvd];
+            addBias(qk, l.attn_q_bias);
+            addBias(kk, l.attn_k_bias);
+            addBias(vk, l.attn_v_bias);
+            headNorm(qk, l.attn_q_norm, cfg.n_heads, hd, cfg.eps);
+            headNorm(kk, l.attn_k_norm, cfg.n_kv_heads, hd, cfg.eps);
+            const pos = seqs[k].pos;
+            for (0..cfg.n_heads) |h| ropeApplyC(cfg, qk[h * hd ..][0..hd], pos);
+            for (0..cfg.n_kv_heads) |h| ropeApplyC(cfg, kk[h * hd ..][0..hd], pos);
+            // Each sequence appends into its own cache at its own position.
+            const base = (li * cfg.ctx_len + pos) * kvd;
+            @memcpy(seqs[k].k_cache[base..][0..kvd], kk);
+            @memcpy(seqs[k].v_cache[base..][0..kvd], vk);
+        }
+
+        // Attention: lane k attends only its own sequence's 0..pos_k history.
+        for (0..n) |k| {
+            const pos = seqs[k].pos;
+            const seq = pos + 1;
+            const t0: usize = if (l.is_swa and cfg.swa_window > 0) seq -| cfg.swa_window else 0;
+            const qk = st.bq[k * qd ..][0..qd];
+            const ok = st.battn[k * qd ..][0..qd];
+            for (0..cfg.n_heads) |h| {
+                const kvh = h / q_per_kv;
+                const qh = qk[h * hd ..][0..hd];
+                for (t0..seq) |t_i| {
+                    const kt = seqs[k].k_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
+                    st.scores[t_i] = backend.dotF32(qh, kt) * scale;
+                }
+                if (l.attn_sinks) |sk| {
+                    softmaxWithSink(st.scores[t0..seq], tensorAsF32(sk)[h]);
+                } else {
+                    backend.softmax(st.scores[t0..seq]);
+                }
+                const oh = ok[h * hd ..][0..hd];
+                @memset(oh, 0);
+                for (t0..seq) |t_i| {
+                    const vt = seqs[k].v_cache[(li * cfg.ctx_len + t_i) * kvd + kvh * hd ..][0..hd];
+                    backend.axpy(oh, vt, st.scores[t_i]);
+                }
+            }
+        }
+        mmul(l.attn_output, st.bproj[0 .. n * cfg.dim], st.battn[0 .. n * qd], n);
+        for (0..n) |k| {
+            const row = st.bproj[k * cfg.dim ..][0..cfg.dim];
+            addBias(row, l.attn_output_b);
+            backend.add(st.bx[k * cfg.dim ..][0..cfg.dim], row);
+        }
+
+        // ---- FFN ----
+        for (0..n) |k| {
+            backend.rmsnorm(st.bnormed[k * cfg.dim ..][0..cfg.dim], st.bx[k * cfg.dim ..][0..cfg.dim], tensorAsF32(l.ffn_norm), cfg.eps);
+        }
+        if (!l.is_moe) {
+            const f = l.ffn_gate.?.ne1;
+            mmul(l.ffn_gate.?, st.bgate[0 .. n * f], st.bnormed[0 .. n * cfg.dim], n);
+            mmul(l.ffn_up.?, st.bup[0 .. n * f], st.bnormed[0 .. n * cfg.dim], n);
+            for (0..n) |k| backend.swiglu(st.bact[k * f ..][0..f], st.bgate[k * f ..][0..f], st.bup[k * f ..][0..f]);
+            mmul(l.ffn_down.?, st.bffn[0 .. n * cfg.dim], st.bact[0 .. n * f], n);
+            for (0..n) |k| backend.add(st.bx[k * cfg.dim ..][0..cfg.dim], st.bffn[k * cfg.dim ..][0..cfg.dim]);
+            continue;
+        }
+        // MoE: each expert unpacked once for the whole batch, run over the
+        // lanes that selected it (batch-union). This is where a batched MoE
+        // decode actually amortizes -- the per-lane path does B x the expert
+        // work and does not.
+        try moeBatchUnion(m, st, l, li, n, true);
+    }
+
+    for (0..n) |k| {
+        const lane = st.bx[k * cfg.dim ..][0..cfg.dim];
+        backend.rmsnorm(st.normed, lane, tensorAsF32(m.output_norm), cfg.eps);
+        mv(m.output, out[k * cfg.vocab ..][0..cfg.vocab], st.normed);
+        seqs[k].pos += 1;
+    }
+}
+
 fn mmul(t: Tensor, out: []f32, xs: []const f32, n: usize) void {
     backend.matmul(t.ty, out, t.data, xs, n, t.ne1, t.ne0);
 }
@@ -1782,6 +2039,74 @@ test "batched prefill matches token-by-token prefill" {
         try stepBatch(&m, &c, toks[3..], 3);
         for (a.logits, c.logits) |want, got| {
             try std.testing.expectApproxEqAbs(want, got, @max(@abs(want), @abs(got)) * 1e-3 + 1e-3);
+        }
+    }
+}
+
+test "continuous-batch decode is token-identical to independent single streams" {
+    // decodeBatch batches the weight matmuls across *unrelated* sequences, each
+    // with its own KV cache and position. The failure modes are all silent:
+    // one lane reading another's cache, a KV write at the batch index instead
+    // of the sequence's own position, or a RoPE angle from the wrong pos. Each
+    // would diverge here and only here, since every lane still produces fluent
+    // text on its own. The reference is the same streams run one at a time.
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    for ([_][]const u8{ "llama", "qwen3moe", "glm4moe", "gpt-oss" }) |arch| {
+        var pbuf: [96]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pbuf, "test-cb-{s}.gguf", .{arch});
+        defer Io.Dir.cwd().deleteFile(io, path) catch {};
+        try gguf.writeMoeFixture(gpa, io, path, 11, arch);
+
+        var m = try load(gpa, io, path);
+        defer m.deinit();
+
+        // Three independent sequences, deliberately different tokens (same
+        // length so the batch stays full every step).
+        const streams = [_][4]u32{
+            .{ 7, 21, 4, 90 },
+            .{ 3, 3, 15, 2 },
+            .{ 50, 1, 8, 33 },
+        };
+        const n = streams.len;
+        const vocab = m.cfg.vocab;
+
+        // Reference: each stream through its own single-sequence State.
+        const want = try gpa.alloc(f32, n * vocab);
+        defer gpa.free(want);
+        for (streams, 0..) |s, si| {
+            var a = try State.init(gpa, m.cfg);
+            defer a.deinit(gpa);
+            for (s, 0..) |t, i| try step(&m, &a, t, i);
+            @memcpy(want[si * vocab ..][0..vocab], a.logits);
+        }
+
+        // Batched: n sequences advanced in lockstep, one token per call.
+        var st = try State.init(gpa, m.cfg);
+        defer st.deinit(gpa);
+        var seqs: [n]Seq = undefined;
+        for (0..n) |k| seqs[k] = try Seq.init(gpa, m.cfg);
+        defer for (0..n) |k| seqs[k].deinit(gpa);
+
+        const got = try gpa.alloc(f32, n * vocab);
+        defer gpa.free(got);
+        var toks: [n]u32 = undefined;
+        for (0..streams[0].len) |i| {
+            for (0..n) |k| toks[k] = streams[k][i];
+            try decodeBatch(&m, &st, &seqs, &toks, got);
+        }
+
+        for (0..n) |k| {
+            for (want[k * vocab ..][0..vocab], got[k * vocab ..][0..vocab], 0..) |w, g, j| {
+                const tol = @max(@abs(w), @abs(g)) * 1e-3 + 1e-3;
+                std.testing.expectApproxEqAbs(w, g, tol) catch |e| {
+                    std.debug.print("{s}: lane {d} logit {d}: serial {d} vs batched {d}\n", .{ arch, k, j, w, g });
+                    return e;
+                };
+            }
         }
     }
 }
