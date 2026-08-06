@@ -76,7 +76,7 @@ with it.
   peers. Space scales with `--hold-fraction`: your fraction of the routed
   experts, plus the resident chunks every node holds (about 10% of the
   model). For the devnet's ~11 GB Qwen3-30B-A3B at the default hold-fraction
-  of 0.2, budget about 4 GB free.
+  of 0.7, budget about 9 GB free.
 - **Network**: any. A faster link shortens cold-miss expert fetches and the
   initial sync, nothing else. Peers behind NAT work in dial-out-only mode.
 
