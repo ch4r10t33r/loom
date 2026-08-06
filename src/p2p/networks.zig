@@ -4,7 +4,7 @@
 //! serves. Every checkpoint below was verified against this codebase with
 //! `loom gguf check` before earning its row.
 //!
-//!   devnet   1337  GLM-4.5-Air (106B-A12B, glm4moe)  -- PoC validation;
+//!   devnet   1337  Qwen3-30B-A3B (30B-A3B, qwen3moe) -- PoC validation;
 //!                  runs distributed on commodity boxes today.
 //!   testnet  2     GLM-4.6 (357B-A32B, glm4moe)      -- performance tier;
 //!                  ~200 GB at Q4_K_M, one 256 GB box or a small cluster.
@@ -34,7 +34,7 @@ pub const Network = struct {
 };
 
 pub const registry = [_]Network{
-    .{ .name = "devnet", .id = 1337, .arch = "glm4moe", .model = "unsloth/GLM-4.5-Air-GGUF (Q4_K_M)", .desc = "PoC validation -- GLM-4.5-Air 106B-A12B", .strict = false, .bootnodes = &.{"168.119.167.242:8771"} },
+    .{ .name = "devnet", .id = 1337, .arch = "qwen3moe", .model = "unsloth/Qwen3-30B-A3B-GGUF (Q2_K)", .desc = "PoC validation -- Qwen3-30B-A3B 30B-A3B", .strict = false, .bootnodes = &.{"168.119.167.242:8771"} },
     .{ .name = "testnet", .id = 2, .arch = "glm4moe", .model = "unsloth/GLM-4.6-GGUF (Q4_K_M)", .desc = "performance tier -- GLM-4.6 357B-A32B", .strict = true },
     .{ .name = "mainnet", .id = 1, .arch = "glm-dsa", .model = "unsloth/GLM-5.2-GGUF (UD-Q4_K_XL)", .desc = "production -- GLM 5.2 744B-A40B", .strict = true },
 };
