@@ -1,5 +1,5 @@
 #!/bin/sh
-# One command to join the loom devnet (GLM-4.5-Air, network id 1337):
+# One command to join the loom devnet (Qwen3-30B-A3B, network id 1337):
 #
 #   curl -fsSL https://raw.githubusercontent.com/ch4r10t33r/loom/main/scripts/join-devnet.sh | sh
 #
@@ -17,12 +17,12 @@
 #   LOOM_HTTP_MIRROR URL of a static mirror of the devnet model file;
 #                   initial sync pulls shard ranges from it in parallel
 #                   (digest-verified) instead of loading the bootnode.
-#                   Defaults to the official Hugging Face mirror; set to
+#                   Defaults to the upstream Hugging Face file; set to
 #                   the empty string to sync from peers only
 #   LOOM_HTTP_SPLIT_GB  set when the mirror hosts fixed-size parts
 #                   (<url>.part-00000, ...) of this many GiB each, e.g. a
 #                   Hugging Face mirror where single files cap at 50 GB;
-#                   defaults to 20 to match the official mirror
+#                   defaults to 0 (the default mirror is one ~11 GB file)
 #   LOOM_ADVERTISE  host:port peers can dial you on        (default unset:
 #                   fine behind NAT; set it if you are publicly reachable
 #                   so you can serve shards to others)
@@ -75,12 +75,13 @@ fi
 ADV=""
 [ -n "${LOOM_ADVERTISE:-}" ] && ADV="--advertise ${LOOM_ADVERTISE}"
 
-# Official devnet mirror: the merged GLM-4.5-Air GGUF as 20 GiB parts on
-# Hugging Face. Every shard is digest-verified against the p2p manifest, so
-# the mirror only ever donates bandwidth -- it cannot alter what a node runs.
-DEFAULT_MIRROR="https://huggingface.co/ch4r10t33r/loom-devnet-glm-4.5-air/resolve/main/merged.gguf"
+# Default devnet mirror: the upstream Qwen3-30B-A3B Q2_K GGUF, a single
+# ~11 GB file on Hugging Face (under its 50 GB cap, so no split parts).
+# Every shard is digest-verified against the p2p manifest, so the mirror
+# only ever donates bandwidth -- it cannot alter what a node runs.
+DEFAULT_MIRROR="https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF/resolve/main/Qwen3-30B-A3B-Q2_K.gguf"
 MIRROR_URL="${LOOM_HTTP_MIRROR-$DEFAULT_MIRROR}"
-SPLIT_GB="${LOOM_HTTP_SPLIT_GB:-20}"
+SPLIT_GB="${LOOM_HTTP_SPLIT_GB:-0}"
 MIRROR=""
 [ -n "$MIRROR_URL" ] && MIRROR="--bootstrap-http $MIRROR_URL --bootstrap-http-split-gb $SPLIT_GB"
 
@@ -91,7 +92,7 @@ else
     echo "alpha metrics: on (numeric stats only; opt out with LOOM_NO_METRICS=1; docs/ALPHA.md)"
 fi
 
-echo "joining devnet (GLM-4.5-Air, network id 1337)..."
+echo "joining devnet (Qwen3-30B-A3B, network id 1337)..."
 exec "$LOOM" node \
     --network devnet \
     --hold-fraction "${LOOM_HOLD:-0.2}" \

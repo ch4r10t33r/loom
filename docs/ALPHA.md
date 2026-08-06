@@ -6,16 +6,16 @@ and how to file useful reports.
 
 ## Join
 
-One command. It installs loom if missing, joins the devnet (GLM-4.5-Air,
-106B), downloads your share of the model from peers, and serves a local
+One command. It installs loom if missing, joins the devnet (Qwen3-30B-A3B,
+30B), downloads your share of the model from peers, and serves a local
 OpenAI-compatible API plus a chat UI:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ch4r10t33r/loom/main/scripts/join-devnet.sh | sh
 ```
 
-You need about 25 GB of free disk and 8 GB of RAM. The initial sync is
-roughly 8 GB (the 6 GB resident bundle every node holds, plus your expert
+You need about 4 GB of free disk and 8 GB of RAM. The initial sync is
+roughly 3 GB (the ~1 GB resident bundle every node holds, plus your expert
 share). Ports 8770-8772 and 8555 are used locally; nothing needs to be
 reachable from the internet (NAT is fine).
 

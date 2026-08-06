@@ -31,9 +31,9 @@ curl -fsSL https://raw.githubusercontent.com/ch4r10t33r/loom/main/install.sh | s
 
 Join the devnet. This installs loom if it is missing, then starts a node
 that downloads its share of the model's GGUF shards to local disk (about a
-fifth of the ~73 GB GLM-4.5-Air checkpoint by default) and serves an OpenAI
-API on `:8772`. The initial sync pulls from the [official Hugging Face
-mirror](https://huggingface.co/ch4r10t33r/loom-devnet-glm-4.5-air) over
+fifth of the ~11 GB Qwen3-30B-A3B checkpoint by default) and serves an OpenAI
+API on `:8772`. The initial sync pulls from the [upstream Hugging Face
+repo](https://huggingface.co/unsloth/Qwen3-30B-A3B-GGUF) over
 parallel HTTP range requests — every shard digest-verified against the
 network's Merkle manifest, so the mirror donates bandwidth but cannot alter
 what your node runs — with the p2p mesh serving whatever the mirror cannot
@@ -75,8 +75,8 @@ with it.
   the local machine (under the node's home directory) and serves it back to
   peers. Space scales with `--hold-fraction`: your fraction of the routed
   experts, plus the resident chunks every node holds (about 10% of the
-  model). For the devnet's ~73 GB GLM-4.5-Air at the default hold-fraction
-  of 0.2, budget about 25 GB free.
+  model). For the devnet's ~11 GB Qwen3-30B-A3B at the default hold-fraction
+  of 0.2, budget about 4 GB free.
 - **Network**: any. A faster link shortens cold-miss expert fetches and the
   initial sync, nothing else. Peers behind NAT work in dial-out-only mode.
 

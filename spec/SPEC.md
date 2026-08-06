@@ -574,7 +574,7 @@ without configuration, while an explicit id keeps one network together across
 model hardforks. `network_id` gates membership; `manifest_version` continues
 to gate content (expert fetch refuses other versions within a network).
 Reserved ids: 1 = mainnet (GLM 5.2), 2 = testnet (GLM-4.6), 1337 = devnet
-(GLM-4.5-Air); see docs/NETWORKS.md. These are protocol constants.
+(Qwen3-30B-A3B); see docs/NETWORKS.md. These are protocol constants.
 
 **AnnounceBatch, type 0x04.** The gossip exchange response: the responder's own
 Announce followed by its whole table, so one round trip both announces and syncs
