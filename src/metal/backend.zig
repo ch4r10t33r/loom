@@ -3798,7 +3798,12 @@ test "metal elementwise kernels individually" {
     var worst_sw: f32 = 0;
     for (ref, cx.act[2].slice(f32)[0..n]) |a, b| worst_sw = @max(worst_sw, @abs(a - b));
 
-    std.debug.print("  rmsnorm max abs diff {d}   swiglu {d}\n", .{ worst_norm, worst_sw });
+    // Print the measured diffs only on failure: under `zig build test` any
+    // stderr from a passing test makes zig 0.16's build runner display the
+    // step through its failure path, tagged with a misleading red
+    // "failed command:" line (cosmetic -- the build still succeeds).
+    if (worst_norm >= 1e-4 or worst_sw >= 1e-5)
+        std.debug.print("  rmsnorm max abs diff {d}   swiglu {d}\n", .{ worst_norm, worst_sw });
     try std.testing.expect(worst_norm < 1e-4);
     try std.testing.expect(worst_sw < 1e-5);
 }
