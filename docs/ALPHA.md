@@ -25,13 +25,16 @@ To leave: stop the process and delete `~/.cache/loom`.
 
 - Sync speed is your downlink. The devnet's origin serves from Germany.
 - Generation speed depends on how much of the model you hold and how far
-  you are from other holders. At the default hold fraction (0.2), a token
-  can need experts you don't have, fetched mid-generation. On a fast link
-  near peers this is seconds; far away on a thin link it is minutes. That
-  boundary is by design and documented in the
-  [whitepaper](../whitepaper/WHITEPAPER.md); loom distributes for capacity
-  first. More holders make everyone faster.
-- Raising `LOOM_HOLD` (e.g. `LOOM_HOLD=0.5`) trades disk for speed.
+  you are from other holders. At the default hold fraction (0.7), most
+  tokens run from local shards; the remainder are fetched mid-generation
+  from peers. On a fast link near peers a miss costs seconds; far away on
+  a thin link it is minutes. That boundary is by design and documented in
+  the [whitepaper](../whitepaper/WHITEPAPER.md); loom distributes for
+  capacity first. More holders make everyone faster.
+- `LOOM_HOLD` trades disk for speed: 1.0 (~11 GB) generates fully locally;
+  below ~0.5 expect origin-bound tokens while the devnet has few holders.
+  The default is 0.7 so each joiner meaningfully raises network replication
+  instead of leaning on the origin.
 - The chat UI is at `http://127.0.0.1:8555`.
 
 ## Things worth trying

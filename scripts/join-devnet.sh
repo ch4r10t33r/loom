@@ -95,7 +95,7 @@ fi
 echo "joining devnet (Qwen3-30B-A3B, network id 1337)..."
 exec "$LOOM" node \
     --network devnet \
-    --hold-fraction "${LOOM_HOLD:-0.2}" \
+    --hold-fraction "${LOOM_HOLD:-0.7}" \
     --ram-gb "${LOOM_RAM_GB:-4}" \
     --p2p-port "${LOOM_P2P_PORT:-8771}" \
     --rpc-port "${LOOM_RPC_PORT:-8770}" \
