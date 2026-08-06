@@ -653,7 +653,17 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
 
         if (joined) |*ji| {
             joined_committee_id = @intCast(ji.committee_id);
-            try out.print("joined committee {d} ({d} member(s) already in it)\n", .{ ji.committee_id, ji.members.len });
+            // "0 members" is the normal first-joiner case, not a failure: the
+            // bootnode is deliberately outside every committee (SPEC.md:
+            // trusted placement service, backstops coverage as origin holder),
+            // so the count is peer REPLICAS, and the origin serves every shard
+            // until those exist. Say so, or the first joiner reads it as an
+            // empty network.
+            if (ji.members.len == 0) {
+                try out.print("joined committee {d} as its first member (origin serves all shards until peers join)\n", .{ji.committee_id});
+            } else {
+                try out.print("joined committee {d} ({d} peer member(s) to replicate with)\n", .{ ji.committee_id, ji.members.len });
+            }
             try out.flush();
             // sync preference: committee members first, then the bootnode
             var srcs = std.ArrayList(sync.PeerAddr).empty;
