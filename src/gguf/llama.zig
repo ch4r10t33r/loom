@@ -707,6 +707,18 @@ pub const State = struct {
     spec_capture: bool = false,
     spec_fwd: u64 = 0,
     spec_acc: u64 = 0,
+    /// Opt-in commitment-weighted verifier expert masking (research lever 8,
+    /// AcceptMoE): during a spec_capture batched verify, restrict each MoE
+    /// layer's routing to a commitment-weighted eligible expert set. NOT
+    /// distribution-preserving for lanes past the first -- lane 0 (the
+    /// committed token) always keeps its natural top-k, so its verdict is
+    /// unchanged. Off by default; the byte-identity test gates the default.
+    verify_mask: bool = false,
+    /// Distinct-expert counters for the masked verify, summed per MoE layer:
+    /// the natural union across lanes vs the eligible set actually allowed.
+    /// The difference is the expert traffic the mask avoided.
+    mask_natural: u64 = 0,
+    mask_eligible: u64 = 0,
 
     pub fn init(gpa: std.mem.Allocator, cfg: Config) !State {
         const kvd = cfg.kvDim();
@@ -1218,7 +1230,15 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool) !v
     const sel = sel_buf[0..cfg.n_used];
     const bias: ?[]const f32 = if (l.exp_probs_b) |b| tensorAsF32(b) else null;
     moe.route(cfg.route, st.router[0..cfg.n_expert], bias, sel);
+    try moeRun(m, st, l, li, dist_ok, sel);
+}
 
+/// Everything moeLayer does after routing: PILOT bookkeeping/prefetch, the
+/// expert fetch+FFN loop, the draft-local rescale, and the shared expert.
+/// Split out so the masked verify path can supply a *restricted* selection
+/// while sharing the fetch/compute body verbatim.
+fn moeRun(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool, sel: []const moe.Selected) !void {
+    const cfg = m.cfg;
     const acc = st.moe_acc;
     @memset(acc, 0);
     if (if (dist_ok and !st.draft_local) m.dist else null) |src| {
@@ -1328,6 +1348,128 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool) !v
         } else {
             backend.add(acc, st.ffn_out);
         }
+    }
+}
+
+/// Commitment-weighted verifier expert masking for one MoE layer of a DSD
+/// verify window (research lever 8, AcceptMoE, arXiv:2608.02989). The window
+/// is a CHAIN: lane d is committed only if every earlier lane's draft is
+/// accepted, so its routing demand is discounted by BETA^d, with BETA set
+/// from the devnet's measured draft acceptance. The eligible set is lane 0's
+/// natural top-k (the anchor: that token's verdict must not change) plus the
+/// top effective-rank experts by discounted demand; on the distributed path,
+/// low-demand NONRESIDENT members are pruned under the rerouting budget the
+/// mask has already incurred, so eligibility follows the cache the way the
+/// fetch tiers do. Every lane then re-routes top-k over the masked logits.
+/// NOT distribution-preserving for lanes past the first -- which is why this
+/// runs only behind the opt-in flag.
+const VERIFY_MASK_BETA: f32 = 0.6; // measured devnet draft acceptance ~0.62
+fn moeVerifyMasked(m: *const Model, st: *State, l: LayerT, li: usize, n: usize) !void {
+    const cfg = m.cfg;
+    const ne = cfg.n_expert;
+    const bias: ?[]const f32 = if (l.exp_probs_b) |b| tensorAsF32(b) else null;
+
+    // Pass 1: natural routing for every lane, logits kept for the re-route.
+    var sels: [backend.MAX_BATCH][moe.MAX_SELECTED]moe.Selected = undefined;
+    for (0..n) |k| {
+        const logits = st.brouter[k * ne ..][0..ne];
+        mv(l.ffn_gate_inp.?, logits, st.bnormed[k * cfg.dim ..][0..cfg.dim]);
+        addBias(logits, l.ffn_gate_inp_b);
+        moe.route(cfg.route, logits, bias, sels[k][0..cfg.n_used]);
+    }
+
+    // Discounted demand per expert, natural-selection counts, and the union.
+    var util = [_]f32{0} ** moe.MAX_EXPERTS;
+    var nat_count = [_]u16{0} ** moe.MAX_EXPERTS;
+    var in_union = [_]bool{false} ** moe.MAX_EXPERTS;
+    var union_n: usize = 0;
+    var w: f32 = 1.0;
+    for (0..n) |k| {
+        for (sels[k][0..cfg.n_used]) |sl| {
+            util[sl.expert] += w * sl.gate;
+            nat_count[sl.expert] += 1;
+            if (!in_union[sl.expert]) {
+                in_union[sl.expert] = true;
+                union_n += 1;
+            }
+        }
+        w *= VERIFY_MASK_BETA;
+    }
+
+    // Anchor: lane 0's natural top-k, always eligible.
+    var eligible = [_]bool{false} ** moe.MAX_EXPERTS;
+    for (sels[0][0..cfg.n_used]) |sl| eligible[sl.expert] = true;
+
+    // Self-sizing: keep the top effective-rank non-anchor experts by demand,
+    // where the effective rank is exp(entropy) of the normalized demand --
+    // concentrated demand keeps few, diffuse demand keeps many.
+    var cand_buf: [moe.MAX_EXPERTS]usize = undefined;
+    var cand_n: usize = 0;
+    var z: f32 = 0;
+    for (0..ne) |e| {
+        if (in_union[e] and !eligible[e]) {
+            cand_buf[cand_n] = e;
+            cand_n += 1;
+            z += util[e];
+        }
+    }
+    var keep: usize = 0;
+    if (cand_n > 0 and z > 0) {
+        var h: f32 = 0;
+        for (cand_buf[0..cand_n]) |e| {
+            const q = util[e] / z;
+            if (q > 0) h -= q * @log(q);
+        }
+        keep = @min(cand_n, @as(usize, @intFromFloat(@ceil(@exp(h)))));
+    }
+    const cands = cand_buf[0..cand_n];
+    std.mem.sort(usize, cands, &util, struct {
+        fn desc(u: *const [moe.MAX_EXPERTS]f32, a: usize, b: usize) bool {
+            return u[a] > u[b];
+        }
+    }.desc);
+    for (cands[0..keep]) |e| eligible[e] = true;
+    var elig_n = cfg.n_used + keep;
+
+    // Residency-aware pruning (distributed path only): drop nonresident
+    // low-demand non-anchor members, spending at most the rerouting budget
+    // the mask has already incurred (natural selections displaced by S), and
+    // never shrinking below a full top-k.
+    if (if (!st.draft_local) m.dist else null) |src| {
+        var budget: usize = 0;
+        for (0..ne) |e| {
+            if (in_union[e] and !eligible[e]) budget += nat_count[e];
+        }
+        var i: usize = keep;
+        while (i > 0 and elig_n > cfg.n_used) {
+            i -= 1;
+            const e = cands[i]; // ascending demand from the sorted tail
+            if (src.getLocal(m.expert_shard[li * ne + e]) != null) continue;
+            if (nat_count[e] > budget) continue;
+            eligible[e] = false;
+            budget -= nat_count[e];
+            elig_n -= 1;
+        }
+    }
+    st.mask_natural += union_n;
+    st.mask_eligible += elig_n;
+
+    // Pass 2: re-route every lane over the masked logits and run the shared
+    // fetch/compute body with the restricted selection. Lane 0's natural
+    // top-k is fully eligible, so its selection, gates and output are
+    // byte-identical to the unmasked path.
+    for (0..n) |k| {
+        const logits = st.brouter[k * ne ..][0..ne];
+        for (0..ne) |e| {
+            if (!eligible[e]) logits[e] = -1e30;
+        }
+        var msel_buf: [moe.MAX_SELECTED]moe.Selected = undefined;
+        const msel = msel_buf[0..cfg.n_used];
+        moe.route(cfg.route, logits, bias, msel);
+        @memcpy(st.normed, st.bnormed[k * cfg.dim ..][0..cfg.dim]);
+        @memcpy(st.router[0..ne], logits);
+        try moeRun(m, st, l, li, true, msel);
+        backend.add(st.bx[k * cfg.dim ..][0..cfg.dim], st.moe_acc);
     }
 }
 
@@ -1579,8 +1721,12 @@ pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usi
             continue;
         }
         // MoE: routing differs per token, so run the expert FFN one token at a
-        // time through the existing single-token path.
-        for (0..n) |k| {
+        // time through the existing single-token path -- unless the opt-in
+        // verifier expert mask is on, which restricts routing to a
+        // commitment-weighted eligible set shared by the whole window.
+        if (st.verify_mask and st.spec_capture) {
+            try moeVerifyMasked(m, st, l, li, n);
+        } else for (0..n) |k| {
             @memcpy(st.normed, st.bnormed[k * cfg.dim ..][0..cfg.dim]);
             try moeLayer(m, st, l, li, true);
             backend.add(st.bx[k * cfg.dim ..][0..cfg.dim], st.moe_acc);
@@ -2039,6 +2185,70 @@ test "batched prefill matches token-by-token prefill" {
         try stepBatch(&m, &c, toks[3..], 3);
         for (a.logits, c.logits) |want, got| {
             try std.testing.expectApproxEqAbs(want, got, @max(@abs(want), @abs(got)) * 1e-3 + 1e-3);
+        }
+    }
+}
+
+test "masked verify shrinks the expert union and never touches lane 0" {
+    // The verifier expert mask (lever 8) restricts a verify window's MoE
+    // routing to a commitment-weighted eligible set. Two invariants make it
+    // safe to ship at all: lane 0 -- the token already committed -- keeps its
+    // natural top-k, so its logits are byte-identical to the unmasked path
+    // and the accept/reject verdict for the first draft position can never
+    // change; and the eligible set is never larger than the natural union,
+    // so the mask can only reduce expert traffic. Both are checked here on
+    // every GQA arch, because either failing is silent output corruption.
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    for ([_][]const u8{ "llama", "qwen3moe", "glm4moe", "gpt-oss" }) |arch| {
+        var pbuf: [96]u8 = undefined;
+        const path = try std.fmt.bufPrint(&pbuf, "test-vmask-{s}.gguf", .{arch});
+        defer Io.Dir.cwd().deleteFile(io, path) catch {};
+        try gguf.writeMoeFixture(gpa, io, path, 11, arch);
+
+        var m = try load(gpa, io, path);
+        defer m.deinit();
+        const c = m.cfg;
+
+        const prefix = [_]u32{ 7, 21, 4 };
+        const window = [_]u32{ 90, 33, 8, 12, 5 };
+
+        var a = try State.init(gpa, c);
+        defer a.deinit(gpa);
+        try stepBatch(&m, &a, &prefix, 0);
+        a.spec_capture = true;
+        try stepBatch(&m, &a, &window, prefix.len);
+        a.spec_capture = false;
+
+        var b = try State.init(gpa, c);
+        defer b.deinit(gpa);
+        try stepBatch(&m, &b, &prefix, 0);
+        b.spec_capture = true;
+        b.verify_mask = true;
+        try stepBatch(&m, &b, &window, prefix.len);
+        b.verify_mask = false;
+        b.spec_capture = false;
+
+        // Lane 0 byte-identical: the committed token's verdict is untouched.
+        for (a.blogits[0..c.vocab], b.blogits[0..c.vocab], 0..) |want, got, i| {
+            std.testing.expectEqual(want, got) catch |e| {
+                std.debug.print("{s}: lane-0 logit {d}: unmasked {d} vs masked {d}\n", .{ arch, i, want, got });
+                return e;
+            };
+        }
+
+        // The mask ran and can only shrink the union.
+        try std.testing.expect(b.mask_natural > 0);
+        try std.testing.expect(b.mask_eligible <= b.mask_natural);
+
+        // Every masked lane still produced finite logits.
+        for (0..window.len) |k| {
+            for (b.blogits[k * c.vocab ..][0..c.vocab]) |v| {
+                try std.testing.expect(std.math.isFinite(v));
+            }
         }
     }
 }
