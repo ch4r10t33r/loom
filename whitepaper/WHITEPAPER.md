@@ -618,6 +618,38 @@ Milestones with exit criteria; full tracking in
    draft-remote-verify measured on the devnet against delegate-wholesale on
    the same prompts, with the mode decision driven by probed RTT and
    measured acceptance.
+7. **Cross-model KV transfer for a two-tier model family** (research lever,
+   gated on the 235B tier; inspired by [17]). The devnet's current and
+   target models are a matched-KV pair within one family -- verified from
+   both GGUF headers: Qwen3-30B-A3B and Qwen3-235B-A22B share 4 KV heads at
+   head-dim 128 (48/94 layers, 32/64 query heads differ, which the method
+   tolerates). [17] shows that within such a family, a closed-form per-head
+   ridge mapping (no training, fit offline from ~500 calibration sequences)
+   converts the small model's KV cache into the large model's, letting the
+   large model decode without re-prefilling -- retaining 73-98% of
+   standalone accuracy on its Qwen3 pairs, stable over multi-turn handoff.
+   For loom this attacks the most expensive operation the network has: the
+   big model's prefill is not FLOPs but WAN expert fetches, so the avoided
+   cost here is larger than in the paper's single-box setting. Three uses,
+   in order of leverage: (a) cross-model DSD -- a peer holds ALL of the 30B
+   (~11 GB) as a full-quality drafter and maps its KV so the 235B verifier
+   never prefills; co-locating drafter and mapper on 235B holders makes the
+   KV transfer a local matmul, and the mapper application is exactly the
+   batched per-head matmul the unified K-quant kernels serve; (b)
+   cost-quality cascading with mid-conversation upgrade to the 235B without
+   re-prefill; (c) session continuity across the 30B-to-235B hardfork. The
+   mapper itself is a 4-12 GB immutable parameter blob -- content-addressed
+   and distributed over loom's own weight layer like any other artifact.
+   Honest gates before any build: [17]'s scope is dense full-attention
+   models and its own Tier-2 result (matched-KV Ministral pairs collapsing
+   to 42-44% retention) proves matched KV does not guarantee transfer, so
+   the MoE pair must be measured; calibration must run against the
+   quantized (Q2_K) models' actual KV; and the paper's attention-output
+   cosine diagnostic (correlates with retention at r=+0.57) is the cheap
+   go/no-go screen to run before investing. Exit: mapper fitted on
+   quantized-KV calibration data, cosine probe passed, and measured
+   HellaSwag-class retention plus end-to-end prefill-avoided latency on the
+   devnet pair.
 
 ---
 
@@ -655,6 +687,7 @@ problem, bound by network and kernels, and the roadmap treats it as such.
 14. Krohn, Freedman, Mazieres. *On-the-fly Verification of Rateless Erasure Codes for Efficient Content Distribution.* IEEE S&P 2004 (homomorphic hashing).
 15. Di Giacinto, E. et al. *LocalAI: The free, open-source OpenAI alternative.* https://localai.io (federated and worker modes: https://localai.io/features/distribute/)
 16. Yu, F., Li, L., McDanel, B., Zhang, S.Q. *DSD: A Distributed Speculative Decoding Solution for Edge-Cloud Agile Large Model Serving.* 2025. https://arxiv.org/abs/2511.21669 (adaptive window control, edge-draft/cloud-verify split, RTT crossover).
+17. Heo, T., Shafipour, R., Zhao, R., et al. (NVIDIA). *Cross-Model KV Cache Transfer in LLM Families: A Closed-Form Linear Mapping for Prefill Reuse.* 2026. https://arxiv.org/abs/2608.03893 (per-head ridge mapper, RoPE-stripped content space, matched-KV pairs, attention-output-cosine retention predictor).
 
 ---
 
@@ -819,6 +852,7 @@ the spec governs the p2p protocol and the roadmap governs status.
 | 2026-08-05 | **Continuous-batching decode (`decodeBatch` + `moeBatchUnion`): N independent sequences advance one token per forward, every weight matmul batched across them, attention per-sequence against its own KV (`Seq`).** The MoE layer routes all lanes, then walks the union of selected experts: each expert's super-blocks decode once and run as a mini-matmul over exactly the lanes that chose it -- the batch-union the whitepaper's latency-hiding section promised, now implemented. `loom gguf batchbench` measures aggregate tok/s against batch size. Verified token-identical to N single-stream decodes across llama/qwen2moe/glm4moe/gpt-oss | This is the vLLM lesson (iteration-level batching) applied at the engine layer, and it is deliberately sequenced AFTER the K-quant kernel rewrite: measured before that rewrite, batch scaling was FLAT (~2.0 tok/s aggregate at batch 1..8 on resident Qwen3-30B Q2_K) because the batched matmul did not amortize the weight unpack and the low-bit types had no batched kernel at all -- the scheduler was writing checks the kernels could not cash. With the unified kernels it scales (2.8 -> 3.6 tok/s aggregate at batch 8 on the same rig). The remaining ceiling is expert overlap: 128 experts with 8 active means unrelated lanes rarely share an expert, so the union is nearly disjoint and the dense projections carry most of the amortization; overlap -- and the win -- grows with batch depth and with models whose expert count is smaller relative to activation | 
 | 2026-08-06 | **Devnet hardfork: the canonical model moves from GLM-4.5-Air Q4_K_M (73 GB, glm4moe) to Qwen3-30B-A3B Q2_K (unsloth/Qwen3-30B-A3B-GGUF, ~11 GB, qwen3moe); network id 1337 is unchanged.** Per the roadmap's upgrade rule this is a majority hardfork on a new GGUF file: the bootnode already serves the new model -- the registry's warn-only devnet arch policy surfaced the transition as `expects arch 'glm4moe', serving 'qwen3moe'` at startup, exactly the mismatch-discovery a PoC network is for -- and this change realigns the registry, join script, and docs with what the network serves. The join script's default mirror now points straight at the upstream unsloth file: a single ~11 GB GGUF under Hugging Face's 50 GB cap, so the split-part convention (2026-08-03) is no longer needed on devnet (split default drops to 0), and a stale or mismatched mirror still fails digests loudly with the p2p pass mopping up. Supersedes the devnet entry of the 2026-08-02 registry row; testnet and mainnet are untouched | The 73 GB checkpoint made devnet heavy for exactly the audience it exists for: a joiner needed ~25 GB of disk and an origin-uplink-bound sync of hours (measured 11 MB/s, 2026-08-03) before a first token. Qwen3-30B-A3B Q2_K drops that to ~4 GB and minutes, and puts the just-landed low-bit K-quant kernels (2026-08-05) and the qwen3moe GQA engine on a live network, with 128-expert top-8 routing keeping the distributed-expert thesis honest at ~9x sparsity. The 235B sibling remains the recorded scale-up target (2026-08-05); the 30B is the same engine and quant family, joinable by anyone today |
 | 2026-08-06 | **Devnet joiner default hold-fraction rises 0.2 -> 0.7** (join script `LOOM_HOLD` default; a bare `loom node` already defaults to 1.0). Joiner disk budget goes ~4 GB -> ~9 GB against the ~11 GB model; docs updated to say plainly that below ~0.5 a cold joiner's tokens are origin-bound while the network is small | Two live measurements forced this. The bootnode's own status line shows `UNDER-REPLICATED 4915/6262 (want R=2)`: at hold 0.2 a joiner covers so little of the corpus that nearly every shard still has a single holder -- the origin -- so the network's replication target is unmet and the origin stays a single point of failure, which contradicts the ">=2 sources per expert" principle this document states as non-negotiable. And a real WAN joiner at hold 0.2 measured 0.04 tok/s with a flat ~66% hit rate: ~130 expert misses x ~1.8 MB per token is ~230 MB of WAN transfer per token from one origin, the whitepaper's own bandwidth-table regime. At 0.7 a joiner runs most tokens locally AND materially raises replication with its first sync. The hardfork's smaller model is what makes this affordable: 0.7 of 11 GB costs less disk than 0.2 of the old 73 GB did |
+| 2026-08-09 | **Cross-model KV cache transfer recorded as research lever 7 (roadmap section 12), gated on the 235B tier.** NVIDIA's closed-form KV mapper [17] converts a small family member's KV cache into a larger member's, skipping the large model's prefill (73-98% retention on its Qwen3 pairs, 4-25x faster than re-prefill, stable multi-turn). Verified from both GGUF headers that the devnet's current and target models are a matched-KV pair (Qwen3-30B-A3B and 235B-A22B: 4 KV heads, head-dim 128; layer/query-head counts differ, which the method tolerates). Recorded uses, by leverage: cross-model DSD (full 30B as drafter, mapped KV so the 235B verifier never prefills, co-located so the transfer is a local matmul), cost-quality cascading with mid-conversation upgrade, and session continuity across the 30B-to-235B hardfork | On loom the avoided cost is not FLOPs but the WAN expert fetches that dominate big-model prefill (measured: ~230 MB/token for a cold joiner), so the win should exceed the paper's single-box 4-25x. Deliberately a lever, not a commitment: the paper's scope is dense full-attention models, and its own matched-KV Ministral pairs collapse to 42-44% retention -- matched KV correlates with transfer but does not guarantee it -- so the MoE pair must be measured, with the paper's attention-output-cosine diagnostic (r=+0.57 with retention) as the cheap go/no-go screen and calibration run against the quantized models' actual KV. The mapper artifact (4-12 GB, immutable, content-addressable) distributes over loom's own weight layer; applying it is the batched per-head matmul the unified K-quant kernels already serve |
 ---
 
 ## Appendix B: Source layout
