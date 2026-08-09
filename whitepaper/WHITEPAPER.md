@@ -650,6 +650,36 @@ Milestones with exit criteria; full tracking in
    quantized-KV calibration data, cosine probe passed, and measured
    HellaSwag-class retention plus end-to-end prefill-avoided latency on the
    devnet pair.
+8. **Commitment-weighted verifier expert selection** (research lever;
+   extends lever 6's DSD; inspired by AcceptMoE [18], evaluated on
+   Qwen3-30B-A3B -- the devnet model). DSD's batched verification pays for
+   the expert UNION across the draft window even though only the accepted
+   prefix matters: on loom's verifier every union member that is not held
+   or cached is a disk page-in or a WAN fetch, so the union -- not the
+   token count -- is the bill. AcceptMoE weights each draft position's
+   router demand by its probability of reaching the accepted output,
+   self-sizes the eligible expert set by the demand distribution's
+   effective rank (the always-committed root token keeps its natural top-k
+   untouched), and prunes low-demand NONRESIDENT experts against the
+   current cache state under a rerouting budget -- eligibility becomes a
+   function of residency, which is precisely loom's fetch-tier model.
+   Measured (SGLang, expert-offloaded): expert-weight traffic -38.6 to
+   -48.6% from residency pruning alone, host-to-device transfers -73.6 to
+   -77.1%, 2.06x end-to-end throughput, -0.27 pp mean accuracy. Loom's fit
+   is unusually direct: our draft window is a CHAIN (gamma <= 8), so
+   commitment probability is acceptance^depth and the DSD gamma
+   controller's live acceptance EMA supplies it -- no offline trace
+   collection -- and shard residency is already tracked per fetch. Two
+   gates, stated plainly: masked verifier routing is NOT
+   distribution-preserving, so this ships as an opt-in mode with the
+   default path keeping the drafted-loop byte-identity test gate; and
+   loom's window (<= 9 lanes) is far smaller than the paper's 64-token
+   trees, so absolute union savings shrink and the win must be re-measured
+   in loom's regime, where the per-expert cost (WAN/disk) is however far
+   larger than their host-to-device copies. Exit: opt-in
+   restricted-routing verify measured on the devnet against the default,
+   reporting verifier expert-fetch count, tok/s, and drafted-output
+   divergence rate on the same prompts.
 
 ---
 
@@ -688,6 +718,7 @@ problem, bound by network and kernels, and the roadmap treats it as such.
 15. Di Giacinto, E. et al. *LocalAI: The free, open-source OpenAI alternative.* https://localai.io (federated and worker modes: https://localai.io/features/distribute/)
 16. Yu, F., Li, L., McDanel, B., Zhang, S.Q. *DSD: A Distributed Speculative Decoding Solution for Edge-Cloud Agile Large Model Serving.* 2025. https://arxiv.org/abs/2511.21669 (adaptive window control, edge-draft/cloud-verify split, RTT crossover).
 17. Heo, T., Shafipour, R., Zhao, R., et al. (NVIDIA). *Cross-Model KV Cache Transfer in LLM Families: A Closed-Form Linear Mapping for Prefill Reuse.* 2026. https://arxiv.org/abs/2608.03893 (per-head ridge mapper, RoPE-stripped content space, matched-KV pairs, attention-output-cosine retention predictor).
+18. Liang, S., Chen, H., Mo, Z., et al. (Imperial College London / Tile-AI). *AcceptMoE: Commitment-Weighted Self-Sizing Verifier Expert Sets for Efficient MoE Speculative Decoding.* 2026. https://arxiv.org/abs/2608.02989 (verifier-side expert selection, commitment-weighted demand, effective-rank self-sizing, residency-aware pruning; evaluated on Qwen3-30B-A3B).
 
 ---
 
@@ -853,6 +884,7 @@ the spec governs the p2p protocol and the roadmap governs status.
 | 2026-08-06 | **Devnet hardfork: the canonical model moves from GLM-4.5-Air Q4_K_M (73 GB, glm4moe) to Qwen3-30B-A3B Q2_K (unsloth/Qwen3-30B-A3B-GGUF, ~11 GB, qwen3moe); network id 1337 is unchanged.** Per the roadmap's upgrade rule this is a majority hardfork on a new GGUF file: the bootnode already serves the new model -- the registry's warn-only devnet arch policy surfaced the transition as `expects arch 'glm4moe', serving 'qwen3moe'` at startup, exactly the mismatch-discovery a PoC network is for -- and this change realigns the registry, join script, and docs with what the network serves. The join script's default mirror now points straight at the upstream unsloth file: a single ~11 GB GGUF under Hugging Face's 50 GB cap, so the split-part convention (2026-08-03) is no longer needed on devnet (split default drops to 0), and a stale or mismatched mirror still fails digests loudly with the p2p pass mopping up. Supersedes the devnet entry of the 2026-08-02 registry row; testnet and mainnet are untouched | The 73 GB checkpoint made devnet heavy for exactly the audience it exists for: a joiner needed ~25 GB of disk and an origin-uplink-bound sync of hours (measured 11 MB/s, 2026-08-03) before a first token. Qwen3-30B-A3B Q2_K drops that to ~4 GB and minutes, and puts the just-landed low-bit K-quant kernels (2026-08-05) and the qwen3moe GQA engine on a live network, with 128-expert top-8 routing keeping the distributed-expert thesis honest at ~9x sparsity. The 235B sibling remains the recorded scale-up target (2026-08-05); the 30B is the same engine and quant family, joinable by anyone today |
 | 2026-08-06 | **Devnet joiner default hold-fraction rises 0.2 -> 0.7** (join script `LOOM_HOLD` default; a bare `loom node` already defaults to 1.0). Joiner disk budget goes ~4 GB -> ~9 GB against the ~11 GB model; docs updated to say plainly that below ~0.5 a cold joiner's tokens are origin-bound while the network is small | Two live measurements forced this. The bootnode's own status line shows `UNDER-REPLICATED 4915/6262 (want R=2)`: at hold 0.2 a joiner covers so little of the corpus that nearly every shard still has a single holder -- the origin -- so the network's replication target is unmet and the origin stays a single point of failure, which contradicts the ">=2 sources per expert" principle this document states as non-negotiable. And a real WAN joiner at hold 0.2 measured 0.04 tok/s with a flat ~66% hit rate: ~130 expert misses x ~1.8 MB per token is ~230 MB of WAN transfer per token from one origin, the whitepaper's own bandwidth-table regime. At 0.7 a joiner runs most tokens locally AND materially raises replication with its first sync. The hardfork's smaller model is what makes this affordable: 0.7 of 11 GB costs less disk than 0.2 of the old 73 GB did |
 | 2026-08-09 | **Cross-model KV cache transfer recorded as research lever 7 (roadmap section 12), gated on the 235B tier.** NVIDIA's closed-form KV mapper [17] converts a small family member's KV cache into a larger member's, skipping the large model's prefill (73-98% retention on its Qwen3 pairs, 4-25x faster than re-prefill, stable multi-turn). Verified from both GGUF headers that the devnet's current and target models are a matched-KV pair (Qwen3-30B-A3B and 235B-A22B: 4 KV heads, head-dim 128; layer/query-head counts differ, which the method tolerates). Recorded uses, by leverage: cross-model DSD (full 30B as drafter, mapped KV so the 235B verifier never prefills, co-located so the transfer is a local matmul), cost-quality cascading with mid-conversation upgrade, and session continuity across the 30B-to-235B hardfork | On loom the avoided cost is not FLOPs but the WAN expert fetches that dominate big-model prefill (measured: ~230 MB/token for a cold joiner), so the win should exceed the paper's single-box 4-25x. Deliberately a lever, not a commitment: the paper's scope is dense full-attention models, and its own matched-KV Ministral pairs collapse to 42-44% retention -- matched KV correlates with transfer but does not guarantee it -- so the MoE pair must be measured, with the paper's attention-output-cosine diagnostic (r=+0.57 with retention) as the cheap go/no-go screen and calibration run against the quantized models' actual KV. The mapper artifact (4-12 GB, immutable, content-addressable) distributes over loom's own weight layer; applying it is the batched per-head matmul the unified K-quant kernels already serve |
+| 2026-08-09 | **Verifier-side expert selection recorded as research lever 8 (extends the DSD lever), from AcceptMoE [18] -- the first catch of the weekly research radar.** DSD's batched verify materializes the expert union of the draft window; AcceptMoE weights each position's router demand by its commitment probability, self-sizes the eligible set by the demand's effective rank (root token's natural top-k always preserved), and prunes low-demand nonresident experts against the live cache under a rerouting budget. Measured on Qwen3-30B-A3B -- the devnet model -- under expert offloading: -38.6 to -48.6% expert-weight traffic from residency pruning, 2.06x end-to-end, -0.27 pp mean accuracy | The verifier union is loom's actual DSD bill: every nonresident union member is a disk page-in on the bootnode (verify measured at disk-streaming speed) or a WAN fetch on a partial holder, so cutting union traffic multiplies DSD throughput where it is weakest. Loom's chain-shaped window makes the paper's offline commitment traces unnecessary -- acceptance^depth from the gamma controller's live EMA supplies the weights -- and shard residency is already tracked per fetch. Gated honestly: masked routing is not distribution-preserving (their -0.27 pp), so it must ship opt-in with the default path keeping the drafted-loop byte-identity test; and loom's <= 9-lane window is far smaller than their 64-token trees, so the absolute saving must be re-measured in loom's regime rather than assumed |
 ---
 
 ## Appendix B: Source layout
