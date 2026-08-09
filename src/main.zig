@@ -456,6 +456,12 @@ fn cmdNode(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, args: [][]const u8, 
     const hold_fraction = try flagF64(args, "--hold-fraction", 1.0);
     const range_mb = try flagF64(args, "--range-mb", 4.0);
 
+    // Wired here and not only in the gguf-run paths: the DSD verifier runs
+    // inside `loom node`, and node.run blocks -- so the mask must be armed
+    // BEFORE it. The v0.36.0 slip (flag parsed by the node but the generator
+    // var set only in runStoreWith/runEngine) made --verify-expert-mask a
+    // silent no-op on a serving node.
+    generator.verify_expert_mask = hasFlag(args, "--verify-expert-mask");
     try node.run(gpa, io, out, .{
         .model = model_spec,
         .rpc_addr = rpc_addr,
