@@ -131,6 +131,7 @@ fn usage(out: *Io.Writer) !void {
         \\            [--advertise HOST:PORT] [--network devnet|testnet|mainnet] [--network-id N]
         \\            [--rag] [--rag-k N] [--r-target N] [--free-quota TOKENS] [--admin-token TOK]
         \\            [--ui-addr A] [--ui-port P] [--status-secs N] [--threads N] [--batch N]
+        \\            [--verify-expert-mask]
         \\  loom light [--full-nodes H:P[,...]] [--openai-port P --openai-full-nodes H:P[,...]]
         \\             [--rpc-addr A] [--rpc-port P] [--openai-addr A] [--client-id ID]
         \\  loom gguf gen <file> [--seed N] [--data-mb M] [--arch deepseek2|llama|qwen2moe|qwen3moe|glm4moe]
@@ -366,14 +367,15 @@ fn defaultRamGb() f64 {
 }
 
 const NODE_FLAGS = [_][]const u8{
-    "--model",          "--rpc-addr",     "--rpc-port",       "--openai-addr",    "--openai-port",
-    "--p2p-addr",       "--p2p-port",     "--ram-gb",         "--pin-gb",         "--seed",
-    "--stats",          "--no-verify",    "--gguf",           "--bootstrap",      "--hold-fraction",
-    "--range-mb",       "--peers",        "--advertise",      "--network-id",     "--network",
-    "--rag",            "--rag-k",        "--r-target",       "--free-quota",     "--admin-token",
-    "--ctx",            "--ui-addr",      "--ui-port",        "--status-secs",    "--threads",
-    "--mmap-weights",   "--gpu-ops",      "--no-gpu-layers",  "--batch",          "--chat-format",
-    "--report-metrics", "--alpha-ingest", "--delegate-below", "--bootstrap-http", "--bootstrap-http-split-gb",
+    "--model",              "--rpc-addr",     "--rpc-port",       "--openai-addr",    "--openai-port",
+    "--p2p-addr",           "--p2p-port",     "--ram-gb",         "--pin-gb",         "--seed",
+    "--stats",              "--no-verify",    "--gguf",           "--bootstrap",      "--hold-fraction",
+    "--range-mb",           "--peers",        "--advertise",      "--network-id",     "--network",
+    "--rag",                "--rag-k",        "--r-target",       "--free-quota",     "--admin-token",
+    "--ctx",                "--ui-addr",      "--ui-port",        "--status-secs",    "--threads",
+    "--mmap-weights",       "--gpu-ops",      "--no-gpu-layers",  "--batch",          "--chat-format",
+    "--report-metrics",     "--alpha-ingest", "--delegate-below", "--bootstrap-http", "--bootstrap-http-split-gb",
+    "--verify-expert-mask",
 };
 
 /// A flag-shaped argument this command does not know is an error, not a
@@ -866,6 +868,7 @@ fn runStoreWith(
     const ctx_cap = try flagUsize(args, "--ctx", 4096);
     generator.kernel_threads = try flagUsize(args, "--threads", 0);
     generator.prefill_batch = try flagUsize(args, "--batch", 0);
+    generator.verify_expert_mask = hasFlag(args, "--verify-expert-mask");
     m.cfg.ctx_len = @min(m.cfg.ctx_len, ctx_cap);
     const c = m.cfg;
     try out.print("gguf: dim={d} layers={d} heads={d} vocab={d} ctx={d}\n", .{
@@ -1078,6 +1081,7 @@ fn runEngine(comptime eng: type, gpa: std.mem.Allocator, io: Io, out: *Io.Writer
     const ctx_cap = try flagUsize(args, "--ctx", 4096);
     generator.kernel_threads = try flagUsize(args, "--threads", 0);
     generator.prefill_batch = try flagUsize(args, "--batch", 0);
+    generator.verify_expert_mask = hasFlag(args, "--verify-expert-mask");
     m.cfg.ctx_len = @min(m.cfg.ctx_len, ctx_cap);
     const c = m.cfg;
     try out.print("gguf: dim={d} layers={d} heads={d} vocab={d} ctx={d}\n", .{

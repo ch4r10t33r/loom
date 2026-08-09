@@ -285,6 +285,12 @@ pub fn defaultThreads() usize {
 /// possible without rebuilding.
 pub var kernel_threads: usize = 0;
 
+/// Opt-in commitment-weighted verifier expert masking for DSD batched
+/// verification (research lever 8; --verify-expert-mask). GQA engine only;
+/// NOT distribution-preserving past the window's first lane, so off by
+/// default and never part of the byte-identity-gated default path.
+pub var verify_expert_mask: bool = false;
+
 pub fn threads() usize {
     return if (kernel_threads == 0) defaultThreads() else kernel_threads;
 }
@@ -564,6 +570,22 @@ fn verifyDraftInner(
     if (batched and draft.len > 1) {
         sess.st.spec_capture = true;
         defer sess.st.spec_capture = false;
+        const masked = comptime @hasField(E.State, "verify_mask");
+        if (masked and verify_expert_mask) {
+            sess.st.verify_mask = true;
+            sess.st.mask_natural = 0;
+            sess.st.mask_eligible = 0;
+        }
+        defer if (masked) {
+            if (sess.st.verify_mask and sess.st.mask_natural > 0) {
+                std.debug.print("verify mask: expert union {d} -> {d} eligible ({d}% kept)\n", .{
+                    sess.st.mask_natural,
+                    sess.st.mask_eligible,
+                    sess.st.mask_eligible * 100 / sess.st.mask_natural,
+                });
+            }
+            sess.st.verify_mask = false;
+        };
         try E.stepBatch(m, &sess.st, draft, pos);
         try sess.toks.append(gpa, draft[0]);
         var accepted: usize = 1;
