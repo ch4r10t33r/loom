@@ -59,11 +59,15 @@ kernel void attn_head(
     device const float *qh = q + (ulong)h * d.hd;
 
     // ---- scores: one dot product per cached position -------------------------
+    // Base-2 softmax: fold log2e into the scale so the exponential below
+    // is a native exp2 regardless of compile options (exp(x) == exp2(x*log2e);
+    // identical softmax ratios, last-bit rounding differences only).
+    const float scale2 = d.scale * M_LOG2E_F;
     for (uint t = tid; t < d.seq; t += nt) {
         device const float *kt = k_cache + (ulong)t * d.kvd + (ulong)kvh * d.hd;
         float s = 0.0f;
         for (uint i = 0; i < d.hd; i++) s += qh[i] * kt[i];
-        scores[t] = s * d.scale;
+        scores[t] = s * scale2;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -81,7 +85,7 @@ kernel void attn_head(
 
     float local_sum = 0.0f;
     for (uint t = tid; t < d.seq; t += nt) {
-        const float e = exp(scores[t] - mx);
+        const float e = exp2(scores[t] - mx);
         scores[t] = e;
         local_sum += e;
     }
