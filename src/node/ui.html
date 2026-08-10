@@ -193,13 +193,16 @@ async function send() {
       '\nmissing experts stream from peers on first use; cold requests take minutes and permanently warm this node';
   }, 1000);
 
+  // The server rejects a model name that is not the one this node serves,
+  // so send the id /health reported -- and no model field at all before the
+  // first poll lands, which the server treats as "whatever you serve".
   const req = {
-    model: 'loom',
     messages: history,
     temperature: parseFloat($('temp').value),
     max_tokens: parseInt($('maxtok').value, 10),
     stream: $('stream').checked,
   };
+  if (lastHealth && lastHealth.model) req.model = lastHealth.model;
 
   try {
     const r = await fetch('/v1/chat/completions', {
