@@ -4,13 +4,20 @@
 // (emitted gates are the unbiased scores), and the renormalization divisor is
 // clamped to the smallest normal f16, as llama.cpp does.
 //
-// One thread does everything: top-k over <=256 experts picking <=16 is a few
-// hundred comparisons, once per layer, against an FFN moving megabytes. The
+// The whole workgroup cooperates: scoring strides the experts, and each
+// top-k round is a parallel argmax (value-then-lowest-index order, so the
+// selection matches the serial first-max-wins loop EXACTLY, ties included).
+// The serial predecessor spent ~24 us per call -- one thread walking
+// n_expert * n_used comparisons at scalar speed while 63 lanes idled -- which
+// the kernel profile billed as the third-largest slot in the frame. The
 // bias, when present, follows the logits in the same buffer at offset
 // n_expert -- the pipeline layout has four bindings and this keeps to three.
 #version 450
 layout(local_size_x = 64) in;
 shared float sc_sh[256];
+shared float ch_sh[256];
+shared float red_v[64];
+shared uint red_i[64];
 layout(std430, binding = 0) readonly buffer L { float logits[]; };
 layout(std430, binding = 1) writeonly buffer I { uint ids[]; };
 layout(std430, binding = 2) buffer G { float gates[]; }; // read back during renormalization
@@ -21,46 +28,74 @@ const uint MAX_SELECTED = 16u;
 
 void main() {
     uint tid = gl_LocalInvocationID.x;
-    float scores[MAX_EXPERTS];
-    float choice[MAX_EXPERTS];
     if (pc.n_expert > MAX_EXPERTS || pc.n_used > MAX_SELECTED) return;
 
-    // Scoring parallelizes across the workgroup (the sigmoid case needs no
-    // reduction); the few-hundred-comparison top-k selection stays on one
-    // thread, as before -- it was the 26 serial sigmoid loops per token that
-    // showed up in the kernel profile, not the selection.
     if (pc.gating == 1u) {
         for (uint e = tid; e < pc.n_expert; e += 64u) sc_sh[e] = 1.0 / (1.0 + exp(-logits[e]));
-        barrier();
-        if (tid != 0u) return;
-        for (uint e = 0u; e < pc.n_expert; e++) scores[e] = sc_sh[e];
     } else {
-        if (tid != 0u) return;
-        float mx = -1.0 / 0.0;
-        for (uint e = 0u; e < pc.n_expert; e++) mx = max(mx, logits[e]);
-        float sum = 0.0;
-        for (uint e = 0u; e < pc.n_expert; e++) {
+        // Softmax: parallel max, strided exp, parallel sum -- the reduction
+        // scratch is red_v, reused by the selection rounds below.
+        float lm = -1.0 / 0.0;
+        for (uint e = tid; e < pc.n_expert; e += 64u) lm = max(lm, logits[e]);
+        red_v[tid] = lm;
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1u) {
+            if (tid < s) red_v[tid] = max(red_v[tid], red_v[tid + s]);
+            barrier();
+        }
+        float mx = red_v[0];
+        barrier();
+        float ls = 0.0;
+        for (uint e = tid; e < pc.n_expert; e += 64u) {
             float v = exp(logits[e] - mx);
-            scores[e] = v;
-            sum += v;
+            sc_sh[e] = v;
+            ls += v;
         }
-        float inv = 1.0 / sum;
-        for (uint e = 0u; e < pc.n_expert; e++) scores[e] *= inv;
+        red_v[tid] = ls;
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1u) {
+            if (tid < s) red_v[tid] += red_v[tid + s];
+            barrier();
+        }
+        float inv = 1.0 / red_v[0];
+        barrier();
+        for (uint e = tid; e < pc.n_expert; e += 64u) sc_sh[e] *= inv;
     }
+    for (uint e = tid; e < pc.n_expert; e += 64u) {
+        ch_sh[e] = sc_sh[e] + (pc.has_bias == 1u ? logits[pc.n_expert + e] : 0.0);
+    }
+    barrier();
 
-    for (uint e = 0u; e < pc.n_expert; e++) {
-        choice[e] = scores[e] + (pc.has_bias == 1u ? logits[pc.n_expert + e] : 0.0);
-    }
     for (uint k = 0u; k < pc.n_used; k++) {
-        uint best = 0u;
-        float best_v = -1.0 / 0.0;
-        for (uint e = 0u; e < pc.n_expert; e++) {
-            if (choice[e] > best_v) { best_v = choice[e]; best = e; }
+        // Parallel argmax over ch_sh: each lane scans its stride, the tree
+        // reduce keeps the higher value and breaks ties on the lower index --
+        // the exact order a serial strict-greater-than scan produces.
+        float bv = -1.0 / 0.0;
+        uint bi = 0xFFFFFFFFu;
+        for (uint e = tid; e < pc.n_expert; e += 64u) {
+            if (ch_sh[e] > bv || (ch_sh[e] == bv && e < bi)) { bv = ch_sh[e]; bi = e; }
         }
-        choice[best] = -1.0 / 0.0;
-        ids[k] = best;
-        gates[k] = scores[best]; // unbiased, deliberately
+        red_v[tid] = bv;
+        red_i[tid] = bi;
+        barrier();
+        for (uint s = 32u; s > 0u; s >>= 1u) {
+            if (tid < s) {
+                if (red_v[tid + s] > red_v[tid] || (red_v[tid + s] == red_v[tid] && red_i[tid + s] < red_i[tid])) {
+                    red_v[tid] = red_v[tid + s];
+                    red_i[tid] = red_i[tid + s];
+                }
+            }
+            barrier();
+        }
+        if (tid == 0u) {
+            uint best = red_i[0];
+            ids[k] = best;
+            gates[k] = sc_sh[best]; // unbiased, deliberately
+            ch_sh[best] = -1.0 / 0.0;
+        }
+        barrier();
     }
+    if (tid != 0u) return;
     if (pc.weights_norm == 1u) {
         float sum = 0.0;
         for (uint k = 0u; k < pc.n_used; k++) sum += gates[k];
