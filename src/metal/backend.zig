@@ -79,6 +79,10 @@ const dmmv_q4k_id_src = @embedFile("../shaders/metal/dmmv_q4k_id.metal");
 const dmmv_q5_0_id_src = @embedFile("../shaders/metal/dmmv_q5_0_id.metal");
 const dmmv_q8_0_id_src = @embedFile("../shaders/metal/dmmv_q8_0_id.metal");
 const dmmv_q6k_src = @embedFile("../shaders/metal/dmmv_q6k.metal");
+const dmmv_q2k_src = @embedFile("../shaders/metal/dmmv_q2k.metal");
+const dmmv_q2k_id_src = @embedFile("../shaders/metal/dmmv_q2k_id.metal");
+const dmmv_q3k_src = @embedFile("../shaders/metal/dmmv_q3k.metal");
+const dmmv_q3k_id_src = @embedFile("../shaders/metal/dmmv_q3k_id.metal");
 const gemm_q4k_src = @embedFile("../shaders/metal/gemm_q4k.metal");
 const attn_src = @embedFile("../shaders/metal/attn.metal");
 const mla_attn_src = @embedFile("../shaders/metal/mla_attn.metal");
@@ -430,6 +434,10 @@ const Ctx = struct {
     dev: mtl.Device,
     q4k: mtl.Pipeline,
     q6k: mtl.Pipeline,
+    q2k: mtl.Pipeline,
+    q3k: mtl.Pipeline,
+    q2k_id: mtl.Pipeline,
+    q3k_id: mtl.Pipeline,
     q5_1: mtl.Pipeline,
     /// Q4_K with two rows per SIMD group, for matrices large enough that group
     /// count matters more than activation reuse. See `dmmvFor`.
@@ -539,6 +547,22 @@ pub fn parallelBegin(n: usize) void {
         return;
     };
     const p6 = dev.pipeline(dmmv_q6k_src, "dmmv_q6k") catch {
+        dev.deinit();
+        return;
+    };
+    const p2k = dev.pipeline(dmmv_q2k_src, "dmmv_q2k") catch {
+        dev.deinit();
+        return;
+    };
+    const p3k = dev.pipeline(dmmv_q3k_src, "dmmv_q3k") catch {
+        dev.deinit();
+        return;
+    };
+    const p2kid = dev.pipeline(dmmv_q2k_id_src, "dmmv_q2k_id") catch {
+        dev.deinit();
+        return;
+    };
+    const p3kid = dev.pipeline(dmmv_q3k_id_src, "dmmv_q3k_id") catch {
         dev.deinit();
         return;
     };
@@ -665,7 +689,7 @@ pub fn parallelBegin(n: usize) void {
         dev.deinit();
         return;
     };
-    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0_id = p50id, .q8_0_id = p80id, .q5_0 = p50, .q8_0 = p80, .f32p = pf32, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_wsum_p = pwsum, .mla_absorb_p = pabs, .mla_rope_p = pmrope, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .reduce_dev_p = predd, .route_p = proute, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .copy_p = pcp, .swiglu_slots_p = pss, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
+    ctx = .{ .dev = dev, .q4k = p, .q6k = p6, .q2k = p2k, .q3k = p3k, .q2k_id = p2kid, .q3k_id = p3kid, .q5_1 = p51, .q4k_wide = p4w, .q4k_id = p4id, .q5_0_id = p50id, .q8_0_id = p80id, .q5_0 = p50, .q8_0 = p80, .f32p = pf32, .gemm_q4k = pg, .attn_p = pattn, .mla_attn_p = pmla, .mla_wsum_p = pwsum, .mla_absorb_p = pabs, .mla_rope_p = pmrope, .rope_p = prope, .kvw_p = pkvw, .sadd_p = psadd, .reduce_p = pred, .reduce_dev_p = predd, .route_p = proute, .zero_p = pzero, .rmsnorm_p = pn, .swiglu_p = ps, .add_p = pa, .copy_p = pcp, .swiglu_slots_p = pss, .act = act, .scratch_x = sx, .scratch_out = so, .norms = nb, .gpa = gpa };
 }
 
 pub fn parallelEnd() void {
@@ -801,6 +825,21 @@ fn freeChunk() ?usize {
         if (c == null) return i;
     }
     return null;
+}
+
+/// Test support: drop every cached host wrap. The wrapFor contract is that
+/// wrapped memory stays alive for the life of the context -- true for model
+/// weights and store mappings, violated by tests that loop over short-lived
+/// fixture allocations. A freed fixture whose page base is reused by a
+/// smaller-or-equal allocation revives a stale MTLBuffer whose GPU mapping
+/// can reference the OLD physical pages: well-formed wrong results and no
+/// error (see the contract note in wrapFor). Tests that wrap temporary host
+/// memory call this first so every wrap in that test is fresh.
+fn resetWrapCache() void {
+    const cx = &(ctx orelse return);
+    var it = cx.wrapped.valueIterator();
+    while (it.next()) |b| b.deinit();
+    cx.wrapped.clearRetainingCapacity();
 }
 
 fn wrapFor(cx: *Ctx, data: []const u8) ?Wrapped {
@@ -1213,12 +1252,24 @@ pub fn hasMlaCache() bool {
 /// which case the host absorption stays in use for every layer.
 pub fn mlaSetWk(li: usize, wk_f32: []const f32) bool {
     const cx = &(ctx orelse return false);
-    if (li != cx.mla_wk.items.len) return false;
+    if (li > cx.mla_wk.items.len) return false;
     // Stored f16: half the per-token absorb traffic, and rounding a weight
     // that was quantized to ~4.5 bits anyway is noise against that.
     const b = cx.dev.alloc(wk_f32.len * @sizeOf(f16)) catch return false;
     const dst = b.slice(f16)[0..wk_f32.len];
     for (dst, wk_f32) |*o, v| o.* = @floatCast(v);
+    // Replace, not refuse, when the layer already has a buffer. The engine
+    // uploads each layer once in order and never hits this; the test suite
+    // shares one Metal context, and the old first-upload-wins rule left later
+    // tests silently reading an EARLIER test's buffer with their own (larger)
+    // dims -- an out-of-bounds read that surfaced only when the heap neighbor
+    // changed. Found by MTL_SHADER_VALIDATION after new allocations moved the
+    // stale read onto garbage.
+    if (li < cx.mla_wk.items.len) {
+        cx.mla_wk.items[li].deinit();
+        cx.mla_wk.items[li] = b;
+        return true;
+    }
     cx.mla_wk.append(cx.gpa, b) catch return false;
     return true;
 }
@@ -1261,6 +1312,9 @@ pub fn mlaAttnHeads(
     // command buffers and waits once, where each of these was one and a wait.
     if (li >= cx.mla_wk.items.len) return false;
     const kvr = cx.mla_kvr;
+    // The stored W_k must cover this call's dims: a smaller buffer means a
+    // stale upload from another shape, and dispatching would read past it.
+    if (cx.mla_wk.items[li].len < n_heads * (nope + v_head_dim) * kvr * @sizeOf(f16)) return false;
     if ((q_nope.len + q_rope.len) * 4 > cx.scratch_x.len) return false;
     if (out.len != n_heads * v_head_dim) return false;
     if (out.len * 4 > cx.scratch_out.len) return false;
@@ -1358,6 +1412,8 @@ pub fn mlaAttnHeads(
 fn dmmvIdFor(cx: *Ctx, t: ggml.Type) ?struct { pipe: mtl.Pipeline, per: usize } {
     return switch (t) {
         .q4_k => .{ .pipe = cx.q4k_id, .per = 4 },
+        .q2_k => .{ .pipe = cx.q2k_id, .per = 4 },
+        .q3_k => .{ .pipe = cx.q3k_id, .per = 4 },
         .q5_0 => .{ .pipe = cx.q5_0_id, .per = 1 },
         .q8_0 => .{ .pipe = cx.q8_0_id, .per = 1 },
         else => null,
@@ -1693,6 +1749,9 @@ pub fn mlaLayerTail(
     const cx = &(ctx orelse return false);
     if (!use_gpu_ops) return false;
     if (li >= cx.mla_wk.items.len) return false;
+    // The stored W_k must cover this call's dims: a smaller buffer means a
+    // stale upload from another shape, and dispatching would read past it.
+    if (cx.mla_wk.items[li].len < n_heads * (nope + v_head_dim) * cx.mla_kvr * @sizeOf(f16)) return false;
     const cbuf = cx.mla_c orelse return false;
     const rbuf = cx.mla_krope orelse return false;
     const seq = pos + 1;
@@ -1918,6 +1977,12 @@ pub fn mlaTokenFrame(
     const cbuf = cx.mla_c orelse return false;
     const rbuf = cx.mla_krope orelse return false;
     if (pos + 1 > cx.mla_ctx or descs.len > cx.mla_wk.items.len) return false;
+    // Every layer's stored W_k must cover this frame's dims (see mlaSetWk:
+    // the suite re-uploads with different shapes; a stale smaller buffer
+    // dispatched with these dims is an out-of-bounds read).
+    for (cx.mla_wk.items[0..descs.len]) |wkb| {
+        if (wkb.len < fc.n_heads * (fc.nope + fc.v_head_dim) * fc.kvr * @sizeOf(f16)) return false;
+    }
     const dim = fc.dim;
     const kd = fc.nope + fc.rope;
     const seq = pos + 1;
@@ -2566,6 +2631,8 @@ fn rowsPerGroup(t: ggml.Type, rows: usize) usize {
         // NR0 in dmmv_q4k.metal, and the wide variant compiled from the same
         // source with NR0 forced to 2.
         .q4_k => if (rows >= Q4K_WIDE_ROWS) 2 else 4,
+        // NR0 in dmmv_q2k.metal / dmmv_q3k.metal.
+        .q2_k, .q3_k => 4,
         else => 1,
     };
 }
@@ -2605,6 +2672,8 @@ fn dmmvFor(cx: *Ctx, t: ggml.Type, rows: usize) ?struct { pipe: mtl.Pipeline, gr
     const pipe = switch (t) {
         .q4_k => if (rows >= Q4K_WIDE_ROWS) cx.q4k_wide else cx.q4k,
         .q6_k => cx.q6k,
+        .q2_k => cx.q2k,
+        .q3_k => cx.q3k,
         .q5_1 => cx.q5_1,
         .q5_0 => cx.q5_0,
         .q8_0 => cx.q8_0,
@@ -2681,6 +2750,7 @@ test "metal q4_k matvec agrees with the exact cpu reference" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest; // no Metal device on this host
+    resetWrapCache();
 
     const saved_use4 = use_gpu_ops;
     use_gpu_ops = true;
@@ -2740,6 +2810,7 @@ test "metal q6_k matvec agrees with the exact cpu reference" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
 
     // Force the GPU path regardless of what calibration would have decided.
     const saved_min = min_rows;
@@ -2777,6 +2848,112 @@ test "metal q6_k matvec agrees with the exact cpu reference" {
     }
 }
 
+test "metal q2_k matvec agrees with the exact cpu reference" {
+    // Same oracle discipline as the q4_k test above: dequantize-then-dot in
+    // f32 (the CPU int8 path is approximate by design), tolerance against the
+    // summed mass. Random bytes are a valid Q2_K encoding once the f16
+    // d/dmin at the block tail are kept finite.
+    const gpa = std.testing.allocator;
+    const cols = 2048;
+    const rows = MIN_GPU_ROWS;
+
+    var prng = std.Random.DefaultPrng.init(0xB22CE);
+    const rnd = prng.random();
+
+    const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q2_k, cols, rows));
+    defer gpa.free(data);
+    rnd.bytes(data);
+    for (0..data.len / 2) |i| data[i * 2 + 1] &= 0xFB; // finite f16 scales
+
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest; // no Metal device on this host
+    resetWrapCache();
+
+    const saved_use = use_gpu_ops;
+    use_gpu_ops = true;
+    defer use_gpu_ops = saved_use;
+
+    const got = try gpa.alloc(f32, rows);
+    defer gpa.free(got);
+    @memset(got, std.math.nan(f32));
+    matvec(.q2_k, got, data, x, rows, cols);
+
+    const row = try gpa.alloc(f32, cols);
+    defer gpa.free(row);
+    for (0..rows) |r| {
+        cpu.dequantRow(.q2_k, row, data, r, cols);
+        var want: f32 = 0;
+        var mass: f32 = 0;
+        for (row, x) |w, xv| {
+            want += w * xv;
+            mass += @abs(w * xv);
+        }
+        const tol = mass * 1e-5;
+        std.testing.expectApproxEqAbs(want, got[r], tol) catch |e| {
+            std.debug.print("metal q2_k row {d}: reference {d} vs gpu {d} (tol {d})\n", .{ r, want, got[r], tol });
+            return e;
+        };
+    }
+}
+
+test "metal q3_k matvec agrees with the exact cpu reference" {
+    // Q3_K adds the hmask third bit and the 12-byte 6-bit scale shuffle; a
+    // wrong kmask constant or hmask bit index shifts whole sub-blocks by 4 and
+    // this test is where it shows. Only d needs the finite-f16 scrub -- the
+    // scales are 6-bit integers with no invalid encodings.
+    const gpa = std.testing.allocator;
+    const cols = 2048;
+    const rows = MIN_GPU_ROWS;
+
+    var prng = std.Random.DefaultPrng.init(0xC33CE);
+    const rnd = prng.random();
+
+    const data = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q3_k, cols, rows));
+    defer gpa.free(data);
+    rnd.bytes(data);
+    for (0..data.len / 2) |i| data[i * 2 + 1] &= 0xFB; // finite f16 scales
+
+    const x = try gpa.alloc(f32, cols);
+    defer gpa.free(x);
+    for (x) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+
+    parallelBegin(1);
+    defer parallelEnd();
+    if (ctx == null) return error.SkipZigTest; // no Metal device on this host
+    resetWrapCache();
+
+    const saved_use = use_gpu_ops;
+    use_gpu_ops = true;
+    defer use_gpu_ops = saved_use;
+
+    const got = try gpa.alloc(f32, rows);
+    defer gpa.free(got);
+    @memset(got, std.math.nan(f32));
+    matvec(.q3_k, got, data, x, rows, cols);
+
+    const row = try gpa.alloc(f32, cols);
+    defer gpa.free(row);
+    for (0..rows) |r| {
+        cpu.dequantRow(.q3_k, row, data, r, cols);
+        var want: f32 = 0;
+        var mass: f32 = 0;
+        for (row, x) |w, xv| {
+            want += w * xv;
+            mass += @abs(w * xv);
+        }
+        const tol = mass * 1e-5;
+        std.testing.expectApproxEqAbs(want, got[r], tol) catch |e| {
+            std.debug.print("metal q3_k row {d}: reference {d} vs gpu {d} (tol {d})\n", .{ r, want, got[r], tol });
+            return e;
+        };
+    }
+}
+
 test "dispatch grids match each kernel's rows per SIMD group" {
     // Pins the arithmetic that produced the worst bug in this work. The dmmv
     // kernels do not agree on how many rows a SIMD group covers -- Q4_K takes
@@ -2794,6 +2971,8 @@ test "dispatch grids match each kernel's rows per SIMD group" {
     try std.testing.expectEqual(@as(usize, 2), rowsPerGroup(.q4_k, Q4K_WIDE_ROWS));
     try std.testing.expectEqual(@as(usize, 2), rowsPerGroup(.q4_k, 102400));
     try std.testing.expectEqual(@as(usize, 1), rowsPerGroup(.q6_k, 4096));
+    try std.testing.expectEqual(@as(usize, 4), rowsPerGroup(.q2_k, 1408));
+    try std.testing.expectEqual(@as(usize, 4), rowsPerGroup(.q3_k, 65536));
     // Row counts that do not divide must round up, not down -- and then round
     // again to a whole threadgroup, or the final partial threadgroup reports a
     // smaller `simdgroups_per_threadgroup` and addresses the wrong rows.
@@ -2841,6 +3020,7 @@ test "metal batched matmul agrees with the exact cpu reference" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
 
     const saved_useg = use_gpu_ops;
     const saved_gemm = gemm_worthwhile;
@@ -2896,6 +3076,7 @@ test "metal fused attention matches the cpu head loop" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
     if (!attnInit(layers, ctx_len, kvd)) return error.SkipZigTest;
 
     var prng = std.Random.DefaultPrng.init(0xA77E);
@@ -2988,6 +3169,7 @@ test "metal layer block matches the cpu layer, end to end" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
     if (!attnInit(layers, ctx_len, kvd)) return error.SkipZigTest;
 
     const saved_use = use_gpu_ops;
@@ -3253,6 +3435,7 @@ test "metal q5_1 matvec agrees with the exact cpu reference" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
     const saved_min = min_rows;
     const saved_ok = gpu_worthwhile;
     const saved_use = use_gpu_ops;
@@ -3332,6 +3515,7 @@ test "metal moe block matches the cpu expert loop" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
     const saved_use = use_gpu_ops;
     use_gpu_ops = true;
     defer use_gpu_ops = saved_use;
@@ -3448,6 +3632,7 @@ test "metal dispatch cost breakdown" {
     parallelBegin(8);
     defer parallelEnd();
     const cx = &(ctx orelse return error.SkipZigTest);
+    resetWrapCache();
 
     var prng = std.Random.DefaultPrng.init(1);
     const rnd = prng.random();
@@ -3527,6 +3712,7 @@ test "metal submission floor" {
     parallelBegin(1);
     defer parallelEnd();
     const cx = &(ctx orelse return error.SkipZigTest);
+    resetWrapCache();
 
     var t: std.Io.Threaded = .init(gpa, .{});
     defer t.deinit();
@@ -3672,6 +3858,7 @@ test "resident ffn block matches the cpu path" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
 
     var prng = std.Random.DefaultPrng.init(0xFF17);
     const rnd = prng.random();
@@ -3761,6 +3948,7 @@ test "metal elementwise kernels individually" {
     parallelBegin(1);
     defer parallelEnd();
     const cx = &(ctx orelse return error.SkipZigTest);
+    resetWrapCache();
     const n = 2048;
 
     var prng = std.Random.DefaultPrng.init(3);
@@ -3824,6 +4012,7 @@ test "resident ffn block vs the cpu ffn" {
     parallelBegin(8);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
 
     var prng = std.Random.DefaultPrng.init(5);
     const rnd = prng.random();
@@ -3901,6 +4090,7 @@ test "metal scaling: where does the gpu actually win" {
     parallelBegin(8);
     defer parallelEnd();
     const cx = &(ctx orelse return error.SkipZigTest);
+    resetWrapCache();
 
     var t: std.Io.Threaded = .init(gpa, .{});
     defer t.deinit();
@@ -4097,6 +4287,7 @@ test "metal q5_0 matvec agrees with the exact cpu reference" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
     const saved_min = min_rows;
     const saved_ok = gpu_worthwhile;
     const saved_use = use_gpu_ops;
@@ -4185,6 +4376,7 @@ test "metal q8_0 matvec agrees with the exact cpu reference" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
     const saved_min = min_rows;
     const saved_ok = gpu_worthwhile;
     const saved_use = use_gpu_ops;
@@ -4261,6 +4453,7 @@ test "moe block accepts every down-projection type real checkpoints use" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
     const saved_use = use_gpu_ops;
     use_gpu_ops = true;
     defer use_gpu_ops = saved_use;
@@ -4300,6 +4493,33 @@ test "moe block accepts every down-projection type real checkpoints use" {
             return error.MoeBlockDeclinedARealType;
         }
     }
+
+    // The devnet model's exact expert mix: Qwen3-30B-A3B Q2_K stores gate/up
+    // as Q2_K and down as Q3_K over a 768-wide expert FFN (a multiple of 256,
+    // unlike the 1408 above, so K-quant downs are legal here).
+    {
+        const qffn = 768;
+        const qwg = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q2_k, dim, qffn));
+        defer gpa.free(qwg);
+        const qwu = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q2_k, dim, qffn));
+        defer gpa.free(qwu);
+        const qwd = try gpa.alignedAlloc(u8, .fromByteUnits(16384), ggml.tensorBytes(.q3_k, qffn, dim));
+        defer gpa.free(qwd);
+        rnd.bytes(qwg);
+        rnd.bytes(qwu);
+        rnd.bytes(qwd);
+        const refs = [_]ExpertRef{.{
+            .gate = .{ .ty = .q2_k, .data = qwg },
+            .up = .{ .ty = .q2_k, .data = qwu },
+            .down = .{ .ty = .q3_k, .data = qwd },
+            .weight = 1.0,
+            .ffn = qffn,
+        }};
+        if (!moeFfnBlock(normed, &refs, got)) {
+            std.debug.print("moe block declined the qwen3 q2_k/q3_k expert mix: the devnet model falls back to the host\n", .{});
+            return error.MoeBlockDeclinedARealType;
+        }
+    }
 }
 
 test "both q4_k kernels agree with the oracle, on each side of the threshold" {
@@ -4315,6 +4535,7 @@ test "both q4_k kernels agree with the oracle, on each side of the threshold" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
     const saved_min = min_rows;
     const saved_ok = gpu_worthwhile;
     const saved_use = use_gpu_ops;
@@ -4388,6 +4609,7 @@ test "q4_k variants, interleaved so drift cannot favour one" {
     parallelBegin(8);
     defer parallelEnd();
     const cx = &(ctx orelse return error.SkipZigTest);
+    resetWrapCache();
     var t: std.Io.Threaded = .init(gpa, .{});
     defer t.deinit();
     const io = t.io();
@@ -4461,6 +4683,7 @@ test "moe block: back to back against a host gap between calls" {
     parallelBegin(8);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
     const saved_use = use_gpu_ops;
     use_gpu_ops = true;
     defer use_gpu_ops = saved_use;
@@ -4808,11 +5031,12 @@ test "id-indexed matvec equals the plain kernel, for every expert type" {
     const rows = 1408;
     const n_planes = 6;
     const ids = [_]u32{ 3, 0, 5, 1, 4, 2 };
-    const types = [_]ggml.Type{ .q4_k, .q5_0, .q8_0 };
+    const types = [_]ggml.Type{ .q4_k, .q2_k, .q3_k, .q5_0, .q8_0 };
 
     parallelBegin(1);
     defer parallelEnd();
     const cx = &(ctx orelse return error.SkipZigTest);
+    resetWrapCache();
     const saved_min = min_rows;
     const saved_ok = gpu_worthwhile;
     const saved_use = use_gpu_ops;
@@ -4838,16 +5062,21 @@ test "id-indexed matvec equals the plain kernel, for every expert type" {
         // Pin every block scale: a random f16 can be inf, and both sides then
         // produce NaN, which compares unequal to itself and reads as a kernel
         // bug.
-        const bs: usize = switch (ty) {
-            .q4_k => 144,
-            .q5_0 => 22,
-            .q8_0 => 34,
+        // (block size, offset of d, offset of dmin or null) -- the K-quants
+        // do not all keep their scales at the block head: Q2_K ends with
+        // d/dmin at 80/82 and Q3_K with d at 108.
+        const bs: usize, const d_off: usize, const dmin_off: ?usize = switch (ty) {
+            .q4_k => .{ 144, 0, 2 },
+            .q2_k => .{ 84, 80, 82 },
+            .q3_k => .{ 110, 108, null },
+            .q5_0 => .{ 22, 0, null },
+            .q8_0 => .{ 34, 0, null },
             else => unreachable,
         };
         var b: usize = 0;
         while (b + bs <= datas[i].len) : (b += bs) {
-            std.mem.writeInt(u16, datas[i][b..][0..2], 0x2C00, .little); // d
-            if (ty == .q4_k) std.mem.writeInt(u16, datas[i][b + 2 ..][0..2], 0x2800, .little); // dmin
+            std.mem.writeInt(u16, datas[i][b + d_off ..][0..2], 0x2C00, .little); // d
+            if (dmin_off) |mo| std.mem.writeInt(u16, datas[i][b + mo ..][0..2], 0x2800, .little); // dmin
         }
     }
     defer for (datas[0..n_alloc]) |d| gpa.free(d);
@@ -4934,6 +5163,7 @@ test "device routing agrees with moe.route, bias and all" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
     const saved_use = use_gpu_ops;
     use_gpu_ops = true;
     defer use_gpu_ops = saved_use;
@@ -5002,6 +5232,7 @@ test "fused routed layer equals host routing plus the verified block" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
     const saved_use = use_gpu_ops;
     use_gpu_ops = true;
     defer use_gpu_ops = saved_use;
@@ -5132,6 +5363,7 @@ test "layer tail equals its constituent buffers plus host glue" {
     parallelBegin(1);
     defer parallelEnd();
     if (ctx == null) return error.SkipZigTest;
+    resetWrapCache();
     const saved_use = use_gpu_ops;
     use_gpu_ops = true;
     defer use_gpu_ops = saved_use;
@@ -5287,6 +5519,7 @@ test "mla rope kernel matches the host ropeApply, plain and yarn, strided" {
     parallelBegin(1);
     defer parallelEnd();
     const cx = &(ctx orelse return error.SkipZigTest);
+    resetWrapCache();
     var prng = std.Random.DefaultPrng.init(0x1207E);
     const rnd = prng.random();
     const host = try gpa.alloc(f32, n_vec * stride);
