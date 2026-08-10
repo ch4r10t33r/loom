@@ -1230,7 +1230,37 @@ fn moeLayer(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool) !v
     const sel = sel_buf[0..cfg.n_used];
     const bias: ?[]const f32 = if (l.exp_probs_b) |b| tensorAsF32(b) else null;
     moe.route(cfg.route, st.router[0..cfg.n_expert], bias, sel);
+    traceRoute(m, li, sel);
     try moeRun(m, st, l, li, dist_ok, sel);
+}
+
+// LOOM_EXPERT_TRACE=<path>: one line per routed MoE layer -- "<layer> <e0>
+// <e1> ..." -- for offline activation-shape analysis (research lever 9,
+// stage 0; scripts/expert-trace-stats.py is the reader). Token boundaries
+// are recovered by the reader from the layer index wrapping, so no position
+// needs threading through. Single-stream diagnostic: the file is truncated
+// at first use and closed by process exit; concurrent engines would
+// interleave lines.
+var trace_file: ?Io.File = null;
+var trace_checked: bool = false;
+
+fn traceRoute(m: *const Model, li: usize, sel: []const moe.Selected) void {
+    if (!trace_checked) {
+        trace_checked = true;
+        if (std.c.getenv("LOOM_EXPERT_TRACE")) |p|
+            trace_file = Io.Dir.cwd().createFile(m.io, std.mem.span(p), .{ .truncate = true }) catch null;
+    }
+    const f = trace_file orelse return;
+    var lb: [256]u8 = undefined;
+    var len: usize = (std.fmt.bufPrint(&lb, "{d}", .{li}) catch return).len;
+    for (sel) |s| {
+        const part = std.fmt.bufPrint(lb[len..], " {d}", .{s.expert}) catch return;
+        len += part.len;
+    }
+    if (len >= lb.len) return;
+    lb[len] = '\n';
+    len += 1;
+    f.writeStreamingAll(m.io, lb[0..len]) catch {};
 }
 
 /// Everything moeLayer does after routing: PILOT bookkeeping/prefetch, the
