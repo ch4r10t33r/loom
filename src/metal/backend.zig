@@ -32,7 +32,12 @@ const GemmDims = extern struct { rows: u32, cols: u32, n: u32 };
 pub fn matmul(t: ggml.Type, out: []f32, data: []const u8, xs: []const f32, n: usize, rows: usize, cols: usize) void {
     if (n <= 1) return matvec(t, out, data, xs, rows, cols);
     const cx = &(ctx orelse return cpu.matmul(t, out, data, xs, n, rows, cols));
-    if (!calibrating and (!use_gpu_ops or !gemm_worthwhile) and calibrated) return cpu.matmul(t, out, data, xs, n, rows, cols);
+    // No `calibrated` term: an uncalibrated process resolves to the CPU, the
+    // same way a calibration tie does. Requiring `calibrated` here meant any
+    // process that never loads a model -- `loom bench`, tests -- paid a
+    // command buffer per call and measured ~1.4 ms of dispatch overhead on a
+    // shape the CPU wins outright.
+    if (!calibrating and (!use_gpu_ops or !gemm_worthwhile)) return cpu.matmul(t, out, data, xs, n, rows, cols);
     if (t != .q4_k or n > MAX_BATCH or cols % 256 != 0) {
         return cpu.matmul(t, out, data, xs, n, rows, cols);
     }
