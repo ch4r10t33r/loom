@@ -1052,6 +1052,7 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
     const debug_split = std.c.getenv("LOOM_FRAME_DEBUG") != null;
     var ph = [_]i128{0} ** 5;
     const nowf = @import("../core/stats.zig").nowMonoNs;
+    const frame_t0 = nowf();
     var c = d.beginCmd() catch return false;
     for (descs, 0..) |dd, li| {
         const p = &plans[li];
@@ -1210,6 +1211,8 @@ pub fn mlaTokenFrame(descs: []const MlaLayerDesc, fc: MlaFrameCfg, x: []f32, pos
         const t0 = nowf();
         d.submitWait(c) catch return false;
         ph[4] += nowf() - t0;
+        if (std.c.getenv("LOOM_FRAME_TIME") != null and !debug_split)
+            std.debug.print("frame record {d}us submit {d}us\n", .{ @divTrunc(t0 - frame_t0, 1000), @divTrunc(nowf() - t0, 1000) });
     }
     if (d.prof) {
         prof_frames += 1;
