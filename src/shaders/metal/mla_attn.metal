@@ -67,13 +67,15 @@ kernel void mla_attn_head(
 
     // ---- scores --------------------------------------------------------------
     // Both halves of the MLA score, against one cache row each.
+    // Base-2 softmax: fold log2e into the scale (see attn.metal).
+    const float scale2 = d.scale * M_LOG2E_F;
     for (uint t = tid; t < d.seq; t += nt) {
         device const float *ct = c_cache + (ulong)t * d.kvr;
         device const float *kt = krope_cache + (ulong)t * d.rope;
         float s = 0.0f;
         for (uint i = 0; i < d.kvr; i++) s += qa[i] * ct[i];
         for (uint i = 0; i < d.rope; i++) s += qr[i] * kt[i];
-        scores[t] = s * d.scale;
+        scores[t] = s * scale2;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -90,7 +92,7 @@ kernel void mla_attn_head(
 
     float local_sum = 0.0f;
     for (uint t = tid; t < d.seq; t += nt) {
-        const float e = exp(scores[t] - mx);
+        const float e = exp2(scores[t] - mx);
         scores[t] = e;
         local_sum += e;
     }
