@@ -289,6 +289,11 @@ fn route(ctx: *Ctx, req: Request, wi: *Io.Writer, dl: ?usize) !?Response {
     const gpa = ctx.gpa;
     const path = stripQuery(req.path);
 
+    // One console line per request, except the /health poll the chat UI
+    // fires every second -- that would bury every other log line.
+    if (!eql(path, "/health"))
+        std.debug.print("openai: {s} {s}\n", .{ req.method, path });
+
     if (ctx.serve_ui and eql(req.method, "GET") and (eql(path, "/") or eql(path, "/index.html"))) {
         // Static, embedded at compile time: the binary stays self-contained,
         // which is the point of shipping one executable.

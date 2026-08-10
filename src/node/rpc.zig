@@ -152,6 +152,13 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
         .string => |s| s,
         else => "anon",
     };
+    // One console line per request: the method when given, else the request
+    // shape ("gen" is the methodless prompt form).
+    const req_kind: []const u8 = if (obj.get("method")) |mv|
+        (if (mv == .string) mv.string else "?")
+    else if (obj.get("prompt") != null) "gen" else "?";
+    std.debug.print("rpc: request method={s} client={s}\n", .{ req_kind, client });
+
     // reject at the boundary with a clear error (security issue #142); the
     // meter enforces the same bound defensively
     if (client.len > meter_mod.MAX_CLIENT_ID_LEN) {
