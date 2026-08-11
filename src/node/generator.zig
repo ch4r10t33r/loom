@@ -291,6 +291,11 @@ pub var kernel_threads: usize = 0;
 /// default and never part of the byte-identity-gated default path.
 pub var verify_expert_mask: bool = false;
 
+/// Path to a pre-gate predictor head (`--pregate-head`, research lever 9):
+/// loaded into the GQA engine after the distributed source attaches, so
+/// every token's expert working set prefetches from layer 0. Null = off.
+pub var pregate_head_path: ?[]const u8 = null;
+
 pub fn threads() usize {
     return if (kernel_threads == 0) defaultThreads() else kernel_threads;
 }

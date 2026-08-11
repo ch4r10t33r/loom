@@ -29,6 +29,7 @@ const backend = @import("../compute/backend.zig");
 const tensor = @import("../core/tensor.zig");
 const spm = @import("spm.zig");
 const moe = @import("moe.zig");
+pub const pregate_mod = @import("pregate.zig");
 const expert_fetch = @import("../p2p/expert_fetch.zig");
 
 /// Re-exported: the SPM tokenizer moved to spm.zig so every engine can share
@@ -206,6 +207,10 @@ pub const Model = struct {
     /// PILOT router-lookahead prefetch (see moeLayer). On by default for the
     /// distributed path; LOOM_NO_PILOT=1 disables for A/B measurement.
     pilot_enabled: bool = false,
+    /// Pre-gate predictor (research lever 9): PILOT at full depth. Loaded
+    /// from `--pregate-head`; predicts every layer's experts from the
+    /// post-layer-0 residual stream and prefetches them with per-layer lead.
+    pregate: ?pregate_mod.Pregate = null,
     /// GLM/DeepSeek-style NextN block: a full extra transformer layer plus
     /// the glue that turns (hidden state, next-token embedding) into a draft
     /// of the token after next. Loaded from blk.{n_layers}; null when the
@@ -238,6 +243,7 @@ pub const Model = struct {
     }
 
     pub fn deinit(self: *Model) void {
+        if (self.pregate) |*pg| pg.deinit(self.gpa);
         if (self.expert_shard.len > 0) self.gpa.free(self.expert_shard);
         self.tok.deinit(self.gpa);
         self.gpa.free(self.layers);
@@ -1124,6 +1130,11 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     }
 
     for (m.layers, 0..) |l, li| {
+        // Pre-gate prefetch: st.x here is the post-layer-0 residual stream
+        // (what the head was trained on); every remaining layer's predicted
+        // experts start fetching now, layer 1 first -- the tightest deadline
+        // gets the queue's head, the deepest layers the most lead.
+        if (li == 1) pregatePrefetch(m, st);
         // ---- attention ----
         backend.rmsnorm(st.normed, st.x, tensorAsF32(l.attn_norm), cfg.eps);
         mv(l.attn_q, st.q, st.normed);
@@ -1213,6 +1224,32 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
 
     backend.rmsnorm(st.normed, st.x, tensorAsF32(m.output_norm), cfg.eps);
     mv(m.output, st.logits, st.normed);
+}
+
+/// Pre-gate prefetch (research lever 9): run the trained head on the
+/// post-layer-0 residual stream and hand every remaining layer's predicted
+/// experts to the async fetch pool, nearest layer first. Decode path only
+/// (the hook sits in `step`); prefill pays batch-union costs instead. A cold
+/// queue overflow drops predictions rather than stalling -- prefetchAsync's
+/// contract -- and mispredictions still warm the store.
+fn pregatePrefetch(m: *const Model, st: *State) void {
+    const pg = if (m.pregate) |*p| p else return;
+    const src = m.dist orelse return;
+    const cfg = m.cfg;
+    if (pg.hid != cfg.dim or pg.n_expert != cfg.n_expert) return;
+    pregate_mod.predict(pg, st.x);
+    var ebuf: [moe.MAX_SELECTED]u16 = undefined;
+    var ids_buf: [moe.MAX_SELECTED]usize = undefined;
+    const k = @min(cfg.n_used, moe.MAX_SELECTED);
+    var pi: usize = 0;
+    while (pi < pg.n_pred) : (pi += 1) {
+        const li = pi + 1;
+        if (li >= m.layers.len) break;
+        if (!m.layers[li].is_moe) continue;
+        const n = pregate_mod.topk(pg, pi, k, &ebuf);
+        for (ebuf[0..n], 0..) |e, j| ids_buf[j] = m.expert_shard[li * cfg.n_expert + e];
+        src.prefetchAsync(ids_buf[0..n]);
+    }
 }
 
 /// One mixture-of-experts FFN layer: route `st.normed`, run the selected
