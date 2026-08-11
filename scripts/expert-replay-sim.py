@@ -148,7 +148,28 @@ def train_cooc(tokens, layers, depth):
     return co
 
 
-def prefetch_sim(tokens, layers, expert_mb, layer_ms, bandwidths, cache_frac, depths):
+def parse_preds(path, n_pred_layers):
+    """Prediction dump: n_pred_layers lines per token, aligned 1:1 with the
+    trace's tokens (both written by pregate_probe.py's eval loop)."""
+    preds, cur, prev_li = [], {}, None
+    with open(path) as f:
+        for line in f:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            li = int(parts[0])
+            if prev_li is not None and li <= prev_li and cur:
+                preds.append(cur)
+                cur = {}
+            cur[li] = [int(x) for x in parts[1:]]
+            prev_li = li
+    if cur:
+        preds.append(cur)
+    return [p for p in preds if len(p) == n_pred_layers]
+
+
+def prefetch_sim(tokens, layers, expert_mb, layer_ms, bandwidths, cache_frac, depths,
+                 preds=None):
     """Replay the second half with an LRU cache plus a DEPTH-layer-lookahead
     prefetcher: predictions for layer li+D are issued at layer li, so a
     predicted miss has D*layer_ms of fetch lead. A note on two deliberate
@@ -176,7 +197,10 @@ def prefetch_sim(tokens, layers, expert_mb, layer_ms, bandwidths, cache_frac, de
     # a pre-gated/trained-predictable model (the lever's stage-2 target)
     # would make real. Depth-D kinds model a conventional pipelined
     # predictor issuing one layer at a time.
-    for kind in ("none", "cooc", "oracle", "pregate-cooc", "pregate-oracle"):
+    kinds = ["none", "cooc", "oracle", "pregate-cooc", "pregate-oracle"]
+    if preds is not None:
+        kinds.append("pregate-file")  # a trained head's dumped predictions
+    for kind in kinds:
         for depth in ([0] if kind == "none" else [0] if kind.startswith("pregate") else depths):
             co = None
             if kind == "cooc":
@@ -215,7 +239,10 @@ def prefetch_sim(tokens, layers, expert_mb, layer_ms, bandwidths, cache_frac, de
                         for tgt in targets:
                             if tgt > layers[-1] or tgt not in t:
                                 continue
-                            pred = predict_for(kind, co, t, li, tgt)
+                            if kind == "pregate-file":
+                                pred = preds[i].get(tgt, []) if i < len(preds) else []
+                            else:
+                                pred = predict_for(kind, co, t, li, tgt)
                             fresh = {e for e in pred if not cache.resident(tgt, e)}
                             old, _ = pending.get(tgt, (set(), 0.0))
                             pending[tgt] = (set(old) | fresh, (tgt - li) * layer_ms)
@@ -233,6 +260,8 @@ def main():
     ap.add_argument("--expert-mb", type=float, default=1.5)
     ap.add_argument("--layer-ms", type=float, default=1.0,
                     help="compute time per MoE layer (lead time a 1-layer prefetch gets)")
+    ap.add_argument("--pregate-pred", default="",
+                    help="prediction dump aligned with the trace (pregate_probe.py --pred-out)")
     args = ap.parse_args()
 
     tokens, layers = parse(args.trace)
@@ -252,9 +281,15 @@ def main():
     print(f"\n== depth-D lookahead prefetch on LRU@25% "
           f"(compute floor {compute_ms:.0f} ms/token) ==")
     print(f"{'predictor':>9} {'depth':>5} {'MB/s':>6} {'stall':>9} {'tok/s':>6} {'waste':>7}")
+    preds = None
+    if args.pregate_pred:
+        preds = parse_preds(args.pregate_pred, len(layers) - 1)
+        if len(preds) != len(tokens):
+            sys.exit(f"prediction dump has {len(preds)} tokens vs trace {len(tokens)}; "
+                     "both files must come from the same pregate_probe run")
     for kind, depth, B, stall, demand, waste in prefetch_sim(
             tokens, layers, args.expert_mb, args.layer_ms,
-            (125.0, 375.0, 1250.0), 0.25, (1, 4, 8, 16, 47)):
+            (125.0, 375.0, 1250.0), 0.25, (1, 4, 8, 16, 47), preds):
         toks = 1000.0 / (compute_ms + stall)
         print(f"{kind:>9} {depth:>5} {B:>6.0f} {stall:>8.1f}ms {toks:>6.1f} {waste:>6.1f}MB")
 
