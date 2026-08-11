@@ -992,6 +992,17 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                     gguf_gen.m.initDeviceAttn();
                     const arch_name = gguf_gen.m.archName();
                     if (attachGgufDist(&gguf_gen.m, gpa, &gguf_src)) |_| {
+                        // Pre-gate head (research lever 9): GQA engine only;
+                        // a load failure downgrades to no-prefetch, loudly.
+                        if (generator.pregate_head_path) |pp| switch (gguf_gen.m) {
+                            .gqa => |*g| {
+                                if (llama.pregate_mod.load(gpa, io, pp)) |pg| {
+                                    g.pregate = pg;
+                                    try out.print("  pregate    head loaded ({d} layers x {d} experts)\n", .{ pg.n_pred, pg.n_expert });
+                                } else |e| try out.print("  pregate    load failed ({s}); continuing without\n", .{@errorName(e)});
+                            },
+                            .deepseek => try out.print("  pregate    unsupported for the deepseek engine; ignored\n", .{}),
+                        };
                         gguf_gen.chat_format = if (opts.chat_format) |cf|
                             chat_template.parse(cf) orelse chat_template.detect(gguf_gen.m.chatTemplate(), arch_name)
                         else
