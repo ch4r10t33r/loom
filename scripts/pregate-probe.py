@@ -25,9 +25,6 @@ import torch.nn as nn
 from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-MODEL = "allenai/OLMoE-1B-7B-0924"
-
-
 def batches(tok, seq_len, batch_size):
     ds = load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT",
                       split="train", streaming=True)
@@ -42,10 +39,10 @@ def batches(tok, seq_len, batch_size):
 
 
 @torch.no_grad()
-def collect(model, ids, top_k):
+def collect(model, ids, top_k, input_layer=1):
     """-> h1 [B*T, H], targets multi-hot [B*T, L-1, E], sel [L, B*T, top_k]"""
     out = model(ids.cuda(), output_hidden_states=True, output_router_logits=True)
-    h1 = out.hidden_states[1].reshape(-1, model.config.hidden_size).float()
+    h1 = out.hidden_states[input_layer].reshape(-1, model.config.hidden_size).float()
     sels = []
     for rl in out.router_logits:  # per layer [B*T, E]
         sels.append(rl.topk(top_k, dim=-1).indices)
@@ -66,18 +63,29 @@ def main():
     ap.add_argument("--head-out", default="pregate-head.pt")
     ap.add_argument("--pred-out", default="")
     ap.add_argument("--head-width", type=int, default=1024)
+    ap.add_argument("--model", default="allenai/OLMoE-1B-7B-0924")
+    ap.add_argument("--load-4bit", action="store_true")
+    ap.add_argument("--input-layer", type=int, default=1,
+                    help="hidden_states index the head reads: 0=embeddings, 1=post-layer-0")
     args = ap.parse_args()
 
-    tok = AutoTokenizer.from_pretrained(MODEL)
-    model = AutoModelForCausalLM.from_pretrained(
-        MODEL, torch_dtype=torch.bfloat16, device_map="cuda")
+    tok = AutoTokenizer.from_pretrained(args.model)
+    if args.load_4bit:
+        from transformers import BitsAndBytesConfig
+        qc = BitsAndBytesConfig(load_in_4bit=True,
+                                bnb_4bit_compute_dtype=torch.bfloat16)
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, quantization_config=qc, device_map="cuda")
+    else:
+        model = AutoModelForCausalLM.from_pretrained(
+            args.model, torch_dtype=torch.bfloat16, device_map="cuda")
     model.eval()
     for p in model.parameters():
         p.requires_grad_(False)
     cfg = model.config
     top_k = cfg.num_experts_per_tok
     n_layers, n_e, hid = cfg.num_hidden_layers, cfg.num_experts, cfg.hidden_size
-    print(f"{MODEL}: {n_layers} layers, {n_e} experts, top-{top_k}, hidden {hid}")
+    print(f"{args.model}: {n_layers} layers, {n_e} experts, top-{top_k}, hidden {hid}")
 
     head = nn.Sequential(
         nn.Linear(hid, args.head_width), nn.GELU(),
@@ -98,7 +106,7 @@ def main():
     for bi, ids in enumerate(batches(tok, args.seq_len, args.batch_size)):
         if bi >= args.train_batches:
             break
-        h1, tgt, sels = collect(model, ids, top_k)
+        h1, tgt, sels = collect(model, ids, top_k, args.input_layer)
         is_eval = (bi % args.eval_every) == args.eval_every - 1
         if not is_eval:
             for i in range(n_layers - 1):
