@@ -35,6 +35,8 @@ def main():
     ap.add_argument("--batch-size", type=int, default=6)
     ap.add_argument("--seq-len", type=int, default=1024)
     ap.add_argument("--skip-tokens", type=int, default=20_000_000)
+    ap.add_argument("--top-pred", type=int, default=0,
+                    help="dump this many ranked predictions per layer (0 = top_k)")
     ap.add_argument("--trace-out", default="olmoe-trace-final.txt")
     ap.add_argument("--pred-out", default="olmoe-pred-final.txt")
     args = ap.parse_args()
@@ -62,9 +64,12 @@ def main():
             out = model(ids.cuda(), output_hidden_states=True, output_router_logits=True)
             h1 = out.hidden_states[1].reshape(-1, hid).float()
             sels = [rl.topk(top_k, dim=-1).indices for rl in out.router_logits]
-            pred = head(h1).view(-1, n_layers - 1, n_e).topk(top_k, dim=-1).indices
+            n_dump = args.top_pred or top_k
+            logits = head(h1).view(-1, n_layers - 1, n_e)
+            pred = logits.topk(n_dump, dim=-1).indices
+            pred8 = pred[:, :, :top_k]
             for i in range(n_layers - 1):
-                hits += (pred[:, i].unsqueeze(2) == sels[i + 1].unsqueeze(1)).any(2).sum().item()
+                hits += (pred8[:, i].unsqueeze(2) == sels[i + 1].unsqueeze(1)).any(2).sum().item()
                 total += sels[i + 1].numel()
             for pos in range(sels[0].shape[0]):
                 for li in range(n_layers):
