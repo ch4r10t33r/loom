@@ -5,8 +5,9 @@
 //!
 //! Lifecycle: joiners fill the first committee whose minimum expert-shard
 //! coverage is below R; when all committees are saturated (min coverage ≥ R),
-//! the next joiner opens a new one. Rejoins (same address) are idempotent and
-//! return the original assignment.
+//! the next joiner opens a new one. Rejoins (same address) at the same
+//! capacity are idempotent and return the original assignment; a rejoin at a
+//! different capacity re-assigns within the same committee (issue #252).
 //!
 //! The registry is in-memory state on the bootnode; it is deliberately NOT in
 //! the inference path and nothing depends on it after a node has joined.
@@ -76,15 +77,35 @@ pub const Registry = struct {
     }
 
     /// Assign `addr` to a committee with capacity for `capacity` expert
-    /// shards. Least-covered shards first. Idempotent on rejoin.
+    /// shards. Least-covered shards first. A rejoin at the same capacity is
+    /// idempotent; a rejoin at a different capacity re-assigns (issue #252:
+    /// the old always-return-stored behavior meant a node that ever joined
+    /// at the default fraction could never come back smaller -- every later
+    /// `--hold-fraction` was silently ignored).
     pub fn join(self: *Registry, addr: []const u8, capacity: usize) !JoinOut {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
 
-        // rejoin: return a copy of the stored assignment
+        const cap = @max(@as(usize, 1), @min(capacity, self.nExperts()));
+
         for (self.committees.items) |*c| {
-            for (c.members.items) |m| {
+            for (c.members.items) |*m| {
                 if (std.mem.eql(u8, m.addr, addr)) {
+                    const held = m.assign.count() - self.n_resident;
+                    if (held != cap) {
+                        // Release the old picks, then re-pick at the new
+                        // size. Freeing drops each shard a coverage point,
+                        // which puts the previously-held set first in the
+                        // least-covered order again: a grow keeps the old
+                        // set and extends it, a shrink keeps its
+                        // least-covered core.
+                        var i: usize = self.n_resident;
+                        while (i < self.n_shards) : (i += 1) {
+                            if (m.assign.has(i)) c.coverage[i - self.n_resident] -= 1;
+                        }
+                        m.assign.deinit(self.gpa);
+                        m.assign = try self.assignExperts(c, cap);
+                    }
                     const copy = weights.Holdings{
                         .bits = try self.gpa.dupe(u8, m.assign.bits),
                         .n = m.assign.n,
@@ -113,8 +134,21 @@ pub const Registry = struct {
         }
         const c = target.?;
 
-        // pick up to `capacity` least-covered expert shards (stable by index)
-        const cap = @max(@as(usize, 1), @min(capacity, self.nExperts()));
+        var assign = try self.assignExperts(c, cap);
+        errdefer assign.deinit(self.gpa);
+
+        const member = Member{
+            .addr = try self.gpa.dupe(u8, addr),
+            .assign = .{ .bits = try self.gpa.dupe(u8, assign.bits), .n = assign.n },
+        };
+        try c.members.append(self.gpa, member);
+
+        return self.buildOut(c, assign, addr);
+    }
+
+    /// Pick `cap` least-covered expert shards (stable by coverage, then
+    /// index), bump their coverage, and return resident+picked. Caller owns.
+    fn assignExperts(self: *Registry, c: *Committee, cap: usize) !weights.Holdings {
         const Idx = struct { cov: u16, idx: usize };
         const order = try self.gpa.alloc(Idx, self.nExperts());
         defer self.gpa.free(order);
@@ -134,14 +168,7 @@ pub const Registry = struct {
             assign.set(self.n_resident + o.idx);
             c.coverage[o.idx] += 1;
         }
-
-        const member = Member{
-            .addr = try self.gpa.dupe(u8, addr),
-            .assign = .{ .bits = try self.gpa.dupe(u8, assign.bits), .n = assign.n },
-        };
-        try c.members.append(self.gpa, member);
-
-        return self.buildOut(c, assign, addr);
+        return assign;
     }
 
     /// Takes ownership of `assign` (already caller-owned at both call sites).
@@ -219,4 +246,50 @@ test "committee assignment: least-covered first, completeness, then new committe
     defer j1b.deinit(gpa);
     try std.testing.expect(j1b.committee_id == 0);
     try std.testing.expect(std.mem.eql(u8, j1b.assign.bits, j1.assign.bits));
+}
+
+test "rejoin at a different capacity re-assigns (issue #252)" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    // 2 resident + 8 expert shards, R=2
+    var reg = Registry.init(gpa, io, 10, 2, 2);
+    defer reg.deinit();
+
+    var j1 = try reg.join("n1:1", 6);
+    defer j1.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 8), j1.assign.count()); // 2 resident + 6
+
+    // shrink: the regression -- the old code returned the stored 6-expert
+    // assignment here, so a fresh low-holdings measurement node was
+    // impossible once its address had ever joined at the default fraction
+    var j2 = try reg.join("n1:1", 2);
+    defer j2.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 0), j2.committee_id);
+    try std.testing.expectEqual(@as(usize, 4), j2.assign.count()); // 2 resident + 2
+    // the kept experts are a subset of the original assignment
+    for (2..10) |i| {
+        if (j2.assign.has(i)) try std.testing.expect(j1.assign.has(i));
+    }
+
+    // coverage bookkeeping stayed consistent: another joiner still gets a
+    // full, valid assignment and the freed shards are available again
+    var j3 = try reg.join("n2:1", 8);
+    defer j3.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 10), j3.assign.count());
+
+    // grow: back to 6 keeps the shrunken core and extends it
+    var j4 = try reg.join("n1:1", 6);
+    defer j4.deinit(gpa);
+    try std.testing.expectEqual(@as(usize, 8), j4.assign.count());
+    for (2..10) |i| {
+        if (j2.assign.has(i)) try std.testing.expect(j4.assign.has(i));
+    }
+
+    // same capacity stays idempotent
+    var j5 = try reg.join("n1:1", 6);
+    defer j5.deinit(gpa);
+    try std.testing.expect(std.mem.eql(u8, j5.assign.bits, j4.assign.bits));
 }

@@ -494,6 +494,14 @@ set: a self-sufficient serving cell for one model version.
 - **Committee lifecycle:** joiners go to the first committee whose minimum shard
   coverage is below `R`. When every shard in every existing committee has coverage
   at or above `R` (saturated), the next joiner opens a new committee.
+- **Rejoin semantics:** a rejoin (same address) at the same capacity is
+  idempotent and returns the stored assignment. A rejoin at a *different*
+  capacity re-assigns within the same committee: the old picks release their
+  coverage points first, so a grow keeps the previous set and extends it and a
+  shrink keeps its least-covered core (issue #252 — the registry previously
+  returned the stored assignment unconditionally, silently ignoring the new
+  fraction). Clients additionally cap the received want-set at their requested
+  fraction, so a pre-fix bootnode cannot force a larger hold.
 - **Heartbeats:** every node maintains a regular heartbeat (wire Heartbeat frames,
   5 s interval) with its committee members. The member set is the join-time seed
   plus the gossip-derived committee view, so membership stays current as the
