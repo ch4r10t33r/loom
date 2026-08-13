@@ -17,6 +17,7 @@ const weights = @import("weights.zig");
 const http_bootstrap = @import("http_bootstrap.zig");
 const dns = @import("dns.zig");
 const sockopt = @import("../core/sockopt.zig");
+const stripe = @import("stripe.zig");
 
 pub const Result = struct {
     store: weights.Store,
@@ -336,6 +337,160 @@ fn fetchFromPeerInto(
     return stats.*;
 }
 
+/// Read a PDATA response for STRIPE g p into buf. Returns false when the
+/// peer declines (partial holder, old peer) -- the caller tries another.
+fn fetchParity(peer: *Peer, g: usize, p: usize, buf: []u8) !bool {
+    try peer.send("STRIPE {d} {d}\n", .{ g, p });
+    const line = try peer.recvLine();
+    if (!std.mem.startsWith(u8, line, "PDATA ")) return false;
+    const len = try std.fmt.parseInt(usize, field(line, "len") orelse return error.BadDataLine, 10);
+    // Same manifest on both sides means the same group padding; anything else
+    // would desync the stream, so drop this connection's answer entirely.
+    if (len != buf.len) return error.BadDataLine;
+    try peer.r.interface.readSliceAll(buf);
+    return true;
+}
+
+/// Striped repair pass (stripe.zig): rebuild a group's missing ranges from
+/// parity pieces instead of fetching the originals. A group qualifies when
+/// all but at most M_PARITY of its ranges are already held locally and at
+/// least one missing range is wanted. Parity rows come from full-group
+/// holders (STRIPE), round-robined across peers; the rebuilt ranges pass
+/// through writeRange's digest check, so a wrong or malicious parity piece
+/// costs one skipped group, never a corrupt store.
+///
+/// Honesty note (whitepaper decision log): under today's pull model any peer
+/// able to serve a group's parity also holds its data and could serve that
+/// directly, so this pass buys load spreading across holders, not new
+/// availability. Availability arrives when parity-only holders (cold tier)
+/// and coded push rollout reuse this wire format.
+///
+/// Propagation plane only -- never the token loop (principle 7).
+pub fn fetchStriped(
+    gpa: std.mem.Allocator,
+    io: Io,
+    store: *weights.Store,
+    peer_addrs: []const PeerAddr,
+    progress: ?*Io.Writer,
+) !FetchStats {
+    var out = FetchStats{};
+    const m = &store.manifest;
+    const n_ranges = m.nRanges();
+    if (peer_addrs.len == 0 or n_ranges == 0) return out;
+
+    // Connect and version-guard every responsive peer once up front.
+    var conns = std.ArrayList(*Peer).empty;
+    defer {
+        for (conns.items) |p| p.close(gpa);
+        conns.deinit(gpa);
+    }
+    for (peer_addrs) |addr| {
+        const peer = Peer.connect(gpa, io, addr) catch continue;
+        const ok = blk: {
+            peer.send("MANIFEST\n", .{}) catch break :blk false;
+            const line = peer.recvLine() catch break :blk false;
+            if (!std.mem.startsWith(u8, line, "MANIFEST ")) break :blk false;
+            const v = parseDigestHex(field(line, "version") orelse break :blk false) catch break :blk false;
+            break :blk hashmod.eql(v, m.version);
+        };
+        if (!ok) {
+            peer.close(gpa);
+            continue;
+        }
+        try conns.append(gpa, peer);
+    }
+    if (conns.items.len == 0) return out;
+
+    // One group's pieces live in memory at once: up to K_DATA local data
+    // reads plus M_PARITY fetched parity rows, each padded to the group max.
+    // Bulk-sync memory, freed before serving starts.
+    const max_len: usize = @intCast(m.maxShardLen());
+    var bufs: [stripe.K_DATA + stripe.M_PARITY][]u8 = undefined;
+    var n_bufs: usize = 0;
+    defer for (bufs[0..n_bufs]) |b| gpa.free(b);
+    for (&bufs) |*b| {
+        b.* = try gpa.alloc(u8, max_len);
+        n_bufs += 1;
+    }
+    var rebuilt: [stripe.K_DATA][]u8 = undefined;
+    var n_rebuilt: usize = 0;
+    defer for (rebuilt[0..n_rebuilt]) |b| gpa.free(b);
+    for (&rebuilt) |*b| {
+        b.* = try gpa.alloc(u8, max_len);
+        n_rebuilt += 1;
+    }
+
+    const n_groups = (n_ranges + stripe.K_DATA - 1) / stripe.K_DATA;
+    var rr: usize = 0; // round-robin cursor over conns
+    var g: usize = 0;
+    groups: while (g < n_groups) : (g += 1) {
+        const first = g * stripe.K_DATA;
+        const last = @min(first + stripe.K_DATA, n_ranges);
+        const k = last - first;
+        var missing: [stripe.M_PARITY]usize = undefined;
+        var n_missing: usize = 0;
+        var want_any = false;
+        var plen: usize = 0;
+        for (first..last) |i| {
+            plen = @max(plen, @as(usize, @intCast(m.rangeLen(i))));
+            if (store.holdings.has(i)) continue;
+            if (n_missing == stripe.M_PARITY) continue :groups; // hole exceeds parity
+            missing[n_missing] = i;
+            n_missing += 1;
+            if (store.wanted.has(i)) want_any = true;
+        }
+        if (n_missing == 0 or !want_any) continue;
+
+        // Pieces: held data ranges (zero-padded), then fetched parity rows.
+        var pieces: [stripe.K_DATA + stripe.M_PARITY]stripe.Piece = undefined;
+        var n_pieces: usize = 0;
+        for (first..last) |i| {
+            if (!store.holdings.has(i)) continue;
+            const rl: usize = @intCast(m.rangeLen(i));
+            const b = bufs[n_pieces];
+            _ = store.readRangeVerified(i, b[0..rl]) catch continue :groups;
+            @memset(b[rl..plen], 0);
+            pieces[n_pieces] = .{ .index = i - first, .bytes = b[0..plen] };
+            n_pieces += 1;
+        }
+        var p: usize = 0;
+        while (p < n_missing) : (p += 1) {
+            const b = bufs[n_pieces];
+            var got = false;
+            var tries: usize = 0;
+            while (tries < conns.items.len) : (tries += 1) {
+                const peer = conns.items[rr % conns.items.len];
+                rr += 1;
+                got = fetchParity(peer, g, p, b[0..plen]) catch false;
+                if (got) {
+                    sockopt.refresh(io, peer.deadline, sockopt.PEER_TIMEOUT_S);
+                    break;
+                }
+            }
+            if (!got) continue :groups; // no reachable full-group holder
+            out.bytes += plen;
+            pieces[n_pieces] = .{ .index = k + p, .bytes = b[0..plen] };
+            n_pieces += 1;
+        }
+
+        var outs: [stripe.K_DATA][]u8 = undefined;
+        for (0..k) |i| outs[i] = rebuilt[i][0..plen];
+        stripe.decode(k, stripe.M_PARITY, pieces[0..n_pieces], outs[0..k]) catch continue :groups;
+        for (missing[0..n_missing]) |i| {
+            if (!store.wanted.has(i)) continue;
+            const rl: usize = @intCast(m.rangeLen(i));
+            // writeRange verifies the digest -- the whole integrity story
+            store.writeRange(i, outs[i - first][0..rl]) catch continue;
+            out.fetched += 1;
+            if (progress) |pw| {
+                pw.print("  striped repair: range {d} rebuilt from group {d} parity\n", .{ i, g }) catch {};
+                pw.flush() catch {};
+            }
+        }
+    }
+    return out;
+}
+
 /// Fetch the serialized manifest (digests + extent lists) from a peer. The
 /// parser verifies the Merkle root pins the digest set. Returns an owned
 /// Manifest.
@@ -510,6 +665,16 @@ pub fn bootstrapWithWanted(
                 stats.fetched, wanted, @as(f64, @floatFromInt(stats.bytes)) / (1024.0 * 1024.0), addr.host, addr.port,
             });
             try pw.flush();
+        }
+    }
+    // Striped fallback: whatever direct fetching left behind may still be
+    // recoverable as small holes (<= M_PARITY per group) from parity pieces.
+    if (store.missingCount() > 0 and peers.len > 0) {
+        if (fetchStriped(gpa, io, &store, peers, progress) catch null) |s| {
+            if (s.fetched > 0) {
+                stats.fetched += s.fetched;
+                stats.bytes += s.bytes;
+            }
         }
     }
     try store.saveSidecars();

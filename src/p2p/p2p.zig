@@ -20,6 +20,10 @@
 //!   HOLDINGS      -> HOLDINGS <hex bitmap>      (bit i = holds range i; the
 //!                    same compact summary destined for ENR metadata + gossip)
 //!   GETR <i>      -> DATA <i> len=<l> sha256=<hex>\n<raw bytes> | ERR not_held
+//!   STRIPE <g> <p> -> PDATA <g> <p> len=<l>\n<raw bytes> | ERR not_held
+//!                    (parity row p of range group g; stripe.zig. Served only
+//!                    by full-group holders; ranges zero-padded to the group
+//!                    max. Propagation plane only -- never the token loop.)
 //!   -- bootnode (when a committee registry is attached; SPEC.md) --
 //!   JOIN addr=<h:p> fraction=<f>
 //!                 -> COMMITTEE id=<n> members=<a,b,...> assign=<hex bitmap>
@@ -45,6 +49,7 @@ const rag_store = @import("../rag/store.zig");
 const generator = @import("../node/generator.zig");
 const wire = @import("wire.zig");
 const sockopt = @import("../core/sockopt.zig");
+const stripe = @import("stripe.zig");
 
 pub const Ctx = struct {
     gpa: std.mem.Allocator,
@@ -400,6 +405,42 @@ fn handleLine(ctx: *Ctx, line: []const u8, ri: *Io.Reader, wi: *Io.Writer, dl: ?
         if (ctx.heat) |h| _ = h[i].fetchAdd(1, .monotonic);
         try wi.print("DATA {d} len={d} sha256={s}\n", .{ i, data.len, hashmod.toHex(store.manifest.digests[i]) });
         try wi.writeAll(data);
+    } else if (std.mem.startsWith(u8, line, "STRIPE ")) {
+        // Parity piece for a range group (propagation plane; stripe.zig).
+        // Parity is a linear mix of every data range in the group, so only a
+        // full-group holder can serve it -- a partial holder answers not_held
+        // and the client falls back to plain GETR. Parity is computed on the
+        // fly from verified reads; deterministic Cauchy coefficients mean
+        // every honest holder produces byte-identical pieces. The receiver's
+        // digest check on the reconstructed ranges is the integrity story;
+        // no separate parity commitment exists.
+        const store = ctx.store orelse return wi.print("ERR no_store\n", .{});
+        var pit = std.mem.tokenizeScalar(u8, line[7..], ' ');
+        const g_s = pit.next() orelse return wi.print("ERR bad_id\n", .{});
+        const p_s = pit.next() orelse return wi.print("ERR bad_id\n", .{});
+        const g = std.fmt.parseInt(usize, g_s, 10) catch return wi.print("ERR bad_id\n", .{});
+        const p = std.fmt.parseInt(usize, p_s, 10) catch return wi.print("ERR bad_id\n", .{});
+        const n_ranges = store.manifest.nRanges();
+        const first = g *| stripe.K_DATA;
+        if (first >= n_ranges or p >= stripe.M_PARITY) return wi.print("ERR range\n", .{});
+        const last = @min(first + stripe.K_DATA, n_ranges);
+        var plen: usize = 0;
+        for (first..last) |i| {
+            if (!store.holdings.has(i)) return wi.print("ERR not_held\n", .{});
+            plen = @max(plen, @as(usize, @intCast(store.manifest.rangeLen(i))));
+        }
+        const out = try ctx.gpa.alloc(u8, plen);
+        defer ctx.gpa.free(out);
+        @memset(out, 0);
+        const buf = try ctx.gpa.alloc(u8, plen);
+        defer ctx.gpa.free(buf);
+        for (first..last) |i| {
+            const rl: usize = @intCast(store.manifest.rangeLen(i));
+            const data = store.readRangeVerified(i, buf[0..rl]) catch return wi.print("ERR read\n", .{});
+            stripe.accumulate(stripe.coeff(p, i - first, stripe.M_PARITY), data, out);
+        }
+        try wi.print("PDATA {d} {d} len={d}\n", .{ g, p, plen });
+        try wi.writeAll(out);
     } else if (std.mem.startsWith(u8, line, "FRAME ")) {
         const len = std.fmt.parseInt(usize, line[6..], 10) catch return wi.print("ERR bad_frame\n", .{});
         // read the body in chunks so memory tracks bytes actually delivered
@@ -797,4 +838,127 @@ test "announce batch entries carry the responder's network_id" {
         survivors += 1;
     }
     try std.testing.expectEqual(@as(usize, 2), survivors); // self + the table entry
+}
+
+const gguf_fixture = @import("../gguf/gguf.zig");
+
+test "STRIPE serves decodable parity; partial holders decline" {
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const model_path = try std.fmt.bufPrint(&pbuf, ".zig-cache/tmp/{s}/m.gguf", .{tmp.sub_path});
+    try gguf_fixture.writeMoeFixture(gpa, io, model_path, 3, "llama");
+    var sbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const store_dir = try std.fmt.bufPrint(&sbuf, ".zig-cache/tmp/{s}/store", .{tmp.sub_path});
+
+    var store = try weights.openFull(gpa, io, model_path, store_dir, 0, null);
+    defer store.deinit();
+    const n_ranges = store.manifest.nRanges();
+    const k = @min(stripe.K_DATA, n_ranges); // group 0
+
+    var ctx = Ctx{
+        .gpa = gpa,
+        .io = io,
+        .entries = &.{},
+        .unique_bytes = 0,
+        .addr = "127.0.0.1",
+        .port = 0,
+        .store = &store,
+    };
+
+    // the group's originals, zero-padded to the group max, straight from disk
+    var plen: usize = 0;
+    for (0..k) |i| plen = @max(plen, @as(usize, @intCast(store.manifest.rangeLen(i))));
+    var originals: [stripe.K_DATA][]u8 = undefined;
+    var n_orig: usize = 0;
+    defer for (originals[0..n_orig]) |b| gpa.free(b);
+    for (0..k) |i| {
+        const b = try gpa.alloc(u8, plen);
+        originals[n_orig] = b;
+        n_orig += 1;
+        const rl: usize = @intCast(store.manifest.rangeLen(i));
+        _ = try store.readRangeVerified(i, b[0..rl]);
+        @memset(b[rl..], 0);
+    }
+
+    // fetch both parity rows through the wire handler
+    var parity: [stripe.M_PARITY][]u8 = undefined;
+    var n_par: usize = 0;
+    defer for (parity[0..n_par]) |b| gpa.free(b);
+    const wbuf = try gpa.alloc(u8, plen + 128);
+    defer gpa.free(wbuf);
+    for (0..stripe.M_PARITY) |p| {
+        var w: Io.Writer = .fixed(wbuf);
+        var r: Io.Reader = .fixed("");
+        var lbuf: [32]u8 = undefined;
+        const line = try std.fmt.bufPrint(&lbuf, "STRIPE 0 {d}", .{p});
+        try handleLine(&ctx, line, &r, &w, null);
+        var resp: Io.Reader = .fixed(w.buffered());
+        const header = try resp.takeDelimiterInclusive('\n');
+        var hbuf: [64]u8 = undefined;
+        const want = try std.fmt.bufPrint(&hbuf, "PDATA 0 {d} len={d}\n", .{ p, plen });
+        try std.testing.expectEqualStrings(want, header);
+        const b = try gpa.alloc(u8, plen);
+        parity[n_par] = b;
+        n_par += 1;
+        try resp.readSliceAll(b);
+        // parity must be the deterministic Cauchy mix of the originals
+        const expect = try gpa.alloc(u8, plen);
+        defer gpa.free(expect);
+        var data_const: [stripe.K_DATA][]const u8 = undefined;
+        for (0..k) |i| data_const[i] = originals[i];
+        stripe.encodeRow(p, stripe.M_PARITY, data_const[0..k], expect);
+        try std.testing.expectEqualSlices(u8, expect, b);
+    }
+
+    // client half: erase up to M_PARITY data pieces, decode from the rest
+    const n_drop = @min(stripe.M_PARITY, k);
+    var pieces: [stripe.K_DATA + stripe.M_PARITY]stripe.Piece = undefined;
+    var n_pieces: usize = 0;
+    for (n_drop..k) |i| {
+        pieces[n_pieces] = .{ .index = i, .bytes = originals[i] };
+        n_pieces += 1;
+    }
+    for (0..n_drop) |p| {
+        pieces[n_pieces] = .{ .index = k + p, .bytes = parity[p] };
+        n_pieces += 1;
+    }
+    var rebuilt: [stripe.K_DATA][]u8 = undefined;
+    var n_reb: usize = 0;
+    defer for (rebuilt[0..n_reb]) |b| gpa.free(b);
+    var outs: [stripe.K_DATA][]u8 = undefined;
+    for (0..k) |i| {
+        rebuilt[i] = try gpa.alloc(u8, plen);
+        n_reb += 1;
+        outs[i] = rebuilt[i];
+    }
+    try stripe.decode(k, stripe.M_PARITY, pieces[0..n_pieces], outs[0..k]);
+    for (0..k) |i| try std.testing.expectEqualSlices(u8, originals[i], rebuilt[i]);
+
+    // a partial holder must decline: parity needs the whole group
+    store.holdings.clear(0);
+    {
+        var ebuf: [256]u8 = undefined;
+        var w: Io.Writer = .fixed(&ebuf);
+        var r: Io.Reader = .fixed("");
+        try handleLine(&ctx, "STRIPE 0 0", &r, &w, null);
+        try std.testing.expectEqualStrings("ERR not_held\n", w.buffered());
+    }
+    // out-of-range parity row and group
+    store.holdings.set(0);
+    {
+        var ebuf: [256]u8 = undefined;
+        var w: Io.Writer = .fixed(&ebuf);
+        var r: Io.Reader = .fixed("");
+        try handleLine(&ctx, "STRIPE 0 99", &r, &w, null);
+        try std.testing.expectEqualStrings("ERR range\n", w.buffered());
+        var w2: Io.Writer = .fixed(&ebuf);
+        try handleLine(&ctx, "STRIPE 999999 0", &r, &w2, null);
+        try std.testing.expectEqualStrings("ERR range\n", w2.buffered());
+    }
 }
