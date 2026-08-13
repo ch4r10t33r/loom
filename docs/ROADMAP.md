@@ -71,6 +71,15 @@ through to the mesh and completed inference.
    (the hardfork guard, #4). Verified live: a node that booted 5/9 against a
    dead peer recovered to 9/9 within one repair tick of the peer returning.
    Still todo: peers discovered via ENR/gossip instead of a static list.
+   *Striped repair (✅ implemented):* both bootstrap and the repair loop end
+   with a parity pass (`STRIPE` op, `stripe.zig`; commonware-stripes-style
+   systematic Reed-Solomon, k=8 data + m=2 parity per range group) that
+   rebuilds groups missing at most 2 ranges from local data plus parity
+   fetched round-robin across full-group holders. Reconstructed ranges are
+   digest-verified like any fetch. Under the pull model this spreads load
+   rather than adding availability (a parity server necessarily holds the
+   data); it is the wire foundation for parity-only cold holders and coded
+   push rollout. See SPEC.md "Striped parity fetch".
 7. **Gossip advertising** *(decided: alongside ENR; ✅ first cut implemented)*.
    Per-node weight holdings are also advertised on a global gossip topic.
    Division of labor: ENR = the compact, discovery-time summary; gossip = live,

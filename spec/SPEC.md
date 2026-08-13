@@ -131,6 +131,41 @@ the shard count on the critical path of every sync. Receivers verify
 every shard against their own manifest digests, exactly as with `GETR`,
 and degrade to per-shard `GETR` when a peer answers `ERR unknown`.
 
+## Striped parity fetch (propagation plane)
+
+Consecutive manifest ranges form fixed groups of `k = 8`; each group defines
+`m = 2` parity pieces under a systematic Reed-Solomon code over GF(2^8)
+(`src/p2p/stripe.zig`). The generator is `[I; C]` with `C` a Cauchy matrix
+derived only from `(k, m, row, column)`, so parity is deterministic: every
+honest holder computes byte-identical pieces, and pieces from different
+peers compose. Within a group, ranges are zero-padded to the group's longest
+range; any `k` of the `k+m` pieces reconstruct all `k` originals.
+
+`STRIPE <g> <p>` asks for parity row `p` of group `g` and answers
+`PDATA <g> <p> len=<l>` followed by the raw bytes, or `ERR not_held`. Only a
+node holding **every** range in the group can serve parity (it is a linear
+mix of all of them); partial holders decline and the client falls back to
+`GETR`. Servers compute parity on the fly from digest-verified reads.
+
+A syncing node uses this as a repair pass after direct fetching: a group
+missing at most `m` ranges is rebuilt from local data plus fetched parity,
+with the parity rows round-robined across peers. Reconstructed ranges pass
+through the same manifest-digest check as fetched ones, so a wrong or
+malicious parity piece costs one skipped group and never corrupts the store
+— this is what lets plain RS run against untrusted peers without the
+homomorphic-hash machinery RLNC-style recoding would need (pieces are fixed
+objects, and the final artifact is checked against a commitment the swarm
+already agrees on).
+
+Scope honesty: under the current pull model, any peer able to serve a
+group's parity necessarily holds the group's data and could serve it
+directly, so today the pass buys load spreading across holders, not new
+availability. The wire format is the foundation for parity-only holders (an
+EC'd cold tier at 1.25x overhead instead of 2x replication) and coded push
+rollout, where the availability gain is real. Per the whitepaper's
+principle 7, striping stays in the propagation plane; the per-token fetch
+path never touches coded data.
+
 ## Heat (sync ordering hint)
 
 `HEAT` asks a peer which shards it serves most. The reply is one line,
@@ -667,6 +702,7 @@ replica (it pairs with the heartbeat `load` hint).
 | `COMMITTEES` | summary lines | bootnode debug: per-committee members, min/max coverage, complete/saturated |
 | `MANIFESTFILE` | serialized manifest | digests plus extent lists, root-verified by the client |
 | `GETR <i>` | shard bytes | fetch one shard (committee or mesh) |
+| `STRIPE <g> <p>` | parity bytes | parity row p of range group g (striped repair; sync path is still line-form) |
 | `GOSSIP addr=.. version=.. holdings=..` | peer table | the global announce plus mesh exchange |
 | `PING` | `PONG` | heartbeat |
 

@@ -293,6 +293,19 @@ fn repairThread(ctx: *RepairCtx) void {
             const s = sync.fetchFromPeer(ctx.gpa, ctx.io, ctx.store, addr, null) catch continue;
             repaired += s.fetched;
         }
+        // Striped fallback (sync.zig fetchStriped): small holes no direct
+        // holder could fill may still be rebuilt from group parity.
+        if (ctx.store.missingCount() > 0) {
+            var peer_addrs = std.ArrayList(sync.PeerAddr).empty;
+            defer peer_addrs.deinit(ctx.gpa);
+            for (addrs) |addr_str| {
+                const addr = sync.PeerAddr.parse(addr_str) catch continue;
+                peer_addrs.append(ctx.gpa, addr) catch break;
+            }
+            if (sync.fetchStriped(ctx.gpa, ctx.io, ctx.store, peer_addrs.items, null) catch null) |s| {
+                repaired += s.fetched;
+            }
+        }
         if (repaired > 0) {
             ctx.store.saveSidecars() catch {};
             std.debug.print("repair: recovered {d} ranges, held {d}/{d}\n", .{
