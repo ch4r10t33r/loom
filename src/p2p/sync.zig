@@ -159,6 +159,21 @@ fn fetchHeat(gpa: std.mem.Allocator, peer: *Peer) ![]usize {
     return ids.toOwnedSlice(gpa);
 }
 
+test "capWanted trims excess expert bits, never resident ones (issue #252)" {
+    const gpa = std.testing.allocator;
+    var wanted = try weights.Holdings.initEmpty(gpa, 10);
+    defer wanted.deinit(gpa);
+    // 2 resident + 6 of 8 expert bits set
+    for (0..8) |i| wanted.set(i);
+    capWanted(&wanted, 2, 3);
+    try std.testing.expectEqual(@as(usize, 5), wanted.count()); // 2 resident + 3
+    try std.testing.expect(wanted.has(0) and wanted.has(1)); // resident untouched
+    try std.testing.expect(wanted.has(2) and wanted.has(4) and !wanted.has(5));
+    // cap above the set count is a no-op
+    capWanted(&wanted, 2, 8);
+    try std.testing.expectEqual(@as(usize, 5), wanted.count());
+}
+
 test "fetchOrder: resident first, then heat, then the tail in index order" {
     const gpa = std.testing.allocator;
     const heat = [_]usize{ 7, 3, 99, 7 }; // 99 out of range, 7 repeated
@@ -520,6 +535,21 @@ pub const JoinInfo = struct {
     }
 };
 
+/// Clear expert-range bits past `cap`, keeping the lowest-indexed set bits.
+/// Resident bits (below n_resident) are never touched.
+fn capWanted(wanted: *weights.Holdings, n_resident: usize, cap: usize) void {
+    var kept: usize = 0;
+    var i: usize = n_resident;
+    while (i < wanted.n) : (i += 1) {
+        if (!wanted.has(i)) continue;
+        if (kept < cap) {
+            kept += 1;
+            continue;
+        }
+        wanted.clear(i);
+    }
+}
+
 /// SPEC.md join flow: adopt the manifest from the bootnode, then JOIN — the
 /// bootnode assigns a committee, member list, and a least-covered-first
 /// want-set. Errors with PeerNotBootnode if the peer doesn't run a registry.
@@ -540,6 +570,15 @@ pub fn joinSwarm(gpa: std.mem.Allocator, io: Io, addr: PeerAddr, self_addr: []co
 
     var wanted = try weights.Holdings.fromHex(gpa, assign_hex, manifest.nRanges());
     errdefer wanted.deinit(gpa);
+
+    // Issue #252 defense in depth: a pre-fix bootnode's rejoin path returns
+    // the STORED assignment no matter what fraction this JOIN asked for, so
+    // a node that ever joined at the default fraction could never come back
+    // smaller. Enforce the requested cap locally (same rounding as the
+    // bootnode's JOIN handler); against a fixed bootnode this is a no-op.
+    const n_experts = manifest.nRanges() - manifest.n_resident;
+    const cap: usize = @intFromFloat(@max(1.0, @round(std.math.clamp(fraction, 0.0, 1.0) * @as(f32, @floatFromInt(n_experts)))));
+    capWanted(&wanted, manifest.n_resident, cap);
 
     var members = std.ArrayList([]u8).empty;
     errdefer {
