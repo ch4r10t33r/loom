@@ -14,9 +14,20 @@
 //! replication (hot experts gain holders by being used).
 //!
 //! Failure policy matches the eager-churn decision: holder selection spreads
-//! round-robin across peers that advertise the shard (client-side spreading,
-//! no single-holder hotspot), and a failed peer falls through to the next —
-//! the token stalls only if *no* reachable peer holds the shard.
+//! across peers (client-side spreading, no single-holder hotspot), and a
+//! failed peer falls through to the next — the token stalls only if *no*
+//! reachable peer holds the shard.
+//!
+//! Holder selection is bandwidth-weighted (FreeToken's principle that
+//! measured bandwidths, not topology, should divide miss work — arXiv:
+//! 2608.16157 — applied to loom's actual asymmetry: heterogeneous peer
+//! links instead of PCIe-vs-host): each peer's throughput is tracked as an
+//! EMA over its completed fetches, and first-choice picks follow smooth
+//! weighted round-robin over those measurements, so a datacenter peer
+//! absorbs proportionally more of a layer's parallel misses than a
+//! residential one and both finish together. Unmeasured peers get a
+//! uniform prior; the committee-before-mesh order (SPEC.md) is preserved —
+//! weighting reorders choices within each group, never across them.
 
 const std = @import("std");
 const Io = std.Io;
@@ -116,7 +127,20 @@ pub const Source = struct {
     cache_seq: u64 = 0,
     stats: Stats = .{},
     stats_mutex: Io.Mutex = .init,
-    rr: usize = 0, // round-robin start for holder spreading
+    rr: usize = 0, // uniform fallback start when nothing is measured yet
+    /// Per-holder measured throughput (bytes/s, EMA) and the smooth-WRR
+    /// credit that turns it into a pick order. Slot i < committee.len is
+    /// committee[i]; slot committee.len + j is peers[j]. Holders past
+    /// MAX_HOLDERS fall back to uniform spreading. Guarded by stats_mutex.
+    peer_bw: [MAX_HOLDERS]f64 = @splat(0),
+    peer_credit: [MAX_HOLDERS]f64 = @splat(0),
+
+    pub const MAX_HOLDERS = 64;
+    /// Prior for a peer with no completed fetch yet: 1 MB/s. Low enough
+    /// that one real measurement dominates it, high enough that cold peers
+    /// still get probed.
+    const BW_PRIOR: f64 = 1e6;
+    const BW_EMA_ALPHA: f64 = 0.3;
 
     pub fn init(gpa: std.mem.Allocator, io: Io, store: *weights.Store, peers: []const sync.PeerAddr) !Source {
         return initCached(gpa, io, store, peers, 0);
@@ -397,29 +421,78 @@ pub const Source = struct {
         }
     }
 
-    /// Fetch shard `id` from the first peer (starting round-robin) that holds
-    /// it. Digest-verified + persisted via writeRange; concurrent calls for
-    /// distinct shards write disjoint extents. Returns bytes filled in `buf`.
+    /// Smooth weighted round-robin over holder slots [base, base+n): every
+    /// pick adds each slot's weight to its credit and the winner pays the
+    /// round's total back, so over time slot i leads proportional to its
+    /// measured bandwidth -- deterministic, burst-free interleaving (the
+    /// classic nginx algorithm). Slots past MAX_HOLDERS degrade to the old
+    /// uniform rotation.
+    fn swrrPick(self: *Source, base: usize, n: usize) usize {
+        if (n <= 1) return 0;
+        if (base + n > MAX_HOLDERS) {
+            const s = self.rr;
+            self.rr +%= 1; // benign race: only spreads
+            return s % n;
+        }
+        self.stats_mutex.lockUncancelable(self.io);
+        defer self.stats_mutex.unlock(self.io);
+        var total: f64 = 0;
+        var best: usize = 0;
+        var best_credit: f64 = -std.math.inf(f64);
+        for (0..n) |i| {
+            const w = if (self.peer_bw[base + i] > 0) self.peer_bw[base + i] else BW_PRIOR;
+            self.peer_credit[base + i] += w;
+            total += w;
+            if (self.peer_credit[base + i] > best_credit) {
+                best_credit = self.peer_credit[base + i];
+                best = i;
+            }
+        }
+        self.peer_credit[base + best] -= total;
+        return best;
+    }
+
+    /// Fold one completed fetch into the holder's throughput EMA.
+    fn notePeerBw(self: *Source, slot: usize, bytes: usize, ns: i128) void {
+        if (slot >= MAX_HOLDERS or ns <= 0) return;
+        const bw = @as(f64, @floatFromInt(bytes)) * 1e9 / @as(f64, @floatFromInt(ns));
+        self.stats_mutex.lockUncancelable(self.io);
+        defer self.stats_mutex.unlock(self.io);
+        self.peer_bw[slot] = if (self.peer_bw[slot] == 0)
+            bw
+        else
+            BW_EMA_ALPHA * bw + (1.0 - BW_EMA_ALPHA) * self.peer_bw[slot];
+    }
+
+    /// Fetch shard `id` from the first holder that answers, first choices
+    /// spread by measured bandwidth (swrrPick). Digest-verified + persisted
+    /// via writeRange; concurrent calls for distinct shards write disjoint
+    /// extents. Returns bytes filled in `buf`.
     fn fetchShard(self: *Source, id: usize, buf: []u8) !usize {
         const m = &self.store.manifest;
         const want_len: usize = @intCast(m.rangeLen(id));
         if (want_len > buf.len) return error.ShardTooLarge;
 
         const t0 = stats_mod.nowNs(self.io);
-        const start = blk: {
-            const s = self.rr;
-            self.rr +%= 1; // benign race under concurrent prefetch: only spreads
-            break :blk s;
-        };
+        const start = if (self.committee.len > 0) self.swrrPick(0, self.committee.len) else 0;
+        const mesh_start = if (self.peers.len > 0) self.swrrPick(self.committee.len, self.peers.len) else 0;
 
-        // SPEC.md order: committee first (round-robin spread), then the mesh
+        // SPEC.md order: committee first, then the mesh; the weighting
+        // reorders choices within each group, never across them
         const total = self.committee.len + self.peers.len;
         var attempt: usize = 0;
         while (attempt < total) : (attempt += 1) {
-            const addr = if (attempt < self.committee.len)
-                self.committee[(start + attempt) % self.committee.len]
-            else
-                self.peers[(attempt - self.committee.len)];
+            var slot: usize = undefined;
+            var addr: sync.PeerAddr = undefined;
+            if (attempt < self.committee.len) {
+                slot = (start + attempt) % self.committee.len;
+                addr = self.committee[slot];
+            } else {
+                const j = (mesh_start + attempt - self.committee.len) % self.peers.len;
+                slot = self.committee.len + j;
+                addr = self.peers[j];
+            }
+            const t_a = stats_mod.nowNs(self.io);
             const n = self.fetchFromPeer(addr, id, buf[0..want_len]) catch {
                 self.bumpFailure();
                 continue;
@@ -429,6 +502,7 @@ pub const Source = struct {
                 self.bumpFailure();
                 continue;
             };
+            self.notePeerBw(slot, n, stats_mod.nowNs(self.io) - t_a);
             self.stats_mutex.lockUncancelable(self.io);
             self.stats.fetched += 1;
             self.stats.fetch_bytes += n;
@@ -616,4 +690,45 @@ test "fetch pool: prefetch of unfetchable shards completes, dedups, and shuts do
 
     try std.testing.expect(!store.holdings.has(1));
     try std.testing.expect(store.holdings.has(0));
+}
+
+test "swrr: picks follow measured bandwidth proportions, uniform when unmeasured" {
+    const gpa = std.testing.allocator;
+    var thr: std.Io.Threaded = .init(gpa, .{});
+    defer thr.deinit();
+    const io = thr.io();
+    var src = Source{
+        .gpa = gpa,
+        .io = io,
+        .store = undefined, // never touched by swrrPick/notePeerBw
+        .peers = &.{},
+        .scratch = &.{},
+    };
+
+    // unmeasured: every slot has the same prior, so picks rotate uniformly
+    var counts = [_]usize{ 0, 0, 0 };
+    for (0..30) |_| counts[src.swrrPick(0, 3)] += 1;
+    for (counts) |c| try std.testing.expectEqual(@as(usize, 10), c);
+
+    // 3:1 measured bandwidth -> 3:1 first-choice ratio, deterministically
+    src.peer_bw[0] = 3e6;
+    src.peer_bw[1] = 1e6;
+    src.peer_credit = @splat(0);
+    var c2 = [_]usize{ 0, 0 };
+    for (0..40) |_| c2[src.swrrPick(0, 2)] += 1;
+    try std.testing.expectEqual(@as(usize, 30), c2[0]);
+    try std.testing.expectEqual(@as(usize, 10), c2[1]);
+
+    // EMA: first sample sets, later samples fold at alpha=0.3
+    src.notePeerBw(5, 1000, 1000); // 1e9 B/s
+    try std.testing.expectApproxEqRel(@as(f64, 1e9), src.peer_bw[5], 1e-9);
+    src.notePeerBw(5, 500, 1000); // sample 5e8
+    try std.testing.expectApproxEqRel(@as(f64, 0.3 * 5e8 + 0.7 * 1e9), src.peer_bw[5], 1e-9);
+    // bad sample is ignored
+    src.notePeerBw(5, 500, 0);
+    try std.testing.expectApproxEqRel(@as(f64, 0.3 * 5e8 + 0.7 * 1e9), src.peer_bw[5], 1e-9);
+
+    // out-of-range slots never touch the arrays
+    src.notePeerBw(Source.MAX_HOLDERS, 1000, 1000);
+    _ = src.swrrPick(Source.MAX_HOLDERS - 1, 2); // uniform fallback path
 }
