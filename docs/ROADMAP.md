@@ -112,8 +112,13 @@ payment-proof verification; persistent ledgers.
 `expert_fetch.zig` + `loom gguf run <store-dir> --peers`: a node running a
 deepseek2 model from a *partial* expert-sharded store fetches missing experts
 from peers inside the token loop — parallel per-layer prefetch (miss latency =
-max, not sum), round-robin holder spreading, per-peer fallback, digest-verify
-before disk, fetched shards persisted + advertised (organic heat replication).
+max, not sum), bandwidth-weighted holder spreading (smooth weighted round-robin
+over per-peer throughput EMAs, FreeToken-style measured division of miss work;
+uniform prior for cold peers, committee-before-mesh order preserved), per-peer
+fallback, digest-verify before disk, fetched shards persisted + advertised
+(organic heat replication). Prefill additionally streams each MoE layer's whole
+missing expert set routing-blind while the layer's attention computes
+(FreeToken's full-layer prefill insight; lossy, decode untouched).
 Verified on real DeepSeek-V2-Lite: a 33% store (573/1737 shards) produced the
 correct completion ("Paris."), streaming 641 experts / 3.5 GB from one peer
 with zero failures; token-identical to a full-copy run on the fixture. The

@@ -1226,6 +1226,22 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
     mv(m.output, st.logits, st.normed);
 }
 
+/// Prefill-time routing-blind layer prefetch (stepBatch only): queue every
+/// missing expert shard of MoE layer `li` for async fetch before the
+/// layer's attention runs. During prefill the batch union covers most of
+/// the layer, so no routing information is needed to know the fetches are
+/// wanted -- and the attention compute is the lead time that hides them.
+fn prefillPrefetchLayer(m: *const Model, st: *State, l: LayerT, li: usize) void {
+    if (st.draft_local) return;
+    const src = m.dist orelse return;
+    if (!l.is_moe or l.ffn_gate_inp == null) return;
+    const cfg = m.cfg;
+    var ids_buf: [512]usize = undefined;
+    const n = @min(cfg.n_expert, ids_buf.len);
+    for (0..n) |e| ids_buf[e] = m.expert_shard[li * cfg.n_expert + e];
+    src.prefetchAsync(ids_buf[0..n]);
+}
+
 /// Pre-gate prefetch (research lever 9): run the trained head on the
 /// post-layer-0 residual stream and hand every remaining layer's predicted
 /// experts to the async fetch pool, nearest layer first. Decode path only
@@ -1714,6 +1730,17 @@ pub fn stepBatch(m: *const Model, st: *State, tokens: []const u32, pos_base: usi
     }
 
     for (m.layers, 0..) |l, li| {
+        // Prefill expert streaming (FreeToken, arXiv:2608.16157): a prompt
+        // batch activates nearly a MoE layer's whole expert set, so fetching
+        // can be routing-blind -- start pulling this layer's complete
+        // missing expert set while its attention computes, instead of
+        // discovering the union one token at a time at the FFN. Lossy by
+        // design: a full fetch queue drops the tail and the FFN loop
+        // fetches the remainder exactly as before. Decode paths are
+        // untouched -- there the union is small and PILOT/pre-gating
+        // already predict it.
+        prefillPrefetchLayer(m, st, l, li);
+
         // ---- attention ----
         for (0..n) |k| {
             backend.rmsnorm(st.bnormed[k * cfg.dim ..][0..cfg.dim], st.bx[k * cfg.dim ..][0..cfg.dim], tensorAsF32(l.attn_norm), cfg.eps);
