@@ -269,6 +269,26 @@ const RepairCtx = struct {
     alpha: ?*alpha.Metrics = null,
 };
 
+const AuditCtx = struct {
+    gpa: std.mem.Allocator,
+    io: Io,
+    store: *weights.Store,
+};
+
+/// Background whole-store digest sweep: the proactive half of audit #5
+/// P0-5, moved off the boot critical path by the fast-boot reopen. Failed
+/// shards are cleared (eager repair re-fetches them) and the sidecars
+/// saved, exactly as the old synchronous audit did.
+fn auditThread(ctx: *AuditCtx) void {
+    const scratch = ctx.gpa.alloc(u8, @intCast(ctx.store.manifest.maxShardLen())) catch return;
+    defer ctx.gpa.free(scratch);
+    const failed = ctx.store.auditHeld(scratch) catch 0;
+    if (failed > 0) {
+        std.debug.print("store audit (background): {d} shard(s) failed digest, cleared\n", .{failed});
+        ctx.store.saveSidecars() catch {};
+    }
+}
+
 fn repairThread(ctx: *RepairCtx) void {
     while (true) {
         Io.sleep(ctx.io, .{ .nanoseconds = REPAIR_INTERVAL_NS }, .awake) catch return;
@@ -634,6 +654,17 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                 store.?.manifest.n_resident,
                 opts.r_target,
             );
+        }
+        // The fast-boot reopen (weights.tryReopenFull) skips the proactive
+        // whole-store audit so serving starts in seconds instead of after
+        // minutes of hashing; run that audit here in the background. A
+        // corrupt shard is still swept and cleared within minutes of boot
+        // (audit #5 P0-5, rescheduled off the critical path), and the read
+        // path digest-verifies every shard at use regardless.
+        {
+            const actx = try gpa.create(AuditCtx);
+            actx.* = .{ .gpa = gpa, .io = io, .store = &store.? };
+            if (std.Thread.spawn(.{}, auditThread, .{actx})) |t| t.detach() else |_| gpa.destroy(actx);
         }
     } else if (peer_list.items.len > 0) sync_block: {
         const store_dir = try std.fmt.allocPrint(gpa, "{s}/gguf-synced", .{opts.cache_root});

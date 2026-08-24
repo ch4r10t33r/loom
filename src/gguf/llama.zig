@@ -1231,7 +1231,17 @@ pub fn step(m: *const Model, st: *State, token: u32, pos: usize) !void {
 /// layer's attention runs. During prefill the batch union covers most of
 /// the layer, so no routing information is needed to know the fetches are
 /// wanted -- and the attention compute is the lead time that hides them.
+var prefill_stream_checked: bool = false;
+var prefill_stream_enabled: bool = true;
+
 fn prefillPrefetchLayer(m: *const Model, st: *State, l: LayerT, li: usize) void {
+    if (!prefill_stream_checked) {
+        prefill_stream_checked = true;
+        // LOOM_NO_PREFILL_STREAM=1 disables for A/B attribution (the
+        // battery's before/after needs one lever at a time)
+        prefill_stream_enabled = std.c.getenv("LOOM_NO_PREFILL_STREAM") == null;
+    }
+    if (!prefill_stream_enabled) return;
     if (st.draft_local) return;
     const src = m.dist orelse return;
     if (!l.is_moe or l.ffn_gate_inp == null) return;

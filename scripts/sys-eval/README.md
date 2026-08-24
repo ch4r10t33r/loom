@@ -70,6 +70,20 @@ RPC mode with layers split across two boxes, the pipeline-parallel
 alternative the whitepaper argues against. Same GGUF, same greedy 96-token
 prompt. llama.cpp is built from source pinned to a tag for reproducibility.
 
+## Lever attribution switches
+
+Each fetch-path lever has an env kill switch so batteries can measure one
+lever at a time (all default ON):
+
+| env | disables |
+|---|---|
+| `LOOM_NO_PILOT` | router-lookahead prefetch (depth 1) |
+| `LOOM_NO_PREFILL_STREAM` | routing-blind prefill layer streaming |
+| `LOOM_NO_BWRR` | bandwidth-weighted holder selection (uniform rotation) |
+| `LOOM_NO_FAST_BOOT` | sidecar fast reopen (forces the full boot hash) |
+
+`--pregate-head` stays a flag: present = on.
+
 ## Outputs
 
 Every battery appends to `sys-eval-out/*.csv` with a `run_id` and wall-clock
