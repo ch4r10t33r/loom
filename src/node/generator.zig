@@ -158,6 +158,16 @@ pub const GgufGen = struct {
     /// deliberately not a pool.
     vsess_gqa: ?DraftSess(llama) = null,
     vsess_mla: ?DraftSess(deepseek) = null,
+    /// Generation lane (FreeToken's agentic-reuse observation, whitepaper
+    /// [20]): the KV of the last request persists, and the next request
+    /// re-prefills only past the longest common token prefix. Multi-turn
+    /// chat extends its own history, so each turn pays prefill for the new
+    /// suffix instead of the whole conversation. Same self-keying LCP rule
+    /// as the verify lane; one extra KV cache held until process exit.
+    /// Steady-state idle memory rises by one State; PEAK memory does not
+    /// (the State existed for the duration of every generation already).
+    gsess_gqa: ?DraftSess(llama) = null,
+    gsess_mla: ?DraftSess(deepseek) = null,
     /// The distributed expert source, or null when this GGUF is served
     /// locally (a dense model has no routed experts to fetch, so there is no
     /// source to attach). Optional rather than undefined: hitRate() reads it
@@ -165,6 +175,32 @@ pub const GgufGen = struct {
     src: ?*expert_fetch.Source = null,
     ctx_cap: usize,
     chat_format: chat_template.Format = .generic,
+
+    /// Free every cached KV lane (verify + generation, both engine
+    /// variants). A node never calls this -- lanes live until process exit
+    /// -- but tests own their allocations.
+    pub fn deinitSessions(g: *GgufGen, gpa: std.mem.Allocator) void {
+        if (g.vsess_gqa) |*sess| {
+            sess.st.deinit(gpa);
+            sess.toks.deinit(gpa);
+            g.vsess_gqa = null;
+        }
+        if (g.gsess_gqa) |*sess| {
+            sess.st.deinit(gpa);
+            sess.toks.deinit(gpa);
+            g.gsess_gqa = null;
+        }
+        if (g.vsess_mla) |*sess| {
+            sess.st.deinit(gpa);
+            sess.toks.deinit(gpa);
+            g.vsess_mla = null;
+        }
+        if (g.gsess_mla) |*sess| {
+            sess.st.deinit(gpa);
+            sess.toks.deinit(gpa);
+            g.gsess_mla = null;
+        }
+    }
 };
 
 pub const Generator = union(enum) {
@@ -378,8 +414,8 @@ fn genGguf(
 ) !Result {
     _ = io;
     return switch (g.m) {
-        .deepseek => |*m| genGgufInner(deepseek, m, gpa, prompt_text, max_tokens, temp, seed, budget, sink, parse_special),
-        .gqa => |*m| genGgufInner(llama, m, gpa, prompt_text, max_tokens, temp, seed, budget, sink, parse_special),
+        .deepseek => |*m| genGgufInner(deepseek, m, &g.gsess_mla, gpa, prompt_text, max_tokens, temp, seed, budget, sink, parse_special),
+        .gqa => |*m| genGgufInner(llama, m, &g.gsess_gqa, gpa, prompt_text, max_tokens, temp, seed, budget, sink, parse_special),
     };
 }
 
@@ -388,6 +424,7 @@ fn genGguf(
 fn genGgufInner(
     comptime E: type,
     m: *E.Model,
+    sess_slot: *?DraftSess(E),
     gpa: std.mem.Allocator,
     prompt_text: []const u8,
     max_tokens: usize,
@@ -413,8 +450,36 @@ fn genGgufInner(
     defer gpa.free(toks);
     const maxn = clampMax(max_tokens, budget, toks.len);
 
-    var st = try E.State.init(gpa, c);
-    defer st.deinit(gpa);
+    // A model on the recorded path prefills through `step` too. Mixing the two
+    // means the prompt's KV rows are produced by one code path and the decode
+    // rows by another, which is a correctness question before it is a
+    // performance one -- and the recorded path is where the whole token lives
+    // in device memory, so it cannot consume a batch anyway.
+    const recorded = @hasField(@TypeOf(m.*), "gpu_layers") and m.gpu_layers;
+
+    // KV session reuse (whitepaper [20], the verify lane's LCP rule applied
+    // to generation): keep the last request's State and re-prefill only past
+    // the longest common token prefix. Off on the recorded path (device KV
+    // staleness is its own question) and under LOOM_NO_KV_REUSE for A/B.
+    const use_sess = !recorded and std.c.getenv("LOOM_NO_KV_REUSE") == null;
+    var fresh: ?E.State = null;
+    defer if (fresh) |*s| s.deinit(gpa);
+    var lcp: usize = 0;
+    const st: *E.State = blk: {
+        if (use_sess) {
+            if (sess_slot.* == null) {
+                sess_slot.* = .{ .st = try E.State.init(gpa, c), .toks = .empty };
+            }
+            const sess = &sess_slot.*.?;
+            while (lcp < sess.toks.items.len and lcp < toks.len and sess.toks.items[lcp] == toks[lcp]) lcp += 1;
+            // always re-feed the last prompt token so st.logits is fresh
+            // even on a full-prefix hit
+            if (toks.len > 0 and lcp >= toks.len) lcp = toks.len - 1;
+            break :blk &sess.st;
+        }
+        fresh = try E.State.init(gpa, c);
+        break :blk &fresh.?;
+    };
     const scratch = try gpa.alloc(f32, c.vocab);
     defer gpa.free(scratch);
     var prng = std.Random.DefaultPrng.init(seed);
@@ -424,25 +489,24 @@ fn genGgufInner(
     // Batched where the engine offers it: the whole prompt is known, so one
     // unpacked weight can serve several tokens, which is most of
     // time-to-first-token on a long prompt.
-    var pos: usize = 0;
-    // A model on the recorded path prefills through `step` too. Mixing the two
-    // means the prompt's KV rows are produced by one code path and the decode
-    // rows by another, which is a correctness question before it is a
-    // performance one -- and the recorded path is where the whole token lives
-    // in device memory, so it cannot consume a batch anyway.
-    const recorded = @hasField(@TypeOf(m.*), "gpu_layers") and m.gpu_layers;
+    var pos: usize = lcp;
     if (@hasDecl(E, "stepBatch") and !recorded) {
         while (pos < toks.len and pos < c.ctx_len) {
             const take = @min(@min(batchSize(), toks.len - pos), c.ctx_len - pos);
-            try E.stepBatch(m, &st, toks[pos..][0..take], pos);
+            try E.stepBatch(m, st, toks[pos..][0..take], pos);
             pos += take;
         }
     } else {
-        for (toks) |t| {
-            if (pos >= c.ctx_len) break;
-            try E.step(m, &st, t, pos);
+        while (pos < toks.len and pos < c.ctx_len) {
+            try E.step(m, st, toks[pos], pos);
             pos += 1;
         }
+    }
+    // the session's history is now exactly the prompt tokens that were fed
+    if (use_sess) {
+        const sess = &sess_slot.*.?;
+        sess.toks.clearRetainingCapacity();
+        try sess.toks.appendSlice(gpa, toks[0..pos]);
     }
 
     var aw = std.Io.Writer.Allocating.init(gpa);
@@ -466,7 +530,7 @@ fn genGgufInner(
             if (sink) |s| try s.emit(s.ctx, aw.writer.buffered()[before..]);
             if (comptime @hasDecl(E, "stepSpec")) {
                 if (spec_on) {
-                    const r = try E.stepSpec(m, &st, last, pos);
+                    const r = try E.stepSpec(m, st, last, pos);
                     pos += r.n;
                     if (r.n == 2) {
                         produced += 1;
@@ -482,9 +546,19 @@ fn genGgufInner(
                     continue;
                 }
             }
-            try E.step(m, &st, last, pos);
+            try E.step(m, st, last, pos);
             pos += 1;
+            if (use_sess) sess_slot.*.?.toks.append(gpa, last) catch {};
             last = @intCast(sampler.sample(scratch, st.logits, temp, rnd));
+        }
+    }
+    // MTP speculative decode advances the KV through stepSpec with token
+    // bookkeeping this session does not model; invalidate rather than guess.
+    if (use_sess) {
+        if (comptime @hasDecl(E, "stepSpec")) {
+            if (temp <= 0 and m.mtp != null and std.c.getenv("LOOM_NO_MTP") == null) {
+                sess_slot.*.?.toks.clearRetainingCapacity();
+            }
         }
     }
 
@@ -830,10 +904,7 @@ test "verifyDraft: exact drafts all accepted, a corrupted draft is cut at the fi
         // the correction must be what the model actually wants there
         try std.testing.expect(v2.correction != bad[1]);
     }
-    if (g.vsess_gqa) |*sess| {
-        sess.st.deinit(gpa);
-        sess.toks.deinit(gpa);
-    }
+    g.deinitSessions(gpa);
     // g.m's model copy shares tensors with `m`; only one deinit (above).
 }
 
@@ -878,8 +949,52 @@ test "generateDrafted round-trips token-identical against a local verifier" {
     try std.testing.expectEqualStrings(ref.text, out.res.text);
     try std.testing.expectEqual(ref.completion_tokens, out.res.completion_tokens);
     try std.testing.expectEqual(out.drafted, out.accepted); // same model: nothing rejected
-    if (g.vsess_gqa) |*sess| {
-        sess.st.deinit(gpa);
-        sess.toks.deinit(gpa);
-    }
+    g.deinitSessions(gpa);
+}
+
+test "KV session reuse: repeated and extended prompts stay token-identical" {
+    const gpa = std.testing.allocator;
+    var thr: std.Io.Threaded = .init(gpa, .{});
+    defer thr.deinit();
+    const io = thr.io();
+    const path = "test-kv-reuse.gguf";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    try gguf_mod.writeMoeFixture(gpa, io, path, 9, "qwen3moe");
+
+    var m = try llama.load(gpa, io, path);
+    defer m.deinit();
+
+    var g = GgufGen{ .m = .{ .gqa = m }, .ctx_cap = 256 };
+    defer g.deinitSessions(gpa);
+    const gen = Generator{ .gguf = &g };
+
+    // The first call runs on an empty session, so it IS the fresh-state
+    // reference; the second is a full-prefix hit and must match it exactly.
+    var r1 = try gen.generate(gpa, io, "hello world", 6, 0, 42, null, null, false);
+    defer r1.deinit(gpa);
+    try std.testing.expect(r1.text.len > 0);
+    var r2 = try gen.generate(gpa, io, "hello world", 6, 0, 42, null, null, false);
+    defer r2.deinit(gpa);
+    try std.testing.expectEqualStrings(r1.text, r2.text);
+
+    // Chat-turn shape: an extended prompt reuses the common prefix. The
+    // reference comes from a second GgufGen whose session starts empty
+    // (same model; tensors are shared read-only, states are per-session).
+    var g2 = GgufGen{ .m = .{ .gqa = m }, .ctx_cap = 256 };
+    defer g2.deinitSessions(gpa);
+    const gen2 = Generator{ .gguf = &g2 };
+    const extended = "hello world and then some more words";
+    var ref = try gen2.generate(gpa, io, extended, 6, 0, 42, null, null, false);
+    defer ref.deinit(gpa);
+    var got = try gen.generate(gpa, io, extended, 6, 0, 42, null, null, false);
+    defer got.deinit(gpa);
+    try std.testing.expectEqualStrings(ref.text, got.text);
+
+    // Diverging prompt (different chat): prefix reuse must not leak the old
+    // conversation into the output.
+    var ref2 = try gen2.generate(gpa, io, "completely different", 6, 0, 7, null, null, false);
+    defer ref2.deinit(gpa);
+    var got2 = try gen.generate(gpa, io, "completely different", 6, 0, 7, null, null, false);
+    defer got2.deinit(gpa);
+    try std.testing.expectEqualStrings(ref2.text, got2.text);
 }
