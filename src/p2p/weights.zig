@@ -1136,8 +1136,85 @@ fn loadBitmapFile(gpa: std.mem.Allocator, io: Io, dir: []const u8, name: []const
 /// Open a store around an existing complete GGUF file (the origin/full holder).
 /// The GGUF stays where it is (opened in place); sidecars go to `store_dir`.
 /// mode: .expert requires expert tensors; null = auto (expert if present).
+/// Fast origin bootstrap (FreeToken's fast-bootstrap principle, whitepaper
+/// [20]): adopt a previous boot's sidecar manifest instead of re-hashing the
+/// whole model file, when the file's size matches the manifest and the first
+/// and last ranges spot-verify against their recorded digests. This is what
+/// turns an origin restart from minutes of hashing (the 11 GB devnet file;
+/// ~15 for a 235B) into seconds.
+///
+/// Integrity is NOT weakened, only rescheduled: every shard is digest-
+/// verified at first use (readRangeVerified on the serve, matmul and GETR
+/// paths alike), a shard that fails there reads as absent and repair
+/// re-fetches it, and the caller is expected to run Store.auditHeld in the
+/// background for the proactive sweep the old synchronous path did
+/// (node.zig does). A same-size file whose middle changed is therefore
+/// caught at first touch of a changed range, not at boot -- the trade
+/// audit #5 P0-5 made per-read verification the backstop for.
+fn tryReopenFull(gpa: std.mem.Allocator, io: Io, gguf_path: []const u8, store_dir: []const u8, mode: ?Mode) ?Store {
+    const mtext = readFileIn(gpa, io, store_dir, "ranges.manifest") catch return null;
+    defer gpa.free(mtext);
+    var manifest = parseManifestBytes(gpa, mtext) catch return null;
+    var manifest_owned = true;
+    defer if (manifest_owned) manifest.deinit(gpa);
+    if (mode) |mo| {
+        if (manifest.mode != mo) return null;
+    }
+    const n = manifest.nRanges();
+    if (n == 0) return null;
+
+    const file = Io.Dir.cwd().openFile(io, gguf_path, .{}) catch return null;
+    var file_owned = true;
+    defer if (file_owned) file.close(io);
+    const fsize = file.length(io) catch return null;
+    if (fsize != manifest.file_size) return null;
+
+    var holdings = Holdings.initFull(gpa, n) catch return null;
+    var holdings_owned = true;
+    defer if (holdings_owned) holdings.deinit(gpa);
+    var wanted = Holdings.initFull(gpa, n) catch return null;
+    var wanted_owned = true;
+    defer if (wanted_owned) wanted.deinit(gpa);
+
+    const dir_copy = gpa.dupe(u8, store_dir) catch return null;
+
+    manifest_owned = false;
+    file_owned = false;
+    holdings_owned = false;
+    wanted_owned = false;
+    var store = Store{
+        .gpa = gpa,
+        .io = io,
+        .dir = dir_copy,
+        .manifest = manifest,
+        .holdings = holdings,
+        .wanted = wanted,
+        .file = file,
+    };
+
+    // spot-check: first range (covers the GGUF header) and last range must
+    // match the sidecar's digests, or this is not the file the manifest
+    // describes
+    const scratch = gpa.alloc(u8, @intCast(store.manifest.maxShardLen())) catch {
+        store.deinit();
+        return null;
+    };
+    defer gpa.free(scratch);
+    for ([_]usize{ 0, n - 1 }) |i| {
+        const want: usize = @intCast(store.manifest.rangeLen(i));
+        _ = store.readRangeVerified(i, scratch[0..want]) catch {
+            store.deinit();
+            return null;
+        };
+    }
+    return store;
+}
+
 pub fn openFull(gpa: std.mem.Allocator, io: Io, gguf_path: []const u8, store_dir: []const u8, range_size: u64, mode: ?Mode) !Store {
     try makePath(io, store_dir);
+    if (std.c.getenv("LOOM_NO_FAST_BOOT") == null) {
+        if (tryReopenFull(gpa, io, gguf_path, store_dir, mode)) |st| return st;
+    }
     var manifest: Manifest = switch (mode orelse .expert) {
         .expert => buildExpertManifest(gpa, io, gguf_path) catch |e| switch (e) {
             error.NoExpertTensors, error.NotGguf => if (mode == null)
@@ -1526,5 +1603,80 @@ test "hold cap: holdings never exceed it, resident chunks survive, coldest goes 
         // partial block at each end of every hole. Checked by reverting the
         // alignment: without it the punch is refused and this fails.
         try std.testing.expect(allocated < held_bytes * 3);
+    }
+}
+
+const gguf_fixture_for_tests = @import("../gguf/gguf.zig");
+
+test "openFull fast reopen adopts sidecars; the read path backstops corruption" {
+    const gpa = std.testing.allocator;
+    var thr: std.Io.Threaded = .init(gpa, .{});
+    defer thr.deinit();
+    const io = thr.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const model_path = try std.fmt.bufPrint(&pbuf, ".zig-cache/tmp/{s}/m.gguf", .{tmp.sub_path});
+    try gguf_fixture_for_tests.writeMoeFixture(gpa, io, model_path, 3, "llama");
+    var sbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const store_dir = try std.fmt.bufPrint(&sbuf, ".zig-cache/tmp/{s}/store", .{tmp.sub_path});
+
+    // first open: the slow build path; note the version and a mid-file offset
+    var version0: hashmod.Digest = undefined;
+    var corrupt_off: u64 = 0;
+    {
+        var store = try openFull(gpa, io, model_path, store_dir, 0, null);
+        defer store.deinit();
+        version0 = store.manifest.version;
+        try std.testing.expect(store.manifest.nRanges() >= 3);
+        corrupt_off = store.manifest.extents[store.manifest.extent_start[1]].offset;
+    }
+
+    // flip one byte of shard 1, size unchanged
+    const blob = blk: {
+        const f = try Io.Dir.cwd().openFile(io, model_path, .{});
+        defer f.close(io);
+        const len: usize = @intCast(try f.length(io));
+        const b = try gpa.alloc(u8, len);
+        _ = try f.readPositionalAll(io, b, 0);
+        break :blk b;
+    };
+    defer gpa.free(blob);
+    blob[@intCast(corrupt_off)] ^= 0xFF;
+    {
+        const f = try Io.Dir.cwd().createFile(io, model_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, blob);
+    }
+
+    {
+        var store = try openFull(gpa, io, model_path, store_dir, 0, null);
+        defer store.deinit();
+        // fast path proven: the OLD manifest was adopted -- a rebuild would
+        // have hashed the flipped byte into a different digest set
+        try std.testing.expect(hashmod.eql(store.manifest.version, version0));
+        try std.testing.expect(store.holdings.has(1));
+        // and the read path backstop catches it at first use, clearing the bit
+        const scratch = try gpa.alloc(u8, @intCast(store.manifest.maxShardLen()));
+        defer gpa.free(scratch);
+        const want: usize = @intCast(store.manifest.rangeLen(1));
+        try std.testing.expect(if (store.readRangeVerified(1, scratch[0..want])) |_| false else |_| true);
+        try std.testing.expect(!store.holdings.has(1));
+    }
+
+    // restore the byte and drop the sidecar: the rebuild path still works
+    blob[@intCast(corrupt_off)] ^= 0xFF;
+    {
+        const f = try Io.Dir.cwd().createFile(io, model_path, .{ .truncate = true });
+        defer f.close(io);
+        try f.writeStreamingAll(io, blob);
+    }
+    var mbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const sidecar = try std.fmt.bufPrint(&mbuf, "{s}/ranges.manifest", .{store_dir});
+    try Io.Dir.cwd().deleteFile(io, sidecar);
+    {
+        var store = try openFull(gpa, io, model_path, store_dir, 0, null);
+        defer store.deinit();
+        try std.testing.expect(hashmod.eql(store.manifest.version, version0));
     }
 }

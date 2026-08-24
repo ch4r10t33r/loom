@@ -99,6 +99,17 @@ const Pool = struct {
     }
 };
 
+var bwrr_checked: bool = false;
+var bwrr_enabled: bool = true;
+
+fn bwrrEnabled() bool {
+    if (!bwrr_checked) {
+        bwrr_checked = true;
+        bwrr_enabled = std.c.getenv("LOOM_NO_BWRR") == null;
+    }
+    return bwrr_enabled;
+}
+
 pub const Source = struct {
     pool: Pool = .{},
     gpa: std.mem.Allocator,
@@ -429,7 +440,8 @@ pub const Source = struct {
     /// uniform rotation.
     fn swrrPick(self: *Source, base: usize, n: usize) usize {
         if (n <= 1) return 0;
-        if (base + n > MAX_HOLDERS) {
+        // LOOM_NO_BWRR=1 restores uniform rotation for A/B attribution
+        if (base + n > MAX_HOLDERS or !bwrrEnabled()) {
             const s = self.rr;
             self.rr +%= 1; // benign race: only spreads
             return s % n;
