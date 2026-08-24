@@ -81,6 +81,7 @@ lever at a time (all default ON):
 | `LOOM_NO_PREFILL_STREAM` | routing-blind prefill layer streaming |
 | `LOOM_NO_BWRR` | bandwidth-weighted holder selection (uniform rotation) |
 | `LOOM_NO_FAST_BOOT` | sidecar fast reopen (forces the full boot hash) |
+| `LOOM_NO_KV_REUSE` | KV session reuse across requests (fresh state per request) |
 
 `--pregate-head` stays a flag: present = on.
 
