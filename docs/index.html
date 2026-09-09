@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>loom — distributed expert cache for MoE inference</title>
+<meta name="description" content="Serve large mixture-of-experts models from the pooled RAM and disk of commodity machines. Experts flow, not activations.">
+<style>
+  :root {
+    --bg: #0d1117; --fg: #e6edf3; --dim: #8b949e; --line: #21262d;
+    --accent: #7ee787; --accent2: #79c0ff; --card: #161b22; --warn: #d29922;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg: #ffffff; --fg: #1f2328; --dim: #57606a; --line: #d0d7de;
+            --accent: #1a7f37; --accent2: #0969da; --card: #f6f8fa; --warn: #9a6700; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg);
+         font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, sans-serif; }
+  main { max-width: 880px; margin: 0 auto; padding: 0 20px 80px; }
+  code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  a { color: var(--accent2); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  header { padding: 72px 0 28px; }
+  h1 { font-size: 42px; margin: 0; letter-spacing: -1px; }
+  h1 .cursor { color: var(--accent); animation: blink 1.2s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  .tagline { font-size: 20px; color: var(--dim); margin: 10px 0 0; }
+  .badges { margin-top: 18px; display: flex; gap: 10px; flex-wrap: wrap; font-size: 13px; }
+  .badges span { border: 1px solid var(--line); border-radius: 20px; padding: 3px 12px; color: var(--dim); }
+  h2 { font-size: 24px; margin: 56px 0 12px; letter-spacing: -0.5px; }
+  h2::before { content: "# "; color: var(--accent); }
+  p  { margin: 12px 0; }
+  .dim { color: var(--dim); }
+  pre { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+        padding: 14px 16px; overflow-x: auto; font-size: 14px; line-height: 1.5; }
+  pre .c { color: var(--dim); }
+  pre .g { color: var(--accent); }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 20px 0; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 8px; padding: 16px; }
+  .card b { display: block; font-size: 15px; margin-bottom: 6px; }
+  .card .n { font-size: 26px; color: var(--accent); font-weight: 700; }
+  .card p { font-size: 14px; color: var(--dim); margin: 6px 0 0; }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 14px; margin: 16px 0; }
+  th, td { border: 1px solid var(--line); padding: 8px 10px; text-align: left; vertical-align: top; }
+  th { background: var(--card); }
+  td.loomrow, tr.loomrow td { background: color-mix(in srgb, var(--accent) 8%, var(--bg)); }
+  .diagram { background: var(--card); border: 1px solid var(--line); border-radius: 8px;
+             padding: 10px; margin: 20px 0; overflow-x: auto; }
+  .diagram svg { display: block; margin: 0 auto; min-width: 640px; }
+  ul { padding-left: 22px; }
+  li { margin: 6px 0; }
+  .note { border-left: 3px solid var(--warn); padding: 2px 14px; color: var(--dim);
+          background: var(--card); border-radius: 0 8px 8px 0; margin: 18px 0; font-size: 15px; }
+  footer { border-top: 1px solid var(--line); margin-top: 72px; padding-top: 20px;
+           color: var(--dim); font-size: 14px; display: flex; gap: 18px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+  <h1 class="mono">loom<span class="cursor">▌</span></h1>
+  <p class="tagline">A distributed expert cache for large mixture-of-experts inference.
+  Pool the RAM and disk of ordinary machines; serve a model none of them could hold alone.</p>
+  <div class="badges">
+    <span>Apache-2.0</span><span>Zig, one static binary</span><span>CPU-first</span>
+    <span>live devnet</span><span>byte-identical outputs</span>
+  </div>
+</header>
+
+<h2>The thesis: experts flow, not activations</h2>
+<p>A modern MoE model activates a small fraction of its weights per token — and only the
+routed <em>experts</em> change from token to token. Loom treats those experts as an
+immutable, content-addressed, sparsely accessed blob store. Every node runs its own
+full forward pass; the only thing that crosses the network is expert weight blocks —
+cacheable, prefetchable, digest-verified.</p>
+
+<div class="diagram">
+<svg viewBox="0 0 720 240" width="720" height="240" xmlns="http://www.w3.org/2000/svg" font-family="ui-monospace,Menlo,monospace" font-size="12">
+  <!-- left: layer-split -->
+  <text x="20" y="24" fill="var(--dim)">layer-split (Petals, exo, RPC)</text>
+  <rect x="20"  y="40" width="90" height="40" rx="6" fill="none" stroke="var(--dim)"/>
+  <rect x="140" y="40" width="90" height="40" rx="6" fill="none" stroke="var(--dim)"/>
+  <rect x="260" y="40" width="90" height="40" rx="6" fill="none" stroke="var(--dim)"/>
+  <text x="38"  y="64" fill="var(--fg)">layers 0–26</text>
+  <text x="155" y="64" fill="var(--fg)">layers 27–53</text>
+  <text x="275" y="64" fill="var(--fg)">layers 54–80</text>
+  <line x1="110" y1="60" x2="140" y2="60" stroke="var(--warn)" marker-end="url(#a)"/>
+  <line x1="230" y1="60" x2="260" y2="60" stroke="var(--warn)" marker-end="url(#a)"/>
+  <text x="20" y="106" fill="var(--warn)">activations cross per token, per layer —</text>
+  <text x="20" y="122" fill="var(--warn)">serial: one slow peer stalls every token</text>
+  <!-- right: loom -->
+  <text x="420" y="24" fill="var(--dim)">loom</text>
+  <rect x="420" y="40" width="120" height="40" rx="6" fill="none" stroke="var(--accent)"/>
+  <rect x="560" y="40" width="120" height="40" rx="6" fill="none" stroke="var(--accent)"/>
+  <rect x="490" y="150" width="120" height="40" rx="6" fill="none" stroke="var(--accent)"/>
+  <text x="432" y="58" fill="var(--fg)">full forward,</text>
+  <text x="432" y="73" fill="var(--fg)">partial store</text>
+  <text x="572" y="58" fill="var(--fg)">full forward,</text>
+  <text x="572" y="73" fill="var(--fg)">partial store</text>
+  <text x="502" y="168" fill="var(--fg)">full forward,</text>
+  <text x="502" y="183" fill="var(--fg)">partial store</text>
+  <line x1="540" y1="60"  x2="560" y2="60"  stroke="var(--accent)" stroke-dasharray="4 3"/>
+  <line x1="480" y1="80"  x2="530" y2="150" stroke="var(--accent)" stroke-dasharray="4 3"/>
+  <line x1="620" y1="80"  x2="570" y2="150" stroke="var(--accent)" stroke-dasharray="4 3"/>
+  <text x="420" y="215" fill="var(--accent)">immutable expert blocks flow on miss — cached,</text>
+  <text x="420" y="231" fill="var(--accent)">verified, soft-failure: a lost peer costs a re-fetch</text>
+  <defs><marker id="a" markerWidth="8" markerHeight="8" refX="6" refY="3" orient="auto">
+    <path d="M0,0 L6,3 L0,6 z" fill="var(--warn)"/></marker></defs>
+</svg>
+</div>
+
+<p>Because the blocks are immutable and Merkle-rooted, integrity is a free side effect:
+every shard is verified against the manifest digest before it touches a matmul or disk,
+a poisoned peer costs one rejected block, and a node that dies costs a re-fetch from a
+replica — never a broken pipeline.</p>
+
+<h2>Try it — join the live devnet</h2>
+<pre><span class="c"># one command: installs loom, syncs your share of the expert shards from</span>
+<span class="c"># peers (no model download), serves an OpenAI-compatible API locally</span>
+<span class="g">curl -fsSL https://raw.githubusercontent.com/ch4r10t33r/loom/main/scripts/join-devnet.sh | sh</span></pre>
+<p class="dim">The devnet serves Qwen3-30B-A3B (Q2_K, 6,262 content-addressed shards).
+Your node holds a random redundant fraction, fetches the rest from peers inside the
+token loop, and serves shards back. Chat UI on <span class="mono">localhost:8555</span>.
+Details: <a href="https://github.com/ch4r10t33r/loom/blob/main/docs/ALPHA.md">alpha guide</a>.</p>
+
+<div class="note"><b>Honest expectations.</b> On slow links the win is <em>capacity</em>,
+not speed — pooling lets a swarm hold what no member can, but a partial holder on a
+saturated link decodes slowly. Loom is throughput-and-capacity-first serving
+infrastructure, not a fast single-chat engine. The numbers below say exactly where it
+helps and by how much.</div>
+
+<h2>Measured, not promised</h2>
+<p>Every design decision in loom carries a dated, append-only
+<a href="https://github.com/ch4r10t33r/loom/blob/main/whitepaper/WHITEPAPER.md">decision log</a>
+entry with the measurement that forced it — including the negative results.</p>
+<div class="cards">
+  <div class="card"><b>Pre-gating payoff, live</b><span class="n">−16.1%</span>
+    <p>aggregate wall time on a 2.5 MB/s link (−9.0% at 119 MB/s), byte-identical output:
+    a 12M-parameter head predicts every layer's experts from layer-0 state and prefetches them.</p></div>
+  <div class="card"><b>Restart to serving</b><span class="n">2 s</span>
+    <p>was 1–2 minutes: an origin adopts its previous boot's Merkle manifest and audits
+    in the background; every read stays digest-verified.</p></div>
+  <div class="card"><b>Output discipline</b><span class="n">byte-exact</span>
+    <p>a partial holder's output is byte-identical to a full node's; every optimization
+    ships gated on that equality.</p></div>
+  <div class="card"><b>Repair</b><span class="n">RS 8+2</span>
+    <p>eager churn repair within one 2 s tick, plus systematic Reed–Solomon parity that
+    rebuilds small holes — decode-then-verify, no trust in parity servers.</p></div>
+</div>
+
+<h2>How it works</h2>
+<ul>
+  <li><b>Content-addressed store</b> — the GGUF is partitioned into expert-aligned
+      ranges, each digest-hashed under a Merkle root; the root <em>is</em> the model version.</li>
+  <li><b>Committees</b> — a bootnode assigns joiners least-covered shards, so complete
+      coverage and redundancy hold by construction, not probability.</li>
+  <li><b>Measured fetch path</b> — RAM → disk → peers, with holder selection weighted by
+      each peer's measured throughput; a layer's misses are fetched in parallel.</li>
+  <li><b>Prediction</b> — routing for every layer is predicted at layer 0 by a bolt-on
+      head (no retraining), turning fetch stalls into overlapped prefetch.</li>
+  <li><b>Version rollout</b> — model upgrades are majority hardforks on a new manifest
+      root; nodes on the old version are refused, never silently mixed.</li>
+</ul>
+
+<h2>Compared honestly</h2>
+<div class="tablewrap">
+<table>
+  <tr><th>System</th><th>Unit distributed</th><th>Crosses the network per token</th><th>A lost peer costs</th></tr>
+  <tr><td>Petals / exo / llama.cpp RPC</td><td>layer ranges</td><td>activations, every layer</td><td>the pipeline stalls</td></tr>
+  <tr><td>Browser swarms (WebRTC layer-split)</td><td>layer ranges</td><td>activations, every layer</td><td>the room stalls</td></tr>
+  <tr><td>Single-node offload (FreeToken, KTransformers)</td><td>nothing (one machine)</td><td>nothing</td><td>—</td></tr>
+  <tr class="loomrow"><td><b>loom</b></td><td>expert blocks (immutable weights)</td><td>expert blocks, only on cache miss</td><td>a re-fetch from a replica</td></tr>
+</table>
+</div>
+<p class="dim">Layer-split systems are deployed and effective; the distinction is structural.
+Single-node offload engines are complementary — they assume the whole model fits one
+machine's storage; loom removes exactly that assumption.</p>
+
+<h2>Research</h2>
+<ul>
+  <li><a href="https://github.com/ch4r10t33r/loom/blob/main/paper/main.pdf">
+      <b>Pre-Gating Without Retraining</b></a> — predicting every expert a token will
+      need, from layer 0, with a bolt-on head. All traces, scripts, and trained heads
+      released with the code.</li>
+  <li><a href="https://github.com/ch4r10t33r/loom/blob/main/whitepaper/WHITEPAPER.pdf">
+      <b>Whitepaper</b></a> — architecture, trust model, bandwidth math, and the
+      full decision log with every measurement (including the refuted ideas).</li>
+</ul>
+
+<footer>
+  <a href="https://github.com/ch4r10t33r/loom">GitHub</a>
+  <a href="https://github.com/ch4r10t33r/loom/releases">Releases</a>
+  <a href="https://github.com/ch4r10t33r/loom/blob/main/docs/ROADMAP.md">Roadmap</a>
+  <span>Apache-2.0</span>
+</footer>
+
+</main>
+</body>
+</html>
