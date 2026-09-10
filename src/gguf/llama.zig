@@ -30,6 +30,7 @@ const tensor = @import("../core/tensor.zig");
 const spm = @import("spm.zig");
 const moe = @import("moe.zig");
 pub const pregate_mod = @import("pregate.zig");
+pub const rlora_mod = @import("recover_lora.zig");
 const expert_fetch = @import("../p2p/expert_fetch.zig");
 
 /// Re-exported: the SPM tokenizer moved to spm.zig so every engine can share
@@ -211,6 +212,10 @@ pub const Model = struct {
     /// from `--pregate-head`; predicts every layer's experts from the
     /// post-layer-0 residual stream and prefetches them with per-layer lead.
     pregate: ?pregate_mod.Pregate = null,
+    /// Recover-LoRA adapters (recover_lora.zig): per-expert low-rank deltas
+    /// that claw back quantization loss, fully resident while expert bodies
+    /// stream. Loaded from `--recover-lora`; GQA engine, non-oai archs only.
+    rlora: ?rlora_mod.Rlora = null,
     /// GLM/DeepSeek-style NextN block: a full extra transformer layer plus
     /// the glue that turns (hidden state, next-token embedding) into a draft
     /// of the token after next. Loaded from blk.{n_layers}; null when the
@@ -244,6 +249,7 @@ pub const Model = struct {
 
     pub fn deinit(self: *Model) void {
         if (self.pregate) |*pg| pg.deinit(self.gpa);
+        if (self.rlora) |*ra| ra.deinit(self.gpa);
         if (self.expert_shard.len > 0) self.gpa.free(self.expert_shard);
         self.tok.deinit(self.gpa);
         self.gpa.free(self.layers);
@@ -957,6 +963,44 @@ fn denseFFN(st: *State, gate_w: Tensor, up_w: Tensor, down_w: Tensor) void {
     mv(down_w, st.ffn_out, st.act[0..n]);
 }
 
+/// Recover-LoRA: validate a loaded adapter file against this model's shape
+/// and attach it. Refusing on mismatch (rather than trusting the header)
+/// keeps a stale or foreign .lra from silently corrupting every expert.
+pub fn attachRlora(m: *Model, ra: rlora_mod.Rlora) bool {
+    if (m.cfg.arch.oai) return false; // oai FFN variant not wired (v1)
+    if (ra.n_layers != m.layers.len or ra.n_expert != m.cfg.n_expert or
+        ra.dim != m.cfg.dim or ra.ffn != m.cfg.moe_ffn) return false;
+    m.rlora = ra;
+    return true;
+}
+
+/// out += B @ (A @ x): the LoRA delta, two f16 matvecs and an add. The
+/// alpha/r scale is baked into B at export, so nothing is scaled here.
+fn loraApply(ra: *const rlora_mod.Rlora, a_bytes: []const u8, b_bytes: []const u8, in_dim: usize, out_dim: usize, x: []const f32, out: []f32) void {
+    const at = Tensor{ .ty = .f16, .data = a_bytes, .ne0 = in_dim, .ne1 = ra.rank };
+    mv(at, ra.tmp_r[0..ra.rank], x);
+    const bt = Tensor{ .ty = .f16, .data = b_bytes, .ne0 = ra.rank, .ne1 = out_dim };
+    mv(bt, ra.tmp_out[0..out_dim], ra.tmp_r[0..ra.rank]);
+    backend.add(out, ra.tmp_out[0..out_dim]);
+}
+
+/// denseFFN with this expert's Recover-LoRA deltas folded in at the three
+/// projection outputs (gate/up before the activation, down after). A
+/// sibling of denseFFN rather than a parameter on it: the shared-expert and
+/// dense-layer callers must stay byte-identical to before.
+fn loraFFN(m: *const Model, st: *State, ge: Tensor, ue: Tensor, de: Tensor, li: usize, e: usize) void {
+    const ra = &m.rlora.?;
+    const pr = ra.pair(li, e);
+    const n = ge.ne1;
+    mv(ge, st.gate[0..n], st.normed);
+    mv(ue, st.up[0..n], st.normed);
+    loraApply(ra, pr.ag, pr.bg, ra.dim, ra.ffn, st.normed, st.gate[0..n]);
+    loraApply(ra, pr.au, pr.bu, ra.dim, ra.ffn, st.normed, st.up[0..n]);
+    backend.swiglu(st.act[0..n], st.gate[0..n], st.up[0..n]);
+    mv(de, st.ffn_out, st.act[0..n]);
+    loraApply(ra, pr.ad, pr.bd, ra.ffn, ra.dim, st.act[0..n], st.ffn_out);
+}
+
 /// gpt-oss expert FFN: denseFFN plus the per-expert bias columns (gate/up
 /// added before the activation, down after) and swiglu_oai in place of plain
 /// SwiGLU. Bias tensors are {width, n_expert}; expert e owns column e.
@@ -1406,6 +1450,8 @@ fn moeRun(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool, sel:
             const de = Tensor{ .ty = dt.ty, .data = blk[gl + ul ..][0..dl], .ne0 = dt.ne0, .ne1 = dt.ne1 };
             if (cfg.arch.oai) {
                 oaiExpertFFN(st, ge, ue, de, l, s.expert);
+            } else if (m.rlora != null) {
+                loraFFN(m, st, ge, ue, de, li, s.expert);
             } else {
                 denseFFN(st, ge, ue, de);
             }
@@ -1415,6 +1461,8 @@ fn moeRun(m: *const Model, st: *State, l: LayerT, li: usize, dist_ok: bool, sel:
             const de = try l.ffn_down_exps.?.expert(s.expert);
             if (cfg.arch.oai) {
                 oaiExpertFFN(st, ge, ue, de, l, s.expert);
+            } else if (m.rlora != null) {
+                loraFFN(m, st, ge, ue, de, li, s.expert);
             } else {
                 denseFFN(st, ge, ue, de);
             }
@@ -1925,6 +1973,14 @@ fn moeBatchUnion(m: *const Model, st: *State, l: LayerT, li: usize, n: usize, di
                 if (l.ffn_up_exps_b) |b| backend.add(ubuf, tensorAsF32(b)[e * f ..][0..f]);
                 swigluOai(st.bact[j * f ..][0..f], gbuf, ubuf);
             } else {
+                // Recover-LoRA per lane, so this path stays token-identical
+                // to the single-stream one when adapters are attached
+                if (m.rlora) |*ra| {
+                    const pr = ra.pair(li, e);
+                    const xin = st.bgather[j * dim ..][0..dim];
+                    loraApply(ra, pr.ag, pr.bg, ra.dim, ra.ffn, xin, gbuf);
+                    loraApply(ra, pr.au, pr.bu, ra.dim, ra.ffn, xin, ubuf);
+                }
                 backend.swiglu(st.bact[j * f ..][0..f], gbuf, ubuf);
             }
         }
@@ -1933,6 +1989,9 @@ fn moeBatchUnion(m: *const Model, st: *State, l: LayerT, li: usize, n: usize, di
             const outp = st.bffn[j * dim ..][0..dim];
             if (cfg.arch.oai) {
                 if (l.ffn_down_exps_b) |b| backend.add(outp, tensorAsF32(b)[e * dim ..][0..dim]);
+            } else if (m.rlora) |*ra| {
+                const pr = ra.pair(li, e);
+                loraApply(ra, pr.ad, pr.bd, ra.ffn, ra.dim, st.bact[j * f ..][0..f], outp);
             }
             const g = gates[j];
             for (st.bx[lanes[j] * dim ..][0..dim], outp) |*a, v| a.* += g * v;
@@ -2488,4 +2547,126 @@ test "MTP speculative decode is token-identical to plain greedy decode" {
         try std.testing.expect(st.spec_fwd > 0);
     }
     try std.testing.expectEqualSlices(u32, &ref, &got);
+}
+
+test "recover-lora: zero adapters are a bit-exact no-op; nonzero change output; batched matches serial" {
+    // Three guarantees in one fixture pass. Zero adapters must not perturb a
+    // single bit (proves the wiring adds exactly B(Ax) and nothing else);
+    // nonzero adapters must change the logits (proves they are applied at
+    // all); and continuous-batch decode with adapters must match the serial
+    // path (proves moeBatchUnion applies the same per-lane deltas moeRun
+    // does -- the cross-path divergence this feature could silently create).
+    const gpa = std.testing.allocator;
+    var threaded: std.Io.Threaded = .init(gpa, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
+    const path = "test-rlora.gguf";
+    defer Io.Dir.cwd().deleteFile(io, path) catch {};
+    try gguf.writeMoeFixture(gpa, io, path, 9, "qwen3moe");
+    var m = try load(gpa, io, path);
+    defer m.deinit();
+    const cfg = m.cfg;
+    const rank = 2;
+    const pe = 3 * rank * (cfg.dim + cfg.moe_ffn);
+    const n_pairs = m.layers.len * cfg.n_expert;
+
+    const lra_path = "test-rlora.lra";
+    defer Io.Dir.cwd().deleteFile(io, lra_path) catch {};
+    const writeLra = struct {
+        fn go(io_: Io, p: []const u8, n_layers: u32, n_expert: u32, dim: u32, ffn: u32, count: usize, fill: f16) !void {
+            var hdr: [24]u8 = undefined;
+            @memcpy(hdr[0..4], "LRA1");
+            std.mem.writeInt(u32, hdr[4..8], n_layers, .little);
+            std.mem.writeInt(u32, hdr[8..12], n_expert, .little);
+            std.mem.writeInt(u32, hdr[12..16], rank, .little);
+            std.mem.writeInt(u32, hdr[16..20], dim, .little);
+            std.mem.writeInt(u32, hdr[20..24], ffn, .little);
+            const f = try Io.Dir.cwd().createFile(io_, p, .{ .truncate = true });
+            defer f.close(io_);
+            try f.writeStreamingAll(io_, &hdr);
+            var chunk: [4096]u8 = undefined;
+            var i: usize = 0;
+            while (i < 2048) : (i += 1) std.mem.writeInt(u16, chunk[i * 2 ..][0..2], @bitCast(fill), .little);
+            var left = count * 2;
+            while (left > 0) {
+                const take = @min(left, chunk.len);
+                try f.writeStreamingAll(io_, chunk[0..take]);
+                left -= take;
+            }
+        }
+    }.go;
+
+    const toks = [_]u32{ 7, 21, 4, 90 };
+    const vocab = cfg.vocab;
+
+    // reference: no adapters
+    const ref = try gpa.alloc(f32, vocab);
+    defer gpa.free(ref);
+    {
+        var st = try State.init(gpa, cfg);
+        defer st.deinit(gpa);
+        for (toks, 0..) |tk, i| try step(&m, &st, tk, i);
+        @memcpy(ref, st.logits);
+    }
+
+    // zero adapters: bit-exact no-op
+    try writeLra(io, lra_path, @intCast(m.layers.len), @intCast(cfg.n_expert), @intCast(cfg.dim), @intCast(cfg.moe_ffn), n_pairs * pe, 0.0);
+    try std.testing.expect(attachRlora(&m, try rlora_mod.load(gpa, io, lra_path)));
+    {
+        var st = try State.init(gpa, cfg);
+        defer st.deinit(gpa);
+        for (toks, 0..) |tk, i| try step(&m, &st, tk, i);
+        try std.testing.expectEqualSlices(f32, ref, st.logits);
+    }
+
+    // nonzero adapters: output must move
+    m.rlora.?.deinit(gpa);
+    m.rlora = null;
+    try writeLra(io, lra_path, @intCast(m.layers.len), @intCast(cfg.n_expert), @intCast(cfg.dim), @intCast(cfg.moe_ffn), n_pairs * pe, 0.125);
+    try std.testing.expect(attachRlora(&m, try rlora_mod.load(gpa, io, lra_path)));
+    const serial = try gpa.alloc(f32, vocab);
+    defer gpa.free(serial);
+    {
+        var st = try State.init(gpa, cfg);
+        defer st.deinit(gpa);
+        for (toks, 0..) |tk, i| try step(&m, &st, tk, i);
+        @memcpy(serial, st.logits);
+    }
+    var moved = false;
+    for (ref, serial) |a, b| {
+        if (a != b) {
+            moved = true;
+            break;
+        }
+    }
+    try std.testing.expect(moved);
+
+    // a shape-mismatched file is refused
+    m.rlora.?.deinit(gpa);
+    m.rlora = null;
+    try writeLra(io, lra_path, @intCast(m.layers.len + 1), @intCast(cfg.n_expert), @intCast(cfg.dim), @intCast(cfg.moe_ffn), (n_pairs + cfg.n_expert) * pe, 0.125);
+    var bad = try rlora_mod.load(gpa, io, lra_path);
+    try std.testing.expect(!attachRlora(&m, bad));
+    bad.deinit(gpa);
+
+    // batched decode with adapters matches the serial path
+    try writeLra(io, lra_path, @intCast(m.layers.len), @intCast(cfg.n_expert), @intCast(cfg.dim), @intCast(cfg.moe_ffn), n_pairs * pe, 0.125);
+    try std.testing.expect(attachRlora(&m, try rlora_mod.load(gpa, io, lra_path)));
+    {
+        var st = try State.init(gpa, cfg);
+        defer st.deinit(gpa);
+        var seqs: [1]Seq = .{try Seq.init(gpa, cfg)};
+        defer seqs[0].deinit(gpa);
+        const got = try gpa.alloc(f32, vocab);
+        defer gpa.free(got);
+        for (toks) |tk| try decodeBatch(&m, &st, &seqs, &.{tk}, got);
+        for (serial, got, 0..) |w, g, j| {
+            const tol = @max(@abs(w), @abs(g)) * 1e-3 + 1e-3;
+            std.testing.expectApproxEqAbs(w, g, tol) catch |e| {
+                std.debug.print("rlora batched: logit {d}: serial {d} vs batched {d}\n", .{ j, w, g });
+                return e;
+            };
+        }
+    }
 }

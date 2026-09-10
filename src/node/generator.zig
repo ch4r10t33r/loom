@@ -331,6 +331,7 @@ pub var verify_expert_mask: bool = false;
 /// loaded into the GQA engine after the distributed source attaches, so
 /// every token's expert working set prefetches from layer 0. Null = off.
 pub var pregate_head_path: ?[]const u8 = null;
+pub var recover_lora_path: ?[]const u8 = null;
 
 pub fn threads() usize {
     return if (kernel_threads == 0) defaultThreads() else kernel_threads;

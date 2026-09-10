@@ -1047,6 +1047,22 @@ pub fn run(gpa: std.mem.Allocator, io: Io, out: *Io.Writer, opts: Options) !void
                             },
                             .deepseek => try out.print("  pregate    unsupported for the deepseek engine; ignored\n", .{}),
                         };
+                        // Recover-LoRA adapters: same GQA-only, fail-loud-
+                        // continue-without contract as the pre-gate head.
+                        if (generator.recover_lora_path) |rp| switch (gguf_gen.m) {
+                            .gqa => |*g| {
+                                if (llama.rlora_mod.load(gpa, io, rp)) |ra| {
+                                    var owned = ra;
+                                    if (llama.attachRlora(g, owned)) {
+                                        try out.print("  recover-lora adapters loaded (rank {d}, {d} layers x {d} experts)\n", .{ owned.rank, owned.n_layers, owned.n_expert });
+                                    } else {
+                                        owned.deinit(gpa);
+                                        try out.print("  recover-lora shape mismatch with this model; ignored\n", .{});
+                                    }
+                                } else |e| try out.print("  recover-lora load failed ({s}); continuing without\n", .{@errorName(e)});
+                            },
+                            .deepseek => try out.print("  recover-lora unsupported for the deepseek engine; ignored\n", .{}),
+                        };
                         gguf_gen.chat_format = if (opts.chat_format) |cf|
                             chat_template.parse(cf) orelse chat_template.detect(gguf_gen.m.chatTemplate(), arch_name)
                         else
