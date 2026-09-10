@@ -119,6 +119,11 @@ fallback, digest-verify before disk, fetched shards persisted + advertised
 (organic heat replication). Prefill additionally streams each MoE layer's whole
 missing expert set routing-blind while the layer's attention computes
 (FreeToken's full-layer prefill insight; lossy, decode untouched).
+   *Recover-LoRA (v0 wired, training staged):* per-expert low-rank adapters
+   (`--recover-lora`, LRA1 format) recover quantization loss while staying
+   fully resident (~830 MB for all devnet experts) as the Q2_K bodies
+   stream; quality-vs-rank curve pending the next GPU rental
+   (`scripts/recover-lora-train.py`).
 Verified on real DeepSeek-V2-Lite: a 33% store (573/1737 shards) produced the
 correct completion ("Paris."), streaming 641 experts / 3.5 GB from one peer
 with zero failures; token-identical to a full-copy run on the fixture. The
