@@ -74,6 +74,9 @@ jobs:
       - name: Format check
         run: zig "${ZIG}" fmt --check src/ build.zig
 
+      - name: Training module syntax check
+        run: python3 -m compileall -q train/
+
       - name: Build
         run: zig "${ZIG}" build -Dcommit="${GITHUB_SHA}"
 

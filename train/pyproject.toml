@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "loomtrain"
+version = "0.1.0"
+description = "loom's training plane: bolt-on artifacts (pre-gate heads, Recover-LoRA adapters, retrained routers, BTX expert branches) for the loom distributed MoE serving engine"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
+# torch/transformers/datasets/gguf are deliberately NOT pinned here: every
+# training run happens on a rented GPU box whose CUDA build dictates the
+# torch wheel, and the house recipe (docs in each module) pins per-run.
+# The package itself only hard-requires numpy (format writers).
+dependencies = ["numpy"]
+
+[project.scripts]
+loomtrain = "loomtrain.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["loomtrain*"]
