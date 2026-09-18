@@ -76,10 +76,11 @@ def build(args):
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
     torch.manual_seed(args.seed)
-    log(f"loading {args.model} (bf16, low_cpu_mem_usage)")
+    dev = args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
+    log(f"loading {args.model} (bf16, low_cpu_mem_usage, device {dev})")
     model = AutoModelForCausalLM.from_pretrained(
         args.model, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
-        device_map={"": 0},
+        device_map={"": dev},
     )
     tok = AutoTokenizer.from_pretrained(args.model)
 
@@ -92,8 +93,9 @@ def build(args):
             for p in self.base.parameters():
                 p.requires_grad = False
             in_f, out_f = base.in_features, base.out_features
-            self.A = nn.Parameter(torch.randn(rank, in_f, dtype=torch.float32) * 0.02)
-            self.B = nn.Parameter(torch.zeros(out_f, rank, dtype=torch.float32))
+            dev = base.weight.device
+            self.A = nn.Parameter(torch.randn(rank, in_f, dtype=torch.float32, device=dev) * 0.02)
+            self.B = nn.Parameter(torch.zeros(out_f, rank, dtype=torch.float32, device=dev))
             self.scale = alpha / rank
 
         def forward(self, x):
@@ -152,7 +154,7 @@ def train(args):
             continue
         maxlen = max(len(x) for x in buf)
         input_ids = torch.full((len(buf), maxlen), tok.pad_token_id or 0,
-                               dtype=torch.long, device="cuda")
+                               dtype=torch.long, device=model.device)
         for i, x in enumerate(buf):
             input_ids[i, : len(x)] = torch.tensor(x)
         labels = input_ids.clone()
@@ -240,6 +242,7 @@ if __name__ == "__main__":
     tp.add_argument("--seq", type=int, default=1024)
     tp.add_argument("--batch", type=int, default=4)
     tp.add_argument("--seed", type=int, default=0)
+    tp.add_argument("--device", default="auto", help="auto|cuda|cpu (cpu = the pre-flight dry-run)")
     tp.add_argument("--out", default="rlora-ckpt.pt")
     ep = sub.add_parser("export")
     ep.add_argument("--ckpt", required=True)
