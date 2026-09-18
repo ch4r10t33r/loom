@@ -35,6 +35,10 @@ because buffered training logs have hidden progress before).
 
 ## First run: Recover-LoRA, end to end on a loom-served model
 
+One-click on Colab (select the **A100** runtime, then Run all):
+[train/notebooks/recover_lora_a27b.ipynb](https://colab.research.google.com/github/ch4r10t33r/loom/blob/main/train/notebooks/recover_lora_a27b.ipynb)
+— it performs every step below and saves `a27b.lra` to your Drive.
+
 Train adapters against the *exact deployed quantization* — the script
 dequantizes the GGUF's expert tensors into the HF model before freezing,
 because adapters must learn the deployed rounding, not a proxy:
