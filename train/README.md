@@ -44,21 +44,21 @@ Four tiers, cheapest first:
    ```
 2. **CI, automatic**: every change under train/ rebuilds the container
    image and imports every module under the exact pinned stack.
-3. **Colab, functional GPU test** (free/Pro tier): the pip install path is
-   exactly what Colab exercises -- no Docker needed. Base model for this
-   tier is **OLMoE-1B-7B** (the smallest MoE in the house toolchain; its
-   HF module layout and GGUF tensor names match what recover-lora expects).
-   A T4 is very tight for 7B bf16; prefer an L4/A100 runtime.
+3. **Colab Pro / small rental, end-to-end test**: the pip install path is
+   exactly what Colab exercises -- no Docker needed. Base model:
+   **Qwen1.5-MoE-A2.7B** -- deliberately the smallest MoE loom's engine
+   SERVES (qwen2moe arch), so the exported .lra closes the loop through
+   `loom gguf run --recover-lora`. ~29 GB bf16: an A100-40GB runtime
+   (Colab Pro) or a 48 GB rental; free-tier T4 cannot hold it.
    ```
    !pip install "loomtrain @ git+https://github.com/ch4r10t33r/loom@v0.45.0#subdirectory=train"
-   !huggingface-cli download bartowski/OLMoE-1B-7B-0924-GGUF --include "*Q4_K_M*" --local-dir .
-   !python -u -m loomtrain.recover_lora train --model allenai/OLMoE-1B-7B-0924        --gguf OLMoE-1B-7B-0924-Q4_K_M.gguf --rank 4 --tokens 2000000 --batch 2 --seq 512        --out olmoe-rlora.pt
-   !python -m loomtrain.recover_lora export --ckpt olmoe-rlora.pt --out olmoe.lra
+   !huggingface-cli download Qwen/Qwen1.5-MoE-A2.7B-Chat-GGUF --include "*q4_k_m*" --local-dir .
+   !python -u -m loomtrain.recover_lora train --model Qwen/Qwen1.5-MoE-A2.7B-Chat        --gguf qwen1_5-moe-a2_7b-chat-q4_k_m.gguf --rank 4 --tokens 2000000 --batch 2 --seq 512        --out a27b-rlora.pt
+   !python -m loomtrain.recover_lora export --ckpt a27b-rlora.pt --out a27b.lra
    ```
-   This validates the full training path (GGUF dequant install, adapter
-   gradients, LRA1 export). Note: loom's engine does not serve the olmoe
-   arch, so the serve-side attach is covered by loom's own fixture tests,
-   not this tier.
+   This validates the full path: GGUF dequant install, adapter
+   gradients, LRA1 export, and the engine attach on a model loom
+   actually serves.
 4. **The real run** (rented GPU): Qwen3-30B-A3B against the devnet's Q2_K
    GGUF needs the base in bf16 (~60 GB) -- an 80 GB A100/H100 rental, not
    a 24 GB card. Rank {4,8,16} curve, then the devnet A/B with

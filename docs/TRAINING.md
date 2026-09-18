@@ -33,25 +33,31 @@ Every subcommand also runs module-direct with zero install from a checkout:
 `python3 -u -m loomtrain.recover_lora ...` (identical behavior; `-u`
 because buffered training logs have hidden progress before).
 
-## First run: Recover-LoRA on a small MoE (fits Colab)
+## First run: Recover-LoRA, end to end on a loom-served model
 
 Train adapters against the *exact deployed quantization* — the script
 dequantizes the GGUF's expert tensors into the HF model before freezing,
 because adapters must learn the deployed rounding, not a proxy:
 
 ```sh
-huggingface-cli download bartowski/OLMoE-1B-7B-0924-GGUF --include "*Q4_K_M*" --local-dir .
-loomtrain recover-lora train --model allenai/OLMoE-1B-7B-0924 \
-    --gguf OLMoE-1B-7B-0924-Q4_K_M.gguf --rank 4 --tokens 2000000 \
-    --batch 2 --seq 512 --out olmoe-rlora.pt
-loomtrain recover-lora export --ckpt olmoe-rlora.pt --out olmoe.lra
+huggingface-cli download Qwen/Qwen1.5-MoE-A2.7B-Chat-GGUF --include "*q4_k_m*" --local-dir .
+loomtrain recover-lora train --model Qwen/Qwen1.5-MoE-A2.7B-Chat \
+    --gguf qwen1_5-moe-a2_7b-chat-q4_k_m.gguf --rank 4 --tokens 2000000 \
+    --batch 2 --seq 512 --out a27b-rlora.pt
+loomtrain recover-lora export --ckpt a27b-rlora.pt --out a27b.lra
 ```
+
+The base is chosen so the loop CLOSES: Qwen1.5-MoE-A2.7B is the
+smallest MoE loom's engine serves (qwen2moe arch), so the exported
+`.lra` loads straight into `loom gguf run --recover-lora a27b.lra` and
+the whole pipeline — dequant install, adapter training, export, engine
+attach — is exercised on one model. ~29 GB bf16 for training: a Colab
+Pro A100 (40 GB) or a cheap 48 GB rental; free-tier Colab cannot hold
+it, and a smaller non-servable model would test only half the point.
 
 Watch for the `first-step grad sum` line: it must be nonzero, or the
 freeze mask or checkpointing ate the backward pass and the run aborts
-loudly rather than training a ghost. (OLMoE validates the training path;
-loom's engine serves qwen-family archs, so production `.lra` targets are
-the devnet model — see the hardware note below.)
+loudly rather than training a ghost.
 
 ## The production run: Qwen3-30B against the devnet's Q2_K
 
