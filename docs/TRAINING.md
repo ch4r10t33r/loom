@@ -44,9 +44,9 @@ dequantizes the GGUF's expert tensors into the HF model before freezing,
 because adapters must learn the deployed rounding, not a proxy:
 
 ```sh
-huggingface-cli download Qwen/Qwen1.5-MoE-A2.7B-Chat-GGUF --include "*q4_k_m*" --local-dir .
+huggingface-cli download RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf --include "*Q4_K_M*" --local-dir .
 loomtrain recover-lora train --model Qwen/Qwen1.5-MoE-A2.7B-Chat \
-    --gguf qwen1_5-moe-a2_7b-chat-q4_k_m.gguf --rank 4 --tokens 2000000 \
+    --gguf Qwen1.5-MoE-A2.7B-Chat.Q4_K_M.gguf --rank 4 --tokens 2000000 \
     --batch 2 --seq 512 --out a27b-rlora.pt
 loomtrain recover-lora export --ckpt a27b-rlora.pt --out a27b.lra
 ```
