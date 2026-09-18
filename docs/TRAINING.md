@@ -25,7 +25,7 @@ docker run --gpus all -v $PWD:/work ghcr.io/ch4r10t33r/loom-train --help
 **pip, from a release tag** (Colab, or any box with Python ≥ 3.10):
 
 ```sh
-pip install "loomtrain @ git+https://github.com/ch4r10t33r/loom@v0.45.0#subdirectory=train"
+pip install "loomtrain @ git+https://github.com/ch4r10t33r/loom@v0.45.1#subdirectory=train"
 loomtrain --help
 ```
 

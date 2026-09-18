@@ -8,7 +8,7 @@ the two meet only through content-addressed artifact files.
 
 ```sh
 # from a rented GPU box, pinned to a loom release tag:
-pip install "loomtrain @ git+https://github.com/ch4r10t33r/loom@v0.45.0#subdirectory=train"
+pip install "loomtrain @ git+https://github.com/ch4r10t33r/loom@v0.45.1#subdirectory=train"
 loomtrain recover-lora train --model Qwen/Qwen3-30B-A3B --gguf model-q2k.gguf ...
 # or, zero-install, module-direct (identical behavior):
 python3 -u -m loomtrain.recover_lora train ...
@@ -51,7 +51,7 @@ Four tiers, cheapest first:
    `loom gguf run --recover-lora`. ~29 GB bf16: an A100-40GB runtime
    (Colab Pro) or a 48 GB rental; free-tier T4 cannot hold it.
    ```
-   !pip install "loomtrain @ git+https://github.com/ch4r10t33r/loom@v0.45.0#subdirectory=train"
+   !pip install "loomtrain @ git+https://github.com/ch4r10t33r/loom@v0.45.1#subdirectory=train"
    !huggingface-cli download RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf --include "*Q4_K_M*" --local-dir .
    !python -u -m loomtrain.recover_lora train --model Qwen/Qwen1.5-MoE-A2.7B-Chat        --gguf Qwen1.5-MoE-A2.7B-Chat.Q4_K_M.gguf --rank 4 --tokens 2000000 --batch 2 --seq 512        --out a27b-rlora.pt
    !python -m loomtrain.recover_lora export --ckpt a27b-rlora.pt --out a27b.lra
