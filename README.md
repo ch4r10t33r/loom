@@ -113,6 +113,7 @@ Docker images (linux/amd64 and arm64) publish to
 | [`loom run`](docs/COMMANDS.md#loom-run--one-shot-local-inference) | one-shot local inference against a loom checkpoint (no servers) |
 | [`loom gen`](docs/COMMANDS.md#loom-gen--generate-a-synthetic-checkpoint) / [`loom info`](docs/COMMANDS.md#loom-info--inspect--verify-a-checkpoint) | create / inspect + verify loom-format checkpoints |
 | [`loom bench`](docs/PERFORMANCE.md) / [`loom iobench`](docs/COMMANDS.md#loom-iobench--disk-profiler) | kernel invariants / disk profiler for the engine's random-read pattern |
+| [`loomtrain`](docs/TRAINING.md) | the training executable (Python, [`train/`](train)): pre-gate heads, Recover-LoRA adapters, router retraining — bolt-on artifacts the engine loads beside a frozen model |
 
 `loom node --network devnet|testnet|mainnet` selects a
 [named network](docs/NETWORKS.md). Each network serves exactly one model
@@ -127,6 +128,7 @@ worked examples with real output are in the
 - [Command tour](docs/COMMANDS.md) — every command, worked examples, protocols (RPC, OpenAI, P2P wire)
 - [CLI reference](docs/CLI.md) — every flag, defaults, env overrides
 - [Install details](docs/INSTALL.md) — manual install, checksum verification, Gatekeeper
+- [Training getting started](docs/TRAINING.md) — `loomtrain` install (Docker/pip/Colab), first run, artifact-to-flag map
 - [Multi-node walkthrough](docs/MULTI-NODE-WALKTHROUGH.md) — shard a real MoE model across a swarm on one host
 - [Two-machine test](docs/TWO-MACHINE-TEST.md) — a real cross-machine swarm with measured tok/s
 - [Named networks](docs/NETWORKS.md) — devnet / testnet / mainnet, models and policies

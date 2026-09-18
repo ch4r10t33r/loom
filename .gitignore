@@ -8,3 +8,5 @@ zig-pkg/
 # macOS
 .DS_Store
 legal/
+*.egg-info/
+__pycache__/
