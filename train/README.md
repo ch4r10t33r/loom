@@ -8,7 +8,7 @@ the two meet only through content-addressed artifact files.
 
 ```sh
 # from a rented GPU box, pinned to a loom release tag:
-pip install "loomtrain @ git+https://github.com/ch4r10t33r/loom@v0.44.0#subdirectory=train"
+pip install "loomtrain @ git+https://github.com/ch4r10t33r/loom@v0.45.0#subdirectory=train"
 loomtrain recover-lora train --model Qwen/Qwen3-30B-A3B --gguf model-q2k.gguf ...
 # or, zero-install, module-direct (identical behavior):
 python3 -u -m loomtrain.recover_lora train ...
@@ -30,3 +30,36 @@ pyproject.toml: the box's CUDA build dictates the torch wheel; each
 module's docstring records the per-run pins that worked (the house
 recipe). Ops shell scripts and measurement batteries stay in
 `../scripts/` — this package is only for code that trains.
+
+## Testing the package
+
+Four tiers, cheapest first:
+
+1. **CPU, anywhere** (no GPU, ~2 min): install and re-export the released
+   pre-gate checkpoint; the output must be byte-identical to the deployed
+   artifact (both are release assets on v0.40.3):
+   ```sh
+   loomtrain pregate-export pregate-head-qwen3.pt check.lpg --n-expert 128
+   cmp pregate-qwen3.lpg check.lpg   # byte-identical or the package is broken
+   ```
+2. **CI, automatic**: every change under train/ rebuilds the container
+   image and imports every module under the exact pinned stack.
+3. **Colab, functional GPU test** (free/Pro tier): the pip install path is
+   exactly what Colab exercises -- no Docker needed. Base model for this
+   tier is **OLMoE-1B-7B** (the smallest MoE in the house toolchain; its
+   HF module layout and GGUF tensor names match what recover-lora expects).
+   A T4 is very tight for 7B bf16; prefer an L4/A100 runtime.
+   ```
+   !pip install "loomtrain @ git+https://github.com/ch4r10t33r/loom@v0.45.0#subdirectory=train"
+   !huggingface-cli download bartowski/OLMoE-1B-7B-0924-GGUF --include "*Q4_K_M*" --local-dir .
+   !python -u -m loomtrain.recover_lora train --model allenai/OLMoE-1B-7B-0924        --gguf OLMoE-1B-7B-0924-Q4_K_M.gguf --rank 4 --tokens 2000000 --batch 2 --seq 512        --out olmoe-rlora.pt
+   !python -m loomtrain.recover_lora export --ckpt olmoe-rlora.pt --out olmoe.lra
+   ```
+   This validates the full training path (GGUF dequant install, adapter
+   gradients, LRA1 export). Note: loom's engine does not serve the olmoe
+   arch, so the serve-side attach is covered by loom's own fixture tests,
+   not this tier.
+4. **The real run** (rented GPU): Qwen3-30B-A3B against the devnet's Q2_K
+   GGUF needs the base in bf16 (~60 GB) -- an 80 GB A100/H100 rental, not
+   a 24 GB card. Rank {4,8,16} curve, then the devnet A/B with
+   `loom node --recover-lora qwen3-30b-q2k.lra`.
