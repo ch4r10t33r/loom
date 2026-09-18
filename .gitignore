@@ -10,3 +10,4 @@ zig-pkg/
 legal/
 *.egg-info/
 __pycache__/
+train/build/
