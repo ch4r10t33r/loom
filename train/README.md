@@ -52,8 +52,8 @@ Four tiers, cheapest first:
    (Colab Pro) or a 48 GB rental; free-tier T4 cannot hold it.
    ```
    !pip install "loomtrain @ git+https://github.com/ch4r10t33r/loom@v0.45.0#subdirectory=train"
-   !huggingface-cli download Qwen/Qwen1.5-MoE-A2.7B-Chat-GGUF --include "*q4_k_m*" --local-dir .
-   !python -u -m loomtrain.recover_lora train --model Qwen/Qwen1.5-MoE-A2.7B-Chat        --gguf qwen1_5-moe-a2_7b-chat-q4_k_m.gguf --rank 4 --tokens 2000000 --batch 2 --seq 512        --out a27b-rlora.pt
+   !huggingface-cli download RichardErkhov/Qwen_-_Qwen1.5-MoE-A2.7B-Chat-gguf --include "*Q4_K_M*" --local-dir .
+   !python -u -m loomtrain.recover_lora train --model Qwen/Qwen1.5-MoE-A2.7B-Chat        --gguf Qwen1.5-MoE-A2.7B-Chat.Q4_K_M.gguf --rank 4 --tokens 2000000 --batch 2 --seq 512        --out a27b-rlora.pt
    !python -m loomtrain.recover_lora export --ckpt a27b-rlora.pt --out a27b.lra
    ```
    This validates the full path: GGUF dequant install, adapter
