@@ -14,6 +14,17 @@ loomtrain recover-lora train --model Qwen/Qwen3-30B-A3B --gguf model-q2k.gguf ..
 python3 -u -m loomtrain.recover_lora train ...
 ```
 
+On boxes with Docker (Vast/RunPod templates take the image directly):
+
+```sh
+docker run --gpus all -v $PWD:/work ghcr.io/ch4r10t33r/loom-train \
+  recover-lora train --model Qwen/Qwen3-30B-A3B --gguf model-q2k.gguf ...
+```
+
+The image (train/Dockerfile, published by CI on main) bakes in the house
+pins -- transformers 4.55.4 and friends -- so a fresh rental skips the
+dependency archaeology entirely.
+
 torch/transformers/datasets/gguf are deliberately unpinned in
 pyproject.toml: the box's CUDA build dictates the torch wheel; each
 module's docstring records the per-run pins that worked (the house

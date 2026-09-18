@@ -1,0 +1,72 @@
+name: train-image
+
+# The loomtrain CUDA/torch image: multi-GB, so built only when the training
+# plane actually changes, in its own workflow -- the main CI's required
+# checks stay untouched and PRs elsewhere never pay this build.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "train/**"
+      - ".github/workflows/train-image.yml"
+  pull_request:
+    paths:
+      - "train/**"
+      - ".github/workflows/train-image.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  image:
+    name: training image build, smoke test, publish on main
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io on main
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # The base image plus pip layers run ~8 GB unpacked; standard runners
+      # have ~14 GB free, so drop the preinstalled toolchains first.
+      - name: Free runner disk
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc || true
+          df -h /
+
+      - name: Build image
+        run: docker build -t loom-train:ci train/
+
+      # No GPU on the runner, so the smoke test proves what it can: the CLI
+      # dispatches, every subcommand module imports (which pulls in the
+      # pinned torch/transformers/datasets/gguf stack), and the pins are the
+      # ones the house recipe demands.
+      - name: Smoke test the image
+        run: |
+          set -eux
+          docker run --rm loom-train:ci --help
+          docker run --rm -i --entrypoint python3 loom-train:ci - <<'EOF'
+          import importlib
+          import torch, transformers, datasets, gguf, bitsandbytes, numpy
+          assert transformers.__version__ == "4.55.4", transformers.__version__
+          for m in ("recover_lora", "pregate_probe", "pregate_dump", "pregate_export", "router_retrain", "cli"):
+              importlib.import_module(f"loomtrain.{m}")
+          print("torch", torch.__version__, "cuda-built:", torch.version.cuda)
+          EOF
+
+      - name: Log in to GHCR
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Push to ghcr.io
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          set -eux
+          owner=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          image="ghcr.io/${owner}/loom-train"
+          docker tag loom-train:ci "${image}:latest"
+          docker tag loom-train:ci "${image}:${GITHUB_SHA}"
+          docker push "${image}:latest"
+          docker push "${image}:${GITHUB_SHA}"
+          echo "published ${image}:latest and ${image}:${GITHUB_SHA}"
