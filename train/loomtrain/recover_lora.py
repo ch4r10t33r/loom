@@ -11,10 +11,10 @@ before freezing them. bnb-4bit is NOT a stand-in -- a different rounding
 gives the adapters a different error to learn.
 
 Stages:
-  train:   python3 -u recover-lora-train.py train \
+  train:   python3 -u -m loomtrain.recover_lora train \
              --model Qwen/Qwen3-30B-A3B --gguf qwen3-30b-a3b-q2k.gguf \
              --rank 8 --tokens 50000000 --out rlora-ckpt.pt
-  export:  python3 recover-lora-train.py export \
+  export:  python3 -m loomtrain.recover_lora export \
              --ckpt rlora-ckpt.pt --out qwen3-30b-q2k.lra
 
 LRA1 format (matches src/gguf/recover_lora.zig): "LRA1", u32 n_layers,

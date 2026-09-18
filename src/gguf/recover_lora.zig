@@ -21,7 +21,7 @@
 //! in layer-major order, each pair laid out as
 //!   Ag[r*dim] Bg[ffn*r] Au[r*dim] Bu[ffn*r] Ad[r*ffn] Bd[dim*r]
 //! (gate, up: dim -> ffn; down: ffn -> dim). Written by
-//! scripts/recover-lora-train.py --export.
+//! loomtrain recover-lora export (train/loomtrain/recover_lora.py).
 //!
 //! Scratch note: the engine serves one request at a time (rpc.zig's
 //! documented contract), so the inference scratch lives here rather than in

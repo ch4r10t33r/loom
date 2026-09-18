@@ -15,7 +15,7 @@
 //! u32 n_pred (layers predicted, i.e. n_layers-1), u32 n_expert, then f32
 //! arrays w1[width*hid] b1[width] w2[n_pred*n_expert*width]
 //! b2[n_pred*n_expert] -- PyTorch Linear layout (row-major [out, in]),
-//! written by scripts/pregate-export.py from the probe's checkpoint.
+//! written by train/loomtrain/pregate_export.py from the probe's checkpoint.
 //!
 //! Scratch note: the engine serves one request at a time (rpc.zig's
 //! documented contract), so the inference scratch lives here rather than in
