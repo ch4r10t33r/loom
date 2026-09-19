@@ -285,19 +285,30 @@ fn handleRequest(ctx: *Ctx, line: []const u8, wi: *Io.Writer) !void {
 
 /// Emit raw bytes as a JSON string with proper escaping.
 fn writeJsonBytes(wi: *Io.Writer, bytes: []const u8) !void {
-    try wi.print("\"", .{});
-    for (bytes) |b| {
-        switch (b) {
-            '"' => try wi.print("\\\"", .{}),
-            '\\' => try wi.print("\\\\", .{}),
-            '\n' => try wi.print("\\n", .{}),
-            '\r' => try wi.print("\\r", .{}),
-            '\t' => try wi.print("\\t", .{}),
-            0x20...0x21, 0x23...0x5b, 0x5d...0x7e => try wi.print("{c}", .{b}),
-            else => try wi.print("\\u{x:0>4}", .{b}),
-        }
+    if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
+    try std.json.Stringify.encodeJsonString(bytes, .{}, wi);
+}
+
+test "native RPC JSON preserves Unicode and escapes controls" {
+    const gpa = std.testing.allocator;
+    const text = "Café 中文 😀\n\t\"\\\x01";
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    try writeJsonBytes(&output.writer, text);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, output.written(), .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(text, parsed.value.string);
+}
+
+test "native RPC JSON rejects invalid UTF-8" {
+    const gpa = std.testing.allocator;
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    if (writeJsonBytes(&output.writer, &.{0xff})) {
+        return error.ExpectedInvalidUtf8;
+    } else |err| {
+        try std.testing.expectEqual(error.InvalidUtf8, err);
     }
-    try wi.print("\"", .{});
 }
 
 /// Constant-time-ish equality for the admin token (avoids trivial early-exit).

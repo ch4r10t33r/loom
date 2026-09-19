@@ -679,12 +679,37 @@ const StreamCtx = struct {
     /// write fail, which aborts generation — the compute is already spent, so
     /// this is what gets billed (security issue #30).
     emitted: u64 = 0,
+    /// A generator may emit a multi-byte UTF-8 code point one byte at a time.
+    /// Hold only the incomplete suffix; invalid sequences fail the stream.
+    pending_utf8: [3]u8 = undefined,
+    pending_utf8_len: usize = 0,
 
     fn emit(ptr: *anyopaque, bytes: []const u8) anyerror!void {
         const self: *StreamCtx = @ptrCast(@alignCast(ptr));
         self.emitted += 1;
         sockopt.refreshServe(self.io, self.dl);
-        const esc = try jsonEscapeAlloc(self.gpa, bytes);
+
+        var joined: ?[]u8 = null;
+        defer if (joined) |buf| self.gpa.free(buf);
+        const input = if (self.pending_utf8_len == 0)
+            bytes
+        else blk: {
+            const buf = try self.gpa.alloc(u8, self.pending_utf8_len + bytes.len);
+            @memcpy(buf[0..self.pending_utf8_len], self.pending_utf8[0..self.pending_utf8_len]);
+            @memcpy(buf[self.pending_utf8_len..], bytes);
+            self.pending_utf8_len = 0;
+            joined = buf;
+            break :blk buf;
+        };
+
+        const complete_len = try utf8CompletePrefixLen(input);
+        const suffix = input[complete_len..];
+        if (suffix.len > self.pending_utf8.len) return error.InvalidUtf8;
+        @memcpy(self.pending_utf8[0..suffix.len], suffix);
+        self.pending_utf8_len = suffix.len;
+        if (complete_len == 0) return;
+
+        const esc = try jsonEscapeAlloc(self.gpa, input[0..complete_len]);
         defer self.gpa.free(esc);
         if (self.is_chat) {
             try self.wi.print("data: {{\"id\":\"chatcmpl-loom-{d}\",\"object\":\"chat.completion.chunk\",\"created\":0,\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"{s}\"}},\"finish_reason\":null}}]}}\n\n", .{ self.id, self.model, esc });
@@ -692,6 +717,10 @@ const StreamCtx = struct {
             try self.wi.print("data: {{\"id\":\"cmpl-loom-{d}\",\"object\":\"text_completion\",\"created\":0,\"model\":\"{s}\",\"choices\":[{{\"index\":0,\"text\":\"{s}\",\"finish_reason\":null}}]}}\n\n", .{ self.id, self.model, esc });
         }
         try self.wi.flush();
+    }
+
+    fn finish(self: *const StreamCtx) !void {
+        if (self.pending_utf8_len != 0) return error.InvalidUtf8;
     }
 };
 
@@ -748,6 +777,14 @@ fn streamCompletions(
     if (ctx.meter) |m| {
         _ = m.settle(client, reserved, @intCast(res.prompt_tokens + res.completion_tokens));
     }
+
+    // A truncated final code point is invalid UTF-8 just like an invalid byte
+    // sequence encountered during generation.
+    sctx.finish() catch {
+        wi.print("data: {{\"error\":{{\"message\":\"generation_failed\",\"type\":\"server_error\"}}}}\n\ndata: [DONE]\n\n", .{}) catch {};
+        wi.flush() catch {};
+        return;
+    };
 
     const finish: []const u8 = if (res.stop) "stop" else "length";
     if (is_chat) {
@@ -1003,21 +1040,103 @@ fn consoleLine(ctx: *Ctx, comptime fmt: []const u8, args: anytype) void {
 }
 
 fn jsonEscapeAlloc(gpa: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    var buf = std.ArrayList(u8).empty;
-    errdefer buf.deinit(gpa);
-    for (bytes) |b| switch (b) {
-        '"' => try buf.appendSlice(gpa, "\\\""),
-        '\\' => try buf.appendSlice(gpa, "\\\\"),
-        '\n' => try buf.appendSlice(gpa, "\\n"),
-        '\r' => try buf.appendSlice(gpa, "\\r"),
-        '\t' => try buf.appendSlice(gpa, "\\t"),
-        0x20...0x21, 0x23...0x5b, 0x5d...0x7e => try buf.append(gpa, b),
-        else => {
-            var tmp: [6]u8 = undefined;
-            try buf.appendSlice(gpa, try std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{b}));
-        },
+    if (!std.unicode.utf8ValidateSlice(bytes)) return error.InvalidUtf8;
+    var out: Io.Writer.Allocating = .init(gpa);
+    defer out.deinit();
+    try std.json.Stringify.encodeJsonStringChars(bytes, .{}, &out.writer);
+    return out.toOwnedSlice();
+}
+
+/// Return the valid, complete UTF-8 prefix. An incomplete final code point is
+/// left for the next streaming token; malformed input fails immediately.
+fn utf8CompletePrefixLen(bytes: []const u8) !usize {
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const sequence_len: usize = std.unicode.utf8ByteSequenceLength(bytes[i]) catch return error.InvalidUtf8;
+        if (bytes.len - i < sequence_len) return i;
+        _ = std.unicode.utf8Decode(bytes[i .. i + sequence_len]) catch return error.InvalidUtf8;
+        i += sequence_len;
+    }
+    return i;
+}
+
+test "buffered OpenAI JSON preserves Unicode and escapes controls" {
+    const gpa = std.testing.allocator;
+    const text = "Café 中文 😀\n\t\"\\\x01";
+    const escaped = try jsonEscapeAlloc(gpa, text);
+    defer gpa.free(escaped);
+    const body = try std.fmt.allocPrint(gpa, "{{\"choices\":[{{\"text\":\"{s}\"}}]}}", .{escaped});
+    defer gpa.free(body);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, body, .{});
+    defer parsed.deinit();
+    const got = parsed.value.object.get("choices").?.array.items[0].object.get("text").?.string;
+    try std.testing.expectEqualStrings(text, got);
+}
+
+test "OpenAI JSON rejects invalid UTF-8" {
+    const gpa = std.testing.allocator;
+    if (jsonEscapeAlloc(gpa, &.{0xff})) |escaped| {
+        defer gpa.free(escaped);
+        return error.ExpectedInvalidUtf8;
+    } else |err| {
+        try std.testing.expectEqual(error.InvalidUtf8, err);
+    }
+}
+
+test "OpenAI SSE preserves Unicode split across byte tokens" {
+    const gpa = std.testing.allocator;
+    const text = "Café 中文 😀";
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var sctx = StreamCtx{
+        .wi = &output.writer,
+        .gpa = gpa,
+        .io = undefined,
+        .dl = null,
+        .id = 1,
+        .model = "test-model",
+        .is_chat = true,
     };
-    return buf.toOwnedSlice(gpa);
+    for (text) |b| {
+        const one = [_]u8{b};
+        try StreamCtx.emit(&sctx, &one);
+    }
+
+    var rebuilt: Io.Writer.Allocating = .init(gpa);
+    defer rebuilt.deinit();
+    var events = std.mem.splitSequence(u8, output.written(), "\n\n");
+    while (events.next()) |event| {
+        if (event.len == 0) continue;
+        const prefix = "data: ";
+        try std.testing.expect(std.mem.startsWith(u8, event, prefix));
+        const parsed = try std.json.parseFromSlice(std.json.Value, gpa, event[prefix.len..], .{});
+        defer parsed.deinit();
+        const content = parsed.value.object.get("choices").?.array.items[0].object.get("delta").?.object.get("content").?.string;
+        try rebuilt.writer.writeAll(content);
+    }
+    try std.testing.expectEqualStrings(text, rebuilt.written());
+    try sctx.finish();
+}
+
+test "OpenAI SSE rejects invalid or truncated UTF-8" {
+    const gpa = std.testing.allocator;
+    var output: Io.Writer.Allocating = .init(gpa);
+    defer output.deinit();
+    var sctx = StreamCtx{
+        .wi = &output.writer,
+        .gpa = gpa,
+        .io = undefined,
+        .dl = null,
+        .id = 1,
+        .model = "test-model",
+        .is_chat = true,
+    };
+
+    try std.testing.expectError(error.InvalidUtf8, StreamCtx.emit(&sctx, &.{0xff}));
+
+    var truncated = sctx;
+    try StreamCtx.emit(&truncated, &.{0xe2});
+    try std.testing.expectError(error.InvalidUtf8, truncated.finish());
 }
 
 // ---- helpers ---------------------------------------------------------------
