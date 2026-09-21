@@ -77,10 +77,14 @@ def build(args):
 
     torch.manual_seed(args.seed)
     dev = args.device if args.device != "auto" else ("cuda" if torch.cuda.is_available() else "cpu")
-    log(f"loading {args.model} (bf16, low_cpu_mem_usage, device {dev})")
+    # several small cards: shard layers across all of them (accelerate's
+    # naive model parallelism -- fine here, the batch is tiny and the LoRA
+    # params inherit each wrapped layer's own device)
+    dmap = "auto" if (dev == "cuda" and torch.cuda.device_count() > 1) else {"": dev}
+    log(f"loading {args.model} (bf16, low_cpu_mem_usage, device_map {dmap})")
     model = AutoModelForCausalLM.from_pretrained(
         args.model, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
-        device_map={"": dev},
+        device_map=dmap,
     )
     tok = AutoTokenizer.from_pretrained(args.model)
 
