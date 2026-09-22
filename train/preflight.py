@@ -56,11 +56,15 @@ def main():
 
     # synthetic stream: the dry-run must not depend on dataset connectivity
     def fake_load_dataset(*a, **k):
+        # distinct content per dataset name: identical streams train
+        # identical branches, whose mixture is routing-invariant -- which
+        # made the router gradient legitimately zero and masked nothing
+        tag = abs(hash(a[0] if a else "x")) % 997
         def gen():
             for i in itertools.count():
-                yield {"text": (f"the loom weaves expert {i} ") * 40}
+                yield {"text": (f"stream {tag} weaves thread {i * (tag + 1)} ") * 40}
         return gen()
-    real_datasets.load_dataset = fake_load_dataset
+    real_datasets.load_dataset = fake_load_dataset  # covers recover_lora AND btx streams
 
     class A:
         pass
@@ -86,7 +90,63 @@ def main():
     want = 24 + nl * ne * 3 * r * (dim + ffn) * 2
     got = os.path.getsize("tiny.lra")
     assert got == want, f"LRA1 size {got} != formula {want}"
-    print(f"PREFLIGHT OK: trained, exported, size matches formula ({got} bytes)")
+    print(f"recover-lora preflight OK ({got} bytes)")
+
+    # ---- BTX: tiny dense seed -> 2 branches -> exact merge -> router train
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+    from loomtrain import btx
+
+    scfg = Qwen3Config(hidden_size=64, intermediate_size=128,
+                       num_hidden_layers=2, num_attention_heads=4,
+                       num_key_value_heads=2, head_dim=16, vocab_size=151936,
+                       max_position_embeddings=512, tie_word_embeddings=True)
+    torch.manual_seed(1)
+    Qwen3ForCausalLM(scfg).save_pretrained("tinyseed")
+    AutoTokenizer.from_pretrained("Qwen/Qwen1.5-MoE-A2.7B-Chat").save_pretrained("tinyseed")
+
+    class B:
+        pass
+    for i, out in enumerate(("tb0", "tb1")):
+        b = B()
+        b.seed = "tinyseed"
+        b.dataset = f"synthetic-{i}"
+        b.subset = None
+        b.tokens = 2000
+        b.lr = 5e-5
+        b.seq = 128
+        b.batch = 2
+        b.device = "cpu"
+        b.seed_val = i
+        b.out = out
+        btx.branch(b)
+
+    m = B()
+    m.seed = "tinyseed"
+    m.branches = ["tb0", "tb1"]
+    m.dataset = "synthetic-a"
+    m.subset = None
+    m.dataset2 = "synthetic-b"
+    m.subset2 = None
+    m.router_tokens = 1500
+    m.router_lr = 1e-3
+    m.seq = 128
+    m.batch = 2
+    m.device = "cpu"
+    m.out = "tinymerged"
+    btx.merge(m)
+
+    # the merged model must load as a qwen3moe and run a forward
+    from transformers import AutoModelForCausalLM as AM
+    mm = AM.from_pretrained("tinymerged")
+    assert mm.config.model_type == "qwen3_moe" and mm.config.num_experts == 2
+    ids = torch.randint(0, 1000, (1, 16))
+    mm(input_ids=ids)
+    # exact-merge invariant: the merged trunk equals the seed's trunk
+    seed_m = AM.from_pretrained("tinyseed")
+    a = mm.model.layers[0].self_attn.q_proj.weight
+    bq = seed_m.model.layers[0].self_attn.q_proj.weight
+    assert torch.equal(a, bq), "trunk drifted -- merge is not exact"
+    print("PREFLIGHT OK: recover-lora + btx pipelines both pass")
 
 
 if __name__ == "__main__":

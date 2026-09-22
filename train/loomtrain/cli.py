@@ -16,6 +16,7 @@ SUBCOMMANDS = {
     "pregate-dump": "loomtrain.pregate_dump",
     "pregate-export": "loomtrain.pregate_export",
     "router-retrain": "loomtrain.router_retrain",
+    "btx": "loomtrain.btx",
 }
 
 
