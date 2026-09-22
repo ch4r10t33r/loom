@@ -106,7 +106,7 @@ def main():
 
     class B:
         pass
-    for i, out in enumerate(("tb0", "tb1")):
+    def branch_args(i, out, ternary=False):
         b = B()
         b.seed = "tinyseed"
         b.dataset = f"synthetic-{i}"
@@ -117,8 +117,12 @@ def main():
         b.batch = 2
         b.device = "cpu"
         b.seed_val = i
+        b.ternary = ternary
         b.out = out
-        btx.branch(b)
+        return b
+
+    for i, out in enumerate(("tb0", "tb1")):
+        btx.branch(branch_args(i, out))
 
     m = B()
     m.seed = "tinyseed"
@@ -146,6 +150,26 @@ def main():
     a = mm.model.layers[0].self_attn.q_proj.weight
     bq = seed_m.model.layers[0].self_attn.q_proj.weight
     assert torch.equal(a, bq), "trunk drifted -- merge is not exact"
+
+    # ---- BTX ternary arm: QAT branches -> saved weights ternary-valued ->
+    # merge still composes and forward-runs
+    for i, out in enumerate(("tt0", "tt1")):
+        btx.branch(branch_args(i, out, ternary=True))
+    tb = AM.from_pretrained("tt0")
+    w = tb.model.layers[0].mlp.gate_proj.weight
+    uniq = max(int(torch.unique(row).numel()) for row in w)
+    assert uniq <= 3, f"ternary save not snapped: {uniq} distinct values in a row"
+    assert not torch.equal(w, seed_m.model.layers[0].mlp.gate_proj.weight), \
+        "ternary branch FFN never moved off the seed"
+    mt = m
+    mt.branches = ["tt0", "tt1"]
+    mt.out = "tinymerged-t"
+    btx.merge(mt)
+    mmt = AM.from_pretrained("tinymerged-t")
+    ew = mmt.model.layers[0].mlp.experts[0].gate_proj.weight
+    uniq = max(int(torch.unique(row).numel()) for row in ew)
+    assert uniq <= 3, "merged expert lost ternary values"
+    mmt(input_ids=ids)
     print("PREFLIGHT OK: recover-lora + btx pipelines both pass")
 
 

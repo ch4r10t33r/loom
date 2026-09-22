@@ -124,12 +124,35 @@ def train_loop(model, tok, dataset, tokens, seq, batch, lr, device, save_fn, onl
     log(f"loop done: {seen/1e6:.1f}M tokens")
 
 
+def ternary_quantize(w):
+    """BitNet-b1.58-style ternary snap with a per-output-row scale:
+    gamma = mean|w| per row, w_q = clip(round(w/gamma), -1, 1) * gamma.
+    Every row's values land in {-gamma, 0, +gamma}."""
+    import torch
+    gamma = w.abs().mean(dim=1, keepdim=True).clamp(min=1e-8)
+    return (w / gamma).round().clamp(-1, 1) * gamma
+
+
+def apply_ternary_qat(lin):
+    """QAT forward on one Linear: ternary weights in the forward pass,
+    straight-through estimator so gradients reach the fp32 latents."""
+    import torch
+
+    def fwd(x):
+        w = lin.weight
+        w_ste = w + (ternary_quantize(w) - w).detach()
+        return torch.nn.functional.linear(x, w_ste, lin.bias)
+
+    lin.forward = fwd
+
+
 def branch(args):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     torch.manual_seed(args.seed_val)
     dev = resolve_device(args.device)
-    log(f"branch: seed {args.seed} on {args.dataset} -> {args.out} (device {dev})")
+    log(f"branch: seed {args.seed} on {args.dataset} -> {args.out} (device {dev})"
+        + (" [ternary QAT]" if args.ternary else ""))
     # fp32 masters (bf16 compute via autocast): full-FFN training in bf16
     # params is where silent quality loss hides
     model = AutoModelForCausalLM.from_pretrained(
@@ -140,9 +163,37 @@ def branch(args):
     def is_ffn(name):
         return any(k in name for k in ("mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"))
 
+    q_lins = []
+    if args.ternary:
+        # Ternary is a TRAINING-time property (QAT), not a conversion: the
+        # latents stay fp32, the forward sees ternary weights via STE, and
+        # the saved artifact snaps to the ternary values. Quality arm only:
+        # weights are ternary-VALUED but stored f16/f32 -- the fetch-byte
+        # win needs a ternary storage type + loom kernel, gated on this
+        # arm's eval.
+        for name, mod in model.named_modules():
+            if is_ffn(name) and isinstance(mod, torch.nn.Linear):
+                apply_ternary_qat(mod)
+                q_lins.append(mod)
+        assert q_lins, "no FFN Linear modules matched for ternary QAT"
+        z = sum((ternary_quantize(m.weight) == 0).sum().item() for m in q_lins)
+        n = sum(m.weight.numel() for m in q_lins)
+        log(f"ternary QAT on {len(q_lins)} FFN projections ({z/n:.1%} zeros at init)")
+
     def save():
+        if q_lins:
+            # export the SNAPPED weights (the model the merge composes must
+            # be the model QAT optimized), keeping latents intact to train on
+            with torch.no_grad():
+                latents = [m.weight.detach().cpu().clone() for m in q_lins]
+                for m in q_lins:
+                    m.weight.copy_(ternary_quantize(m.weight))
         model.save_pretrained(args.out)
         tok.save_pretrained(args.out)
+        if q_lins:
+            with torch.no_grad():
+                for m, w in zip(q_lins, latents):
+                    m.weight.copy_(w.to(m.weight.device))
         log(f"saved -> {args.out}")
 
     train_loop(model, tok, args.dataset, args.tokens, args.seq, args.batch,
@@ -267,6 +318,7 @@ if __name__ == "__main__":
     bp.add_argument("--batch", type=int, default=8)
     bp.add_argument("--device", default="auto")
     bp.add_argument("--seed-val", type=int, default=0)
+    bp.add_argument("--ternary", action="store_true")
     bp.add_argument("--out", required=True)
 
     mp = sub.add_parser("merge")
