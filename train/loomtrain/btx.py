@@ -30,6 +30,7 @@ timestamps, python3 -u, eval only from final weights.
 """
 
 import argparse
+import math
 import time
 
 
@@ -84,6 +85,15 @@ def train_loop(model, tok, dataset, tokens, seq, batch, lr, device, save_fn, onl
     model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
     model.train()
     opt = torch.optim.AdamW(trainable, lr=lr)
+    # Warmup + cosine decay to zero over the planned token budget. Constant
+    # LR leaves the weights "hot" at save time: stage-0 branches trained at
+    # constant 5e-5 ended WORSE than the seed on their own domain, and an
+    # unannealed endpoint is the standard cause.
+    total_steps = max(math.ceil(tokens / (batch * seq)), 1)
+    warmup = min(100, max(total_steps // 20, 1))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: (
+        (s + 1) / warmup if s < warmup
+        else 0.5 * (1 + math.cos(math.pi * min((s - warmup) / max(total_steps - warmup, 1), 1.0)))))
     use_amp = device.startswith("cuda")
 
     seen, step_i, t0 = 0, 0, time.time()
@@ -99,6 +109,7 @@ def train_loop(model, tok, dataset, tokens, seq, batch, lr, device, save_fn, onl
             log(f"first-step grad sum {gn:.3e}")
             assert gn > 0, "no gradient reached the trainable params"
         opt.step()
+        sched.step()
         opt.zero_grad(set_to_none=True)
         seen += int((labels != -100).sum())
         step_i += 1
