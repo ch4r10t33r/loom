@@ -127,10 +127,7 @@ def main():
     m = B()
     m.seed = "tinyseed"
     m.branches = ["tb0", "tb1"]
-    m.dataset = "synthetic-a"
-    m.subset = None
-    m.dataset2 = "synthetic-b"
-    m.subset2 = None
+    m.datasets = ["synthetic-a", "synthetic-b"]
     m.router_tokens = 1500
     m.router_lr = 1e-3
     m.seq = 128
@@ -150,6 +147,24 @@ def main():
     a = mm.model.layers[0].self_attn.q_proj.weight
     bq = seed_m.model.layers[0].self_attn.q_proj.weight
     assert torch.equal(a, bq), "trunk drifted -- merge is not exact"
+
+    # ---- BTX 3-branch merge: the first TRULY sparse routing (top-2-of-3
+    # selects, unlike top-2-of-2 which always uses both experts)
+    btx.branch(branch_args(2, "tb2"))
+    m3 = B()
+    m3.seed = "tinyseed"
+    m3.branches = ["tb0", "tb1", "tb2"]
+    m3.datasets = ["synthetic-a", "synthetic-b", "synthetic-c"]
+    m3.router_tokens = 1500
+    m3.router_lr = 1e-3
+    m3.seq = 128
+    m3.batch = 2
+    m3.device = "cpu"
+    m3.out = "tinymerged3"
+    btx.merge(m3)
+    mm3 = AM.from_pretrained("tinymerged3")
+    assert mm3.config.num_experts == 3 and mm3.config.num_experts_per_tok == 2
+    mm3(input_ids=ids)
 
     # ---- BTX ternary arm: QAT branches -> saved weights ternary-valued ->
     # merge still composes and forward-runs

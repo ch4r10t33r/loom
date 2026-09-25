@@ -20,8 +20,10 @@ Stages:
              --device cuda:0 --out branch-web
   merge:   python3 -u -m loomtrain.btx merge --seed Qwen/Qwen3-0.6B-Base \
              --branches branch-web branch-math --router-tokens 5000000 \
-             --dataset HuggingFaceFW/fineweb-edu --dataset2 open-web-math/open-web-math \
+             --datasets HuggingFaceFW/fineweb-edu open-web-math/open-web-math \
              --out btx-moe
+           (one "repo[:subset]" spec per branch; router trains on the
+            round-robin interleave of all of them)
   eval:    python3 -u -m loomtrain.btx eval --model btx-moe \
              --dataset open-web-math/open-web-math --tokens 200000
 
@@ -46,9 +48,12 @@ def resolve_device(name):
 
 
 def stream_batches(tok, dataset, seq, batch, skip=0, subset=None):
-    """Padded (input_ids, labels) batches from a streaming HF dataset."""
+    """Padded (input_ids, labels) batches from a streaming HF dataset.
+    `dataset` may carry its config inline as "repo[:subset]"."""
     import torch
     from datasets import load_dataset
+    if subset is None and ":" in dataset:
+        dataset, subset = dataset.split(":", 1)
     kwargs = {"streaming": True, "split": "train"}
     if subset:
         kwargs["name"] = subset
@@ -271,10 +276,11 @@ def merge(args):
         log(f"saved -> {args.out}")
 
     if args.router_tokens > 0:
-        # router-only training on an interleaved 50/50 domain mix
-        a = stream_batches(tok, args.dataset, args.seq, args.batch, subset=args.subset)
-        b = stream_batches(tok, args.dataset2, args.seq, args.batch, subset=args.subset2)
-        mixed = itertools.chain.from_iterable(zip(a, b))
+        # router-only training on a round-robin interleave of every branch's
+        # domain (one dataset spec per branch, "repo[:subset]")
+        streams = [stream_batches(tok, ds, args.seq, args.batch)
+                   for ds in args.datasets]
+        mixed = itertools.chain.from_iterable(zip(*streams))
         train_loop(moe, tok, "mixed", args.router_tokens, args.seq,
                    args.batch, args.router_lr, dev, save,
                    only=lambda n: "mlp.gate." in n, stream=mixed)
@@ -324,10 +330,8 @@ if __name__ == "__main__":
     mp = sub.add_parser("merge")
     mp.add_argument("--seed", required=True)
     mp.add_argument("--branches", nargs="+", required=True)
-    mp.add_argument("--dataset", required=True)
-    mp.add_argument("--subset", default=None)
-    mp.add_argument("--dataset2", required=True)
-    mp.add_argument("--subset2", default=None)
+    mp.add_argument("--datasets", nargs="+", required=True,
+                    help='one "repo[:subset]" spec per branch domain')
     mp.add_argument("--router-tokens", type=int, default=5_000_000)
     mp.add_argument("--router-lr", type=float, default=1e-3)
     mp.add_argument("--seq", type=int, default=1024)
